@@ -1,0 +1,376 @@
+syntax = "proto3";
+package chimaera.v1;
+
+import "chimaera/v1/common.proto";
+
+// ---------------------------------------------------------------------------
+// Replicated shard state. Every record here lives in a Raft group's state
+// machine and is produced only by `chimaera_core::shard::ShardState::apply`.
+// ---------------------------------------------------------------------------
+
+enum CallKind {
+  CALL_FUNCTION = 0;
+  CALL_ACTOR_CTOR = 1;
+  CALL_ACTOR_METHOD = 2;
+  CALL_MAP_ITEM = 3;
+}
+
+message TaskSpec {
+  TaskKey key = 1;
+  CallKind kind = 2;
+  bytes fn_digest = 3;          // content digest of the shipped code blob
+  ObjectRef args = 4;           // pickled call frame, futures replaced by placeholders
+  repeated TaskKey deps = 5;    // outcomes this call consumes
+  Effects effects = 6;
+  uint32 max_attempts = 7;      // includes the first attempt
+  uint64 deadline_hlc = 8;      // 0 = none
+  bytes policy = 9;             // frozen effective policy, opaque to the shard
+  bytes actor = 10;             // actor id for CALL_ACTOR_*
+  uint64 handle = 11;           // submitting handle, for per-handle ordering
+  uint64 seq = 12;
+  string method = 13;
+  uint32 item_index = 14;
+  TaskKey parent = 15;
+  bool speculation_allowed = 16;  // effects NONE and deterministic
+  uint32 max_oom_escalations = 17;
+  repeated string retry_exception_types = 18;
+}
+
+message Attempt {
+  uint32 attempt = 1;
+  PeerInc peer = 2;
+  bool revoked = 3;
+  bool speculative = 4;
+}
+
+message TaskRecord {
+  enum State {
+    PENDING = 0;  // waiting on dependencies
+    READY = 1;    // runnable, not granted
+    RUNNING = 2;  // at least one live attempt
+    DONE = 3;     // outcome committed, immutable
+  }
+  TaskSpec spec = 1;
+  State state = 2;
+  uint32 deps_remaining = 3;
+  uint32 infra_failures = 4;
+  uint32 oom_failures = 5;
+  uint32 user_retries = 6;
+  repeated Attempt attempts = 7;
+  uint32 next_attempt = 8;
+  uint32 external_started_attempt = 9;  // 0 = no start consumed
+  Outcome outcome = 10;
+  uint32 pins = 11;
+  uint64 submitted_hlc = 12;
+  uint64 done_hlc = 13;
+  bytes last_fingerprint = 14;
+  uint64 memory_hint = 15;              // raised after OOM, bytes
+  repeated ErrorRecord failure_history = 16;  // bounded, newest last
+}
+
+message RunRecord {
+  enum State {
+    ACTIVE = 0;
+    FINISHED = 1;
+    CANCELLED = 2;
+  }
+  bytes run = 1;
+  string tenant = 2;
+  string submission_key = 3;
+  State state = 4;
+  bool detached = 5;
+  uint64 client_grace_ms = 6;
+  uint64 created_hlc = 7;
+  uint64 finished_hlc = 8;
+  uint64 retention_ms = 9;
+  bytes code_digest = 10;
+  bytes env_digest = 11;
+  string description = 12;
+}
+
+message ActorSpec {
+  bytes actor = 1;
+  TaskKey ctor = 2;           // constructor task; its outcome gates method calls
+  string tenant = 3;
+  string key = 4;             // stable name for keyed actors, empty otherwise
+  bytes class_digest = 5;
+  enum Restart {
+    RESTART_NEVER = 0;
+    RESTART_FRESH = 1;
+    RESTART_CHECKPOINT = 2;
+  }
+  Restart restart = 6;
+  bool durable = 7;           // keyed durable state with a command log
+  uint32 max_restarts = 8;
+  bytes policy = 9;
+  bool detached = 10;
+}
+
+message ActorRecord {
+  enum State {
+    PENDING = 0;     // waiting for placement
+    ALIVE = 1;
+    RESTARTING = 2;
+    DEAD = 3;
+  }
+  ActorSpec spec = 1;
+  State state = 2;
+  uint64 generation = 3;
+  PeerInc host = 4;
+  uint32 restarts = 5;
+  uint64 state_version = 6;       // durable actors
+  bytes durable_state = 7;        // durable actors, <= 1 MiB inline
+  uint64 checkpoint_version = 8;
+  ObjectRef checkpoint = 9;       // restart=checkpoint snapshot
+  ErrorRecord death = 10;
+  uint64 commands_retained = 11;
+}
+
+message ActorCommandRecord {
+  bytes cmd_id = 1;
+  bytes fingerprint = 2;
+  uint64 version = 3;
+  ObjectRef reply = 4;
+  uint64 committed_hlc = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Commands. A command is applied deterministically: no wall clock, no
+// randomness, ordered iteration only. `hlc` is assigned by the proposing
+// leader and clamped to be monotonic at apply time.
+// ---------------------------------------------------------------------------
+
+message ShardCmd {
+  uint32 vshard = 1;
+  uint64 vshard_epoch = 2;
+  PeerInc issuer = 3;
+  uint64 hlc = 4;
+  oneof body {
+    RunCreate run_create = 10;
+    SubmitTasks submit_tasks = 11;
+    GrantAttempts grant = 12;
+    StartExternal start_external = 13;
+    PublishResults publish = 14;
+    RecordFailure record_failure = 15;
+    Cancel cancel = 16;
+    Subscribe subscribe = 17;
+    DepNotify dep_notify = 18;
+    OutboxAck outbox_ack = 19;
+    Release release = 20;
+    RetireIncarnation retire = 21;
+    ActorCreate actor_create = 22;
+    ActorPlace actor_place = 23;
+    ActorDied actor_died = 24;
+    ActorCommandCommit actor_commit = 25;
+    ActorCheckpoint actor_checkpoint = 26;
+    RunFinish run_finish = 27;
+    Gc gc = 28;
+    AdoptVShard adopt_vshard = 29;
+    CancelRun cancel_run = 30;
+  }
+}
+
+message RunCreate {
+  RunRecord run = 1;
+}
+
+message SubmitTasks {
+  repeated TaskSpec tasks = 1;
+  // Optimistic first grant: the ingress peer is already running attempt 1.
+  PeerInc grant_to = 2;
+}
+
+message Grant {
+  TaskKey task = 1;
+  PeerInc peer = 2;
+  bool speculative = 3;
+}
+
+message GrantAttempts {
+  repeated Grant grants = 1;
+}
+
+message StartExternal {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  PeerInc peer = 3;
+}
+
+message PublishEntry {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  PeerInc peer = 3;
+  Outcome outcome = 4;
+}
+
+message PublishResults {
+  repeated PublishEntry entries = 1;
+}
+
+message RecordFailure {
+  enum Kind {
+    INFRA = 0;
+    OOM = 1;
+    RETRYABLE_USER = 2;
+  }
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  PeerInc peer = 3;
+  Kind kind = 4;
+  ErrorRecord error = 5;
+  bytes fingerprint = 6;
+  uint64 memory_peak = 7;
+}
+
+message Cancel {
+  TaskKey task = 1;
+  ErrorRecord.Kind reason = 2;  // CANCELLED or DEADLINE
+  string message = 3;
+}
+
+message CancelRun {
+  bytes run = 1;
+  string message = 2;
+}
+
+// Ask the producer's vshard to notify `subscriber_vshard` when it completes.
+message Subscribe {
+  TaskKey producer = 1;
+  uint32 subscriber_vshard = 2;
+}
+
+message DepNotify {
+  TaskKey producer = 1;
+  Outcome outcome = 2;
+}
+
+message OutboxAck {
+  repeated uint64 seqs = 1;
+}
+
+message Release {
+  repeated TaskKey tasks = 1;
+}
+
+message RetireIncarnation {
+  PeerInc peer = 1;
+}
+
+message ActorCreate {
+  ActorSpec spec = 1;
+}
+
+message ActorPlace {
+  bytes actor = 1;
+  uint64 expected_generation = 2;
+  PeerInc host = 3;
+}
+
+message ActorDied {
+  bytes actor = 1;
+  uint64 generation = 2;
+  ErrorRecord reason = 3;
+}
+
+message ActorCommandCommit {
+  bytes actor = 1;
+  uint64 generation = 2;
+  bytes cmd_id = 3;
+  bytes fingerprint = 4;
+  uint64 prev_version = 5;
+  bytes new_state = 6;
+  ObjectRef reply = 7;
+}
+
+message ActorCheckpoint {
+  bytes actor = 1;
+  uint64 generation = 2;
+  uint64 version = 3;
+  ObjectRef snapshot = 4;
+}
+
+message RunFinish {
+  bytes run = 1;
+  RunRecord.State state = 2;
+}
+
+message Gc {
+  uint32 max_keys = 1;
+}
+
+message AdoptVShard {
+  uint32 vshard = 1;
+  uint64 epoch = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Replies
+// ---------------------------------------------------------------------------
+
+message TaskAck {
+  enum Status {
+    ACCEPTED = 0;
+    DUPLICATE = 1;     // already known; `state` and `outcome` are current
+    REJECTED = 2;
+    PUBLISHED = 3;
+    EXISTING = 4;      // an outcome was already committed; it is returned
+    STALE = 5;         // fenced: retired incarnation or revoked attempt
+    GRANTED = 6;
+    DENIED = 7;
+    NOT_FOUND = 8;
+  }
+  TaskKey task = 1;
+  Status status = 2;
+  TaskRecord.State state = 3;
+  Outcome outcome = 4;
+  uint32 attempt = 5;
+  string reason = 6;
+}
+
+message ActorAck {
+  enum Status {
+    OK = 0;
+    EXISTING = 1;
+    STALE_GENERATION = 2;
+    DUPLICATE = 3;        // same command id and fingerprint: stored reply
+    CONFLICT = 4;         // same command id, different fingerprint
+    VERSION_CONFLICT = 5;
+    NOT_FOUND = 6;
+    DEAD = 7;
+    REJECTED = 8;         // not durable, or state over the inline limit
+  }
+  bytes actor = 1;
+  Status status = 2;
+  ActorRecord record = 3;
+  ObjectRef reply = 4;
+  uint64 version = 5;
+  string reason = 6;
+}
+
+message ShardReply {
+  oneof body {
+    RunRecord run = 1;
+    TaskAcks tasks = 2;
+    ActorAck actor = 3;
+    uint64 count = 4;
+    string rejected = 5;  // envelope rejected: vshard not owned, stale epoch, retired issuer
+  }
+}
+
+message TaskAcks {
+  repeated TaskAck acks = 1;
+}
+
+// A cross-vshard dependency notification waiting to be delivered by the
+// producer group's leader. Removed by OutboxAck after the target commits it.
+message OutboxEntry {
+  uint64 seq = 1;
+  uint32 target_vshard = 2;
+  DepNotify notify = 3;
+}
+
+// Ownership of one virtual shard by this group.
+message VShardOwnership {
+  uint32 vshard = 1;
+  uint64 epoch = 2;
+}

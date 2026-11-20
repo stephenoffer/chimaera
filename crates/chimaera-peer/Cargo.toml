@@ -1,0 +1,12 @@
+[package]
+name = "chimaera-peer"
+description = "The Chimaera peer agent: scheduling, execution, objects, accounting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chimaera-core.workspace = true
+libc.workspace = true
+tracing.workspace = true

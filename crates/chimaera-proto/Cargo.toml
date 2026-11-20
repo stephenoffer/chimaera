@@ -1,0 +1,23 @@
+[package]
+name = "chimaera-proto"
+description = "Wire and log schemas for Chimaera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+prost.workspace = true
+blake3.workspace = true
+lz4_flex.workspace = true
+zstd.workspace = true
+thiserror.workspace = true
+tonic = { workspace = true, optional = true, features = ["codegen", "transport"] }
+tonic-prost = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[features]
+default = []
+grpc = ["dep:tonic", "dep:tonic-prost"]

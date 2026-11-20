@@ -1,0 +1,16 @@
+[package]
+name = "chimaera-core"
+description = "Pure, deterministic Chimaera logic: ids, shard state machine, membership, placement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chimaera-proto.workspace = true
+prost.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

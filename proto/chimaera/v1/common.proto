@@ -1,0 +1,72 @@
+syntax = "proto3";
+package chimaera.v1;
+
+// Identifiers are 16-byte values carried as `bytes`. chimaera-core wraps them in
+// fixed-size newtypes and rejects any other length at decode time.
+
+// A peer process lifetime. A peer that restarts gets a new incarnation, and
+// every grant or publication from a retired incarnation is fenced.
+message PeerInc {
+  bytes peer = 1;
+  uint64 inc = 2;
+}
+
+// Identifies one logical task (function call, map item, actor call).
+message TaskKey {
+  bytes run = 1;
+  bytes task = 2;
+}
+
+// Effect contract of a call. Ordered: a scope or `.options()` may only move it
+// upward (stricter).
+enum Effects {
+  EFFECTS_NONE = 0;        // replayable; retried on infrastructure loss
+  EFFECTS_IDEMPOTENT = 1;  // replayable, never speculated
+  EFFECTS_EXTERNAL = 2;    // at-most-once start; OutcomeUnknown after a fenced start
+}
+
+// A handle to an immutable value. Small values travel inline.
+message ObjectRef {
+  bytes object_id = 1;
+  uint64 size = 2;
+  bytes inline_data = 3;
+  repeated PeerInc locations = 4;
+  bytes checksum = 5;  // blake3, first 16 bytes
+  // Number of pickle protocol-5 out-of-band buffers following the main frame.
+  uint32 oob_buffers = 6;
+}
+
+message ErrorRecord {
+  enum Kind {
+    USER = 0;             // exception raised by user code
+    INFRA = 1;            // retries exhausted on infrastructure loss
+    OOM = 2;              // out of memory after the OOM escalation budget
+    CANCELLED = 3;
+    DEADLINE = 4;
+    OUTCOME_UNKNOWN = 5;  // external effect may have happened
+    CAUSAL = 6;           // a prerequisite failed
+    INFEASIBLE = 7;
+    WORKER_CRASHED = 8;   // fatal signal on the same input on healthy peers
+    DATA_LOST = 9;
+    ACTOR_DIED = 10;
+    COMMAND_CONFLICT = 11;
+  }
+  Kind kind = 1;
+  string type_name = 2;
+  string message = 3;
+  bytes exc_pickle = 4;   // opaque to Rust; only clients unpickle it
+  string traceback = 5;
+  TaskKey upstream = 6;   // set for CAUSAL
+  uint32 attempt = 7;
+  string detail_json = 8; // structured extras: OOM peak/limit, feasibility diff
+  uint32 item_index = 9;
+}
+
+message Outcome {
+  oneof value {
+    ObjectRef ok = 1;
+    ErrorRecord err = 2;
+  }
+  uint32 attempt = 3;
+  PeerInc peer = 4;
+}

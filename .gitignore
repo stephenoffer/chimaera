@@ -1,0 +1,10 @@
+/target
+__pycache__/
+*.pyc
+.venv/
+*.so
+*.egg-info/
+.pytest_cache/
+/python/chimaera/_bin/
+/dist/
+.chimaera/

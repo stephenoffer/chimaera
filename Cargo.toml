@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/chimaera-proto",
+    "crates/chimaera-core",
+    "crates/chimaera-peer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+
+[workspace.dependencies]
+chimaera-proto = { path = "crates/chimaera-proto" }
+chimaera-core = { path = "crates/chimaera-core" }
+chimaera-raft = { path = "crates/chimaera-raft" }
+chimaera-peer = { path = "crates/chimaera-peer" }
+
+prost = "0.14"
+tonic = { version = "0.14.9", default-features = false }
+tonic-prost = "0.14.9"
+tonic-prost-build = "0.14.9"
+blake3 = "1.8"
+lz4_flex = "0.14"
+zstd = "0.14"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+proptest = "1.12"
+libc = "0.2"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "process", "io-util", "fs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
