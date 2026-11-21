@@ -4,6 +4,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "proto"))
         .collect();
+    // The directory too, so an added .proto file triggers a rebuild.
+    println!("cargo:rerun-if-changed={}", root.join("chimaera/v1").display());
     for f in &files {
         println!("cargo:rerun-if-changed={}", f.display());
     }

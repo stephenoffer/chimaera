@@ -21,7 +21,7 @@ mod tests;
 
 use crate::hlc;
 use crate::ids::{Id, VSHARDS};
-use crate::kv::Kv;
+use crate::kv::{Kv, KvRead};
 use chimaera_proto::v1 as pb;
 use pb::shard_cmd::Body;
 use prost::Message;
@@ -103,6 +103,11 @@ pub enum Event {
     ActorChanged(Id),
     /// A bounded CancelRun stopped early; propose it again.
     CancelRunContinues(Id),
+    /// A run and its tasks were deleted after retention; its objects can go.
+    RunExpired(Id),
+    /// A run stopped being active (finished or cancelled): its non-detached
+    /// actors end with it.
+    RunEnded(Id),
 }
 
 pub struct Applied {
@@ -137,7 +142,7 @@ pub(super) type Kind = pb::error_record::Kind;
 pub(super) type AStatus = pb::actor_ack::Status;
 pub(super) type AState = pb::actor_record::State;
 
-pub(super) fn load<M: Message + Default>(kv: &dyn Kv, key: &[u8]) -> Option<M> {
+pub(super) fn load<M: Message + Default>(kv: &dyn KvRead, key: &[u8]) -> Option<M> {
     kv.get(key).map(|b| M::decode(b.as_slice()).expect("shard state is corrupt: undecodable record"))
 }
 
@@ -275,7 +280,7 @@ impl ShardState {
         }
     }
 
-    pub fn is_retired(&self, kv: &dyn Kv, p: PeerInc) -> bool {
+    pub fn is_retired(&self, kv: &dyn KvRead, p: PeerInc) -> bool {
         #[cfg(test)]
         if self.mutants.skip_fencing {
             return false;
@@ -286,15 +291,18 @@ impl ShardState {
     // ---- group-wide -------------------------------------------------------
 
     fn adopt(&self, cx: &mut Cx, a: &pb::AdoptVShard) -> pb::ShardReply {
-        if a.vshard >= VSHARDS as u32 {
+        if a.vshards.iter().any(|v| *v >= VSHARDS as u32) {
             return rejected("vshard out of range");
         }
-        let key = keys::owned(a.vshard as u16);
-        let cur = load_u64_opt(cx.kv, &key);
-        if cur.is_none_or(|c| a.epoch > c) {
-            cx.kv.put(key, a.epoch.to_be_bytes().to_vec());
+        let mut adopted = 0u64;
+        for v in &a.vshards {
+            let key = keys::owned(*v as u16);
+            if load_u64_opt(cx.kv, &key).is_none_or(|c| a.epoch > c) {
+                cx.kv.put(key, a.epoch.to_be_bytes().to_vec());
+                adopted += 1;
+            }
         }
-        reply(pb::shard_reply::Body::Count(a.epoch.max(cur.unwrap_or(0))))
+        reply(pb::shard_reply::Body::Count(adopted))
     }
 
     fn retire(&self, cx: &mut Cx, r: &pb::RetireIncarnation) -> pb::ShardReply {
@@ -374,6 +382,7 @@ impl ShardState {
                     cx.kv.delete(&target);
                     cx.kv.delete(&ekey);
                     deleted += 1;
+                    cx.events.push(Event::RunExpired(run));
                 }
             } else {
                 cx.kv.delete(&target);
@@ -439,6 +448,7 @@ impl ShardState {
             rec.finished_hlc = cx.now;
             store(cx.kv, key.clone(), &rec);
             cx.kv.put(keys::expiry(cx.now + hlc::from_ms(rec.retention_ms), &key), Vec::new());
+            cx.events.push(Event::RunEnded(id));
         }
         let page = cx.kv.scan_prefix(&keys::tasks_of_run(v, &id), CANCEL_BATCH);
         let mut cancelled = 0u64;
@@ -486,10 +496,13 @@ impl ShardState {
                     continue;
                 }
             }
+            // One pin for the submitting client, plus one per dependent that
+            // arrived before this producer did.
+            let early = cx.kv.scan_prefix(&keys::of_producer(v, keys::DEPENDENT, tk.pair()), usize::MAX).len() as u32;
             let mut rec = pb::TaskRecord {
                 spec: Some(spec.clone()),
                 next_attempt: 1,
-                pins: 1,
+                pins: 1 + early,
                 submitted_hlc: cx.now,
                 ..Default::default()
             };
@@ -497,15 +510,20 @@ impl ShardState {
             let mut failed_dep: Option<pb::Outcome> = None;
             for dep in &spec.deps {
                 let Some(d) = Tk::parse(dep) else {
-                    failed_dep = Some(err_outcome(Kind::DataLost, "malformed dependency key"));
-                    break;
+                    failed_dep.get_or_insert_with(|| err_outcome(Kind::DataLost, "malformed dependency key"));
+                    continue;
                 };
+                // Every local dependency is pinned exactly once here and
+                // unpinned exactly once when this task completes.
+                self.pin(cx, v, d);
+                if failed_dep.is_some() {
+                    continue;
+                }
                 if let Some(o) = self.known_outcome(cx.kv, v, d) {
-                    if is_ok(&o) {
-                        continue;
+                    if !is_ok(&o) {
+                        failed_dep = Some(causal(d, &o));
                     }
-                    failed_dep = Some(causal(d, &o));
-                    break;
+                    continue;
                 }
                 if d.v() == v && cx.kv.get(&d.key()).is_none() {
                     // A producer here that is not submitted yet must belong to a live run.
@@ -516,7 +534,7 @@ impl ShardState {
                             Kind::DataLost,
                             format!("prerequisite {} is not known and its run is not active", d.task.hex()),
                         ));
-                        break;
+                        continue;
                     }
                 }
                 cx.kv.put(keys::pair(v, keys::DEPENDENT, d.pair(), tk.pair()), Vec::new());
@@ -526,10 +544,7 @@ impl ShardState {
                 }
             }
             if let Some(o) = failed_dep {
-                // Drop dependency entries already written for this task.
-                for dep in spec.deps.iter().filter_map(Tk::parse) {
-                    cx.kv.delete(&keys::pair(v, keys::DEPENDENT, dep.pair(), tk.pair()));
-                }
+                // complete() drops this task's dependency entries and pins.
                 rec.deps_remaining = 0;
                 let rec = self.finish(cx, tk, rec, o);
                 acks.push(ack_rec(tk, Status::Accepted, &rec));
@@ -556,7 +571,7 @@ impl ShardState {
 
     /// Outcome of `d` if this vshard already knows it (local record or a
     /// received cross-vshard notification).
-    fn known_outcome(&self, kv: &dyn Kv, v: u16, d: Tk) -> Option<pb::Outcome> {
+    fn known_outcome(&self, kv: &dyn KvRead, v: u16, d: Tk) -> Option<pb::Outcome> {
         if d.v() == v {
             load::<pb::TaskRecord>(kv, &d.key()).and_then(|r| r.outcome)
         } else {
@@ -923,6 +938,30 @@ impl ShardState {
         rec
     }
 
+    /// Pin a local producer's result for a dependent. Remote producers are
+    /// pinned through their own vshard's subscription.
+    fn pin(&self, cx: &mut Cx, v: u16, producer: Tk) {
+        if producer.v() != v {
+            return;
+        }
+        if let Some(mut p) = load::<pb::TaskRecord>(cx.kv, &producer.key()) {
+            p.pins += 1;
+            store(cx.kv, producer.key(), &p);
+        }
+    }
+
+    fn unpin(&self, cx: &mut Cx, producer: Tk) {
+        let Some(mut p) = load::<pb::TaskRecord>(cx.kv, &producer.key()) else { return };
+        if p.pins == 0 {
+            return;
+        }
+        p.pins -= 1;
+        if p.pins == 0 && p.state() == TState::Done {
+            cx.events.push(Event::Releasable(producer));
+        }
+        store(cx.kv, producer.key(), &p);
+    }
+
     fn complete(&self, cx: &mut Cx, tk: Tk, mut rec: pb::TaskRecord, outcome: pb::Outcome) -> pb::TaskRecord {
         for a in &rec.attempts {
             if let Some(p) = peer_of(&a.peer) {
@@ -937,6 +976,16 @@ impl ShardState {
         cx.events.push(Event::Done { task: tk, outcome });
         if rec.pins == 0 {
             cx.events.push(Event::Releasable(tk));
+        }
+        // A completed dependent stops waiting and no longer needs its local
+        // producers' results. Removing its entries keeps a later-submitted
+        // producer from counting it as a pin.
+        let deps: Vec<Tk> = rec.spec.as_ref().map_or(Vec::new(), |s| s.deps.iter().filter_map(Tk::parse).collect());
+        for d in deps {
+            cx.kv.delete(&keys::pair(tk.v(), keys::DEPENDENT, d.pair(), tk.pair()));
+            if d.v() == tk.v() {
+                self.unpin(cx, d);
+            }
         }
         rec
     }
@@ -1054,16 +1103,128 @@ impl ShardState {
     }
 }
 
+/// Read helpers for peers serving queries from (possibly stale) local state.
+pub mod read {
+    use super::*;
+
+    pub fn task(kv: &dyn KvRead, tk: Tk) -> Option<pb::TaskRecord> {
+        load(kv, &tk.key())
+    }
+
+    /// Outcome of `producer` as seen from a dependent in `vshard`: its own
+    /// record when the same group holds it, else the copy a DepNotify left.
+    pub fn dep_outcome(kv: &dyn KvRead, vshard: u16, producer: Tk) -> Option<pb::Outcome> {
+        task(kv, producer)
+            .and_then(|r| r.outcome)
+            .or_else(|| load(kv, &keys::notified(vshard, (&producer.run, &producer.task))))
+    }
+
+    pub fn run(kv: &dyn KvRead, run: Id) -> Option<pb::RunRecord> {
+        load(kv, &keys::run(run.vshard(), &run))
+    }
+
+    /// One page of a run's tasks after the task id `after` (exclusive; empty =
+    /// from the start), in task-id order.
+    pub fn tasks_page(kv: &dyn KvRead, run: Id, after: Option<Id>, limit: usize) -> Vec<(Tk, pb::TaskRecord)> {
+        let prefix = keys::tasks_of_run(run.vshard(), &run);
+        let after_key = after.map(|t| keys::task(run.vshard(), &run, &t)).unwrap_or_default();
+        kv.scan_after(&prefix, &after_key, limit)
+            .into_iter()
+            .map(|(k, v)| {
+                let (r, t) = keys::trailing_pair(&k);
+                (Tk { run: r, task: t }, pb::TaskRecord::decode(v.as_slice()).expect("shard state is corrupt"))
+            })
+            .collect()
+    }
+
+    /// Task records of one run, in key order, at most `limit`.
+    pub fn tasks_of_run(kv: &dyn KvRead, run: Id, limit: usize) -> Vec<pb::TaskRecord> {
+        kv.scan_prefix(&keys::tasks_of_run(run.vshard(), &run), limit)
+            .into_iter()
+            .map(|(_, v)| pb::TaskRecord::decode(v.as_slice()).expect("shard state is corrupt"))
+            .collect()
+    }
+
+    pub fn actor(kv: &dyn KvRead, actor: Id) -> Option<pb::ActorRecord> {
+        load(kv, &keys::actor(actor.vshard(), &actor))
+    }
+
+    /// Ids of the actors whose records live in `vshard`.
+    pub fn actors(kv: &dyn KvRead, vshard: u16, limit: usize) -> Vec<Id> {
+        let mut prefix = vshard.to_be_bytes().to_vec();
+        prefix.push(keys::ACTOR);
+        kv.scan_prefix(&prefix, limit)
+            .into_iter()
+            .filter(|(k, _)| k.len() == 3 + 16)
+            .filter_map(|(k, _)| Id::from_slice(&k[3..]).ok())
+            .collect()
+    }
+
+    /// Runnable, ungranted tasks of `vshard` (a new leader schedules these).
+    pub fn ready(kv: &dyn KvRead, vshard: u16, limit: usize) -> Vec<Tk> {
+        let prefix = {
+            let mut p = vshard.to_be_bytes().to_vec();
+            p.push(keys::READY);
+            p
+        };
+        kv.scan_prefix(&prefix, limit)
+            .into_iter()
+            .map(|(k, _)| {
+                let (run, task) = keys::trailing_pair(&k);
+                Tk { run, task }
+            })
+            .collect()
+    }
+
+    /// Live attempts of `vshard`: (task, attempt, holder). A new leader
+    /// re-sends these to their holders, which ignore duplicates.
+    pub fn granted(kv: &dyn KvRead, vshard: u16, limit: usize) -> Vec<(Tk, u32, PeerInc)> {
+        let mut prefix = vshard.to_be_bytes().to_vec();
+        prefix.push(keys::GRANT);
+        kv.scan_prefix(&prefix, limit)
+            .into_iter()
+            .filter_map(|(k, _)| {
+                // [v:2][G][peer:16][inc:8][run:16][task:16][attempt:4]
+                if k.len() != 3 + 16 + 8 + 32 + 4 {
+                    return None;
+                }
+                let peer = Id::from_slice(&k[3..19]).ok()?;
+                let inc = u64::from_be_bytes(k[19..27].try_into().ok()?);
+                let (run, task) = keys::trailing_pair(&k[..k.len() - 4]);
+                let attempt = u32::from_be_bytes(k[k.len() - 4..].try_into().ok()?);
+                Some((Tk { run, task }, attempt, (peer, inc)))
+            })
+            .collect()
+    }
+
+    pub fn outbox(kv: &dyn KvRead, limit: usize) -> Vec<pb::OutboxEntry> {
+        kv.scan_prefix(&keys::outbox_prefix(), limit)
+            .into_iter()
+            .map(|(_, v)| pb::OutboxEntry::decode(v.as_slice()).expect("shard state is corrupt"))
+            .collect()
+    }
+
+    pub fn owned_vshards(kv: &dyn KvRead) -> Vec<(u16, u64)> {
+        kv.scan_prefix(&keys::owned_prefix(), usize::MAX)
+            .into_iter()
+            .map(|(k, v)| {
+                let vs = u16::from_be_bytes([k[k.len() - 2], k[k.len() - 1]]);
+                (vs, u64::from_be_bytes(v.as_slice().try_into().expect("8-byte epoch")))
+            })
+            .collect()
+    }
+}
+
 fn stale(tk: Tk, rec: &pb::TaskRecord, why: &str) -> pb::TaskAck {
     let mut a = ack_rec(tk, Status::Stale, rec);
     a.reason = why.into();
     a
 }
 
-fn load_u64_opt(kv: &dyn Kv, key: &[u8]) -> Option<u64> {
+fn load_u64_opt(kv: &dyn KvRead, key: &[u8]) -> Option<u64> {
     kv.get(key).map(|b| u64::from_be_bytes(b.as_slice().try_into().expect("8-byte counter")))
 }
 
-fn load_u64(kv: &dyn Kv, key: &[u8]) -> u64 {
+fn load_u64(kv: &dyn KvRead, key: &[u8]) -> u64 {
     load_u64_opt(kv, key).unwrap_or(0)
 }

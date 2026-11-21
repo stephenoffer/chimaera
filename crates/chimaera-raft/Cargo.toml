@@ -1,0 +1,25 @@
+[package]
+name = "chimaera-raft"
+description = "Multi-raft host for Chimaera shard groups (openraft + redb)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chimaera-core.workspace = true
+chimaera-proto.workspace = true
+openraft = { version = "=0.10.1", features = ["serde"] }
+redb = "5.0"
+tokio.workspace = true
+libc.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+prost.workspace = true
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+openraft = { version = "=0.10.1", features = ["serde"] }

@@ -1,0 +1,20 @@
+# Single-node head-to-head: Ray (the node's own cluster) vs Chimaera (a local
+# peer on the same node), built from source on the node. One c7i.16xlarge,
+# no workers, at most one hour.
+#   anyscale job submit -f deploy/anyscale/eval.job.yaml --wait
+name: chimaera-eval-single-node
+# The org's default cloud (AWS us-west-2) and its default project.
+cloud: anyscale_v2_default_cloud
+compute_config:
+  cloud: anyscale_v2_default_cloud
+  head_node:
+    instance_type: c7i.16xlarge
+    # Schedulable head: this run has no workers.
+    resources:
+      CPU: 64
+  worker_nodes: []
+working_dir: .
+excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
+entrypoint: bash deploy/anyscale/run_eval.sh
+max_retries: 0
+timeout_s: 3600

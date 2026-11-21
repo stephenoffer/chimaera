@@ -1,0 +1,182 @@
+syntax = "proto3";
+package chimaera.v1;
+
+import "chimaera/v1/common.proto";
+import "chimaera/v1/shard.proto";
+import "chimaera/v1/client.proto";
+
+// Peer <-> peer. Raft traffic, forwarded proposals, work pushed by a group
+// leader to the peer it placed it on, object bytes, and liveness. Every call
+// carries the cluster id so peers of different clusters never mix.
+
+service Mesh {
+  // Exchange member records while forming or joining a cluster.
+  rpc Join(JoinRequest) returns (JoinReply);
+  // One openraft RPC (postcard body) for a group hosted on the target.
+  rpc Raft(RaftRequest) returns (RaftReply);
+  // Propose a shard command on the target's replica of its group.
+  rpc Propose(ProposeRequest) returns (ProposeReply);
+  // Read records of a group hosted on the target.
+  rpc Read(ReadRequest) returns (ReadReply);
+  // Granted attempts placed on the target, and actor records it hosts.
+  rpc Dispatch(DispatchRequest) returns (DispatchReply);
+  // Stream an object's bytes from the target's store.
+  rpc Fetch(FetchRequest) returns (stream FetchChunk);
+  // Outcomes of tasks in groups the target hosts, as they commit.
+  rpc Watch(WatchRequest) returns (stream OutcomeEvent);
+  // Liveness probe; the reply carries the target's load.
+  rpc Ping(PingRequest) returns (PingReply);
+  // Stop work on tasks that ended elsewhere, and drop objects.
+  rpc Forget(ForgetRequest) returns (ForgetReply);
+}
+
+message Member {
+  bytes peer = 1;
+  uint64 incarnation = 2;
+  uint64 node_id = 3;
+  string addr = 4;       // host:port other peers dial
+  double cpus = 5;
+  uint64 memory_bytes = 6;
+  repeated string gpus = 7;
+}
+
+message JoinRequest {
+  string cluster = 1;
+  Member member = 2;
+  uint32 bootstrap_expect = 3;
+}
+
+message JoinReply {
+  repeated Member members = 1;   // everyone the target knows, including itself
+  // Set once the cluster has formed: the plan a late joiner adopts.
+  ClusterPlan plan = 2;
+}
+
+// Deterministic layout computed from the founding members.
+message ClusterPlan {
+  string cluster = 1;
+  uint32 data_groups = 2;               // groups 1..=data_groups own vshards
+  repeated uint64 directory_voters = 3; // group 0
+  repeated GroupVoters groups = 4;
+  repeated Member founders = 5;
+}
+
+message GroupVoters {
+  uint32 group = 1;
+  repeated uint64 voters = 2;
+}
+
+message RaftRequest {
+  string cluster = 1;
+  uint32 group = 2;
+  uint32 kind = 3;
+  bytes body = 4;
+}
+
+message RaftReply {
+  bytes body = 1;
+}
+
+message ProposeRequest {
+  string cluster = 1;
+  uint32 group = 2;
+  ShardCmd cmd = 3;
+}
+
+message ProposeReply {
+  ShardReply reply = 1;
+  bool not_leader = 2;
+  uint64 leader_hint = 3;   // node id, 0 when unknown
+  string error = 4;
+}
+
+message ReadRequest {
+  string cluster = 1;
+  repeated TaskKey tasks = 2;
+  bytes run = 3;
+  bytes actor = 4;
+  bool linearizable = 5;
+  // With limit > 0: one page of `run`'s tasks after `after_task`.
+  bytes after_task = 6;
+  uint32 limit = 7;
+}
+
+message ReadReply {
+  repeated TaskRecord tasks = 1;  // same order as requested; empty record if absent
+  RunRecord run = 2;
+  ActorRecord actor = 3;
+  string error = 4;
+  repeated TaskKey page_keys = 5;   // keys of `tasks` in page mode
+}
+
+// An attempt the leader granted to the target, with everything needed to run
+// it without reading the task's group.
+message RemoteWork {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  TaskSpec spec = 3;
+  repeated Outcome deps = 4;
+  ExecEnvSpec env = 5;
+  bool detached = 6;
+  // Re-run a restarted actor's committed constructor without publishing.
+  bool replay = 7;
+}
+
+message DispatchRequest {
+  string cluster = 1;
+  repeated RemoteWork work = 2;
+  // Current records of actors the target hosts (placement, restarts, death).
+  repeated ActorRecord actors = 3;
+  ExecEnvSpec actor_env = 4;
+}
+
+message DispatchReply {
+  uint32 accepted = 1;
+}
+
+message FetchRequest {
+  string cluster = 1;
+  bytes run = 2;
+  bytes object_id = 3;   // or, with `code`, the code blob's digest
+  bool code = 4;
+}
+
+message FetchChunk {
+  bytes data = 1;
+  uint64 total = 2;   // set on the first chunk
+}
+
+message WatchRequest {
+  string cluster = 1;
+  repeated TaskKey tasks = 2;
+}
+
+message PingRequest {
+  string cluster = 1;
+  uint64 from_node = 2;
+}
+
+message PingReply {
+  uint64 node_id = 1;
+  uint64 incarnation = 2;
+  double cpus = 3;
+  double cpu_used = 4;
+  uint32 queued = 5;
+  uint32 running = 6;
+  repeated uint32 leading = 7;   // groups the target leads
+  uint32 actors = 8;             // actor instances hosted
+  bool draining = 9;             // shutting down: place nothing new there
+}
+
+message ForgetRequest {
+  string cluster = 1;
+  repeated TaskKey tasks = 2;   // ended: stop queued or running attempts
+  repeated ObjectRef objects = 3;
+  bytes run = 4;
+  bool run_expired = 5;         // drop all of the run's objects
+  bool run_ended = 6;           // end the run's actors hosted here
+  // Records of actor calls that ended without running on their host.
+  repeated TaskRecord ended = 7;
+}
+
+message ForgetReply {}

@@ -69,7 +69,9 @@ impl ShardState {
         if let Some(old) = peer_of(&rec.host) {
             cx.kv.delete(&keys::actor_host(v, &old.0, old.1, &id));
         }
-        let rec = self.actor_lost(cx, v, id, rec, a.reason.clone().unwrap_or_default());
+        let reason = a.reason.clone().unwrap_or_default();
+        let rec =
+            if a.terminal { self.actor_ended(cx, v, id, rec, reason) } else { self.actor_lost(cx, v, id, rec, reason) };
         Self::actor_reply(AStatus::Ok, Some(&rec), &a.actor)
     }
 
@@ -92,6 +94,23 @@ impl ShardState {
             rec.set_state(AState::Dead);
             rec.death = Some(reason);
         }
+        store(cx.kv, keys::actor(v, &id), &rec);
+        cx.events.push(Event::ActorChanged(id));
+        rec
+    }
+
+    /// End an actor on purpose: dead regardless of its restart policy.
+    pub(super) fn actor_ended(
+        &self,
+        cx: &mut Cx,
+        v: u16,
+        id: Id,
+        mut rec: pb::ActorRecord,
+        reason: pb::ErrorRecord,
+    ) -> pb::ActorRecord {
+        rec.host = None;
+        rec.set_state(AState::Dead);
+        rec.death = Some(reason);
         store(cx.kv, keys::actor(v, &id), &rec);
         cx.events.push(Event::ActorChanged(id));
         rec

@@ -7,7 +7,7 @@
 //! same test against deliberately broken state machines.
 
 use super::*;
-use crate::kv::MemKv;
+use crate::kv::{KvRead, MemKv};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,8 +50,8 @@ struct Harness {
 impl Harness {
     fn new(sm: ShardState) -> Self {
         let mut h = Harness { sm, a: MemKv::default(), b: MemKv::default(), hlc: 1 };
+        h.raw(Body::AdoptVshard(pb::AdoptVShard { vshards: vec![V as u32, V2 as u32], epoch: EPOCH }), V);
         for v in [V, V2] {
-            h.raw(Body::AdoptVshard(pb::AdoptVShard { vshard: v as u32, epoch: EPOCH }), v);
             h.raw(
                 Body::RunCreate(pb::RunCreate {
                     run: Some(pb::RunRecord { run: run_id(v).to_vec(), tenant: "t".into(), ..Default::default() }),
@@ -413,10 +413,67 @@ fn durable_actor_commands_are_deduplicated() {
     assert_eq!(commit(&mut h, b"cmd3", b"x", 2, 8, 0).status(), AStatus::StaleGeneration);
     assert_eq!(commit(&mut h, b"cmd3", b"x", 1, 8, 1).status(), AStatus::VersionConflict);
     // Losing the host restarts the actor; the old generation is fenced.
+    // (A terminal end, below, never restarts.)
     h.retire(host);
     let rec: pb::ActorRecord = load(&h.a, &keys::actor(V, &actor)).unwrap();
     assert_eq!(rec.state(), AState::Restarting);
     assert_eq!(commit(&mut h, b"cmd3", b"x", 2, 8, 0).status(), AStatus::StaleGeneration);
+    h.raw(
+        Body::ActorPlace(pb::ActorPlace {
+            actor: actor.to_vec(),
+            expected_generation: 1,
+            host: Some(peer_pb((peer(0), 2))),
+        }),
+        V,
+    );
+    h.raw(Body::ActorDied(pb::ActorDied { actor: actor.to_vec(), generation: 2, reason: None, terminal: true }), V);
+    let rec: pb::ActorRecord = load(&h.a, &keys::actor(V, &actor)).unwrap();
+    assert_eq!(rec.state(), AState::Dead, "a terminal end is never restarted");
+}
+
+#[test]
+fn a_result_stays_pinned_until_its_dependents_complete() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (a, b) = (task_id(V, 0), task_id(V, 1));
+    h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
+    h.submit(spec(b, &[a], pb::Effects::None, 3), None);
+    h.publish(a, 1, p, obj(1));
+    // The client drops its handle to `a`, but `b` has not run yet.
+    let r = h.raw(Body::Release(pb::Release { tasks: vec![a.pb()] }), V);
+    assert!(!r.events.contains(&Event::Releasable(a)));
+    h.grant(b, p, false);
+    let done = h.raw(
+        Body::Publish(pb::PublishResults {
+            entries: vec![pb::PublishEntry {
+                task: Some(b.pb()),
+                attempt: 1,
+                peer: Some(peer_pb(p)),
+                outcome: Some(obj(2)),
+            }],
+        }),
+        V,
+    );
+    assert!(done.events.contains(&Event::Releasable(a)), "{:?}", done.events);
+    // A dependent submitted before its producer still pins it.
+    let (c, d) = (task_id(V, 2), task_id(V, 3));
+    h.submit(spec(d, &[c], pb::Effects::None, 3), None);
+    h.submit(spec(c, &[], pb::Effects::None, 3), Some(p));
+    assert_eq!(h.task(c).unwrap().pins, 2);
+    // A dependent cancelled before its producer exists leaves no stale pin.
+    let (e, f) = (task_id(V, 4), task_id(V, 5));
+    h.submit(spec(f, &[e], pb::Effects::None, 3), None);
+    h.cancel(f);
+    h.submit(spec(e, &[], pb::Effects::None, 3), Some(p));
+    assert_eq!(h.task(e).unwrap().pins, 1, "only the client pin remains");
+    // A dependent that fails on one dep releases the pins it took on the others.
+    let (g, x, y) = (task_id(V, 6), task_id(V, 7), task_id(V, 8));
+    h.submit(spec(g, &[], pb::Effects::None, 3), Some(p));
+    h.publish(g, 1, p, user_err("boom"));
+    h.submit(spec(x, &[], pb::Effects::None, 3), Some(p));
+    h.submit(spec(y, &[g, x], pb::Effects::None, 3), None);
+    assert_eq!(err_kind(&h.task(y).unwrap()), Some(Kind::Causal));
+    assert_eq!(h.task(x).unwrap().pins, 1, "pin on x released by y's completion");
 }
 
 #[test]
@@ -427,7 +484,8 @@ fn finished_run_cancels_leftovers_and_expires() {
     h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
     h.submit(spec(b, &[], pb::Effects::None, 3), Some(p));
     h.publish(a, 1, p, obj(1));
-    h.raw(Body::RunFinish(pb::RunFinish { run: run_id(V).to_vec(), state: 0 }), V);
+    let fin = h.raw(Body::RunFinish(pb::RunFinish { run: run_id(V).to_vec(), state: 0 }), V);
+    assert!(fin.events.contains(&Event::RunEnded(run_id(V))));
     assert_eq!(err_kind(&h.task(b).unwrap()), Some(Kind::Cancelled));
     let (rejected, _) = h.submit(spec(task_id(V, 2), &[], pb::Effects::None, 3), None);
     assert_eq!(status(&rejected), Status::Rejected);
@@ -435,7 +493,8 @@ fn finished_run_cancels_leftovers_and_expires() {
     h.raw(Body::Gc(pb::Gc { max_keys: 100 }), V);
     assert!(h.task(a).is_some());
     h.hlc += hlc::from_ms(DEFAULT_RUN_RETENTION_MS + 1);
-    h.raw(Body::Gc(pb::Gc { max_keys: 100 }), V);
+    let gc = h.raw(Body::Gc(pb::Gc { max_keys: 100 }), V);
+    assert!(gc.events.contains(&Event::RunExpired(run_id(V))));
     assert!(h.task(a).is_none() && h.task(b).is_none());
     assert!(h.a.get(&keys::run(V, &run_id(V))).is_none());
 }
@@ -755,7 +814,12 @@ fn run_case(defs: &[TaskDef], ops: &[Op], sm: ShardState) -> Result<(), TestCase
             Op::ActorDied { a } => {
                 let actor_gen = load::<pb::ActorRecord>(&h.a, &keys::actor(V, &actors[*a])).map_or(0, |r| r.generation);
                 Some(h.raw(
-                    Body::ActorDied(pb::ActorDied { actor: actors[*a].to_vec(), generation: actor_gen, reason: None }),
+                    Body::ActorDied(pb::ActorDied {
+                        actor: actors[*a].to_vec(),
+                        generation: actor_gen,
+                        reason: None,
+                        terminal: false,
+                    }),
                     V,
                 ))
             }

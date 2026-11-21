@@ -40,6 +40,10 @@
 >     distributed reference counting across owners.
 > 15. **`fn.partial(...)`** passes constants once; `fn.map(*sources)` zips like builtin `map`.
 > 16. **Memory strings** require a byte unit (`MB`, `MiB`): `"512m"` means MiB to Docker and millibytes to Kubernetes.
+> 17a. **Adoption rule.** A canary is adopted when its mean gain clears the threshold (8%) *and* the one-sided
+>     95% Student-t lower bound clears half of it; "mean − 2·SE > 0" adopted 11.5% of no-gain changes under ±15%
+>     window noise because it re-checks after every pair with a normal quantile. The t rule adopts 3.7% of null
+>     changes and 93% of real 20% gains (`crates/chimaera-core/src/adapt.rs` tests).
 > 17. **Controllers identify the binding stage first.** The same knob can speed up one pipeline and slow down
 >     another; only the binding stage's knobs move.
 > 18. **`accounting="isolated"`** fails preflight on hosts without cgroup v2 delegation (including macOS) with

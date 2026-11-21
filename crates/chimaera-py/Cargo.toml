@@ -1,0 +1,24 @@
+[package]
+name = "chimaera-py"
+description = "Python extension module chimaera._native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+chimaera-core.workspace = true
+chimaera-proto = { workspace = true, features = ["grpc"] }
+prost.workspace = true
+tonic = { workspace = true, features = ["codegen", "transport"] }
+tokio.workspace = true
+tokio-stream = "0.1"
+blake3.workspace = true
+pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py311"] }
+
+[build-dependencies]
+pyo3-build-config = "0.30.1"

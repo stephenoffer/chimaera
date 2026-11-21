@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "chimaera"
+version = "0.1.0"
+description = "One decorator for distributed Python, on a Rust runtime with no head node"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = ["cloudpickle>=3.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout", "numpy"]
+
+[tool.maturin]
+manifest-path = "crates/chimaera-py/Cargo.toml"
+python-source = "python"
+module-name = "chimaera._native"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+# No test may hang the suite: a stuck wait fails with a traceback instead.
+timeout = 300
+markers = ["slow: takes over a minute (voter replacement, long kill tests)"]

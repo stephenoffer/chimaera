@@ -1,0 +1,115 @@
+syntax = "proto3";
+package chimaera.v1;
+
+import "chimaera/v1/common.proto";
+import "chimaera/v1/shard.proto";
+
+// Peer <-> Python executor protocol over a Unix domain socket, framed with
+// chimaera_proto::frame. Rust never unpickles: `args`, results and exceptions
+// are opaque bytes produced and consumed by Python.
+
+message ExecHello {
+  uint32 executor_id = 1;
+  uint32 pid = 2;
+  string python = 3;     // sys.version
+  string abi = 4;        // e.g. cp314-darwin-arm64
+}
+
+message ExecWelcome {
+  string object_dir = 1;   // where results larger than the inline limit go
+  string code_dir = 2;     // code blobs by digest
+  string peer_socket = 3;  // client socket, for nested submissions
+  bytes peer = 4;
+  uint64 incarnation = 5;
+  uint64 inline_limit = 6;
+}
+
+// One call. For an auto-batched range, `items` holds the other calls of the
+// same function; each keeps its own identity, outcome and error.
+message ExecItem {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  ObjectRef args = 3;
+  repeated Outcome deps = 4;   // outcomes of TaskSpec.deps, in order
+  uint32 item_index = 5;
+}
+
+message Execute {
+  CallKind kind = 1;
+  bytes fn_digest = 2;
+  string method = 3;
+  bytes actor = 4;
+  repeated ExecItem items = 5;
+  Policy policy = 6;
+  uint64 deadline_unix_ms = 7;   // 0 = none
+  bytes run = 8;
+  repeated string retry_exception_types = 9;
+}
+
+message ExecDone {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  Outcome outcome = 3;
+  // Exception matched retry_exception_types: record a retryable failure
+  // (with this fingerprint) instead of publishing the error.
+  bool retryable = 4;
+  bytes fingerprint = 5;
+  uint64 entry_unix_ns = 6;
+  uint64 exit_unix_ns = 7;
+}
+
+// The task is blocked waiting on other futures (CPU grant can be lent out).
+message ExecBlocked {
+  TaskKey task = 1;
+  bool blocked = 2;
+  repeated TaskKey waiting_on = 3;
+}
+
+// One item a generator call yielded, in order. The peer forwards it to the
+// call's watchers; the executor waits for credit before running far ahead.
+message ExecYield {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  uint64 index = 3;
+  Outcome value = 4;
+}
+
+// The consumer has taken items below `up_to`; the generator may yield up to
+// `up_to + window`.
+message ExecCredit {
+  TaskKey task = 1;
+  uint64 up_to = 2;
+}
+
+// A line of output a task printed; the peer forwards it to the run's clients.
+message ExecLog {
+  TaskKey task = 1;
+  string stream = 2;   // stdout | stderr
+  string text = 3;
+}
+
+message ExecCancel {
+  TaskKey task = 1;
+}
+
+message ExecShutdown {}
+
+message ExecToPeer {
+  oneof msg {
+    ExecHello hello = 1;
+    ExecDone done = 2;
+    ExecBlocked blocked = 3;
+    ExecLog log = 4;
+    ExecYield yield_item = 5;
+  }
+}
+
+message PeerToExec {
+  oneof msg {
+    ExecWelcome welcome = 1;
+    Execute execute = 2;
+    ExecCancel cancel = 3;
+    ExecShutdown shutdown = 4;
+    ExecCredit credit = 5;
+  }
+}

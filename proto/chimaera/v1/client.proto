@@ -1,0 +1,247 @@
+syntax = "proto3";
+package chimaera.v1;
+
+import "chimaera/v1/common.proto";
+import "chimaera/v1/shard.proto";
+
+// Client <-> peer. The same service serves a local client over a Unix socket
+// and a remote client over TLS. Any peer can serve any run: requests route by
+// the ids, which embed their vshard.
+
+service Peer {
+  rpc Hello(ClientHello) returns (PeerInfo);
+  rpc CreateRun(CreateRunRequest) returns (RunRecord);
+  rpc PutCode(PutCodeRequest) returns (PutCodeReply);
+  // One ordered stream per client: submissions, watches, releases and
+  // cancellations go up; acks, outcomes and actor changes come down.
+  rpc Session(stream ClientMsg) returns (stream SessionEvent);
+  rpc GetTask(TaskKey) returns (TaskRecord);
+  rpc GetActor(ActorQuery) returns (ActorRecord);
+  rpc Explain(ExplainRequest) returns (ExplainReply);
+  // Page through a run's tasks and outcomes (reattach, inspection).
+  rpc ListTasks(ListTasksRequest) returns (ListTasksReply);
+  rpc Status(StatusRequest) returns (StatusReply);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownReply);
+  // Bring an object produced on another peer into this peer's store.
+  rpc Localize(LocalizeRequest) returns (LocalizeReply);
+}
+
+message ClientHello {
+  uint32 wire_version = 1;
+  string client = 2;       // "python-3.14.7 chimaera-0.1.0"
+  string token = 3;        // cluster mode; local sockets are authenticated by file mode and peer credentials
+  string tenant = 4;
+}
+
+message PeerInfo {
+  uint32 wire_version = 1;
+  bytes peer = 2;
+  uint64 incarnation = 3;
+  string object_dir = 4;   // local mode: clients read and write objects here directly
+  string code_dir = 5;
+  uint64 inline_limit = 6;
+  double usable_cores = 7;
+  uint64 memory_bytes = 8;
+  string version = 9;
+  repeated string gpus = 10;
+}
+
+message CreateRunRequest {
+  string tenant = 1;
+  string submission_key = 2;   // idempotency key; a retry returns the same run
+  bool detached = 3;
+  uint64 client_grace_ms = 4;
+  string description = 5;
+  bytes code_digest = 6;
+  bytes env_digest = 7;
+  // How executors for this run start (local mode runs the client's own
+  // interpreter, working directory and import path).
+  string python = 8;
+  string cwd = 9;
+  repeated string sys_path = 10;
+  map<string, string> env = 11;
+}
+
+message PutCodeRequest {
+  bytes digest = 1;
+  bytes code = 2;
+}
+
+message PutCodeReply {
+  bool stored = 1;
+}
+
+message ActorCreateMsg {
+  ActorSpec spec = 1;
+  TaskSpec ctor = 2;
+}
+
+message WatchMsg {
+  repeated TaskKey tasks = 1;
+}
+
+message CancelMsg {
+  TaskKey task = 1;
+  bool force = 2;
+  ErrorRecord.Kind reason = 3;
+}
+
+message ClientMsg {
+  uint64 seq = 1;   // echoed on the matching ack
+  oneof msg {
+    SubmitTasks submit = 2;      // grant_to is ignored; the peer places work
+    WatchMsg watch = 3;
+    Release release = 4;
+    CancelMsg cancel = 5;
+    ActorCreateMsg actor_create = 6;
+    bytes attach_run = 7;        // adopt an existing run (reattach)
+    bool heartbeat = 8;
+    // The driver is exiting normally: finish the run and cancel what remains
+    // unless it was created detached.
+    bool finish_run = 9;
+    // Close an actor: pending calls fail, its process ends, it is not restarted.
+    bytes close_actor = 10;
+    // A stream consumer has taken items below `up_to`.
+    StreamCredit stream_credit = 11;
+  }
+}
+
+message StreamCredit {
+  TaskKey task = 1;
+  uint64 up_to = 2;
+}
+
+message StreamItem {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  uint64 index = 3;
+  Outcome value = 4;
+}
+
+message OutcomeEvent {
+  TaskKey task = 1;
+  Outcome outcome = 2;
+}
+
+message LogEvent {
+  TaskKey task = 1;
+  string stream = 2;
+  string text = 3;
+  uint32 pid = 4;
+}
+
+message SessionEvent {
+  uint64 seq = 1;   // ack of ClientMsg.seq; 0 for unsolicited events
+  oneof event {
+    TaskAcks acks = 2;
+    OutcomeEvent outcome = 3;
+    ActorAck actor = 4;
+    string error = 5;
+    LogEvent log = 6;
+    StreamItem stream_item = 7;
+  }
+}
+
+message ActorQuery {
+  bytes actor = 1;
+}
+
+message ExplainRequest {
+  bytes run = 1;
+  TaskKey task = 2;          // one task; empty = run summary
+  bool decisions = 3;
+  bool pending = 4;
+}
+
+// One attempt as measured by its peer. Every measurement carries how and over
+// what scope it was taken; a missing value is absent, never zero.
+message Measure {
+  double value = 1;
+  string scope = 2;      // attempt | process | process_lifetime | sampled | pool
+  string method = 3;     // cgroup | rusage | proc | sampled
+  double coverage = 4;   // fraction of the attempt the measurement covers
+}
+
+message AttemptRecord {
+  TaskKey task = 1;
+  uint32 attempt = 2;
+  PeerInc peer = 3;
+  uint32 executor = 4;
+  string fn_name = 5;
+  uint64 submitted_unix_ns = 6;
+  uint64 ready_unix_ns = 7;
+  uint64 dispatched_unix_ns = 8;
+  uint64 py_entry_unix_ns = 9;
+  uint64 py_exit_unix_ns = 10;
+  uint64 published_unix_ns = 11;
+  Policy granted = 12;
+  map<string, Measure> measures = 13;   // cpu_seconds, mean_cores, rss_peak_bytes, ...
+  string end_reason = 14;               // ok | user_error | oom | killed | cancelled | peer_lost | ...
+  string detail = 15;
+  string placement_reason = 16;
+}
+
+message Decision {
+  uint64 at_unix_ns = 1;
+  string controller = 2;
+  string knob = 3;
+  string scope = 4;
+  string old_value = 5;
+  string new_value = 6;
+  string outcome = 7;     // adopted | reverted | clamped | observed | pending
+  string evidence = 8;
+  string reason = 9;
+}
+
+message ExplainReply {
+  RunRecord run = 1;
+  TaskRecord task = 2;
+  repeated AttemptRecord attempts = 3;
+  repeated Decision decisions = 4;
+  string pending_reason = 5;
+  map<string, uint64> counts = 6;    // run summary: tasks by state
+}
+
+message StatusRequest {}
+
+message StatusReply {
+  PeerInfo peer = 1;
+  repeated RunRecord runs = 2;
+  uint32 executors = 3;
+  uint32 busy_executors = 4;
+  uint64 queued = 5;
+  uint64 running = 6;
+  double cpu_in_use = 7;
+  uint64 object_bytes = 8;
+  repeated string pending_reasons = 9;
+  uint32 sessions = 10;
+  // Grant-to-handoff latency of the last attempts dispatched (warm path):
+  // from a granted attempt reaching the core to its Execute being sent.
+  double dispatch_p50_us = 11;
+  double dispatch_p99_us = 12;
+  uint64 dispatch_samples = 13;
+  // Shard commands this peer proposed that have not been answered yet.
+  uint64 proposals_in_flight = 14;
+}
+
+message ShutdownRequest {}
+message ShutdownReply {}
+
+message LocalizeRequest {
+  bytes run = 1;
+  bytes object_id = 2;
+}
+
+message LocalizeReply {}
+
+message ListTasksRequest {
+  bytes run = 1;
+  bytes after_task = 2;   // exclusive cursor; empty = from the start
+  uint32 limit = 3;
+}
+
+message ListTasksReply {
+  repeated OutcomeEvent tasks = 1;   // outcome unset while the task is not done
+  repeated TaskRecord.State states = 2;
+  bytes next_after = 3;              // empty when there are no more
+}

@@ -4,6 +4,8 @@ members = [
     "crates/chimaera-proto",
     "crates/chimaera-core",
     "crates/chimaera-peer",
+    "crates/chimaera-raft",
+    "crates/chimaera-py",
 ]
 
 [workspace.package]

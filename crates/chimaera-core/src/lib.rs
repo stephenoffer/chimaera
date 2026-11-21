@@ -4,6 +4,7 @@
 //! replicated state machine and the membership logic behave identically on
 //! every replica and in simulation.
 
+pub mod adapt;
 pub mod hlc;
 pub mod ids;
 pub mod kv;

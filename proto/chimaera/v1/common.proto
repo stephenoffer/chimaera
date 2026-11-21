@@ -34,6 +34,9 @@ message ObjectRef {
   bytes checksum = 5;  // blake3, first 16 bytes
   // Number of pickle protocol-5 out-of-band buffers following the main frame.
   uint32 oob_buffers = 6;
+  // Run that owns the bytes; a run's objects live under one directory and are
+  // reclaimed together when the run expires.
+  bytes run = 7;
 }
 
 message ErrorRecord {
@@ -69,4 +72,46 @@ message Outcome {
   }
   uint32 attempt = 3;
   PeerInc peer = 4;
+}
+
+// The frozen effective policy of a call. Python merges options (call view,
+// scopes, decorator, defaults) and the peer adds the learned layer; the result
+// travels with the task and is recorded on every attempt.
+message Policy {
+  double cpus = 1;              // 0 = learned/default (1)
+  uint64 memory = 2;            // reservation, bytes; 0 = learned
+  uint64 memory_limit = 3;      // hard cap, bytes; 0 = none
+  double gpus = 4;
+  string device = 5;            // "" or "cuda", "cuda:H100"
+  map<string, double> resources = 6;
+  enum Accounting {
+    ACCOUNTING_AUTO = 0;
+    ACCOUNTING_PROCESS = 1;
+    ACCOUNTING_ISOLATED = 2;
+  }
+  Accounting accounting = 7;
+  enum Adaptive {
+    ADAPTIVE_ON = 0;
+    ADAPTIVE_OBSERVE = 1;
+    ADAPTIVE_FROZEN = 2;
+  }
+  Adaptive adaptive = 8;
+  uint32 concurrency = 9;
+  uint32 range_size = 10;       // 0 = auto
+  bool interactive = 11;        // latency tier: never auto-batched
+  bool deterministic = 12;
+  string env_digest = 13;
+  map<string, string> require = 14;   // hard placement predicates
+  repeated string prefer = 15;        // soft placement preferences
+  string source = 16;                 // "file.py:line" of the call view, for explanations
+}
+
+// How executors start for a run: interpreter, working directory, import path
+// and environment. Stored in the run record so a restarted peer can resume
+// the run's work.
+message ExecEnvSpec {
+  string python = 1;
+  string cwd = 2;
+  repeated string sys_path = 3;
+  map<string, string> env = 4;
 }
