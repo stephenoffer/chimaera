@@ -45,6 +45,21 @@ when the match is unique; IP addresses only match exactly.
 Ports: 7700, or `CHIMAERA_PORT`. Under Slurm the default is
 `7700 + SLURM_JOB_ID % 1000`, so two jobs sharing a node don't collide.
 
+Raft durability: each cluster peer measures its disk's fsync when it starts.
+Where an fsync takes under a millisecond (local SSDs) every commit is synced
+on each voter. Where it takes longer (network volumes such as EBS, about
+3.5 ms) commits are only replicated: a call is acknowledged once a majority of
+its group's machines hold it in memory, because syncing would cap per-call
+throughput (on 4 cloud machines: 2,681 no-op calls/s synced, 17,547/s
+replicated). A peer whose logs were not synced and whose machine rebooted
+without a clean shutdown discards its raft identity when it comes back and
+joins as a new member, so it can never vote with a log it may have lost. What
+stays at risk is a majority of one group's machines failing at the same
+moment, which can lose that group's latest commits. `chimaera status` lists
+the choice and why. `CHIMAERA_RAFT_SYNC` overrides it: `fsync`, `full` (also
+flushes the drive cache; very slow on macOS) or `none`. Local peers never
+sync (one machine survives the peer process dying, not the machine).
+
 Under `auto`, two flags keep the meaning they had before providers existed:
 `--listen` means a hand-configured (`static`) peer, and `--idle-timeout`
 means a local one. Drivers start their local peer on demand with
@@ -180,8 +195,16 @@ SIGTERM (or SIGUSR1) drains a peer: it stops taking new work, other peers stop s
 any, and it waits up to `CHIMAERA_DRAIN_SECONDS` (default 30) for queued and
 running calls before it shuts down. Kubernetes' grace period uses SIGTERM;
 Slurm jobs use SIGUSR1, because `srun` forwards it to the peers and turns
-SIGTERM into a kill (`--signal=B:USR1@120` in the job script). Spot and maintenance notices from cloud
-metadata endpoints arrive in P6.
+SIGTERM into a kill (`--signal=B:USR1@120` in the job script).
+
+On cloud VMs, `CHIMAERA_PREEMPTION_NOTICES=gce|aws|azure` makes the peer poll
+its metadata server every 5 seconds and drain when the VM is about to go away:
+a GCE preemption or `TERMINATE` maintenance event (not a live migration), an
+AWS spot interruption (`spot/instance-action`, through an IMDSv2 token), or an
+Azure scheduled `Preempt`, `Terminate`, `Reboot` or `Redeploy`. GCE gives 30
+seconds' warning for a preemption, so set `CHIMAERA_DRAIN_SECONDS` below that
+there. It is off by default, since only a cloud VM has the metadata address,
+and it has not been run against a real cloud.
 
 ### Tenants and quotas
 
@@ -231,8 +254,19 @@ jobs instead. Each spare `sbatch` job runs a peer that joins the running
 cluster. Shrinking cancels the newest spare job, whose peer drains on the
 SIGTERM `scancel` sends. Spares join with the cluster's token, so submit the
 job with `CHIMAERA_CLUSTER_TOKEN` set (`slurm-launch` then uses it too).
-`deploy/slurm/slurm-autoscale-test.sh` checks this. SkyPilot growth is not
-built.
+`deploy/slurm/slurm-autoscale-test.sh` checks this.
+
+On clouds, `--sky "LAUNCH ARGS"` grows the cluster with one-node SkyPilot
+clusters, `chimaera-spare-1`, `-2`, and so on. Each runs `sky launch` with
+your arguments (where and on what, e.g. `--infra aws --gpus H100:8 --use-spot
+--image-id ...`; the node needs `chimaera` on its PATH) and a peer that joins
+the running cluster. Shrinking sends the newest spare's peer SIGUSR1 over
+`ssh` (SkyPilot writes a host alias per cluster), waits for it to drain, then
+runs `sky down`. `--base N` counts the peers that are not spares (default 1),
+and the spares' names are kept in the cluster's store, so a restarted
+provisioner knows them. Run it with `CHIMAERA_CLUSTER_TOKEN` set. The calls
+it makes are checked against stand-in `sky` and `ssh` commands; it has not
+run against a real SkyPilot install.
 
 ## Selecting and reaching a cluster (P3)
 
@@ -318,14 +352,16 @@ for the executor and removes conflicting ones it inherited:
 | `cuda` | GPU | `CUDA_VISIBLE_DEVICES=<GPU UUIDs>` | `nccl` |
 | `rocm` | GPU or partition | `HIP_VISIBLE_DEVICES=<indices>`; removes `CUDA_VISIBLE_DEVICES`, `GPU_DEVICE_ORDINAL`; keeps an inherited `ROCR_VISIBLE_DEVICES` | `nccl` (RCCL) |
 | `tpu` | chip | `TPU_VISIBLE_CHIPS`; for 1 or 2 chips also `TPU_CHIPS_PER_HOST_BOUNDS` and `TPU_HOST_BOUNDS=1,1,1`; a whole host gets the framework defaults | `xla` |
-| `neuron` | NeuronCore | `NEURON_RT_VISIBLE_CORES` | `xla` |
+| `neuron` | NeuronCore (logical: two physical cores on Trn2 and Trn3 by default) | `NEURON_RT_VISIBLE_CORES` | `xla` |
 | `hpu` | module | `HABANA_VISIBLE_MODULES=<module ids>` | `hccl` |
-| `xpu` | device (tile) | `ZE_AFFINITY_MASK` | `xccl` |
+| `xpu` | card (a two-tile Max 1550 is one) | `ZE_AFFINITY_MASK` in PCI order, with `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1` and `ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE`; removes `ONEAPI_DEVICE_SELECTOR` | `xccl` |
 | `mps` | the one Apple GPU | none: it can't be hidden | `gloo` |
 
 A call granted none of a kind the host has gets an empty list, so it sees no
 devices of that kind. UUIDs are used for CUDA so device ordinals never matter.
-The TPU and Intel rules follow Ray 2.60's accelerator managers.
+The TPU rules follow Ray 2.60's accelerator managers. Intel differs from Ray,
+which leaves Level Zero's device order and hierarchy at their defaults: here
+both are pinned, so a mask names the card the peer chose.
 `ch.device()` returns the framework device string (`"cuda:0"`, `"xla:0"`,
 `"hpu"`, `"xpu:0"`, `"mps"` or `"cpu"`) without importing a framework.
 
@@ -333,13 +369,15 @@ The TPU and Intel rules follow Ray 2.60's accelerator managers.
 
 Discovery reads files, then shared libraries, and runs vendor tools last:
 
-1. A device must be listed by the driver: `/proc/driver/nvidia/gpus` for NVIDIA, the KFD topology for AMD, `/dev/accel*` or Google VFIO groups for TPU.
+1. A device must be listed by the driver: `/proc/driver/nvidia/gpus` for NVIDIA, the KFD topology for AMD, `/dev/accel*` or Google VFIO groups for TPU, `/sys/devices/virtual/neuron_device` for Neuron, Habana (PCI vendor 0x1da3) entries in `/sys/class/accel` for Gaudi (an "operational" one), and Intel (0x8086) DRM render nodes for `xpu`. An Intel integrated GPU is not counted, so `gpus=1` never lands on it.
 2. Its `/dev` node must exist. A Kubernetes device plugin mounts only the nodes it granted, while procfs still lists every GPU on the host.
 3. A visibility variable the peer itself inherited narrows it further, as Slurm's `CUDA_VISIBLE_DEVICES` does.
 
 NVIDIA memory, MIG instances and NVLink come from NVML, loaded at run time so
-one binary works on every host (P5). Neuron, Gaudi and Intel are read from
-their vendor tools (`neuron-ls --json-output`, `hl-smi`, `xpu-smi`) in P5.
+one binary works on every host (P5). Ray reads Neuron, Gaudi and Intel from
+their vendor tools; Chimaera reads the files their drivers document, with
+no tool installed. Models come from the PCI id (`gaudi3`, `Max 1550`) or the
+Neuron instance family (`trn2`).
 
 Only CUDA's `CUDA_VISIBLE_DEVICES=""` behavior is documented by its vendor
 and relied on as fact. Every other vendor detail here is unverified on
@@ -348,16 +386,19 @@ replaces the hand-written fixtures in `tests/fixtures/topology/`.
 
 ## Your environment on remote peers (P3)
 
+Planned: three modes, chosen automatically. What works now is under **Today** below.
+
 | Mode | What ships | Python the executor runs | Default for |
 |---|---|---|---|
 | `shared` | paths only | your interpreter's path | local runs, Slurm and HPC on a shared filesystem |
 | `image` | your project's local code | the image's Python; a peer refuses a run built for another image | Kubernetes, SkyPilot with a container |
 | `uv` | `uv.lock` and `pyproject.toml` (or a lock built from what you have installed), plus local code | an environment built once per digest on each peer | SSH, VMs, SkyPilot |
 
-Chimaera picks the first that applies: an explicit `env=`, running inside the
-cluster's image, a peer that already has an identical environment, a `uv.lock`
-in your project, then a lock built from your installed packages. If none
-applies, `ch.EnvironmentMismatch` names the fixes.
+Chimaera will pick the first that applies: an explicit `env=`, running inside
+the cluster's image, a peer that already has an identical environment, a
+`uv.lock` in your project, then a lock built from your installed packages,
+and otherwise fail with an error naming the fixes. None of that selection,
+the image check or the built lock exists yet.
 
 **Today:** a driver connected to a remote cluster (`CHIMAERA_ADDRESS` or a
 profile) ships its project's own modules. These are the `sys.path`

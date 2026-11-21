@@ -286,5 +286,96 @@
    "p99_us": 479,
    "concurrent_per_s": 98972
   }
+ },
+ "step2_round_trips_vs_live_base": [
+  {
+   "bin": "chimaera-livebase-rel",
+   "task": [
+    525.2,
+    2748.2
+   ],
+   "actor": [
+    529.9,
+    1355.3
+   ],
+   "load": 16.64599609375
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    260.4,
+    2519.8
+   ],
+   "actor": [
+    284.7,
+    759.2
+   ],
+   "load": 16.51416015625
+  },
+  {
+   "bin": "chimaera-livebase-rel",
+   "task": [
+    499.1,
+    1495.5
+   ],
+   "actor": [
+    565.1,
+    1564.2
+   ],
+   "load": 15.912109375
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    258.3,
+    905.1
+   ],
+   "actor": [
+    319.2,
+    1492.8
+   ],
+   "load": 14.8779296875
+  },
+  {
+   "bin": "chimaera-livebase-rel",
+   "task": [
+    508.7,
+    1442.7
+   ],
+   "actor": [
+    623.9,
+    2705.8
+   ],
+   "load": 14.2470703125
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    256.8,
+    1800.5
+   ],
+   "actor": [
+    312.2,
+    1536.1
+   ],
+   "load": 13.82666015625
+  }
+ ],
+ "commit_path_nondurable": {
+  "no log, Durability::None": {
+   "p50_us": 31,
+   "p99_us": 42,
+   "concurrent_per_s": 123744
+  },
+  "raft log (same run)": {
+   "p50_us": 139,
+   "p99_us": 367,
+   "concurrent_per_s": 142972
+  }
+ },
+ "python_suite": {
+  "live_base_debug": "268 passed, 5 skipped, 1 failed (test_cluster unsynced reboot, pre-existing)",
+  "step1_debug": "267 passed, 5 skipped, 2 failed (same cluster test; test_locality spread timing, passes on rerun with both binaries)",
+  "step2_debug": "269 passed, 5 skipped, 0 failed"
  }
 }

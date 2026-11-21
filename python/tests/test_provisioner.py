@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
+import chimaera as ch
 from chimaera._cluster import Node
 from chimaera.provisioner import Memory, Rules, decide
 
 
-def node(cpus=4.0, used=0.0, queued=0, alive=True):
-    return Node("p", "a:1", cpus, 1 << 30, [], alive, used, queued, False, {})
+def node(cpus=4.0, used=0.0, queued=0, alive=True, address="a:1"):
+    return Node("p", address, cpus, 1 << 30, [], alive, used, queued, False, {})
 
 
 RULES = Rules(min=1, max=5, up_after=10, down_after=60)
@@ -125,3 +130,52 @@ def test_in_cluster_it_calls_the_api_server_with_the_pods_service_account(tmp_pa
     path = "/apis/apps/v1/namespaces/ml/statefulsets/chimaera/scale"
     assert [s[:3] for s in seen] == [("GET", path, "Bearer sa-token"), ("PATCH", path, "Bearer sa-token"), ("GET", path, "Bearer sa-token")]
     assert seen[1][3] == ("application/merge-patch+json", {"spec": {"replicas": 5}})
+
+
+def test_skypilot_spares_launch_join_and_drain_before_teardown(tmp_path, monkeypatch):
+    from chimaera.provisioner import SkySpares
+
+    log = tmp_path / "calls"
+    for tool in ("sky", "ssh"):  # stand-ins that record their arguments, one line per call
+        path = tmp_path / tool
+        path.write_text(
+            f'#!/bin/sh\nprintf "{tool}" >> {log}\nfor a in "$@"; do printf " [%s]" "$a" >> {log}; done\necho >> {log}\n'
+        )
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("CHIMAERA_CLUSTER_TOKEN", "t")
+    ch.Store("provisioner/sky").delete("spares")
+    peers = [node(2, 0, address="10.0.0.6:7700"), node(2, 0, address="10.0.0.5:7700")]
+    monkeypatch.setattr(ch, "cluster", lambda: type("View", (), {"nodes": lambda self: peers})())
+
+    def calls(pool):
+        for c in pool._children:
+            c.wait(timeout=30)
+        return log.read_text().splitlines() if log.exists() else []
+
+    pool = SkySpares(1, ["--infra", "aws", "--use-spot"], drain_s=0)
+    pool.scale(3)
+    launches = sorted(calls(pool))  # the two launches run at once, in either order
+    assert len(launches) == 2 and pool.replicas() == 3
+    first = launches[0]
+    assert first.startswith(
+        "sky [launch] [-c] [chimaera-spare-1] [-y] [-d] [--env] [CHIMAERA_CLUSTER_TOKEN] [--infra] [aws] [--use-spot] [chimaera peer start"
+    )
+    assert "--listen 0.0.0.0:7700" in first and "--seeds 10.0.0.5:7700,10.0.0.6:7700]" in first
+    assert "chimaera-spare-2" in launches[1]
+    # A restarted provisioner knows the spares; shrinking drains the newest, then tears it down.
+    again = SkySpares(1, [], drain_s=0)
+    assert again.replicas() == 3
+    log.unlink()
+    again.scale(2)
+    assert calls(again) == [
+        "ssh [chimaera-spare-2] [pkill] [-USR1] [-x] [chimaera]",
+        "sky [down] [-y] [chimaera-spare-2]",
+    ]
+    assert again.replicas() == 2
+    again.scale(1)
+    calls(again)
+    assert again.replicas() == 1
+    peers[:] = [node(2, 0, address="")]  # a local peer: nothing for a spare to join
+    with pytest.raises(RuntimeError, match="no live peer has a network address"):
+        again.scale(2)

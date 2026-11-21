@@ -340,3 +340,47 @@ def test_explain_reports_attempts_with_measurement_scope():
     assert scope == "process" and 0.25 < cpu < 0.6
     peak_scope = a["measures"]["rss_peak_bytes"][1]
     assert peak_scope == "process_lifetime", "a lifetime peak must not be reported as the call's own"
+
+
+@ch.remote
+def square_of(x: int) -> int:
+    return x * x
+
+
+@ch.remote
+def fails_with_key_error(_: int) -> int:
+    raise KeyError("upstream")
+
+
+@ch.remote
+def received(xs):
+    """What the call got: values, or the names of the types of what it got."""
+    if isinstance(xs, dict):
+        return {k: type(v).__name__ for k, v in xs.items()}
+    return [type(x).__name__ for x in xs]
+
+
+@ch.remote
+def total_of(xs) -> int:
+    return sum(xs.values()) if isinstance(xs, dict) else sum(xs)
+
+
+def test_futures_inside_a_list_tuple_or_dict_arrive_as_values():
+    fs = [square_of.remote(i) for i in range(5)]
+    assert total_of.remote(fs).result(timeout=60) == 30
+    assert total_of.remote(tuple(fs)).result(timeout=60) == 30
+    assert total_of.remote({"a": fs[1], "b": fs[2], "c": 10}).result(timeout=60) == 15
+    # Order is kept, and plain items pass through untouched.
+    assert received.remote([fs[0], 7, "x"]).result(timeout=60) == ["int", "int", "str"]
+
+
+def test_a_failed_future_inside_a_list_fails_the_call():
+    with pytest.raises(KeyError, match="upstream"):
+        total_of.remote([square_of.remote(1), fails_with_key_error.remote(0)]).result(timeout=60)
+
+
+def test_handles_keeps_futures_unresolved_and_deeper_nesting_is_left_alone():
+    f = square_of.remote(3)
+    assert received.remote(ch.handles([f])).result(timeout=60) == ["Future"]
+    assert received.remote({"k": ch.handles(f)}).result(timeout=60) == {"k": "Future"}
+    assert received.remote([[f]]).result(timeout=60) == ["list"], "only one level is resolved"

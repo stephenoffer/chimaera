@@ -93,17 +93,348 @@ pub fn sweep_arenas(objects: &Path) -> usize {
     n
 }
 
-/// Start the object plane's housekeeping thread for `objects`.
-pub fn start(objects: PathBuf) {
-    let _ = std::thread::Builder::new().name("chimaera-objplane".into()).spawn(move || {
-        loop {
-            let n = sweep_arenas(&objects);
-            if n > 0 {
-                tracing::info!("removed the shared-memory arenas of {n} exited processes");
+/// Reserve classes: files of 2^class bytes (2 MiB .. 1 GiB), the same
+/// classes writers ask for (chimaera-py's objects.rs).
+const MIN_CLASS: u32 = 21;
+const MAX_CLASS: u32 = 30;
+/// A class nobody asked for in this long gives back one file.
+const DECAY: Duration = Duration::from_secs(60);
+
+/// Pre-zeroed tmpfs files that writers take by rename, so a new object or
+/// NumPy array starts on pages that are already allocated and zeroed: no
+/// page faults where the copy or the computation happens. The kernel's
+/// zeroing (the bulk of a fresh page's cost) moves to this thread.
+///
+/// Demand-driven: a writer that finds no file of its class leaves
+/// `want-<class>`; each want doubles that class's target, and targets decay
+/// by one file per idle minute. The whole reserve stays under `budget`.
+pub struct Reserve {
+    dir: PathBuf,
+    budget: u64,
+    target: [u32; 32],
+    last_want: [Option<std::time::Instant>; 32],
+    seq: u64,
+}
+
+impl Reserve {
+    pub fn new(dir: PathBuf, budget: u64) -> Reserve {
+        let _ = std::fs::create_dir_all(&dir);
+        // Files a previous peer left are kept; half-filled ones are dropped.
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".fill-")) {
+                let _ = std::fs::remove_file(e.path());
             }
-            std::thread::sleep(Duration::from_secs(10));
+        }
+        Reserve { dir, budget, target: [0; 32], last_want: [None; 32], seq: 0 }
+    }
+
+    /// One round: read wants and stock, decay idle classes, fill what is
+    /// missing (smallest classes first) and drop what is over target.
+    pub fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        let mut stock: [Vec<PathBuf>; 32] = Default::default();
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(k) = name.strip_prefix("want-").and_then(|k| k.parse::<u32>().ok()) {
+                let _ = std::fs::remove_file(e.path());
+                if (MIN_CLASS..=MAX_CLASS).contains(&k) {
+                    let t = &mut self.target[k as usize];
+                    *t = (*t * 2).clamp(1, (self.budget >> k).max(1) as u32);
+                    self.last_want[k as usize] = Some(now);
+                }
+            } else if let Some(k) = name.split_once('-').and_then(|(k, _)| k.parse::<u32>().ok())
+                && (MIN_CLASS..=MAX_CLASS).contains(&k)
+            {
+                stock[k as usize].push(e.path());
+            }
+        }
+        for k in MIN_CLASS..=MAX_CLASS {
+            let i = k as usize;
+            if self.target[i] > 0 && self.last_want[i].is_none_or(|t| now.duration_since(t) >= DECAY) {
+                self.target[i] -= 1;
+                self.last_want[i] = Some(now);
+            }
+            while stock[i].len() > self.target[i] as usize {
+                let _ = std::fs::remove_file(stock[i].pop().expect("non-empty"));
+            }
+        }
+        // What is missing, smallest classes first, within the budget; filled
+        // by FILLERS threads at once (zeroing pages is the kernel's work, and
+        // one thread cannot keep up with a burst of new objects).
+        let mut bytes: u64 = (MIN_CLASS..=MAX_CLASS).map(|k| (stock[k as usize].len() as u64) << k).sum();
+        let mut todo: Vec<(u32, u64)> = Vec::new();
+        for k in MIN_CLASS..=MAX_CLASS {
+            let mut have = stock[k as usize].len();
+            while have < self.target[k as usize] as usize && bytes + (1u64 << k) <= self.budget {
+                self.seq += 1;
+                todo.push((k, self.seq));
+                have += 1;
+                bytes += 1 << k;
+            }
+        }
+        let dir = &self.dir;
+        for batch in todo.chunks(FILLERS) {
+            std::thread::scope(|s| {
+                for &(k, seq) in batch {
+                    s.spawn(move || {
+                        if let Err(e) = fill(dir, k, seq) {
+                            tracing::debug!("reserve: cannot fill a 2^{k} file: {e}");
+                        }
+                    });
+                }
+            });
+        }
+    }
+}
+
+/// Threads filling the reserve at once.
+const FILLERS: usize = 4;
+
+/// Create `<dir>/<k>-<seq>`: 2^k bytes of allocated, zeroed pages.
+fn fill(dir: &Path, k: u32, seq: u64) -> std::io::Result<PathBuf> {
+    {
+        use std::os::fd::AsRawFd;
+        let tmp = dir.join(format!(".fill-{k}-{seq}"));
+        let done = dir.join(format!("{k}-{seq}"));
+        let len = 1usize << k;
+        let r = (|| {
+            let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
+            f.set_len(len as u64)?; // first: a huge-page tmpfs then allocates huge pages
+            // SAFETY: a fresh shared mapping of our own file, unmapped below.
+            unsafe {
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    f.as_raw_fd(),
+                    0,
+                );
+                if p == libc::MAP_FAILED {
+                    return Err(std::io::Error::last_os_error());
+                }
+                const MADV_POPULATE_WRITE: libc::c_int = 23;
+                let rc = libc::madvise(p, len, MADV_POPULATE_WRITE);
+                let err = std::io::Error::last_os_error();
+                if rc != 0 && err.raw_os_error() == Some(libc::EINVAL) {
+                    // Before Linux 5.14: touch each page instead. The space was
+                    // checked by the caller's budget against a tmpfs that has room.
+                    for off in (0..len).step_by(4096) {
+                        std::ptr::write_volatile((p as *mut u8).add(off), 0);
+                    }
+                } else if rc != 0 {
+                    libc::munmap(p, len);
+                    return Err(err);
+                }
+                libc::munmap(p, len);
+            }
+            std::fs::rename(&tmp, &done)
+        })();
+        if r.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r.map(|()| done)
+    }
+}
+
+fn fs_size(p: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statvfs fills `st` for a NUL-terminated path.
+    #[allow(clippy::unnecessary_cast)]
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_blocks as u64 * st.f_frsize as u64)
+}
+
+/// Bytes of objects the in-memory store may hold before writers put new
+/// objects straight on disk: `CHIMAERA_MEMORY_POOL` when set, else 90% of
+/// the object filesystem.
+pub fn memory_limit(objects: &Path) -> u64 {
+    std::env::var("CHIMAERA_MEMORY_POOL")
+        .ok()
+        .and_then(|v| crate::budget::parse_size(&v))
+        .unwrap_or_else(|| fs_size(objects).map_or(0, |b| b / 10 * 9))
+}
+
+/// Start the object plane of an in-memory store at `objects` whose spill
+/// directory (on disk) is `spill`: tell writers where things are (the
+/// `.plane` file, read by chimaera-py's _objects), keep the page reserve
+/// filled, and sweep the arenas of exited processes. A store on disk
+/// (`spill` None) only gets the sweeping.
+pub fn start(objects: PathBuf, spill: Option<PathBuf>) {
+    let mut reserve = None;
+    if let Some(spill) = &spill {
+        let limit = memory_limit(&objects);
+        let dir = objects.join(".reserve");
+        let plane = format!("reserve={}\nspill={}\nlimit={limit}\n", dir.display(), spill.display());
+        if let Err(e) = crate::stores::write_atomic(&objects.join(".plane"), plane.as_bytes()) {
+            tracing::warn!("object plane: cannot write {}: {e}", objects.join(".plane").display());
+        }
+        reserve = Some(Reserve::new(dir, (2u64 << 30).min(limit / 16)));
+    }
+    let _ = std::thread::Builder::new().name("chimaera-objplane".into()).spawn(move || {
+        let mut last_sweep = std::time::Instant::now() - Duration::from_secs(60);
+        loop {
+            if last_sweep.elapsed() >= Duration::from_secs(10) {
+                last_sweep = std::time::Instant::now();
+                let n = sweep_arenas(&objects);
+                if n > 0 {
+                    tracing::info!("removed the shared-memory arenas of {n} exited processes");
+                }
+            }
+            if let Some(r) = reserve.as_mut() {
+                r.tick();
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     });
+}
+
+/// How long a new object waits before it is replicated (see watch).
+#[cfg(target_os = "linux")]
+const REPLICA_DELAY: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+fn is_object_name(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Replicate every object this peer stores to its ring successor (see the
+/// Replicate RPC), so a lost peer loses no data: a consumer whose holder is
+/// gone finds the copy on another live member. Objects are seen through
+/// inotify as they appear in the store: renamed into place from a writer's
+/// `.tmp` name, or hard-linked from a NumPy arena. Copies fetched from other
+/// peers (`.part` names) and spills are not replicated again. The copy lags
+/// the write by one transfer. `CHIMAERA_OBJECT_REPLICAS=0` turns this off.
+#[cfg(target_os = "linux")]
+pub fn replicate_new_objects(
+    objects: PathBuf,
+    mesh: std::sync::Arc<crate::mesh::MeshClient>,
+    rt: tokio::runtime::Handle,
+) {
+    if std::env::var("CHIMAERA_OBJECT_REPLICAS").as_deref() == Ok("0") {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("chimaera-replicas".into()).spawn(move || {
+        if let Err(e) = watch(&objects, &mesh, &rt) {
+            tracing::warn!("object replicas are off: cannot watch {}: {e}", objects.display());
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn watch(
+    objects: &Path,
+    mesh: &std::sync::Arc<crate::mesh::MeshClient>,
+    rt: &tokio::runtime::Handle,
+) -> std::io::Result<()> {
+    use std::collections::HashMap;
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: inotify syscalls on paths we own; the event buffer is parsed
+    // within the length read() returned.
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let add = |p: &Path, mask: u32| -> i32 {
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).expect("no NUL in paths");
+        unsafe { libc::inotify_add_watch(fd, c.as_ptr(), mask) }
+    };
+    const RUN_MASK: u32 = libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_MOVED_FROM;
+    let root = add(objects, libc::IN_CREATE);
+    if root < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut runs: HashMap<i32, PathBuf> = HashMap::new();
+    for e in std::fs::read_dir(objects)?.flatten() {
+        if is_object_name(&e.file_name().to_string_lossy()) {
+            let wd = add(&e.path(), RUN_MASK);
+            if wd >= 0 {
+                runs.insert(wd, e.path());
+            }
+        }
+    }
+    // Rename sources by cookie: true when the old name was a writer's temporary.
+    let mut moved: HashMap<u32, bool> = HashMap::new();
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        let mut off = 0usize;
+        let head = std::mem::size_of::<libc::inotify_event>();
+        while off + head <= n as usize {
+            // SAFETY: the kernel wrote a whole event (header + name) here.
+            let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
+            let raw = &buf[off + head..off + head + ev.len as usize];
+            let name =
+                String::from_utf8_lossy(&raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]).into_owned();
+            off += head + ev.len as usize;
+            if ev.mask & libc::IN_IGNORED != 0 {
+                runs.remove(&ev.wd);
+                continue;
+            }
+            if ev.wd == root {
+                if ev.mask & libc::IN_ISDIR != 0 && is_object_name(&name) {
+                    let wd = add(&objects.join(&name), RUN_MASK);
+                    if wd >= 0 {
+                        runs.insert(wd, objects.join(&name));
+                    }
+                }
+                continue;
+            }
+            let Some(run_dir) = runs.get(&ev.wd) else { continue };
+            if ev.mask & libc::IN_MOVED_FROM != 0 {
+                if moved.len() > 4096 {
+                    moved.clear(); // unpaired cookies (moves out of the directory)
+                }
+                moved.insert(ev.cookie, name.contains(".tmp"));
+                continue;
+            }
+            let local = if ev.mask & libc::IN_MOVED_TO != 0 {
+                moved.remove(&ev.cookie) == Some(true)
+            } else {
+                ev.mask & libc::IN_CREATE != 0 && ev.mask & libc::IN_ISDIR == 0 // a hard link from an arena
+            };
+            if !local || !is_object_name(&name) {
+                continue;
+            }
+            let path = run_dir.join(&name);
+            let (Some(run), Some(object)) =
+                (run_dir.file_name().and_then(|r| decode_hex(&r.to_string_lossy())), decode_hex(&name))
+            else {
+                continue;
+            };
+            let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else { continue };
+            let Some(node) = mesh.successor() else { continue };
+            let mesh = mesh.clone();
+            rt.spawn(async move {
+                // A moment's grace: an object a reader on another peer fetches
+                // meanwhile already has its copy, and the replica would only
+                // compete with that reader for this peer's bandwidth.
+                tokio::time::sleep(REPLICA_DELAY).await;
+                if mesh.was_served(&object) || tokio::fs::metadata(&path).await.is_err() {
+                    return; // fetched elsewhere already, or freed
+                }
+                if let Err(e) = mesh.replicate(node, &run, &object, size).await {
+                    tracing::debug!("replicate {} to node {node}: {e}", path.display());
+                }
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    s.len()
+        .is_multiple_of(2)
+        .then(|| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -122,6 +453,34 @@ mod tests {
         assert!(d.path().join(".arena").join(&me).exists(), "a live process keeps its arena");
         assert!(!d.path().join(".arena/999999999").exists());
         assert!(d.path().join(".arena/not-a-pid").exists(), "unknown names are left alone");
+    }
+
+    #[test]
+    fn the_reserve_follows_demand_within_its_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join(".reserve");
+        let mut r = Reserve::new(dir.clone(), 9 << 20);
+        r.tick();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing until someone asks");
+        std::fs::write(dir.join("want-21"), b"").unwrap();
+        r.tick();
+        let files: Vec<String> =
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert_eq!(files.len(), 1, "one 2 MiB file after one want: {files:?}");
+        assert!(files[0].starts_with("21-"));
+        assert_eq!(std::fs::metadata(dir.join(&files[0])).unwrap().len(), 2 << 20);
+        for _ in 0..4 {
+            std::fs::write(dir.join("want-21"), b"").unwrap();
+            r.tick();
+        }
+        let n = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(n, 4, "doubling stops at the 9 MiB budget (four 2 MiB files)");
+        std::fs::write(dir.join("want-30"), b"").unwrap();
+        r.tick();
+        assert!(
+            !std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with("30-")),
+            "a 1 GiB file does not fit the budget"
+        );
     }
 
     #[test]

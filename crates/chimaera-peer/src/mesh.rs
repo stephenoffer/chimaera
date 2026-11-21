@@ -3,7 +3,7 @@
 
 use crate::core::CoreMsg;
 use crate::router::Router;
-use crate::stores::{CodeStore, ObjectStore};
+use crate::stores::{CodeStore, ObjectStore, hex};
 use chimaera_core::pb;
 use chimaera_core::shard::{Tk, read};
 use chimaera_core::swim::{Config as SwimConfig, State as SwimState, Swim, Update as SwimUpdate};
@@ -58,11 +58,13 @@ impl tonic::service::Interceptor for CheckToken {
 }
 
 const MAX_MESSAGE: usize = 256 << 20;
-const FETCH_CHUNK: usize = 1 << 20;
+const FETCH_CHUNK: usize = 4 << 20;
 /// Objects this large come over several streams at once (the guides measured
 /// 8-10x from multiple connections on large transfers).
 const PARALLEL_FETCH: u64 = 64 << 20;
-const FETCH_RANGES: u64 = 4;
+/// Peers asked for an object (holders included) before it counts as lost.
+const REPLICA_SEARCH: usize = 8;
+const FETCH_RANGES: u64 = 8;
 /// Transfers this large teach the bandwidth estimate.
 const RATE_SAMPLE_MIN: u64 = 1 << 20;
 /// Objects fetched this recently are offered as locality hints.
@@ -71,12 +73,14 @@ const RECENT_MAX: usize = 256;
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a relay waits for the target of an indirect probe.
 pub const RELAY_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a ping waits for the core's load report before answering without it.
+const LOAD_WAIT: Duration = Duration::from_millis(200);
 
 /// SWIM timing for cluster peers: probe every 300 ms; a missed direct and
 /// indirect probe makes a member suspect; it is declared dead after
 /// 4 × log10(max(n, 10)) periods without refuting (1.2 s up to 10 peers).
 pub fn swim_config() -> SwimConfig {
-    SwimConfig { period_ms: 300, indirect: 3, suspicion: 4, retransmit: 4, piggyback: 8 }
+    SwimConfig { period_ms: 300, indirect: 3, suspicion: 4, retransmit: 4, piggyback: 8, suspicion_floor_ms: 6_000 }
 }
 
 /// What this peer knows about another member.
@@ -129,6 +133,9 @@ pub struct MeshClient {
     fetched: Mutex<HashMap<u64, (u64, u64)>>,
     /// Objects fetched recently (locality hints for other peers).
     recent: Mutex<VecDeque<(Instant, Vec<u8>)>>,
+    /// Objects other peers asked this one for, and when: their fetched copy
+    /// already makes a replica unnecessary (see objplane).
+    served: Mutex<HashMap<Vec<u8>, Instant>>,
     /// Profiles other peers sent with their ping replies, for the core.
     received: Mutex<Vec<(u64, pb::ProfileSummary)>>,
     /// SWIM membership (who is alive), driven by the liveness loop.
@@ -155,6 +162,19 @@ static FETCH_SEQ: AtomicU64 = AtomicU64::new(0);
 fn ranges(size: u64, n: u64) -> Vec<(u64, u64)> {
     let step = size.div_ceil(n.max(1)).max(1);
     (0..size).step_by(step as usize).map(|off| (off, step.min(size - off))).collect()
+}
+
+/// Whether a call failed because nothing listens at the peer's address: its
+/// process is gone (a stalled or unreachable peer times out instead).
+fn refused(s: &Status) -> bool {
+    let mut e: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(s);
+    while let Some(err) = e {
+        if err.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused) {
+            return true;
+        }
+        e = err.source();
+    }
+    format!("{s:?}").contains("onnection refused")
 }
 
 fn status_err(s: Status) -> std::io::Error {
@@ -203,6 +223,7 @@ impl MeshClient {
             bandwidth: Mutex::new(HashMap::new()),
             fetched: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
+            served: Mutex::new(HashMap::new()),
             received: Mutex::new(Vec::new()),
             swim: Mutex::new(Swim::new(me_node, swim_inc(me_inc), me_node, swim_config())),
             epoch: Instant::now(),
@@ -224,6 +245,12 @@ impl MeshClient {
                     .tcp_nodelay(true)
                     .http2_keep_alive_interval(Duration::from_secs(5))
                     .keep_alive_timeout(Duration::from_secs(5))
+                    // Objects stream over these channels: windows sized for
+                    // bulk transfer (and grown with the measured bandwidth-delay
+                    // product), not HTTP/2's 64 KiB default.
+                    .initial_stream_window_size(8 << 20)
+                    .initial_connection_window_size(32 << 20)
+                    .http2_adaptive_window(true)
                     .connect_lazy();
                 chans.insert(addr.to_string(), c.clone());
                 c
@@ -430,6 +457,46 @@ impl MeshClient {
         Ok(())
     }
 
+    /// Ask `node` to keep a copy of an object this peer stores (it pulls the
+    /// bytes from here, to its disk).
+    pub async fn replicate(&self, node: u64, run: &[u8], object: &[u8], size: u64) -> std::io::Result<()> {
+        let req = pb::ReplicateRequest {
+            cluster: self.cluster.clone(),
+            run: run.to_vec(),
+            object_id: object.to_vec(),
+            size,
+            from_node: self.me.node_id,
+        };
+        let mut c = self.rpc(node)?;
+        tokio::time::timeout(CALL_TIMEOUT, c.replicate(req))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(status_err)?;
+        Ok(())
+    }
+
+    /// Another peer asked for `object` (it will hold a copy).
+    pub fn note_served(&self, object: &[u8]) {
+        let mut s = self.served.lock().expect("lock");
+        if s.len() > 65536 {
+            s.retain(|_, t| t.elapsed() < Duration::from_secs(60));
+        }
+        s.insert(object.to_vec(), Instant::now());
+    }
+
+    /// Whether another peer asked for `object` in the last minute.
+    pub fn was_served(&self, object: &[u8]) -> bool {
+        self.served.lock().expect("lock").get(object).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+    }
+
+    /// Where this peer's objects are replicated: the next live member by
+    /// node id, wrapping around (None when alone).
+    pub fn successor(&self) -> Option<u64> {
+        let mut ids: Vec<u64> = self.live_others().iter().map(|p| p.member.node_id).collect();
+        ids.sort_unstable();
+        ids.iter().copied().find(|&n| n > self.me.node_id).or_else(|| ids.first().copied())
+    }
+
     /// Give every live peer a copy of a code blob (best effort): the peer a
     /// program connected to may die while its calls still need the code.
     pub fn spread_code(self: &Arc<Self>, digest: Vec<u8>, code: Vec<u8>) {
@@ -464,7 +531,15 @@ impl MeshClient {
             relay_to,
         };
         let r = tokio::time::timeout(timeout, c.ping(req)).await.map_err(std::io::Error::other)?;
-        let mut reply = r.map_err(status_err)?.into_inner();
+        let mut reply = r
+            .map_err(|s| {
+                if refused(&s) {
+                    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, s.to_string())
+                } else {
+                    status_err(s)
+                }
+            })?
+            .into_inner();
         self.swim_in(std::mem::take(&mut reply.updates));
         Ok(reply)
     }
@@ -555,6 +630,9 @@ impl MeshClient {
         let tmp =
             dest.with_extension(format!("part-{}-{}", std::process::id(), FETCH_SEQ.fetch_add(1, Ordering::Relaxed)));
         let started = Instant::now();
+        // Size unknown (a reader asked by name): learn it from a one-byte
+        // range, so a large object still comes over parallel streams.
+        let size = if size == 0 { self.object_size(node, run, object).await.unwrap_or(0) } else { size };
         let mut got = if size >= PARALLEL_FETCH {
             self.fetch_ranges(node, run, object, size, &tmp).await
         } else {
@@ -577,6 +655,23 @@ impl MeshClient {
                 Err(e)
             }
         }
+    }
+
+    /// The size of an object held by `node` (from the first chunk of a
+    /// one-byte range); None from a peer that does not report it.
+    async fn object_size(&self, node: u64, run: &[u8], object: &[u8]) -> Option<u64> {
+        let mut c = self.rpc(node).ok()?;
+        let req = pb::FetchRequest {
+            cluster: self.cluster.clone(),
+            run: run.to_vec(),
+            object_id: object.to_vec(),
+            code: false,
+            offset: 0,
+            len: 1,
+        };
+        let mut stream = c.fetch(req).await.ok()?.into_inner();
+        let first = stream.message().await.ok()??;
+        (first.object_size > 0).then_some(first.object_size)
     }
 
     async fn fetch_ranges(&self, node: u64, run: &[u8], object: &[u8], size: u64, tmp: &Path) -> std::io::Result<u64> {
@@ -735,10 +830,31 @@ impl MeshClient {
         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no peer holds the object");
         // The fastest known holder first.
         candidates.sort_by(|a, b| self.bandwidth(*b).unwrap_or(0.0).total_cmp(&self.bandwidth(*a).unwrap_or(0.0)));
-        for node in candidates {
+        for &node in &candidates {
             match self.fetch(node, run, object, size, dest).await {
                 Ok(_) => return Ok(()),
                 Err(e) => last = e,
+            }
+        }
+        // Every known holder failed (gone, or freed it). Replicas live on the
+        // writer's successor (see Replicate), so try each holder's successor
+        // first, then a few other live members (membership may have moved).
+        let mut live: Vec<u64> = self.live_others().iter().map(|p| p.member.node_id).collect();
+        live.sort_unstable();
+        let succ = |h: u64| live.iter().copied().find(|&n| n > h).or_else(|| live.first().copied());
+        let mut order: Vec<u64> = candidates.iter().filter_map(|&h| succ(h)).collect();
+        order.extend(live.iter().copied());
+        let mut tried = candidates;
+        for node in order {
+            if tried.contains(&node) || node == self.me.node_id {
+                continue;
+            }
+            if tried.len() >= REPLICA_SEARCH {
+                break;
+            }
+            tried.push(node);
+            if self.fetch(node, run, object, size, dest).await.is_ok() {
+                return Ok(());
             }
         }
         Err(last)
@@ -962,6 +1078,9 @@ impl pb::mesh_server::Mesh for MeshService {
     async fn fetch(&self, req: Request<pb::FetchRequest>) -> Result<Response<Self::FetchStream>, Status> {
         let r = req.into_inner();
         self.0.check(&r.cluster)?;
+        if !r.code && r.len != 1 {
+            self.0.mesh.note_served(&r.object_id); // not a size probe: a copy is on its way
+        }
         let path = if r.code { self.0.code.path(&r.object_id) } else { self.0.objects.path(&r.run, &r.object_id) };
         let chunks =
             crate::stores::read_chunks(&path, r.offset, r.len, FETCH_CHUNK).await.map_err(|e| match e.kind() {
@@ -969,7 +1088,7 @@ impl pb::mesh_server::Mesh for MeshService {
                 _ => Status::invalid_argument(e.to_string()),
             })?;
         let stream = tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(chunks), |c| {
-            c.map(|c| pb::FetchChunk { data: c.data, total: c.total, checksum: c.checksum })
+            c.map(|c| pb::FetchChunk { data: c.data, total: c.total, checksum: c.checksum, object_size: c.object_size })
                 .map_err(|e| Status::internal(e.to_string()))
         });
         Ok(Response::new(Box::pin(stream)))
@@ -1012,7 +1131,13 @@ impl pb::mesh_server::Mesh for MeshService {
         let from = r.from_node;
         self.0.mesh.swim_in(r.updates);
         self.0.core.send(CoreMsg::Load { from, reply }).await.map_err(|_| Status::unavailable("stopping"))?;
-        let mut p = rx.await.map_err(|_| Status::unavailable("stopping"))?;
+        // Liveness is the process answering. A peer whose core is not running
+        // yet (still starting: joining, opening its groups) answers anyway,
+        // marked draining so nothing is placed on it until it reports load.
+        let mut p = match tokio::time::timeout(LOAD_WAIT, rx).await {
+            Ok(r) => r.map_err(|_| Status::unavailable("stopping"))?,
+            Err(_) => pb::PingReply { draining: true, ..Default::default() },
+        };
         if r.relay_to != 0 {
             p.relay_ok = self.0.mesh.ping(r.relay_to, RELAY_TIMEOUT).await.is_ok();
         }
@@ -1042,5 +1167,44 @@ impl pb::mesh_server::Mesh for MeshService {
         self.0.check(&r.cluster)?;
         let _ = self.0.core.send(CoreMsg::RemoteLogs { run: r.run, lines: r.lines }).await;
         Ok(Response::new(pb::PushLogsReply {}))
+    }
+
+    /// Keep a copy of another peer's object. With an in-memory store the copy
+    /// goes to the spill directory on disk behind a symlink (the layout of a
+    /// spilled object): it costs no memory, readers and Fetch follow the link,
+    /// and deleting the object or its run removes it as for any spilled one.
+    async fn replicate(&self, req: Request<pb::ReplicateRequest>) -> Result<Response<pb::ReplicateReply>, Status> {
+        let r = req.into_inner();
+        self.0.check(&r.cluster)?;
+        if r.run.is_empty() || r.object_id.len() != 16 {
+            return Err(Status::invalid_argument("replicate names a run and a 16-byte object id"));
+        }
+        let (mesh, objects) = (self.0.mesh.clone(), self.0.objects.clone());
+        tokio::spawn(async move {
+            let dest = objects.path(&r.run, &r.object_id);
+            if tokio::fs::symlink_metadata(&dest).await.is_ok() {
+                return;
+            }
+            let disk = objects.spill_dir().map(|d| d.join(hex(&r.run)).join(hex(&r.object_id)));
+            let got = mesh.fetch(r.from_node, &r.run, &r.object_id, r.size, disk.as_deref().unwrap_or(&dest)).await;
+            if let Err(e) = got {
+                tracing::debug!("replica of {} from node {}: {e}", hex(&r.object_id), r.from_node);
+                return;
+            }
+            if let Some(disk) = disk {
+                let link = dest.with_extension("part-replica");
+                let _ = tokio::fs::remove_file(&link).await;
+                let made = async {
+                    tokio::fs::create_dir_all(dest.parent().expect("object paths have a run directory")).await?;
+                    tokio::fs::symlink(&disk, &link).await?;
+                    tokio::fs::rename(&link, &dest).await
+                };
+                if let Err(e) = made.await {
+                    tracing::debug!("replica of {}: cannot link it: {e}", hex(&r.object_id));
+                    let _ = tokio::fs::remove_file(&disk).await;
+                }
+            }
+        });
+        Ok(Response::new(pb::ReplicateReply {}))
     }
 }

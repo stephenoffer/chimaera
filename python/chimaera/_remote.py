@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Generic, ParamSpec, TypeVar
 
 from . import _context, _serde, _values
 from ._errors import ChimaeraError, Infeasible, NotFound, OptionsError
-from ._future import Future, ItemFailed, PartDep, Results, Stream, _Chunk, _Part
+from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part
 from ._native import blake3_digest, child_id, derive_id
 from ._options import Effective, Layer, resolve, resolve_cached, signature_of, validate
 from ._batch import Batch
@@ -114,6 +114,21 @@ def build_call(
         return dep_index[key]
 
     def sub(x: Any) -> Any:
+        """A future passed to the call becomes a dependency, directly or one
+        level inside a list, tuple or dict value (not keys, sets, deeper, or
+        subclasses), unless the argument is wrapped in ch.handles."""
+        if isinstance(x, Handles):
+            return x.value
+        kind, marked = type(x), (Future, Handles)
+        if (kind is list or kind is tuple) and any(isinstance(e, marked) for e in x):
+            return kind(sub_one(e) for e in x)
+        if kind is dict and any(isinstance(v, marked) for v in x.values()):
+            return {k: sub_one(v) for k, v in x.items()}
+        return sub_one(x)
+
+    def sub_one(x: Any) -> Any:
+        if isinstance(x, Handles):
+            return x.value
         if isinstance(x, _Part):
             # One value of a call returning several: depend on the call, pick in the callee.
             if x._parent._put is not None:

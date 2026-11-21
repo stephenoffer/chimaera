@@ -20,9 +20,10 @@ JSON line saying what it saw.
 
 Kubernetes is driven through the API server with the pod's service account
 when it runs in the cluster (``chimaera k8s render --provisioner MAX``), else
-with ``kubectl`` (your current context, or ``--namespace``). shortcut: other
-providers (SkyPilot) come next (plan P6). Inside a ``slurm-launch`` job, ``--slurm``
-grows the cluster with spare one-node jobs instead (see ``SlurmSpares``).
+with ``kubectl`` (your current context, or ``--namespace``). Inside a
+``slurm-launch`` job, ``--slurm`` grows the cluster with spare one-node jobs
+instead (see ``SlurmSpares``); ``--sky`` grows it with one-node SkyPilot
+clusters on any cloud (see ``SkySpares``).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import argparse
 import json
 import math
 import os
+import shlex
 import ssl
 import subprocess
 import sys
@@ -149,6 +151,14 @@ class StatefulSet:
             self._kubectl("scale", "statefulset", self.name, f"--replicas={n}")
 
 
+def _seeds() -> tuple[str, str]:
+    """The live peers' addresses (seeds for a joining peer) and their port."""
+    live = sorted(n.address for n in ch.cluster().nodes() if n.alive and n.address)
+    if not live:
+        raise RuntimeError("no live peer has a network address (a local peer?): spares have nothing to join")
+    return ",".join(live), live[0].rsplit(":", 1)[1]
+
+
 class SlurmSpares:
     """A cluster that started in a Slurm job (``slurm-launch``), grown by spare
     one-node jobs whose peers join it. The pool is the original job's nodes
@@ -181,9 +191,7 @@ class SlurmSpares:
             self._run("scancel", job)
 
     def _submit(self) -> None:
-        live = [n for n in ch.cluster().nodes() if n.alive]
-        seeds = ",".join(sorted(n.address for n in live))
-        port = live[0].address.rsplit(":", 1)[1]
+        seeds, port = _seeds()
         peer = (
             f'exec chimaera --dir "${{TMPDIR:-/tmp}}/{self.NAME}-$SLURM_JOB_ID" peer start --provider static '
             f'--listen 0.0.0.0:{port} --advertise "$(hostname):{port}" --seeds {seeds}'
@@ -192,6 +200,57 @@ class SlurmSpares:
         if self.partition:
             args += ["--partition", self.partition]
         self._run(*args, "--wrap", f"srun sh -c '{peer}'")
+
+
+class SkySpares:
+    """A cluster grown by one-node SkyPilot clusters whose peers join it.
+    Growing runs ``sky launch`` with ``launch_args`` (where and on what, e.g.
+    ``--infra aws --gpus H100:8 --use-spot --image-id ...``; the node needs
+    ``chimaera`` on its PATH). Shrinking drains the newest spare's peer
+    (SIGUSR1 over ``ssh NAME``, the host alias SkyPilot writes), waits out the
+    drain, then runs ``sky down``. Both run in the background, so a slow cloud
+    never stalls the loop. The spares' names live in the cluster's store, so a
+    restarted provisioner knows them. Spares join with
+    ``CHIMAERA_CLUSTER_TOKEN``, which must be set where this runs.
+    shortcut: unverified against a real SkyPilot install here."""
+
+    PREFIX = "chimaera-spare"
+
+    def __init__(self, base: int, launch_args: list[str], drain_s: float = 35.0) -> None:
+        if not os.environ.get("CHIMAERA_CLUSTER_TOKEN"):
+            raise SystemExit("--sky needs CHIMAERA_CLUSTER_TOKEN set: spares join the cluster with it")
+        self.base, self.launch_args, self.drain_s = base, launch_args, drain_s
+        self._store = ch.Store("provisioner/sky")
+        self._children: list[subprocess.Popen[bytes]] = []
+
+    def _names(self) -> list[str]:
+        return list(self._store.get("spares") or [])
+
+    def _spawn(self, args: list[str]) -> None:
+        self._children = [c for c in self._children if c.poll() is None]
+        self._children.append(subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+    def replicas(self) -> int:
+        return self.base + len(self._names())
+
+    def scale(self, n: int) -> None:
+        names, want = self._names(), max(0, n - self.base)
+        while len(names) < want:
+            seeds, port = _seeds()
+            peer = (
+                f"chimaera peer start --provider static --listen 0.0.0.0:{port} "
+                f'--advertise "$(hostname -I | cut -d" " -f1):{port}" --seeds {seeds}'
+            )
+            name = f"{self.PREFIX}-{max((int(x.rsplit('-', 1)[1]) for x in names), default=0) + 1}"
+            names.append(name)
+            self._store.put("spares", names)  # first: a launch that never comes up is shrunk away like any stuck peer
+            launch = ["sky", "launch", "-c", name, "-y", "-d", "--env", "CHIMAERA_CLUSTER_TOKEN"]
+            self._spawn([*launch, *self.launch_args, peer])
+        while len(names) > want:
+            name = names.pop()
+            self._store.put("spares", names)
+            q = shlex.quote(name)
+            self._spawn(["sh", "-c", f"ssh {q} pkill -USR1 -x chimaera; sleep {self.drain_s:g}; sky down -y {q}"])
 
 
 def run(pool: Any, rules: Rules, interval: float, out: Any = sys.stdout) -> None:
@@ -218,6 +277,12 @@ def main(argv: list[str] | None = None) -> None:
     where = p.add_mutually_exclusive_group(required=True)
     where.add_argument("--k8s-statefulset", metavar="NAME", help="the StatefulSet of the peers")
     where.add_argument("--slurm", action="store_true", help="grow with spare Slurm jobs (inside a slurm-launch job)")
+    where.add_argument(
+        "--sky",
+        metavar="LAUNCH_ARGS",
+        help='grow with one-node SkyPilot clusters: sky launch args, e.g. "--infra aws --use-spot"',
+    )
+    p.add_argument("--base", type=int, default=1, help="with --sky: peers that are not spares")
     p.add_argument("--partition", help="Slurm partition for spare jobs")
     p.add_argument("--namespace")
     p.add_argument("--cluster", help="a profile or chimaera://host:port (default: $CHIMAERA_ADDRESS)")
@@ -233,6 +298,8 @@ def main(argv: list[str] | None = None) -> None:
     ch.init(cluster=a.cluster)
     if a.slurm:
         pool: Any = SlurmSpares(int(os.environ.get("SLURM_JOB_NUM_NODES", "1")), a.partition)
+    elif a.sky is not None:
+        pool = SkySpares(a.base, shlex.split(a.sky))
     else:
         pool = StatefulSet(a.k8s_statefulset, a.namespace)
     run(pool, Rules(a.min, a.max, a.up_after, a.down_after, a.start_grace), a.interval)

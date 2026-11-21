@@ -25,7 +25,7 @@ use crate::runtime::{self, Node};
 use crate::stores::write_atomic;
 use chimaera_core::pb;
 use chimaera_core::swim::State as SwimState;
-use chimaera_raft::{BasicNode, DiskDurability, Group, RaftHost};
+use chimaera_raft::{BasicNode, Group, RaftHost};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -40,6 +40,8 @@ const PLAN_FILE: &str = "cluster.plan";
 const HOSTED_FILE: &str = "hosted-groups";
 const PING_EVERY: Duration = Duration::from_millis(100);
 const PING_TIMEOUT: Duration = Duration::from_millis(800);
+/// A member whose port refuses connections this long is dead (its process is gone).
+const REFUSED_FOR: Duration = Duration::from_millis(1000);
 /// Members probed per SWIM period: per-peer traffic stays bounded however
 /// large the cluster grows.
 const PROBE_FANOUT: usize = 8;
@@ -227,7 +229,8 @@ async fn form(mesh: &MeshClient, cfg: &ClusterConfig) -> io::Result<pb::ClusterP
 
 /// Run a cluster peer until shutdown.
 pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
-    let (node, _lock) = Node::open(&cfg.dir, cfg.cpus)?;
+    let durability = crate::durability::choose(&cfg.dir.join("raft"))?;
+    let (node, _lock) = Node::open_with(&cfg.dir, cfg.cpus, || crate::durability::guard(&cfg.dir, durability))?;
     let me = pb::Member {
         peer: node.identity.peer.to_vec(),
         incarnation: node.identity.incarnation,
@@ -247,6 +250,12 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     if cfg.token.is_none() {
         tracing::warn!("no cluster token: anyone who can reach {} can join this cluster", cfg.listen);
     }
+    #[cfg(target_os = "linux")]
+    crate::objplane::replicate_new_objects(
+        node.objects.dir().to_path_buf(),
+        mesh.clone(),
+        tokio::runtime::Handle::current(),
+    );
     let plan_slot = Arc::new(RwLock::new(None));
     let starter = Arc::new(StarterSlot::default());
     let server = Arc::new(MeshServer {
@@ -330,7 +339,7 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     *plan_slot.write().expect("lock") = Some(plan.clone());
 
     let (host, raft_events) =
-        RaftHost::open(&cfg.dir.join("raft"), me.node_id, Arc::new(MeshTransport(mesh.clone())), DiskDurability::Os)?;
+        RaftHost::open(&cfg.dir.join("raft"), me.node_id, Arc::new(MeshTransport(mesh.clone())), durability)?;
     let router = Arc::new(Router::cluster(node.identity, plan.data_groups, mesh.clone()));
     let _ = server.router.set(router.clone());
     let groups = Arc::new(Groups {
@@ -391,13 +400,22 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
         token: cfg.token.clone(),
         tls: cfg.tls.as_ref().map(|t| t.clients.clone()),
     });
-    runtime::serve(node, router, raft_events, None, clients).await
+    let served = runtime::serve(node, router, raft_events, None, clients).await;
+    if served.is_ok()
+        && let Err(e) = crate::durability::mark_clean(&cfg.dir)
+    {
+        tracing::warn!("could not record a clean shutdown: {e}");
+    }
+    served
 }
 
 /// Ping every member; mark silent ones dead; as a group leader, retire dead
 /// incarnations and replace dead voters.
 async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>, core: mpsc::Sender<CoreMsg>) {
     let mut dead_since: BTreeMap<u64, Instant> = BTreeMap::new();
+    // Members whose port has refused every probe since then: their process is
+    // gone, so they are declared dead after REFUSED_FOR, not after suspicion.
+    let mut refused_since: BTreeMap<u64, Instant> = BTreeMap::new();
     let mut tick = tokio::time::interval(PING_EVERY);
     loop {
         tick.tick().await;
@@ -406,24 +424,37 @@ async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>, core: mpsc::Sender
         let probes = targets.into_iter().map(|target| {
             let mesh = mesh.clone();
             async move {
-                if let Ok(reply) = mesh.ping(target, PING_TIMEOUT).await {
-                    mesh.note_ping(target, Some(reply));
-                    return (target, true);
-                }
+                // Only the target itself counts: a new identity answering at
+                // a dead one's address must not keep the dead one alive.
+                let refused = match mesh.ping(target, PING_TIMEOUT).await {
+                    Ok(reply) if reply.node_id == target => {
+                        mesh.note_ping(target, Some(reply));
+                        return (target, true, false);
+                    }
+                    Ok(_) => true, // another process holds the address now
+                    Err(e) => e.kind() == std::io::ErrorKind::ConnectionRefused,
+                };
                 let relays = mesh.swim.lock().expect("lock").relays(target);
                 let tries = relays.into_iter().map(|r| {
                     let mesh = mesh.clone();
                     async move { mesh.ping_via(r, target, PING_TIMEOUT).await }
                 });
-                (target, futures_util::future::join_all(tries).await.into_iter().any(|ok| ok))
+                let reached = futures_util::future::join_all(tries).await.into_iter().any(|ok| ok);
+                (target, reached, refused && !reached)
             }
         });
         let results = futures_util::future::join_all(probes).await;
         let changes = {
             let now = mesh.now_ms();
             let mut swim = mesh.swim.lock().expect("lock");
-            for (target, reached) in results {
+            for (target, reached, refused) in results {
                 swim.probed(now, target, reached);
+                if !refused {
+                    refused_since.remove(&target);
+                } else if refused_since.entry(target).or_insert_with(Instant::now).elapsed() >= REFUSED_FOR {
+                    refused_since.remove(&target);
+                    swim.fail(now, target);
+                }
             }
             swim.expire(now);
             swim.take_changes()
@@ -518,6 +549,7 @@ async fn replace_voters(router: &Arc<Router>, mesh: &Arc<MeshClient>, dead_since
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn member(n: u64) -> pb::Member {

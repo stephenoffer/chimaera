@@ -18,6 +18,22 @@ whole generation is cancelled and the gang starts again as a new generation,
 up to ``max_attempts`` times; resume from your own checkpoint. A rank that
 raises fails the gang with that error.
 
+``ranks=ch.auto(initial, min=, max=)`` makes the gang elastic: each
+generation has as many ranks as the live peers can hold (by CPUs, and GPUs
+when the ranks need them), between ``min`` and ``max``; the first starts at
+``initial`` when given. So a gang that loses a peer comes back smaller instead
+of waiting for a replacement. ``gang.decisions`` says what each generation
+chose. shortcut: a running generation never grows; new capacity is used by
+the next one.
+
+``ch.group(*actors)`` makes existing actors one group: pass the handle to them,
+and inside a member ``handle.join()`` is its ``Group``.
+
+``explain()`` on a gang, actor gang or group handle says which collective each
+rank last entered and names the ranks holding the others up. A collective's
+wait includes its name, so ranks on different code paths hang where
+``explain()`` names them instead of mixing their data.
+
 shortcut: ranks meet through a ch.Store rendezvous and are placed one by one,
 so a gang larger than the free capacity waits at the rendezvous (and retries
 after ``RENDEZVOUS_S``). All-or-nothing placement arrives with the shard's
@@ -26,17 +42,23 @@ gang commit (plan P5).
 
 from __future__ import annotations
 
+import functools
+import math
+import operator
 import os
 import socket
 import sys
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 from ._errors import InfrastructureFailure
 from ._future import Future
 from ._native import blake3_digest
-from ._remote import remote
+from ._options import Auto
+from ._remote import Actor, remote
 
 R = TypeVar("R")
 
@@ -73,10 +95,44 @@ class Group:
         self.generation = int(env["CHIMAERA_GANG_GENERATION"])
         self.id = env["CHIMAERA_GANG"]
         self.master = (env["MASTER_ADDR"], int(env["MASTER_PORT"]))
+        self.ranks = list(range(self.size))  # members, as ranks of the gang (a mesh axis lists a subset)
+        self._axis = ""  # set on a mesh axis
         self._seq = 0
 
     def __repr__(self) -> str:
-        return f"<Group rank {self.rank}/{self.size} generation {self.generation}>"
+        axis = f" axis {self._axis}" if self._axis else ""
+        return f"<Group{axis} rank {self.rank}/{self.size} generation {self.generation}>"
+
+    def mesh(self, **axes: int) -> dict[str, Group]:
+        """This rank's groups along each axis of a grid of the ranks:
+        ``mesh(dp=2, tp=4)`` on 8 ranks (the sizes multiply to the group's; the
+        last axis varies fastest, as in torch's DeviceMesh). ``m["tp"]`` holds
+        the ranks that differ from this one only along ``tp``, with the same
+        store collectives; its ``ranks`` are their ranks in this group, for
+        ``dist.new_group`` or torch's ``init_device_mesh``."""
+        if not axes or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in axes.values()):
+            raise ValueError(f"mesh() takes axis sizes as positive integers, got {axes}")
+        if math.prod(axes.values()) != self.size:
+            raise ValueError(
+                f"mesh{tuple(axes.items())}: sizes multiply to {math.prod(axes.values())}, not {self.size}"
+            )
+        names, shape = list(axes), list(axes.values())
+        coords, rest = [], self.rank
+        for n in reversed(shape):
+            coords.insert(0, rest % n)
+            rest //= n
+        out = {}
+        for i, name in enumerate(names):
+            stride = math.prod(shape[i + 1 :])
+            first = self.rank - coords[i] * stride
+            fixed = ",".join(f"{a}{c}" for j, (a, c) in enumerate(zip(names, coords, strict=True)) if j != i)
+            axis = Group.__new__(Group)
+            axis.__dict__.update(self.__dict__)
+            axis.id = f"{self.id}/mesh-{'.'.join(f'{a}{n}' for a, n in axes.items())}/{name}/{fixed}"
+            axis.ranks = [self.ranks[first + k * stride] for k in range(shape[i])]
+            axis.rank, axis.size, axis._axis, axis._seq = coords[i], shape[i], name, 0
+            out[name] = axis
+        return out
 
     @property
     def backend(self) -> str:
@@ -89,6 +145,11 @@ class Group:
     def torch(self, backend: str | None = None) -> Any:
         """``torch.distributed``, its default process group initialized for this
         gang (the rank's call tears it down when it returns)."""
+        if self._axis:
+            raise RuntimeError(
+                f"mesh axis {self._axis!r} has no process group of its own: after the gang's group.torch(), "
+                "use torch's init_device_mesh, or dist.new_group(axis.ranks) on every rank"
+            )
         import torch.distributed as dist
 
         global _torch_group
@@ -102,32 +163,126 @@ class Group:
             _torch_group = (self.id, self.generation)
         return dist
 
-    # Small-object collectives through the store: no torch needed.
+    # Small-object collectives through the store: no torch needed. Each one
+    # records where this rank is, for explain().
 
-    def _round(self) -> tuple[Any, str]:
+    def _collective(self, op: str, timeout: float | None, value: Any = None, send: bool = False) -> tuple[Any, str]:
         from ._store import Store
 
         self._seq += 1
-        return Store(f"gang/{self.id}"), f"{self.generation}/c{self._seq}"
+        store, key = Store(f"gang/{self.id}"), f"{self.generation}/c{self._seq}/{op}"
+        store.put(f"{self.generation}/at/{self.rank}", (self._seq, op, time.time()), ttl=TTL)
+        if send:
+            store.put(f"{key}/{self.rank}", value, ttl=TTL)
+        try:
+            store.barrier(key, self.size).wait(timeout)
+        except TimeoutError:
+            held = _summary(_positions(store, self.generation, self.size))
+            raise TimeoutError(f"{op} #{self._seq} of {self!r} timed out: {held}") from None
+        return store, key
 
     def barrier(self, timeout: float | None = None) -> None:
-        store, key = self._round()
-        store.barrier(key, self.size).wait(timeout)
+        self._collective("barrier", timeout)
 
     def all_gather(self, obj: Any, timeout: float | None = None) -> list[Any]:
         """Every rank's `obj`, in rank order (picklable values up to 1 MiB)."""
-        store, key = self._round()
-        store.put(f"{key}/{self.rank}", obj, ttl=TTL)
-        store.barrier(key, self.size).wait(timeout)
+        store, key = self._collective("all_gather", timeout, obj, send=True)
         return [store.get(f"{key}/{r}") for r in range(self.size)]
+
+    def all_reduce(self, obj: Any, op: Callable[[Any, Any], Any] = operator.add, timeout: float | None = None) -> Any:
+        """Every rank's `obj` combined with `op` (sum by default), on every rank."""
+        store, key = self._collective("all_reduce", timeout, obj, send=True)
+        return functools.reduce(op, [store.get(f"{key}/{r}") for r in range(self.size)])
 
     def broadcast(self, obj: Any = None, src: int = 0, timeout: float | None = None) -> Any:
         """Rank `src`'s `obj`, on every rank."""
-        store, key = self._round()
-        if self.rank == src:
-            store.put(f"{key}/{src}", obj, ttl=TTL)
-        store.barrier(key, self.size).wait(timeout)
+        store, key = self._collective("broadcast", timeout, obj, send=self.rank == src)
         return store.get(f"{key}/{src}")
+
+
+def _positions(store: Any, generation: int, size: int) -> list[Any]:
+    """Each rank's last collective as (number, name, unix time entered); None before the rendezvous."""
+    return [store.get(f"{generation}/at/{r}") for r in range(size)]
+
+
+def _summary(positions: list[Any], pending: list[str] | None = None) -> str:
+    """One sentence naming the ranks that hold the others up."""
+    missing = [r for r, p in enumerate(positions) if p is None]
+    if missing:
+        why = {pending[r] for r in missing if pending and pending[r]}
+        return f"rank(s) {_names(missing)} have not reached the rendezvous" + (
+            f" ({'; '.join(sorted(why))})" if why else ""
+        )
+    newest = max(p[0] for p in positions)
+    ahead = [r for r, p in enumerate(positions) if p[0] == newest]
+    names = {positions[r][1] for r in ahead}
+    if len(names) > 1:
+        calls = ", ".join(f"rank {r} {positions[r][1]}" for r in ahead)
+        return f"the ranks call different collectives as #{newest}: {calls}"
+    behind = [r for r in range(len(positions)) if r not in ahead]
+    if not behind:
+        return f"every rank is in collective #{newest} ({names.pop()}); none is behind"
+    now = time.time()
+    last = "; ".join(
+        f"rank {r} last entered #{positions[r][0]} ({positions[r][1]}, {now - positions[r][2]:.0f} s ago)"
+        for r in behind
+    )
+    return f"{last}; ranks {_names(ahead)} wait in #{newest} ({names.pop()})"
+
+
+def _names(ranks: list[int]) -> str:
+    return ", ".join(map(str, ranks))
+
+
+def _explain(gang: str, generation: int, size: int, pending: list[str] | None = None) -> dict[str, Any]:
+    from ._store import Store
+
+    positions = _positions(Store(f"gang/{gang}"), generation, size)
+    ranks = [
+        {"rank": r, "collective": p[0], "op": p[1], "entered": p[2]}
+        if p is not None
+        else {"rank": r, "collective": None, "pending": pending[r] if pending else ""}
+        for r, p in enumerate(positions)
+    ]
+    return {"generation": generation, "ranks": ranks, "summary": _summary(positions, pending)}
+
+
+def _wanted(v: Any) -> int | Auto:
+    """``ranks`` as an int, or a checked ch.auto with min and max filled in."""
+    if not isinstance(v, Auto):
+        return int(v)
+    lo, hi = (1 if v.min is None else v.min), (v.initial if v.max is None else v.max)
+    for name, x in (("initial", v.initial), ("min", lo), ("max", hi)):
+        if x is not None and (isinstance(x, bool) or not isinstance(x, int) or x < 1):
+            raise ValueError(f"ranks=ch.auto: {name} must be an integer >= 1, got {x!r}")
+    if hi is None:
+        raise ValueError("ranks=ch.auto(...) needs max= (or an initial size)")
+    if lo > hi or (v.initial is not None and not lo <= v.initial <= hi):
+        raise ValueError(f"ranks=ch.auto: need min <= initial <= max; got initial={v.initial}, min={lo}, max={hi}")
+    return Auto(v.initial, lo, hi)
+
+
+def _fits(opts: dict[str, Any]) -> int:
+    """How many ranks of this shape the live peers can hold (CPUs, and GPUs if the ranks need them)."""
+    from ._cluster import cluster
+
+    cpus, gpus = opts.get("cpus") or 1.0, opts.get("gpus") or 0.0
+    cpus = (cpus.initial or 1.0) if isinstance(cpus, Auto) else float(cpus)
+    total = 0
+    for n in cluster().nodes():
+        if n.alive:
+            fit = math.floor(n.cpus / cpus + 1e-9)
+            total += min(fit, math.floor(len(n.gpus) / float(gpus) + 1e-9)) if gpus else fit
+    return total
+
+
+def _size(want: int | Auto, opts: dict[str, Any], first: bool) -> tuple[int, str]:
+    """This generation's rank count, and why (empty for a fixed count)."""
+    if not isinstance(want, Auto):
+        return want, ""
+    fits = _fits(opts)
+    size = max(want.min, min(want.initial if first and want.initial else want.max, fits))
+    return (size, f"{size} ranks: the live peers hold {fits} of this shape (min {want.min}, max {want.max})")
 
 
 def _free_port() -> int:
@@ -153,6 +308,7 @@ def _rendezvous(gang: str, generation: int, rank: int, world: int) -> dict[str, 
 
     store = Store(f"gang/{gang}")
     node = _context.context().node
+    store.put(f"{generation}/at/{rank}", (0, "rendezvous", time.time()), ttl=TTL)
     if rank == 0:
         store.put(f"{generation}/master", (_host_addr(), _free_port()), ttl=TTL)
     store.put(f"{generation}/node/{rank}", node, ttl=TTL)
@@ -201,10 +357,13 @@ class Gang(Generic[R]):
 
     def __init__(self, fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         eff = fn.policy()
-        self.size = int(eff.get("ranks"))
+        self._want = _wanted(eff.get("ranks"))
         self._attempts = int(eff.get("max_attempts") or 3)
         rank_opts = {k: v for k, v in eff.values.items() if k in _RANK_OPTIONS and eff.sources.get(k) != "default"}
+        self._rank_opts = rank_opts
         self._submit = _rank.options(**rank_opts) if rank_opts else _rank
+        self.size = 0
+        self.decisions: list[str] = []  # an elastic gang's size per generation, and why
         self._fn, self._args, self._kwargs = fn, args, kwargs
         self.id = blake3_digest(os.urandom(16))[:8].hex()
         self.generation = 0
@@ -218,6 +377,9 @@ class Gang(Generic[R]):
 
     def _start(self) -> None:
         self.generation += 1
+        self.size, why = _size(self._want, self._rank_opts, first=self.generation == 1)
+        if why:
+            self.decisions.append(f"generation {self.generation}: {why}")
         self.futures = [
             self._submit.remote(self._fn, self.id, self.generation, r, self.size, self._args, self._kwargs)
             for r in range(self.size)
@@ -256,7 +418,11 @@ class Gang(Generic[R]):
 
     def result(self, timeout: float | None = None) -> list[R]:
         if not self._done.wait(timeout):
-            raise TimeoutError(f"gang {self.id} did not finish within {timeout} s")
+            try:
+                held = f": {self.explain()['summary']}"
+            except Exception:  # noqa: BLE001 - the timeout is the error; the explanation is extra
+                held = ""
+            raise TimeoutError(f"gang {self.id} did not finish within {timeout} s{held}")
         if self._error is not None:
             raise self._error
         assert self._result is not None
@@ -266,6 +432,13 @@ class Gang(Generic[R]):
         self._cancelled = True
         for f in self.futures:
             f.cancel(force=True)
+
+    def explain(self) -> dict[str, Any]:
+        """Where each rank of the current generation is: its last collective, or
+        why it has not started; ``summary`` names the ranks holding the others up."""
+        futures = list(self.futures)
+        pending = [str(f.explain().get("pending_reason") or "") for f in futures]
+        return _explain(self.id, self.generation, len(futures), pending)
 
     def __iter__(self) -> Iterator[R]:
         return iter(self.result())
@@ -344,17 +517,27 @@ class GangActor:
         self._cls = cls_view._cls
         self._methods = {n for n in dir(self._cls) if not n.startswith("_") and callable(getattr(self._cls, n))}
         rank_opts = {k: v for k, v in eff.values.items() if k in _RANK_OPTIONS and eff.sources.get(k) != "default"}
+        self._rank_opts = rank_opts
         self._host = _RankHost.options(**rank_opts) if rank_opts else _RankHost
         self._args, self._kwargs = args, kwargs
         self.id = blake3_digest(os.urandom(16))[:8].hex()
         self.generation = 0
         self._hosts: list[Any] = []
-        self._build(int(eff.get("ranks")))
+        self._want = _wanted(eff.get("ranks"))
+        self.decisions: list[str] = []
+        self._build(self._sized(first=True))
+
+    def _sized(self, first: bool) -> int:
+        size, why = _size(self._want, self._rank_opts, first)
+        if why:
+            self.decisions.append(f"generation {self.generation + 1}: {why}")
+        return size
 
     def _build(self, size: int) -> None:
         self.generation += 1
         self._hosts = [
-            self._host.remote(self._cls, self.id, self.generation, r, size, self._args, self._kwargs) for r in range(size)
+            self._host.remote(self._cls, self.id, self.generation, r, size, self._args, self._kwargs)
+            for r in range(size)
         ]
 
     def __len__(self) -> int:
@@ -369,8 +552,9 @@ class GangActor:
         return _RankMethod(self._hosts, name)
 
     def restart(self) -> None:
-        """Build every rank again as the next generation."""
-        self.resize(len(self._hosts))
+        """Build every rank again as the next generation (an elastic gang sizes it
+        to what the live peers hold now)."""
+        self.resize(self._sized(first=False) if isinstance(self._want, Auto) else len(self._hosts))
 
     def resize(self, size: int) -> None:
         """Rebuild the gang with `size` ranks (a new generation)."""
@@ -384,6 +568,10 @@ class GangActor:
             h.close()
         self._hosts = []
 
+    def explain(self) -> dict[str, Any]:
+        """Where each rank is (its last collective); ``summary`` names the ranks holding the others up."""
+        return _explain(self.id, self.generation, len(self._hosts))
+
     def __enter__(self) -> GangActor:
         return self
 
@@ -392,3 +580,61 @@ class GangActor:
 
     def __repr__(self) -> str:
         return f"<GangActor {self._cls.__name__} {len(self._hosts)} ranks, generation {self.generation}>"
+
+
+# The groups this process's actors have joined: (key, generation, actor) -> Group,
+# with one lock per entry so a slow rendezvous never holds up another group's.
+_joined: dict[tuple[str, int, str], Group] = {}
+_joining: dict[tuple[str, int, str], threading.Lock] = {}
+_joining_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class GroupHandle:
+    """Actors made one collective group by ``ch.group``. Pass it to them; inside
+    a member's method, ``join()`` is that member's ``Group`` (rank in the order
+    given to ``ch.group``). The first ``join()`` in each member waits for all
+    of them, as a gang's rendezvous does."""
+
+    key: str
+    generation: int
+    members: tuple[str, ...]
+
+    def join(self) -> Group:
+        from . import _context
+
+        ctx = _context.context()
+        me = ctx.actor_id if ctx is not None else None
+        if me not in self.members:
+            raise ValueError("join() runs inside a method of one of the group's actors")
+        entry = (self.key, self.generation, me)
+        with _joining_lock:
+            lock = _joining.setdefault(entry, threading.Lock())
+        with lock:  # one rendezvous per member, even with concurrent calls
+            joined = _joined.get(entry)
+            if joined is None:
+                env = _rendezvous(f"group-{self.key}", self.generation, self.members.index(me), len(self.members))
+                joined = _joined[entry] = Group(env)
+            return joined
+
+    def explain(self) -> dict[str, Any]:
+        """Where each member is (its last collective); ``summary`` names the ones holding the others up."""
+        return _explain(f"group-{self.key}", self.generation, len(self.members))
+
+
+def group(*actors: Any, key: str | None = None) -> GroupHandle:
+    """Make `actors` one collective group (ranks in the order given). Calling it
+    again with the same ``key`` starts a new generation, for a changed set."""
+    from ._store import Store
+
+    if not actors:
+        raise ValueError("ch.group needs at least one actor")
+    bad = [a for a in actors if not isinstance(a, Actor)]
+    if bad:
+        raise TypeError(f"ch.group takes actors (from Class.remote()), got {bad[0]!r}")
+    ids = tuple(a.id for a in actors)
+    if len(set(ids)) != len(ids):
+        raise ValueError("ch.group: an actor appears more than once")
+    key = key or os.urandom(8).hex()
+    generation = Store(f"gang/group-{key}").counter("declared").add(1)
+    return GroupHandle(key, generation, ids)

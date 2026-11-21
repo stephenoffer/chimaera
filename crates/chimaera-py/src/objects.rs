@@ -48,6 +48,17 @@ fn create_new(path: &Path) -> io::Result<std::fs::File> {
     }
 }
 
+/// Whether `f` is on tmpfs.
+#[allow(clippy::unnecessary_cast)] // f_type's width differs by platform
+fn in_memory(f: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fstatfs fills `st` for a valid descriptor.
+    let ok = unsafe { libc::fstatfs(f.as_raw_fd(), &mut st) } == 0;
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    ok && st.f_type as i64 == TMPFS_MAGIC
+}
+
 /// Free bytes on the filesystem holding `f`.
 #[allow(clippy::unnecessary_cast)] // statvfs field widths differ by platform
 fn free_bytes(f: &std::fs::File) -> Option<u64> {
@@ -69,19 +80,139 @@ fn no_space(path: &Path, want: usize, free: u64) -> io::Error {
     )
 }
 
+/// Where this host's object plane keeps things, from the peer (see the peer's
+/// objplane.rs): set once per process by [`objects_config`].
+#[derive(Default)]
+struct Config {
+    /// The object directory (tmpfs).
+    root: Option<PathBuf>,
+    /// Pre-zeroed files, `<class>-<n>`, refilled by the peer.
+    reserve: Option<PathBuf>,
+    /// Disk directory for objects written while memory is over `limit`.
+    spill: Option<PathBuf>,
+    /// Bytes the object filesystem may hold before new objects go to disk.
+    limit: u64,
+}
+
+static CONFIG: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
+
+/// Configure the object plane of this process: the object directory, its
+/// reserve of pre-zeroed pages, the disk directory objects go to when memory
+/// is over `limit` bytes (0: no limit).
+#[pyfunction]
+#[pyo3(signature = (root, reserve=None, spill=None, limit=0))]
+pub fn objects_config(root: PathBuf, reserve: Option<PathBuf>, spill: Option<PathBuf>, limit: u64) {
+    *CONFIG.write().expect("lock") = Some(Config { root: Some(root), reserve, spill, limit });
+}
+
+/// Smallest and largest reserve classes: files of 2^class bytes.
+pub const RESERVE_MIN_CLASS: u32 = 21;
+pub const RESERVE_MAX_CLASS: u32 = 30;
+
+fn class_of(len: usize) -> u32 {
+    (usize::BITS - len.saturating_sub(1).leading_zeros()).max(RESERVE_MIN_CLASS)
+}
+
+/// Move a pre-zeroed file of at least `len` bytes (at most twice that) from
+/// the reserve to `to`. On a miss, leave a `want-<class>` marker so the peer
+/// keeps some of that size from now on.
+fn take_reserve(dir: &Path, len: usize, to: &Path) -> bool {
+    let k = class_of(len);
+    if k > RESERVE_MAX_CLASS {
+        return false;
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let mut names: Vec<(u32, std::ffi::OsString)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name();
+                let class: u32 = n.to_str()?.split_once('-')?.0.parse().ok()?;
+                (class == k || class == k + 1).then_some((class, n))
+            })
+            .collect();
+        names.sort();
+        for (_, n) in names {
+            if std::fs::rename(dir.join(&n), to).is_ok() {
+                return true; // others may race for the same file: the rename decides
+            }
+        }
+    }
+    let _ = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(format!("want-{k}")));
+    false
+}
+
+/// Bytes in use on the filesystem holding `p`.
+fn fs_used(p: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statvfs on a NUL-terminated path.
+    #[allow(clippy::unnecessary_cast)]
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0)
+        .then(|| (st.f_blocks as u64).saturating_sub(st.f_bfree as u64) * st.f_frsize as u64)
+}
+
+/// Where an object of `total` bytes headed for `path` should be written
+/// instead, when memory is over the limit: its spill path, or None.
+fn spill_target(path: &Path, total: usize) -> Option<PathBuf> {
+    let cfg = CONFIG.read().expect("lock");
+    let cfg = cfg.as_ref()?;
+    let (root, spill) = (cfg.root.as_ref()?, cfg.spill.as_ref()?);
+    if cfg.limit == 0 || fs_used(root)? + total as u64 <= cfg.limit {
+        return None;
+    }
+    Some(spill.join(path.strip_prefix(root).ok()?))
+}
+
 /// Write `parts` (concatenated) to `path` atomically: a temporary name, then
-/// a rename. Returns the bytes written.
+/// a rename. Returns the bytes written. Over the memory limit the object is
+/// written to the spill directory on disk and `path` becomes a symlink to it
+/// (spilled at birth: nothing waits and nothing is moved later); readers map
+/// it either way.
 pub fn write_parts(path: &Path, parts: &[&[u8]]) -> io::Result<u64> {
     let total: usize = parts.iter().map(|p| p.len()).sum();
+    if let Some(target) = spill_target(path, total) {
+        let n = write_file(&target, parts, total)?;
+        let link = tmp_name(path);
+        let r = std::os::unix::fs::symlink(&target, &link).or_else(|e| {
+            if e.kind() != io::ErrorKind::NotFound {
+                return Err(e);
+            }
+            std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))?;
+            std::os::unix::fs::symlink(&target, &link)
+        });
+        if let Err(e) = r.and_then(|()| std::fs::rename(&link, path)) {
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_file(&target);
+            return Err(e);
+        }
+        return Ok(n);
+    }
+    write_file(path, parts, total)
+}
+
+fn write_file(path: &Path, parts: &[&[u8]], total: usize) -> io::Result<u64> {
     let tmp = tmp_name(path);
-    let file = create_new(&tmp)?;
+    let reserve = CONFIG.read().expect("lock").as_ref().and_then(|c| c.reserve.clone());
+    let warm = reserve.is_some_and(|dir| total >= 1 << RESERVE_MIN_CLASS && take_reserve(&dir, total, &tmp));
+    let file = if warm {
+        std::fs::OpenOptions::new().read(true).write(true).open(&tmp).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })?
+    } else {
+        create_new(&tmp)?
+    };
     let result = (|| {
-        if let Some(free) = free_bytes(&file)
+        if !warm
+            && let Some(free) = free_bytes(&file)
             && (free as usize) < total
         {
             return Err(no_space(path, total, free));
         }
-        if total < PARALLEL_MIN || !cfg!(target_os = "linux") {
+        file.set_len(total as u64)?; // a reserve file shrinks to fit
+        // Shared mappings of a disk file fault and allocate blocks page by page;
+        // plain writes into the page cache are faster there. tmpfs is filled
+        // through a mapping, by several threads.
+        if total < PARALLEL_MIN || !cfg!(target_os = "linux") || !in_memory(&file) {
             let mut off = 0u64;
             for p in parts {
                 file.write_all_at(p, off)?;
@@ -89,7 +220,6 @@ pub fn write_parts(path: &Path, parts: &[&[u8]]) -> io::Result<u64> {
             }
             return Ok(());
         }
-        file.set_len(total as u64)?;
         parallel_fill(&file, parts, total).map_err(|e| match free_bytes(&file) {
             Some(free) if (free as usize) < total => no_space(path, total, free),
             _ => e,
@@ -370,21 +500,40 @@ mod arena {
                 return base as *mut c_void;
             }
             let path = self.dir.join(format!("{}", self.seq.fetch_add(1, Ordering::Relaxed)));
+            let (reserve, over_limit) = {
+                let cfg = CONFIG.read().expect("lock");
+                let cfg = cfg.as_ref();
+                let over = cfg.is_some_and(|c| {
+                    c.limit > 0 && c.root.as_ref().and_then(|r| fs_used(r)).is_some_and(|u| u + len as u64 > c.limit)
+                });
+                (cfg.and_then(|c| c.reserve.clone()), over)
+            };
+            if over_limit {
+                return std::ptr::null_mut(); // memory is full of objects: the heap it is
+            }
+            // Pre-zeroed pages when the reserve has them: no faults to fill.
+            let warm = reserve.is_some_and(|d| take_reserve(&d, len, &path));
             let c = cstr(&path);
             // SAFETY: plain syscalls on a path we own; every error is checked.
             unsafe {
-                let mut fd =
-                    libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600);
-                if fd < 0 && *libc::__errno_location() == libc::ENOENT {
+                let create = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+                let mut fd = if warm {
+                    libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC)
+                } else {
+                    libc::open(c.as_ptr(), create, 0o600)
+                };
+                if fd < 0 && !warm && *libc::__errno_location() == libc::ENOENT {
                     let _ = std::fs::create_dir_all(&self.dir);
-                    fd = libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600);
+                    fd = libc::open(c.as_ptr(), create, 0o600);
                 }
                 if fd < 0 {
+                    libc::unlink(c.as_ptr());
                     return std::ptr::null_mut();
                 }
-                let ok = self.fs_has_room(fd, len) && libc::ftruncate(fd, len as libc::off_t) == 0;
+                let ok = (warm || self.fs_has_room(fd, len)) && libc::ftruncate(fd, len as libc::off_t) == 0;
+                let flags = if warm { libc::MAP_SHARED | libc::MAP_POPULATE } else { libc::MAP_SHARED };
                 let base = if ok {
-                    libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+                    libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, flags, fd, 0)
                 } else {
                     libc::MAP_FAILED
                 };
@@ -566,10 +715,55 @@ mod arena {
         }
     }
 
+    /// `struct pm_scan_arg` (linux/fs.h, Linux 6.7+).
+    #[repr(C)]
+    #[derive(Default)]
+    struct PmScanArg {
+        size: u64,
+        flags: u64,
+        start: u64,
+        end: u64,
+        walk_end: u64,
+        vec: u64,
+        vec_len: u64,
+        max_pages: u64,
+        category_inverted: u64,
+        category_mask: u64,
+        category_anyof_mask: u64,
+        return_mask: u64,
+    }
+
     /// Whether the owner wrote to any page of [base, base+len) since the
     /// mapping became private (a written page is anonymous, not the file's).
+    /// PAGEMAP_SCAN answers in the kernel and stops at the first such page;
+    /// older kernels read the page map instead.
     fn dirty(base: usize, len: usize) -> bool {
         let Ok(f) = std::fs::File::open("/proc/self/pagemap") else { return true };
+        {
+            use std::os::fd::AsRawFd;
+            const PAGE_IS_FILE: u64 = 1 << 2;
+            const PAGE_IS_PRESENT: u64 = 1 << 3;
+            const PAGEMAP_SCAN: libc::c_ulong = 0xC060_6610; // _IOWR('f', 16, struct pm_scan_arg)
+            let mut region = [0u64; 3];
+            let mut arg = PmScanArg {
+                size: std::mem::size_of::<PmScanArg>() as u64,
+                start: base as u64,
+                end: (base + len) as u64,
+                vec: region.as_mut_ptr() as u64,
+                vec_len: 1,
+                max_pages: 1,
+                category_inverted: PAGE_IS_FILE,
+                category_mask: PAGE_IS_PRESENT | PAGE_IS_FILE, // present and not the file's page
+                return_mask: PAGE_IS_PRESENT,
+                ..Default::default()
+            };
+            // SAFETY: PAGEMAP_SCAN reads `arg` and writes at most `vec_len`
+            // regions into `region`, both live for the call.
+            let n = unsafe { libc::ioctl(f.as_raw_fd(), PAGEMAP_SCAN as _, &mut arg as *mut PmScanArg) };
+            if n >= 0 {
+                return n > 0;
+            }
+        }
         let pages = len / 4096;
         let mut buf = vec![0u8; pages.min(1 << 16) * 8];
         let mut done = 0;
@@ -738,7 +932,83 @@ mod arena {
     }
 }
 
+/// Whether `obj` is plain data that pickle's fast mode (no memo) encodes
+/// exactly: built only from str, bytes, int, float, bool and None inside
+/// dicts, lists and tuples, with no container reachable twice (so no cycles
+/// and no shared containers whose identity a memo would preserve). The memo
+/// is most of the cost of pickling large containers of strings.
+#[pyfunction]
+pub fn plain_tree(obj: &Bound<'_, PyAny>) -> bool {
+    use pyo3::ffi;
+    /// Containers worth tracking before giving up (memory for the seen set).
+    const MAX_CONTAINERS: usize = 1 << 22;
+    // SAFETY: the GIL is held throughout and no Python code runs, so the
+    // borrowed references from PyDict_Next / PyList_GetItem / PyTuple_GetItem
+    // stay valid while the walk uses them.
+    unsafe {
+        let (t_dict, t_list, t_tuple) =
+            (&raw mut ffi::PyDict_Type, &raw mut ffi::PyList_Type, &raw mut ffi::PyTuple_Type);
+        let atoms = [
+            &raw mut ffi::PyUnicode_Type,
+            &raw mut ffi::PyLong_Type,
+            &raw mut ffi::PyFloat_Type,
+            &raw mut ffi::PyBytes_Type,
+            &raw mut ffi::PyBool_Type,
+        ];
+        let none = ffi::Py_None();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut stack: Vec<*mut ffi::PyObject> = Vec::new();
+        // Atoms are checked in place; only containers go on the stack.
+        let mut visit = |o: *mut ffi::PyObject, stack: &mut Vec<*mut ffi::PyObject>| -> bool {
+            if o == none {
+                return true;
+            }
+            let t = ffi::Py_TYPE(o);
+            if atoms.contains(&t) {
+                return true;
+            }
+            if t == t_dict || t == t_list || t == t_tuple {
+                if !seen.insert(o as usize) || seen.len() > MAX_CONTAINERS {
+                    return false;
+                }
+                stack.push(o);
+                return true;
+            }
+            false
+        };
+        if !visit(obj.as_ptr(), &mut stack) {
+            return false;
+        }
+        while let Some(o) = stack.pop() {
+            let t = ffi::Py_TYPE(o);
+            if t == t_dict {
+                let (mut pos, mut k, mut v) = (0, std::ptr::null_mut(), std::ptr::null_mut());
+                while ffi::PyDict_Next(o, &mut pos, &mut k, &mut v) != 0 {
+                    if !visit(k, &mut stack) || !visit(v, &mut stack) {
+                        return false;
+                    }
+                }
+            } else if t == t_list {
+                for i in 0..ffi::PyList_Size(o) {
+                    if !visit(ffi::PyList_GetItem(o, i), &mut stack) {
+                        return false;
+                    }
+                }
+            } else {
+                for i in 0..ffi::PyTuple_Size(o) {
+                    if !visit(ffi::PyTuple_GetItem(o, i), &mut stack) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(plain_tree, m)?)?;
+    m.add_function(wrap_pyfunction!(objects_config, m)?)?;
     m.add_function(wrap_pyfunction!(write_object, m)?)?;
     m.add_function(wrap_pyfunction!(arena_install, m)?)?;
     m.add_function(wrap_pyfunction!(arena_claim, m)?)?;

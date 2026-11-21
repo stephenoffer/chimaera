@@ -88,6 +88,22 @@ pub fn parse_status_private(status: &str) -> Option<u64> {
     anon.map(|a| (a + swap) * 1024)
 }
 
+/// Freed allocations a worker's NumPy arena keeps for reuse at most (Linux;
+/// the default `cache_bytes` of `arena_install` in chimaera-py objects.rs).
+const ARENA_CACHE_BYTES: u64 = 256 << 20;
+
+/// Memory a process holds between calls, for the leak check: its private
+/// memory plus resident shared memory past what the arena may cache (arena
+/// arrays are tmpfs pages, not anonymous ones).
+pub fn parse_status_held(status: &str) -> Option<u64> {
+    let shmem_kb = status
+        .lines()
+        .find(|l| l.starts_with("RssShmem:"))
+        .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .unwrap_or(0);
+    parse_status_private(status).map(|p| p + (shmem_kb * 1024).saturating_sub(ARENA_CACHE_BYTES))
+}
+
 /// `MemAvailable` from `/proc/meminfo`, in bytes.
 pub fn parse_mem_available(meminfo: &str) -> Option<u64> {
     meminfo
@@ -196,6 +212,63 @@ pub fn private_bytes(pid: u32) -> Option<u64> {
     }
 }
 
+/// What a process holds between calls (see [`parse_status_held`]); the
+/// private memory where there is no arena.
+pub fn held_bytes(pid: u32) -> Option<u64> {
+    if cfg!(target_os = "linux") {
+        read(format!("/proc/{pid}/status")).and_then(|s| parse_status_held(&s))
+    } else {
+        private_bytes(pid)
+    }
+}
+
+/// Free space on the filesystem holding objects below which new calls wait:
+/// writing an object there would fail part-way.
+pub const DISK_RESERVE: u64 = 512 << 20;
+
+/// Bytes free to unprivileged writers on the filesystem holding `path`.
+pub fn disk_free(path: &Path) -> Option<u64> {
+    disk_space(path).map(|(free, _)| free)
+}
+
+/// (free, total) bytes of the filesystem holding `path`.
+pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs writes one struct into `st`; `c` is NUL-terminated.
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        // Field widths differ by platform (u32 vs u64), hence the casts.
+        #[allow(clippy::unnecessary_cast)]
+        Some((st.f_bavail as u64 * st.f_frsize as u64, st.f_blocks as u64 * st.f_frsize as u64))
+    }
+}
+
+/// Bytes of in-memory objects to move to disk so their filesystem keeps a
+/// fifth free: a tmpfs (`/dev/shm` defaults to half of RAM) often fills
+/// before the memory pool does.
+pub fn spill_for_space(free: u64, total: u64) -> u64 {
+    (total / 5).saturating_sub(free)
+}
+
+/// Why new calls wait for disk, or None: the objects' filesystem is under
+/// DISK_RESERVE free. A fixed amount, not a fraction: a large disk that is
+/// mostly full but has room keeps working.
+pub fn disk_wait(free: Option<u64>, dir: &Path) -> Option<String> {
+    let free = free?;
+    (free < DISK_RESERVE).then(|| {
+        format!(
+            "the filesystem holding objects ({}) has {} MiB free; new calls wait for room \
+             (finished calls' arguments and ended runs' stored values are deleted)",
+            dir.display(),
+            free >> 20
+        )
+    })
+}
+
 /// Whether `path` is on tmpfs (its bytes are memory).
 #[cfg(target_os = "linux")]
 pub fn is_tmpfs(path: &Path) -> bool {
@@ -273,6 +346,22 @@ mod tests {
                       RssFile:\t  450000 kB\nRssShmem:\t   50000 kB\nVmSwap:\t    1000 kB\n";
         assert_eq!(parse_status_private(status), Some(301_000 * 1024));
         assert_eq!(parse_status_private("Name: x\n"), None);
+        // New calls wait only when the objects' filesystem is nearly full.
+        let dir = Path::new("/tmp/objects");
+        assert!(
+            disk_wait(Some(100 << 20), dir).is_some_and(|w| w.contains("100 MiB free") && w.contains("/tmp/objects"))
+        );
+        assert_eq!(disk_wait(Some(20 << 30), dir), None);
+        assert_eq!(disk_wait(None, dir), None, "unknown free space never blocks");
+        assert_eq!(spill_for_space(100 << 20, 1000 << 20), 100 << 20, "a 1000 MiB tmpfs keeps 200 MiB free");
+        assert_eq!(spill_for_space(500 << 20, 1000 << 20), 0);
+        assert!(disk_free(Path::new("/")).is_some_and(|b| b > 0));
+        // Arena arrays are shared tmpfs pages: what is held past the arena's
+        // reuse cache counts toward the leak check, the cache itself does not.
+        let held = |shmem_mib: u64| {
+            parse_status_held(&format!("RssAnon:\t  102400 kB\nRssShmem:\t{} kB\n", shmem_mib * 1024)).unwrap() >> 20
+        };
+        assert_eq!((held(0), held(256), held(1256)), (100, 100, 1100));
     }
 
     #[test]

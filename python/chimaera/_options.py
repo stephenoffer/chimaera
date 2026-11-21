@@ -205,7 +205,7 @@ FIELDS: dict[str, tuple[Any, str]] = {
     "splittable": (_bool, "any"),
     "deterministic": (_bool, "any"),
     "replicas": (_or_auto(_pos_int), "pool"),
-    "ranks": (_pos_int, "any"),
+    "ranks": (_or_auto(_pos_int), "any"),
     "key": (_str, "actor"),
     "lifetime": (_choice(("run", "detached")), "actor"),
     "restart": (_choice(("never", "fresh", "checkpoint")), "actor"),

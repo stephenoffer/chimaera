@@ -28,6 +28,7 @@ Scenarios (all times are seconds, medians over repetitions):
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import statistics
@@ -331,6 +332,16 @@ class Consumer:
         c = sum(touch(v) for v in vs) if do_touch else len(vs)
         return time.perf_counter() - t0, c
 
+    def get_all_sums(self, refs: list[Any]) -> tuple[float, list[int]]:
+        """Get and read every value; the per-value checksums, in order."""
+        t0 = time.perf_counter()
+        out = []
+        for r in refs:  # one at a time, so restored values can be dropped as we go
+            v = self._get(r)
+            out.append(touch(v))
+            del v
+        return time.perf_counter() - t0, out
+
     def consume(self, v: Any) -> int:
         return touch(v)
 
@@ -521,8 +532,10 @@ def scenario_cross_node(rt: Runtime, types: list[str], sizes: list[str], **_: An
 
 
 def scenario_spill(rt: Runtime, types: list[str], sizes: list[str], capacity: int = 8 * GB, **_: Any) -> None:
-    """Store 3x the object memory in objects of each size, then read it back
-    in another process; every value is checked."""
+    """Store 3x the object memory in objects of each size, then read it all
+    back in another process (restore); every value is checked. Restore runs
+    inside the consumer in batches, so per-call overhead does not count; the
+    first (oldest, so spilled) object's get is timed on its own too."""
     cons = rt.actor(Consumer, rt.here(), rt.name)
     for s in sizes:
         size = parse_size(s)
@@ -543,24 +556,235 @@ def scenario_spill(rt: Runtime, types: list[str], sizes: list[str], capacity: in
         t_put = time.perf_counter() - t0
         emit(scenario="spill", kind="numpy", size=s, op="put", seconds=t_put, n=len(refs),
              gb_per_s=len(refs) * size / t_put / 1e9, error=err)
-        # Restore: oldest first (those were spilled first).
-        t0 = time.perf_counter()
         first = None
         ok = 0
+        t0 = time.perf_counter()
         try:
-            for i, r in enumerate(refs):
-                g, _, c = rt.get(rt.call(cons, "get_touch", [r]))
-                if first is None:
-                    first = g
-                ok += int(c == sums[i])
+            g, _, c = rt.get(rt.call(cons, "get_touch", [refs[0]]))
+            first = g
+            per = max(1, (2 * GB) // size)
+            for i in range(0, len(refs), per):
+                _, checks = rt.get(rt.call(cons, "get_all_sums", refs[i : i + per]))
+                ok += sum(int(a == b) for a, b in zip(checks, sums[i : i + per]))
         except Exception as e:  # noqa: BLE001
             err = f"{type(e).__name__}: {str(e)[:300]}"
         t_get = time.perf_counter() - t0
         emit(scenario="spill", kind="numpy", size=s, op="restore", seconds=t_get, n=len(refs), verified=ok,
-             first_get_s=first, gb_per_s=len(refs) * size / max(t_get, 1e-9) / 1e9, error=err)
+             gb_per_s=len(refs) * size / max(t_get, 1e-9) / 1e9, error=err)
+        emit(scenario="spill", kind="numpy", size=s, op="first_get", seconds=first)
         for r in refs:
             rt.release(r)
         del refs
+
+
+def _shm_used() -> int:
+    total = 0
+    for d in {"/dev/shm", os.environ.get("CHIMAERA_OBJECT_DIR", "/dev/shm"), os.environ.get("RAY_PLASMA_DIR", "/dev/shm")}:
+        try:
+            st = os.statvfs(d)
+            total = max(total, (st.f_blocks - st.f_bfree) * st.f_frsize)
+        except OSError:
+            pass
+    return total
+
+
+def scenario_usability(rt: Runtime, types: list[str], sizes: list[str], **_: Any) -> None:
+    """Behaviours users hit, checked the same way in both runtimes."""
+    v = rt.get(rt.put(np.zeros(1 << 20)))
+    try:
+        v[0] = 1.0
+        writable = "yes"
+    except ValueError as e:
+        writable = f"no ({e})"
+    emit(scenario="usability", kind="numpy", size="8M", op="modify_array_after_get", result=writable)
+    # Memory comes back when a put's reference is dropped. Ray copies into a
+    # pre-reserved object store, so shared-memory usage barely moves there; the
+    # check is that it does not grow by the payload once the reference is gone.
+    a = np.ones(256 << 20, dtype=np.uint8)
+    before = _shm_used()
+    ref = rt.put(a)
+    rt.get(ref)
+    del ref
+    gc.collect()
+    time.sleep(1.0)
+    grew = _shm_used() - before
+    emit(scenario="usability", kind="numpy", size="256M", op="memory_after_dropping_put", grew_mib=grew >> 20,
+         result="freed" if grew < (64 << 20) else f"still held ({grew >> 20} MiB)")
+    t0 = time.perf_counter()
+    try:
+        big = np.ones(2 << 30, dtype=np.uint8)
+        r = rt.get(rt.put(big))
+        res = f"ok ({len(r) >> 20} MiB)"
+    except Exception as e:  # noqa: BLE001
+        res = f"{type(e).__name__}: {str(e)[:200]}"
+    emit(scenario="usability", kind="numpy", size="2G", op="put_get_2GiB", result=res, seconds=time.perf_counter() - t0)
+
+
+# ---- recovery: a node dies holding objects -------------------------------------
+
+
+def _produce(n: int) -> Any:
+    return np.full(n, 7, dtype=np.uint8)
+
+
+def _put_here(runtime: str, n: int) -> list[Any]:
+    v = np.full(n, 9, dtype=np.uint8)
+    if runtime == "ray":
+        import ray
+
+        return [ray.put(v)]
+    import chimaera as ch
+
+    return [ch.put(v)]
+
+
+def _attempt(get: Any, timeout: float) -> tuple[float, str | None]:
+    t0 = time.perf_counter()
+    try:
+        v = get(timeout)
+        ok = int(v[0]) in (7, 9) and len(v) > 0
+        return time.perf_counter() - t0, None if ok else "wrong value"
+    except Exception as e:  # noqa: BLE001 -- the runtime's own error is the result
+        return time.perf_counter() - t0, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+# The node dies this long after the value was made (both runtimes): Chimaera
+# copies objects to a second peer asynchronously, about a second behind.
+KILL_AFTER = 3.0
+
+
+def scenario_recovery(runtime: str, sizes: list[str], timeout: float = 120.0) -> None:
+    """Three nodes on this machine. For each size: (1) a task's result held
+    only by node B (not fetched by the driver), B killed, then get: Ray
+    rebuilds it from lineage; (2) a value put from a task on node B, B killed,
+    then get. The node is killed KILL_AFTER seconds after the value was made.
+    Each row is the time until get returned, or the error raised."""
+    if runtime == "ray":
+        _recovery_ray(sizes, timeout)
+    else:
+        _recovery_chimaera(sizes, timeout)
+
+
+def _recovery_ray(sizes: list[str], timeout: float) -> None:
+    import ray
+    from ray.cluster_utils import Cluster
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy as NA
+
+    c = Cluster(initialize_head=True, head_node_args={"num_cpus": 2, "include_dashboard": False})
+    ray.init(address=c.address, log_to_driver=False)
+    produce = ray.remote(max_retries=3)(_produce)
+    put_here = ray.remote(_put_here)
+    for s in sizes:
+        n = parse_size(s)
+        for case in ("task_result", "task_put"):
+            node = c.add_node(num_cpus=2)
+            spare = c.add_node(num_cpus=2)
+            c.wait_for_nodes()
+            nid = node.node_id
+            if case == "task_result":
+                ref = produce.options(scheduling_strategy=NA(nid, soft=True)).remote(n)
+                ray.wait([ref], fetch_local=False)
+                target = ref
+            else:
+                target = ray.get(put_here.options(scheduling_strategy=NA(nid, soft=False)).remote("ray", n))[0]
+            time.sleep(KILL_AFTER)
+            c.remove_node(node, allow_graceful=False)
+            dt, err = _attempt(lambda t: ray.get(target, timeout=t), timeout)
+            emit(scenario="recovery", kind=case, size=s, op="get_after_node_loss", seconds=dt, error=err)
+            del target
+            c.remove_node(spare, allow_graceful=False)
+
+
+def _recovery_chimaera(sizes: list[str], timeout: float) -> None:
+    import signal
+    import socket
+    import subprocess
+    import tempfile
+
+    import chimaera as ch
+    from chimaera._native import socket_path
+
+    binary = os.environ["CHIMAERA_BIN"]
+    root = tempfile.mkdtemp(prefix="chrec", dir="/tmp")
+    socks = [socket.socket() for _ in range(3)]
+    for so in socks:
+        so.bind(("127.0.0.1", 0))
+    addrs = [f"127.0.0.1:{so.getsockname()[1]}" for so in socks]
+    for so in socks:
+        so.close()
+    token = os.path.join(root, "token")
+    with open(token, "w") as f:
+        f.write(subprocess.check_output([binary, "cluster", "token"], text=True))
+    procs = {}
+
+    def start(i: int) -> None:
+        d = os.path.join(root, f"p{i}")
+        os.makedirs(d, exist_ok=True)
+        try:
+            os.unlink(socket_path(d, "peer.sock"))  # a killed peer leaves it behind
+        except FileNotFoundError:
+            pass
+        log = open(os.path.join(root, f"p{i}.log"), "ab")
+        procs[i] = subprocess.Popen(
+            [binary, "--dir", d, "peer", "start", "--listen", addrs[i], "--seeds", ",".join(addrs),
+             "--cluster", "rec", "--cpus", "2", "--token-file", token],
+            stdout=log, stderr=log, start_new_session=True)
+
+    def wait_ready(i: int) -> None:
+        sock, deadline = socket_path(os.path.join(root, f"p{i}"), "peer.sock"), time.time() + 60
+        while not os.path.exists(sock):
+            if procs[i].poll() is not None or time.time() > deadline:
+                raise RuntimeError(f"peer {i} did not start: " + open(os.path.join(root, f"p{i}.log")).read()[-1500:])
+            time.sleep(0.05)
+
+    # Founders open their sockets only once the others answer: start all first.
+    for i in range(3):
+        start(i)
+    for i in range(3):
+        wait_ready(i)
+    os.environ["CHIMAERA_HOME"] = os.path.join(root, "p0")
+    from chimaera._runtime import Runtime
+
+    Runtime.get()
+    deadline = time.time() + 60
+    while len(ch.cluster().nodes()) < 3 and time.time() < deadline:
+        time.sleep(0.2)
+    others = [n.peer for n in ch.cluster().nodes() if not n.this_peer]
+    peer_index = {}
+    for i in (1, 2):
+        out = open(os.path.join(root, f"p{i}", "peer-id")).read().strip()
+        peer_index[out] = i
+    produce = ch.remote(max_attempts=3)(_produce)
+    put_here = ch.remote(_put_here)
+    try:
+        for s in sizes:
+            n = parse_size(s)
+            for case in ("task_result", "task_put"):
+                victim = others[0]
+                place = ch.Placement(prefer=[f"node={victim}"]) if case == "task_result" else ch.Placement(
+                    require={"node": victim})
+                if case == "task_result":
+                    target = produce.options(placement=place).remote(n)
+                    while not target.done():  # finished, but not fetched here
+                        time.sleep(0.01)
+                else:
+                    target = put_here.options(placement=place).remote("chimaera", n).result()[0]
+                time.sleep(KILL_AFTER)
+                i = peer_index[victim]
+                os.killpg(procs[i].pid, signal.SIGKILL)
+                procs[i].wait()
+                dt, err = _attempt(lambda t: target.result(t), timeout)
+                emit(scenario="recovery", kind=case, size=s, op="get_after_node_loss", seconds=dt, error=err)
+                del target
+                start(i)  # back for the next case
+                wait_ready(i)
+                time.sleep(2)
+    finally:
+        for p in procs.values():
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def main() -> None:
@@ -572,6 +796,12 @@ def main() -> None:
     ap.add_argument("--address", default=None)
     ap.add_argument("--capacity", default="8G", help="object memory for the spill scenario")
     a = ap.parse_args()
+    if a.scenario == "recovery":
+        t0 = time.time()
+        scenario_recovery(a.runtime, a.sizes.split(","))
+        emit(done="recovery", runtime=a.runtime, wall_s=round(time.time() - t0, 1))
+        sys.stdout.flush()
+        os._exit(0)
     rt = connect(a.runtime, a.address)
     fn = {
         "put": scenario_put,
@@ -581,6 +811,7 @@ def main() -> None:
         "many": scenario_many,
         "cross_node": scenario_cross_node,
         "spill": scenario_spill,
+        "usability": scenario_usability,
     }[a.scenario]
     t0 = time.time()
     fn(rt, a.types.split(","), a.sizes.split(","), capacity=parse_size(a.capacity))

@@ -140,7 +140,7 @@ impl ObjectStore {
     pub fn spill_oldest(&self, want: u64) -> io::Result<u64> {
         let Some(spill) = &self.spill else { return Ok(0) };
         let mut files = Vec::new();
-        for run in std::fs::read_dir(&self.dir)?.flatten() {
+        for run in std::fs::read_dir(&self.dir)?.flatten().filter(|e| !is_plane_dir(e)) {
             let Ok(entries) = std::fs::read_dir(run.path()) else { continue };
             for e in entries.flatten() {
                 let Ok(m) = e.metadata() else { continue }; // does not follow symlinks
@@ -172,6 +172,12 @@ impl ObjectStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The disk directory spilled objects (and replicas of other peers'
+    /// objects) live in, when the store itself is in memory.
+    pub fn spill_dir(&self) -> Option<&Path> {
+        self.spill.as_deref()
     }
 
     pub fn path(&self, run: &[u8], object: &[u8]) -> PathBuf {
@@ -228,6 +234,7 @@ impl ObjectStore {
             std::fs::read_dir(p)
                 .map(|it| {
                     it.flatten()
+                        .filter(|e| !is_plane_dir(e))
                         .map(|e| match e.metadata() {
                             Ok(m) if m.is_dir() => walk(&e.path()),
                             Ok(m) => m.len(),
@@ -255,6 +262,20 @@ impl ObjectStore {
     }
 }
 
+/// Bytes of the files directly in `dir` (0 when it does not exist).
+pub fn dir_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|it| it.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        .unwrap_or(0)
+}
+
+/// The object plane's own directories (`.arena`: live NumPy arrays of running
+/// processes; `.reserve`: pre-zeroed pages): not objects, never counted,
+/// spilled or deleted as such.
+fn is_plane_dir(e: &std::fs::DirEntry) -> bool {
+    e.file_name().as_encoded_bytes().first() == Some(&b'.')
+}
+
 /// One piece of an object being streamed to another process.
 pub struct Chunk {
     pub data: Vec<u8>,
@@ -262,6 +283,8 @@ pub struct Chunk {
     pub total: u64,
     /// blake3 of `data`, first 16 bytes.
     pub checksum: Vec<u8>,
+    /// Set on the first chunk: the whole object's size.
+    pub object_size: u64,
 }
 
 /// Stream `len` bytes of `path` from `offset` (`len` 0 = to the end) in
@@ -293,7 +316,12 @@ pub async fn read_chunks(
             }
             left -= want as u64;
             let checksum = blake3::hash(&data).as_bytes()[..16].to_vec();
-            let chunk = Chunk { data, total: if first { total } else { 0 }, checksum };
+            let chunk = Chunk {
+                data,
+                total: if first { total } else { 0 },
+                checksum,
+                object_size: if first { size } else { 0 },
+            };
             first = false;
             if tx.send(Ok(chunk)).await.is_err() || left == 0 {
                 return;
@@ -332,6 +360,9 @@ mod tests {
         assert_eq!(collect(9000, 0).await, (data[9000..].to_vec(), 1000));
         assert_eq!(collect(10_000, 0).await, (Vec::new(), 0), "an empty range still answers once");
         assert!(read_chunks(&path, 10_001, 0, 1024).await.is_err());
+        let mut rx = read_chunks(&path, 0, 1, 1024).await.unwrap();
+        let first = rx.recv().await.unwrap().unwrap();
+        assert_eq!((first.data.len(), first.object_size), (1, 10_000), "a one-byte range reports the whole size");
     }
 
     #[test]
@@ -377,6 +408,21 @@ mod tests {
         assert!(!store.path(&run.0, &value).exists(), "the stored argument is gone");
         assert!(store.path(&run.0, &result.0).exists(), "the result stays for reattaching clients");
         assert_eq!(store.delete_values(&run), 0);
+    }
+
+    #[test]
+    fn plane_directories_are_neither_counted_nor_spilled() {
+        let (mem, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(disk.path().to_path_buf());
+        for d in [".arena/123", ".reserve"] {
+            std::fs::create_dir_all(mem.path().join(d)).unwrap();
+            std::fs::write(mem.path().join(d).join("21-0"), vec![0u8; 3000]).unwrap();
+        }
+        store.put_blob(b"run", &blake3::hash(b"x").as_bytes()[..16], b"x").unwrap();
+        assert_eq!(store.bytes_used(), 1, "only the object counts");
+        store.spill_oldest(1 << 20).unwrap();
+        assert!(mem.path().join(".reserve/21-0").symlink_metadata().unwrap().is_file(), "reserve files stay in memory");
+        assert!(mem.path().join(".arena/123/21-0").symlink_metadata().unwrap().is_file(), "arena files stay in memory");
     }
 
     #[test]

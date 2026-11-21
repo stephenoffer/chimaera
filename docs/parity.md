@@ -439,23 +439,27 @@ failover. Its numbers are the floor under the real path, and the headroom is wha
   behind. architecture.md D2 now bounds unsafe journal bytes per owner (8 MiB). With the bound in the prototype, the
   worst case fell to 88–112 ms at 1.86M calls/s, with no loss of throughput.
 
-### First step on the real runtime
+### First steps on the real runtime
 
-[bench/proto/local-group](../bench/proto/local-group/RESULTS.md) is a patch to the runtime, not yet applied, that
-makes a local peer's group apply commands without a Raft log.
+The first two steps of D2 are now in the tree ([bench/proto/local-group](../bench/proto/local-group/RESULTS.md)):
+- **No log:** a local peer's group applies commands without a Raft log.
+- **Durability where needed:** an attached run's per-call commands commit without waiting for durability. They
+  become durable within 500 ms. Detached runs, actors, store writes and external effects stay durable.
 
-| Measurement | Without the patch | With the patch |
+Release builds of the same live tree, three alternating runs at the same load:
+
+| Measurement | Before | After |
 |---|---:|---:|
-| Sync task round trip, p50 | 483–499 µs | 295–301 µs |
-| Sync actor call round trip, p50 | 514–531 µs | 330–337 µs |
-| One commit, p50 | 346 µs | 132 µs |
+| Sync task round trip, p50 | 499–525 µs | 257–260 µs |
+| Sync actor call round trip, p50 | 530–624 µs | 285–319 µs |
+| One commit, p50 | 139–346 µs | 31 µs (attached call) |
 
-The round trips are three alternating runs at the same load.
-
-- **Tests:** the Raft tests pass, including a new crash test that fails if commits are not durable. The Python suite
-  has the same 258 passes with and without the patch.
-- **Ray's actor round trip** here is 167–177 µs, so the gap shrinks from about 3× to about 2×.
-- **What closes the rest:** the next D2 step removes the commits from ordinary calls.
+- **Tests:** the Raft crash tests pass, and each fails against a deliberate durability bug. The Python suite passes:
+  269 passed, 5 skipped, 0 failed, including the SIGKILL-mid-run recovery test.
+- **Against Ray:** Ray's actor round trip here is 167–177 µs. Chimaera's local actor call goes from about 3× slower
+  to about 1.7× slower.
+- **What is left:** the per-call stages in the driver, peer and executor, about 200 µs. Commits are now about 60 µs
+  of the round trip.
 
 ### What closes each gap
 

@@ -423,6 +423,9 @@ struct Exec {
     kill_note: Option<String>,
     /// Private memory at the last sample, bytes.
     private: u64,
+    /// Its NumPy arena's files (Linux: arrays allocated as tmpfs files under
+    /// `<objects>/.arena/<pid>`, which are not private memory), bytes.
+    arena: u64,
     /// Memory between calls, to replace a leaking executor (R4).
     leak: LeakWatch,
     /// The function and run of its last call: an idle executor that already
@@ -519,6 +522,8 @@ pub struct Core {
     /// Bytes of objects in the pool (tmpfs only), rescanned every second.
     object_bytes: u64,
     objects_scanned: Instant,
+    /// Free space on the objects' filesystem, at the last scan.
+    disk_free: Option<u64>,
     /// Admission paused by memory pressure.
     mem_paused: bool,
     /// When this peer last killed attempts for memory.
@@ -577,7 +582,24 @@ pub struct Core {
     log_ship: crate::logship::LogShip,
     /// Per-tenant CPU quotas on this peer (CHIMAERA_TENANT_QUOTAS).
     quotas: crate::quotas::Quotas,
+    /// Actors waiting for a peer with their CPUs free (placed on a later tick).
+    actors_waiting: BTreeSet<Id>,
+    /// CPUs of actors just placed (actor, peer, cpus, when), counted as used
+    /// until the peers' own numbers include them.
+    actor_holds: Vec<(Id, Vec<u8>, f64, Instant)>,
 }
+
+/// Where an actor goes: a peer with its CPUs free now, wait until one has
+/// them, or nowhere (no live peer could ever hold it).
+enum ActorPlacement {
+    Host(pb::PeerInc),
+    Wait,
+    Infeasible,
+}
+
+/// How long a placed actor's CPUs count against its peer before that peer's
+/// own load numbers include them.
+const ACTOR_HOLD_TTL: Duration = Duration::from_secs(3);
 
 impl Core {
     #[allow(clippy::too_many_arguments)]
@@ -601,6 +623,8 @@ impl Core {
             log_ship: Default::default(),
             // Validated before the core starts (runtime::serve).
             quotas: crate::quotas::Quotas::from_env().unwrap_or_default(),
+            actors_waiting: BTreeSet::new(),
+            actor_holds: Vec::new(),
             router,
             sup,
             objects,
@@ -626,6 +650,7 @@ impl Core {
             available: None,
             object_bytes: 0,
             objects_scanned: Instant::now() - OBJECTS_SCAN_EVERY,
+            disk_free: None,
             mem_paused: false,
             mem_kills: VecDeque::new(),
             live_floor: HashMap::new(),
@@ -1812,11 +1837,20 @@ impl Core {
     /// a peer that does; another replica takes over if that one goes away.
     fn remote_watch(&self, group: u32, tasks: Vec<Tk>) {
         let Some(mesh) = self.router.mesh.clone() else { return };
-        let tx = self.me_tx.clone();
+        let (tx, router) = (self.me_tx.clone(), self.router.clone());
         tokio::spawn(async move {
             let mut left: BTreeSet<Tk> = tasks.into_iter().collect();
             for round in 0..20 {
-                for node in mesh.voters_of(group) {
+                // The known leader first, then live voters; voters liveness
+                // has given up on last (a peer that hosts no replica of the
+                // group keeps the plan's voter list, which can name the dead).
+                let mut nodes = mesh.voters_of(group);
+                let hint = router.leader_hint(group);
+                nodes.sort_by_key(|n| {
+                    let gone = mesh.member(*n).is_none_or(|p| p.dead || p.suspect);
+                    (gone, Some(*n) != hint)
+                });
+                for node in nodes {
                     if left.is_empty() {
                         return;
                     }
@@ -2113,7 +2147,7 @@ impl Core {
                 })
                 .max()
                 .unwrap_or(0);
-            used += reserved.max(e.private);
+            used += reserved.max(e.private + e.arena);
         }
         used
     }
@@ -2134,6 +2168,9 @@ impl Core {
         // With nothing of ours running, waiting frees nothing: run it alone.
         if !self.running.iter().any(|r| !r.blocked) {
             return None;
+        }
+        if let Some(why) = budget::disk_wait(self.disk_free, self.objects.dir()) {
+            return Some(why);
         }
         if self.mem_paused {
             return Some(format!(
@@ -2270,6 +2307,7 @@ impl Core {
                         last_fn: Vec::new(),
                         last_run: None,
                         private: 0,
+                        arena: 0,
                         leak: LeakWatch::default(),
                     },
                 );
@@ -2353,6 +2391,7 @@ impl Core {
                         last_fn: Vec::new(),
                         last_run: None,
                         private: 0,
+                        arena: 0,
                         leak: LeakWatch::default(),
                     },
                 );
@@ -2668,7 +2707,9 @@ impl Core {
             // One attempt per isolated executor: retire it (its cgroup goes with it).
             self.retire_exec(exec);
         } else if let Some(p) = end_private {
-            self.check_leak(exec, p);
+            // Leaks are judged on what the worker holds, arena arrays included
+            // (they are shared tmpfs pages, not private memory).
+            self.check_leak(exec, p, budget::held_bytes(pid).unwrap_or(p));
         }
         let peak_bytes = peak.map_or(0, |p| p.0);
         if cores.is_none() && !finished && batch_len > 1 {
@@ -3010,13 +3051,13 @@ impl Core {
     }
 
     /// Replace a pooled executor whose memory between calls keeps rising (R4).
-    fn check_leak(&mut self, exec: u32, private: u64) {
+    fn check_leak(&mut self, exec: u32, private: u64, held: u64) {
         let Some(e) = self.execs.get_mut(&exec) else { return };
         e.private = private;
         if e.actor.is_some() {
             return;
         }
-        let Some(why) = e.leak.after_call(private) else { return };
+        let Some(why) = e.leak.after_call(held) else { return };
         let pid = e.pid;
         self.retire_exec(exec);
         self.decide(pb::Decision {
@@ -3247,6 +3288,12 @@ impl Core {
     /// host (this peer or another) informed of its record.
     fn on_actor_changed(&mut self, actor: Id) {
         let Some(Some(rec)) = self.router.read(actor.vshard(), |kv| read::actor(kv, actor)) else { return };
+        // A placed actor's CPUs stop being held for it once it is gone, or once
+        // it runs here (this peer's own count then includes them).
+        let here = rec.host.as_ref().is_some_and(|h| h.peer == self.router.identity.peer.to_vec());
+        if rec.state() == pb::actor_record::State::Dead || (rec.state() == pb::actor_record::State::Alive && here) {
+            self.actor_holds.retain(|(a, ..)| *a != actor);
+        }
         if self.actor_seen.get(&actor) != Some(&(rec.generation, rec.state)) {
             self.actor_seen.insert(actor, (rec.generation, rec.state));
             let message = match rec.state() {
@@ -3273,8 +3320,8 @@ impl Core {
             if host.placing != Some(rec.generation) {
                 host.placing = Some(rec.generation);
                 let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-                match self.choose_actor_host(&policy) {
-                    Some(target) => self.propose(
+                match self.choose_actor_host(actor, &policy) {
+                    ActorPlacement::Host(target) => self.propose(
                         actor.vshard(),
                         pb::shard_cmd::Body::ActorPlace(pb::ActorPlace {
                             actor: actor.to_vec(),
@@ -3282,7 +3329,15 @@ impl Core {
                             host: Some(target),
                         }),
                     ),
-                    None => self.propose(
+                    // Every peer that could hold it has its CPUs in use: it stays
+                    // pending and is placed once some free up (as Ray's actors wait).
+                    ActorPlacement::Wait => {
+                        if let Some(h) = self.actors.get_mut(&actor) {
+                            h.placing = None;
+                        }
+                        self.actors_waiting.insert(actor);
+                    }
+                    ActorPlacement::Infeasible => self.propose(
                         actor.vshard(),
                         pb::shard_cmd::Body::ActorDied(pb::ActorDied {
                             actor: actor.to_vec(),
@@ -3348,34 +3403,68 @@ impl Core {
 
     /// Where a new actor instance goes: this peer or the least loaded of two
     /// sampled live peers with room for its CPU.
-    fn choose_actor_host(&self, policy: &pb::Policy) -> Option<pb::PeerInc> {
+    fn choose_actor_host(&mut self, actor: Id, policy: &pb::Policy) -> ActorPlacement {
         let cpus = policy.cpus.max(0.0);
         let me = self.router.identity.pb();
-        let Some(mesh) = &self.router.mesh else { return Some(me) };
+        self.actor_holds.retain(|(.., at)| at.elapsed() < ACTOR_HOLD_TTL);
+        let holds = &self.actor_holds;
+        let held =
+            |peer: &[u8]| holds.iter().filter(|(_, p, ..)| p.as_slice() == peer).map(|(_, _, c, _)| c).sum::<f64>();
+        let free_here = self.capacity - self.cpu_used - held(&me.peer);
+        let Some(mesh) = self.router.mesh.clone() else {
+            return if self.capacity + 1e-9 < cpus {
+                ActorPlacement::Infeasible
+            } else if free_here + 1e-9 >= cpus {
+                self.hold_actor_cpus(actor, &me, cpus);
+                ActorPlacement::Host(me)
+            } else {
+                ActorPlacement::Wait
+            };
+        };
         // Placement(require=, prefer=), as for tasks (choose_peer).
         let allowed = |m: &pb::Member| crate::labels::satisfies(&m.labels, &policy.require);
         let bonus = |m: &pb::Member| 0.5 * crate::labels::preferred(&m.labels, &policy.prefer) as f64;
         let hosted = self.execs.values().filter(|e| e.actor.is_some()).count() as f64;
         let mine = (self.cpu_used + self.queue.len() as f64 + 0.25 * hosted) / self.capacity.max(1e-9);
         let fits_here = !self.draining && self.capacity + 1e-9 >= cpus && allowed(&mesh.me);
-        let mut best = fits_here.then(|| (mine - bonus(&mesh.me), me));
+        let mut best = (fits_here && free_here + 1e-9 >= cpus).then(|| (mine - bonus(&mesh.me), me.clone()));
         let others: Vec<_> =
             mesh.live_others().into_iter().filter(|p| p.member.cpus + 1e-9 >= cpus && allowed(&p.member)).collect();
+        let ever = fits_here || !others.is_empty();
+        // Free CPUs as each peer last reported them, less actors placed there since.
+        let free: Vec<_> = others
+            .iter()
+            .filter(|p| {
+                let used = p.load.as_ref().map_or(0.0, |l| l.cpu_used);
+                p.member.cpus - used - held(&p.member.peer) + 1e-9 >= cpus
+            })
+            .collect();
         let seed = now_ns() as usize;
-        for i in 0..2.min(others.len()) {
-            let p = &others[(seed + i * 7919) % others.len()];
+        for i in 0..2.min(free.len()) {
+            let p = free[(seed + i * 7919) % free.len()];
             let actors = p.load.as_ref().map_or(0, |l| l.actors) as f64;
             let score = p.pressure() + 0.25 * actors / p.member.cpus.max(1e-9) - bonus(&p.member);
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, pb::PeerInc { peer: p.member.peer.clone(), inc: p.member.incarnation }));
             }
         }
-        if let Some((_, p)) = &best
-            && let Some(v) = mesh.member_by_peer(&p.peer)
-        {
-            mesh.note_placed(v.member.node_id);
+        match best {
+            Some((_, p)) => {
+                if let Some(v) = mesh.member_by_peer(&p.peer) {
+                    mesh.note_placed(v.member.node_id);
+                }
+                self.hold_actor_cpus(actor, &p, cpus);
+                ActorPlacement::Host(p)
+            }
+            None if ever => ActorPlacement::Wait,
+            None => ActorPlacement::Infeasible,
         }
-        best.map(|(_, p)| p)
+    }
+
+    fn hold_actor_cpus(&mut self, actor: Id, peer: &pb::PeerInc, cpus: f64) {
+        if cpus > 0.0 {
+            self.actor_holds.push((actor, peer.peer.clone(), cpus, Instant::now()));
+        }
     }
 
     /// The current record of an actor this peer hosts (or is about to).
@@ -3706,6 +3795,10 @@ impl Core {
 
     fn housekeeping(&mut self) {
         self.spill();
+        // Actors that waited for CPUs: try again (each re-reads its record).
+        for actor in std::mem::take(&mut self.actors_waiting) {
+            self.on_actor_changed(actor);
+        }
         if let Some(mesh) = &self.router.mesh {
             self.log_ship.flush(mesh);
         }
@@ -3776,12 +3869,14 @@ impl Core {
     /// Memory readings each housekeeping tick: every executor's private
     /// memory, the host's availability, and the pressure response (R1).
     fn sample_memory(&mut self) {
+        let arenas = self.objects.dir().join(".arena");
         for (id, e) in &mut self.execs {
             if let Some(p) = budget::private_bytes(e.pid) {
                 e.private = p;
             }
+            e.arena = crate::stores::dir_bytes(&arenas.join(e.pid.to_string()));
             for r in self.running.iter_mut().filter(|r| r.exec == *id) {
-                r.peak = r.peak.max(e.private);
+                r.peak = r.peak.max(e.private + e.arena);
             }
         }
         for r in &self.running {
@@ -3795,16 +3890,30 @@ impl Core {
         }
         if self.objects_scanned.elapsed() >= OBJECTS_SCAN_EVERY {
             self.objects_scanned = Instant::now();
-            self.object_bytes = if self.budget.objects_in_pool { self.objects.bytes_used() } else { 0 };
-            // Objects in memory past SPILL_ABOVE of the pool move to disk
-            // (oldest first), off the core's thread.
-            let over = self.memory_used().saturating_sub((SPILL_ABOVE * self.budget.pool as f64) as u64);
+            let space = budget::disk_space(self.objects.dir());
+            self.disk_free = space.map(|(free, _)| free);
+            // Objects, plus the object plane's pre-zeroed reserve: both memory.
+            self.object_bytes = if self.budget.objects_in_pool {
+                self.objects.bytes_used() + crate::stores::dir_bytes(&self.objects.dir().join(".reserve"))
+            } else {
+                0
+            };
+            // Objects in memory move to disk (oldest first, off the core's
+            // thread) past SPILL_ABOVE of the pool, or when their filesystem
+            // runs short, which a tmpfs smaller than the pool does first.
+            let over = self.memory_used().saturating_sub((SPILL_ABOVE * self.budget.pool as f64) as u64).max(
+                space
+                    .filter(|_| self.budget.objects_in_pool)
+                    .map_or(0, |(free, total)| budget::spill_for_space(free, total)),
+            );
             if over > 0 && self.object_bytes > 0 && !self.spilling.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 let (objects, flag) = (self.objects.clone(), self.spilling.clone());
                 tokio::task::spawn_blocking(move || {
                     match objects.spill_oldest(over) {
                         Ok(n) if n > 0 => {
-                            tracing::info!("memory pool over {SPILL_ABOVE}: moved {n} bytes of objects to disk")
+                            tracing::info!(
+                                "objects past the memory pool's or their filesystem's room: moved {n} bytes to disk"
+                            )
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!("cannot spill objects to disk: {e}"),
@@ -3846,7 +3955,7 @@ impl Core {
             .filter(|r| !r.blocked)
             .filter_map(|r| {
                 let e = self.execs.get(&r.exec)?;
-                let over = e.private.saturating_sub(r.mem);
+                let over = (e.private + e.arena).saturating_sub(r.mem);
                 let last = e.actor.is_some() || r.items.iter().any(|w| w.spec.effects() == pb::Effects::External);
                 (over > 0).then_some((last, std::cmp::Reverse(over), r.exec, e.private, r.mem))
             })
@@ -4029,7 +4138,10 @@ impl Core {
                     self.profiles.len(),
                     self.profiles_path.display()
                 ),
-            ],
+            ]
+            .into_iter()
+            .chain(crate::durability::describe())
+            .collect(),
         }
     }
 }

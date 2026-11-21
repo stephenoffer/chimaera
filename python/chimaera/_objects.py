@@ -57,16 +57,32 @@ def _fs_type(path: str) -> str:
     return kind
 
 
+def _plane(object_dir: str) -> dict[str, str]:
+    """The peer's `.plane` file: where the page reserve and the spill
+    directory are, and the memory limit for objects (see objplane.rs)."""
+    try:
+        with open(os.path.join(object_dir, ".plane")) as f:
+            return dict(line.strip().split("=", 1) for line in f if "=" in line)
+    except OSError:
+        return {}
+
+
 def enable(object_dir: str) -> None:
-    """Route large NumPy allocations of this process to the arena in
-    `object_dir`, now if NumPy is loaded, else as soon as it is imported."""
-    if sys.platform != "linux" or os.environ.get("CHIMAERA_ARENA", "1") == "0":
-        return
+    """Configure this process's writers from the peer's `.plane` file, and
+    route large NumPy allocations to the arena in `object_dir`: now if NumPy
+    is loaded, else as soon as it is imported."""
     with _lock:
         if _state["dir"] is not None:
             return
-        if not _in_memory(object_dir):
-            return
+        _state["dir"] = ""
+    if not hasattr(_native, "objects_config"):
+        return  # an extension built before the object plane: plain writes, no arena
+    plane = _plane(object_dir)
+    if plane:
+        _native.objects_config(object_dir, plane.get("reserve"), plane.get("spill"), int(plane.get("limit", "0")))
+    if sys.platform != "linux" or os.environ.get("CHIMAERA_ARENA", "1") == "0" or not _in_memory(object_dir):
+        return
+    with _lock:
         _state["dir"] = os.path.join(object_dir, ".arena", str(os.getpid()))
     if "numpy" in sys.modules:
         _install()
@@ -76,7 +92,7 @@ def enable(object_dir: str) -> None:
 
 def _install() -> None:
     with _lock:
-        if _state["installed"] or _state["dir"] is None:
+        if _state["installed"] or not _state["dir"]:
             return
         _state["installed"] = True
     try:
@@ -126,5 +142,7 @@ def claim(view: memoryview, run_dir: str, prefix: bytes = b"") -> tuple[bytes, i
 
 
 def stats() -> dict[str, int]:
+    if not hasattr(_native, "arena_stats"):
+        return {"live": 0, "live_bytes": 0, "cached_bytes": 0, "claims": 0, "fallbacks": 0}
     live, live_bytes, cached, claims, fallbacks = _native.arena_stats()
     return {"live": live, "live_bytes": live_bytes, "cached_bytes": cached, "claims": claims, "fallbacks": fallbacks}

@@ -45,6 +45,17 @@ def _resolve(x: Any) -> Any:
     return x.result() if isinstance(x, PutRef) else x
 
 
+def _as_ray(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Ray resolves only top-level refs; refs inside a list, tuple or dict
+    argument arrive as refs. Chimaera resolves them one level deep, so the shim
+    marks those containers ``ch.handles``."""
+
+    def keep(v: Any) -> Any:
+        return ch.handles(v) if type(v) in (list, tuple, dict) else v
+
+    return tuple(keep(a) for a in args), {k: keep(v) for k, v in kwargs.items()}
+
+
 def _resolving(fn: Callable[..., Any], alias: bool) -> Callable[..., Any]:
     """`fn` with its top-level ObjectRef arguments resolved. With `alias`, the
     callee also sees this shim as ``ray`` (the driver installed it)."""
@@ -114,6 +125,7 @@ class RemoteFunction:
         raise TypeError(f"Remote functions cannot be called directly. Instead of running '{name}()', try '{name}.remote()'.")
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
+        args, kwargs = _as_ray(args, kwargs)
         f = self._view.remote(*args, **kwargs)
         return list(f.split(self._returns)) if self._returns > 1 else f
 
@@ -149,6 +161,7 @@ class ActorClass:
             opts["key"] = key
         if "concurrency" not in opts and _has_async_methods(self._cls):
             opts["concurrency"] = 1000  # Ray's default for async actors
+        args, kwargs = _as_ray(args, kwargs)
         return ActorHandle(self._base.options(**opts).remote(*args, **kwargs))
 
     def options(self, **options: Any) -> ActorClass:
@@ -186,6 +199,7 @@ class ActorMethod:
         self._method = method
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
+        args, kwargs = _as_ray(args, kwargs)
         f = self._method.remote(*args, **kwargs)
         try:  # a method declared (or called) with num_returns=n gives n refs, as in Ray
             return list(f.split())

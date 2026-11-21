@@ -67,16 +67,28 @@ impl Node {
     /// Open the peer under `dir`. The returned file holds the directory lock
     /// for as long as it lives.
     pub fn open(dir: &Path, cpus: Option<f64>) -> io::Result<(Node, std::fs::File)> {
+        Node::open_with(dir, cpus, || Ok(()))
+    }
+
+    /// Like `open`, running `before_identity` under the directory lock before
+    /// the peer's identity is loaded (it may discard raft state and identity).
+    pub fn open_with(
+        dir: &Path,
+        cpus: Option<f64>,
+        before_identity: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<(Node, std::fs::File)> {
         let lock = lock_dir(dir)?;
+        before_identity()?;
         let identity = Identity::load(dir)?;
         let shape = crate::topology::discover();
         let capacity = cpus.unwrap_or_else(|| shape.usable_cores());
         let mut objects = ObjectStore::open(object_dir(dir, &identity))?;
-        crate::objplane::start(objects.dir().to_path_buf());
-        if crate::budget::is_tmpfs(objects.dir()) {
+        let in_memory = crate::budget::is_tmpfs(objects.dir());
+        if in_memory {
             // Objects in memory move to disk under pressure (see Core).
             objects = objects.with_spill(dir.join("spill"));
         }
+        crate::objplane::start(objects.dir().to_path_buf(), in_memory.then(|| dir.join("spill")));
         let code = CodeStore::open(dir.join("code"))?;
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(65536);
         Ok((Node { dir: dir.to_path_buf(), identity, shape, capacity, objects, code, core_tx, core_rx }, lock))
@@ -92,6 +104,7 @@ pub async fn run_local(cfg: PeerConfig) -> io::Result<()> {
     let members: BTreeMap<_, _> = [(identity.node_id(), BasicNode::new("local"))].into();
     let group = host.start_group(0, members, true).await?;
     wait_leader(&group).await?;
+    let group = host.without_log(group).await?;
     let router = Arc::new(Router::local(identity, group.clone()));
     let all: Vec<u32> = (0..VSHARDS as u32).collect();
     router
@@ -178,6 +191,7 @@ pub async fn serve(
     );
     tokio::spawn(core.run(core_rx));
     crate::prom::spawn_from_env(core_tx.clone())?;
+    crate::notices::spawn_from_env()?;
     let c2 = core_tx.clone();
     tokio::spawn(async move {
         while let Some(ev) = raft_events.recv().await {

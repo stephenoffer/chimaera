@@ -53,6 +53,27 @@ total = add.remote(word_count.remote("blue sky"), word_count.remote("rain today"
 assert total.result() == 4
 ```
 
+A future passed to a call arrives as its value, and the call starts once the
+value is ready. That holds for a future passed directly and for one inside a
+list, tuple or dict argument (dict values, one level deep), so a call that
+takes a list of results never starts early and sits waiting on them. To pass
+futures as futures, so the call can wait on them itself (with
+`ch.as_completed`, say), wrap the argument in `ch.handles(...)`. **Runs today:**
+
+```python run
+@ch.remote
+def total_of(counts: list[int]) -> int:
+    return sum(counts)
+
+@ch.remote
+def first_done(futures: list[ch.Future[int]]) -> int:
+    return next(iter(ch.as_completed(futures))).result()
+
+parts = [word_count.remote(t) for t in ("a b", "c d e")]
+assert total_of.remote(parts).result() == 5                  # values inside the list
+assert first_done.remote(ch.handles(parts)).result() in (2, 3)
+```
+
 `fn.map(items)` applies a function to every item and streams results back in
 order (`ordered=False` gives completion order). Only a bounded number of items
 are in flight, so a slow consumer slows the producer instead of filling
@@ -134,7 +155,7 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 
 | Option | Meaning |
 |---|---|
-| `cpus`, `memory` | Reserve capacity. `ch.auto(...)` leaves the value to the runtime. |
+| `cpus`, `memory` | Reserve capacity. `ch.auto(...)` leaves the value to the runtime. An actor that asks for `cpus` holds them while it lives, and waits until some peer has them free; an actor no peer could ever hold fails as `ch.Infeasible`. |
 | `memory_limit` | Enforced; going over raises `ch.OutOfMemory` with the measured peak. |
 | `gpus`, `device` | Accelerators (P5 assigns and isolates them; see Tier 3). |
 | `effects` | `"none"` (default), `"idempotent"` or `"external"`. External calls start at most once. |
@@ -211,7 +232,9 @@ except ch.Infeasible as e:
 `ch.NotFound` means nothing exists under a name (`ch.actor(key)`), `ch.Closed`
 that a queue or topic was closed, `ch.VersionConflict` that a store's
 compare-and-set lost, and `ch.LeaseLost` that a fenced write's lock passed to
-someone else. P3 adds `ch.EnvironmentMismatch`; P5 adds `ch.GangFailed`.
+someone else. `ch.GangFailed` means every generation of a gang lost a rank.
+`ch.EnvironmentMismatch` is planned, for a driver whose environment no peer
+can run.
 
 ### Actors: names, pools, context
 
@@ -645,11 +668,74 @@ with Worker.options(ranks=2).gang(100) as workers:
     assert workers[1].step.remote().result() == 101
 ```
 
+**Elastic gangs.** `ranks=ch.auto(initial, min=, max=)` sizes each generation
+to what the live peers can hold (by CPUs, and GPUs when the ranks need them).
+A gang that loses a peer comes back smaller instead of waiting for a
+replacement, and `gang.decisions` says what each generation chose. A running
+generation never grows; new capacity is used from the next one. **Runs today:**
+
+```python run
+@ch.remote(cpus=0.5)
+def world() -> int:
+    return ch.context().gang.size
+
+assert world.options(ranks=ch.auto(2, min=1, max=4)).gang().result() == [2, 2]  # starts at 2
+```
+
+**Groups of actors you already have.** `ch.group(*actors)` makes them one
+group, ranked in the order given. Pass the handle to them; inside a member,
+`handle.join()` is its `Group`, with the same collectives and `torch()` as a
+gang's rank. The first `join()` in each member waits for all of them.
+`ch.group(..., key=k)` again with the same key starts a new generation, for a
+changed set of actors. **Runs today:**
+
+```python run
+@ch.remote(cpus=0.5)
+class Learner:
+    def __init__(self, weight: int):
+        self.weight = weight
+
+    def average(self, handle: ch.GroupHandle) -> float:
+        group = handle.join()
+        return group.all_reduce(self.weight) / group.size   # sum by default; op= any function
+
+learners = [Learner.remote(w) for w in (1, 2, 6)]
+handle = ch.group(*learners)
+assert [f.result() for f in [l.average.remote(handle) for l in learners]] == [3.0] * 3
+```
+
+**When a gang hangs,** `explain()` (on a gang, an actor gang or a group handle)
+says which collective each rank last entered and names the ranks holding the
+others up. A collective's timeout says the same. Each collective waits under
+its own name, so ranks that call different collectives at the same point wait
+for each other, and `explain()` says so, rather than exchanging the wrong
+data. It sees the rendezvous and the store collectives (`barrier`,
+`all_gather`, `all_reduce`, `broadcast`), not calls inside `torch.distributed`.
+
+```python
+print(gang.explain()["summary"])
+# rank 5 last entered #41 (all_gather, 312 s ago); ranks 0, 1, 2, 3, 4, 6, 7 wait in #42 (barrier)
+```
+
 Ranks are placed one by one today and meet through the replicated store, so a
 gang larger than the free capacity waits at the rendezvous. Coming with the
-shard's gang commit (P5): all-or-nothing placement, elastic `ranks=ch.auto`,
-`mesh(dp=, tp=)` and `ch.group(*actors)` for communicators over actors you
-already have.
+shard's gang commit (P5): all-or-nothing placement.
+
+`group.mesh(dp=2, tp=4)` splits a group's ranks into a grid (the last axis
+varies fastest, as in torch's DeviceMesh) and gives this rank's group along
+each axis, with the store collectives and `ranks` (their ranks in the whole
+group). An axis has no torch process group of its own: after `group.torch()`,
+use torch's `init_device_mesh` or `dist.new_group(axis.ranks)`. **Runs today:**
+
+```python run
+@ch.remote(cpus=0.25)
+def row_sum() -> int:
+    group = ch.context().gang
+    tp = group.mesh(dp=2, tp=2)["tp"]                 # ranks 0,1 and 2,3
+    return tp.all_reduce(group.rank)
+
+assert row_sum.options(ranks=4).gang().result() == [1, 1, 5, 5]
+```
 
 ### Reservations
 

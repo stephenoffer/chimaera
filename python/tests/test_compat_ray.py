@@ -564,3 +564,80 @@ def test_placement_groups_run_tasks_and_actors_in_their_bundles():
             placement_group([{"CPU": 1}], strategy="TIGHT")
     finally:
         ray.shutdown()
+
+
+@ray.remote
+class Collective:
+    def declared(self, name, value):
+        import numpy as np
+
+        from chimaera.compat.ray.util import collective as col
+
+        x = np.full(3, float(value))
+        col.allreduce(x, group_name=name)  # joins the declared group on first use
+        top = np.full(3, float(value))
+        col.allreduce(top, group_name=name, op=col.ReduceOp.MAX)
+        word = np.array([col.get_rank(name) * 10.0])
+        col.broadcast(word, src_rank=1, group_name=name)
+        parts = [np.zeros(1) for _ in range(col.get_collective_group_size(name))]
+        col.allgather(parts, np.array([float(value)]), group_name=name)
+        col.barrier(name)
+        return col.get_rank(name), x.tolist(), top.tolist(), word.tolist(), [p.tolist() for p in parts]
+
+    def joins(self, world, rank, name, value):
+        import numpy as np
+
+        from chimaera.compat.ray.util import collective as col
+
+        col.init_collective_group(world, rank, backend="gloo", group_name=name)
+        x = np.array([float(value)])
+        col.reduce(x, dst_rank=0, group_name=name)
+        return col.get_rank(name), col.is_group_initialized(name), x.tolist()
+
+
+def test_collective_groups_reduce_in_place_like_rays():
+    from chimaera.compat.ray.util import collective as col
+
+    actors = [Collective.remote() for _ in range(3)]
+    name = f"g{os.getpid()}-{time.monotonic_ns()}"
+    col.create_collective_group(actors, 3, [2, 0, 1], backend="gloo", group_name=name)
+    with pytest.raises(RuntimeError, match="twice"):
+        col.create_collective_group(actors, 3, [0, 1, 2], group_name=name)
+    out = ray.get([a.declared.remote(name, v) for a, v in zip(actors, (1, 2, 4))])
+    # Ranks follow `ranks`: actor 0 is rank 2. Sums and maxima are on every rank, in place.
+    assert [o[0] for o in out] == [2, 0, 1]
+    assert all(o[1] == [7.0] * 3 and o[2] == [4.0] * 3 and o[3] == [10.0] for o in out)
+    assert all(o[4] == [[2.0], [4.0], [1.0]] for o in out), "gathered in rank order"
+    joined = ray.get([a.joins.remote(3, r, name + "-init", r + 1) for r, a in enumerate(actors)])
+    assert joined == [(0, True, [6.0]), (1, True, [2.0]), (2, True, [3.0])], "only the destination gets the sum"
+    with pytest.raises(NotImplementedError, match="send is not supported"):
+        col.send  # noqa: B018
+    for a in actors:
+        ray.kill(a)
+
+
+@ray.remote
+def one():
+    return 1
+
+
+@ray.remote
+def ref_kinds(xs, named=None):
+    return [isinstance(x, ray.ObjectRef) for x in xs], ray.get(xs), sorted(named or {})
+
+
+@ray.remote
+class RefKinds:
+    def __init__(self, xs):
+        self.were_refs = [isinstance(x, ray.ObjectRef) for x in xs]
+
+    def check(self, xs):
+        return self.were_refs, [isinstance(x, ray.ObjectRef) for x in xs]
+
+
+def test_refs_inside_a_list_arrive_as_refs_as_in_ray():
+    refs = [one.remote(), ray.put(2)]  # a task's result and a put
+    assert ray.get(ref_kinds.remote(refs, named={"a": refs[0]})) == ([True, True], [1, 2], ["a"])
+    a = RefKinds.remote(tuple(refs))
+    assert ray.get(a.check.remote(refs)) == ([True, True], [True, True])
+    ray.kill(a)

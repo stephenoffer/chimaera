@@ -5,8 +5,11 @@ driver attached to the first. Every workload is written the obvious way.
     CHIMAERA_BIN=target/release/chimaera python cluster.py --runtime chimaera
     .venv-bench/bin/python cluster.py --runtime ray
 
-Prints one JSON line per workload: the median of 3 runs after a warmup.
-Sizes keep Ray inside its in-memory object store (no spilling) on a laptop.
+Prints one JSON line per workload. After one warmup run, each workload repeats
+until it has run for --min-seconds (default 120; EVAL_MIN_SECONDS too) and at
+least 3 times: a few seconds is mostly noise. Reported: median, p10, p90 and
+the number of runs. Sizes keep Ray inside its in-memory object store (no
+spilling) on a laptop.
 """
 
 from __future__ import annotations
@@ -192,19 +195,22 @@ def _exit_on_signal(signum: int, _frame: object) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runtime", choices=["ray", "chimaera"], required=True)
-    ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--min-seconds", type=float, default=float(os.environ.get("EVAL_MIN_SECONDS", 120)))
+    ap.add_argument("--min-reps", type=int, default=3)
     a = ap.parse_args()
     signal.signal(signal.SIGTERM, _exit_on_signal)
     rt = Ray() if a.runtime == "ray" else Chimaera()
     try:
         for name, w in WORKLOADS.items():
-            walls, extra = [], {}
-            for rep in range(a.reps + 1):
+            extra = w(rt)  # warmup: executors start, functions are learned
+            walls: list[float] = []
+            while len(walls) < a.min_reps or sum(walls) < a.min_seconds:
                 t = time.perf_counter()
                 extra = w(rt)
-                if rep:  # the first run is a warmup
-                    walls.append(time.perf_counter() - t)
-            row = {"workload": name, "runtime": a.runtime, "wall_s": round(statistics.median(walls), 3), **extra}
+                walls.append(time.perf_counter() - t)
+            q = statistics.quantiles(walls, n=10) if len(walls) >= 2 else walls * 9
+            row = {"workload": name, "runtime": a.runtime, "runs": len(walls), "wall_s": round(statistics.median(walls), 3),
+                   "p10_s": round(q[0], 3), "p90_s": round(q[-1], 3), **extra}
             print(json.dumps(row), flush=True)
     finally:
         rt.close()

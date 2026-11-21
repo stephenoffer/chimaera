@@ -36,7 +36,7 @@ This is early software. What works today and what does not:
 | Retries, `OutcomeUnknown` for external effects, memory limits, cancellation, deadlines | Working |
 | Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |
 | Restarting the peer mid-run and reattaching with `ch.attach(run_id)` | Working |
-| Several peers: replicated shard groups, placement across peers, objects fetched between peers, failover, dead voters replaced | Working on localhost clusters; not yet run across real machines |
+| Several peers: replicated shard groups, placement across peers, objects fetched between peers, failover, dead voters replaced | Working on localhost clusters and on 4 cloud machines (Ray comparison in [qualification](docs/qualification.md)); per-call throughput across machines still trails Ray |
 | Peer authentication: cluster token, mutual TLS | Working on localhost clusters |
 | Durable actors (`state=ch.State()`): committed state, idempotent command ids, restart from the committed state | Working |
 | Learned reservations, memory-aware admission, large values stored once ([details](#what-chimaera-does-for-you)) | Working on one machine; placement across peers weighs input locality and memory |
@@ -231,7 +231,7 @@ crates/chimaera-raft   many Raft groups per peer on openraft and redb
 crates/chimaera-peer   the peer: scheduling, executors, objects, accounting, CLI
 crates/chimaera-py     the Python extension module
 python/chimaera        the Python package
-bench/evals            Ray vs Chimaera single-node comparison
+bench/evals            Ray vs Chimaera comparisons (one node, multi-node)
 docs/                  design, Ray lessons, requirements, qualification
 ```
 
@@ -244,7 +244,7 @@ make proptest-deep    # 20,000 random histories through the shard state machine
 ```
 
 More: [getting started](docs/getting-started.md) ·
-[design](docs/design.md) · [lessons from Ray](docs/ray-lessons.md) ·
+[design](docs/design.md) · [lessons from Ray](docs/ray-lessons.md) · [Ray gotchas and Chimaera](docs/ray-gotchas.md) ·
 [requirements](docs/requirements.md).
 
 ## License

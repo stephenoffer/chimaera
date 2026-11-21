@@ -33,7 +33,7 @@ const CHECKPOINT_ENTRIES: u64 = 512;
 /// A durable checkpoint at least this often while entries are applied: redb
 /// cannot reuse pages freed by non-durable commits until a durable one, so a
 /// long run of them makes every later commit slower.
-const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Events emitted by one apply call of one group, delivered after the commit.
 #[derive(Debug)]
@@ -52,7 +52,7 @@ struct GroupKv<'a, 't> {
     group: u32,
 }
 
-fn with_prefix(group: u32, key: &[u8]) -> Vec<u8> {
+pub(crate) fn with_prefix(group: u32, key: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(4 + key.len());
     k.extend_from_slice(&prefix(group));
     k.extend_from_slice(key);
@@ -283,6 +283,23 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
 
 type Replies = Vec<(Responder, crate::Bytes)>;
 
+/// Apply one command to group `group`'s range of `table`.
+pub(crate) fn apply_cmd(
+    table: &mut Table<'_, &'static [u8], &'static [u8]>,
+    group: u32,
+    shard: &ShardState,
+    cmd: &pb::ShardCmd,
+) -> (pb::ShardReply, Vec<Event>) {
+    let applied = shard.apply(&mut GroupKv { table, group }, cmd);
+    (applied.reply, applied.events)
+}
+
+/// Whether run `run` is detached in `kv` (one group's state); None when there is no such run.
+pub(crate) fn run_detached(kv: &dyn KvRead, run: &[u8]) -> Option<bool> {
+    let id = chimaera_core::ids::Id::from_slice(run).ok()?;
+    chimaera_core::shard::read::run(kv, id).map(|r| r.detached)
+}
+
 fn apply_batch(
     db: &Database,
     group: u32,
@@ -307,10 +324,9 @@ fn apply_batch(
                 EntryPayload::Normal(data) => {
                     let reply = match pb::ShardCmd::decode(data.0.as_slice()) {
                         Ok(cmd) => {
-                            let mut kv = GroupKv { table: &mut table, group };
-                            let applied = shard.apply(&mut kv, &cmd);
-                            events.extend(applied.events);
-                            applied.reply
+                            let (reply, evs) = apply_cmd(&mut table, group, shard, &cmd);
+                            events.extend(evs);
+                            reply
                         }
                         Err(e) => pb::ShardReply {
                             body: Some(pb::shard_reply::Body::Rejected(format!("undecodable command: {e}"))),

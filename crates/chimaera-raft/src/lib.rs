@@ -5,6 +5,7 @@
 //! [`Group::read`]; openraft stays an implementation detail of this crate.
 
 mod backend;
+mod local;
 mod log_store;
 mod network;
 mod state_machine;
@@ -146,7 +147,18 @@ impl RaftHost {
         if bootstrap && !raft.is_initialized().await.map_err(log_store::io_err)? {
             raft.initialize(members).await.map_err(log_store::io_err)?;
         }
-        Ok(Group { id, node_id: self.node_id, raft, db: self.sm_db.clone() })
+        Ok(Group { id, node_id: self.node_id, raft, db: self.sm_db.clone(), local: None })
+    }
+
+    /// Turn a local peer's single-member group into one that applies commands
+    /// without a Raft log. Call it once the group leads: it waits until every
+    /// committed entry is applied (a restart replays the log tail first), then
+    /// shuts Raft down. Cluster groups must not use this.
+    pub async fn without_log(&self, group: Group) -> io::Result<Group> {
+        group.linearizable().await.map_err(io::Error::other)?;
+        let _ = group.raft.shutdown().await;
+        let applier = local::Applier::start(group.id, self.sm_db.clone(), self.events.clone())?;
+        Ok(Group { local: Some(Arc::new(applier)), ..group })
     }
 }
 
@@ -187,6 +199,9 @@ pub struct Group {
     node_id: NodeId,
     pub raft: Raft,
     db: Arc<Database>,
+    /// Set for a local peer's group after recovery: commands apply without a
+    /// log (see [`RaftHost::without_log`]) and `raft` is shut down.
+    local: Option<Arc<local::Applier>>,
 }
 
 impl Group {
@@ -194,6 +209,12 @@ impl Group {
     /// accepts proposals; others return `NotLeader` with a hint.
     pub async fn propose(&self, cmd: &pb::ShardCmd) -> Result<pb::ShardReply, ProposeError> {
         use openraft::error::{ClientWriteError, RaftError};
+        if let Some(local) = &self.local {
+            return local
+                .propose(cmd.clone())
+                .await
+                .map_err(|reason| ProposeError::Unavailable { group: self.id, reason });
+        }
         match self.raft.client_write(Bytes(cmd.encode_to_vec())).await {
             Ok(resp) => pb::ShardReply::decode(resp.data.0.as_slice())
                 .map_err(|e| ProposeError::Unavailable { group: self.id, reason: format!("undecodable reply: {e}") }),
@@ -208,12 +229,18 @@ impl Group {
     /// deposed leader the view may be stale; use [`Group::linearizable`] first
     /// when the caller needs the latest committed state.
     pub fn read<T>(&self, f: impl FnOnce(&dyn KvRead) -> T) -> io::Result<T> {
+        if let Some(local) = &self.local {
+            return local.read(f); // includes writes not yet in the database
+        }
         let view = GroupRead::open(&self.db, self.id)?;
         Ok(f(&view))
     }
 
     /// Wait until local state reflects everything committed before this call.
     pub async fn linearizable(&self) -> Result<(), ProposeError> {
+        if self.local.is_some() {
+            return Ok(()); // one applier: local state is always the latest
+        }
         self.raft
             .ensure_linearizable(openraft::raft::ReadPolicy::ReadIndex)
             .await
@@ -222,12 +249,15 @@ impl Group {
     }
 
     pub async fn is_leader(&self) -> bool {
-        self.raft.current_leader().await == Some(self.node_id)
+        self.local.is_some() || self.raft.current_leader().await == Some(self.node_id)
     }
 
     /// Leader and voters as this replica last saw them.
     pub fn view(&self) -> (Option<NodeId>, Vec<NodeId>) {
         use openraft::async_runtime::WatchReceiver;
+        if self.local.is_some() {
+            return (Some(self.node_id), vec![self.node_id]);
+        }
         let rx = self.raft.metrics();
         let m = rx.borrow_watched();
         (m.current_leader, m.membership_config.membership().voter_ids().collect())

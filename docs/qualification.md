@@ -62,7 +62,7 @@ macOS. Each peer offers 4 CPUs; 4 data groups of 3 voters plus the directory.
 | A peer without the cluster token is refused | pass (local) | the joiner's log shows `missing or wrong cluster token`; it never serves |
 | Mutual TLS: the cluster runs over TLS; a peer from another CA is refused | pass (local) | 60 calls across peers over TLS; the foreign peer's handshake fails with `invalid peer certificate: BadSignature` and it never serves |
 | Kill ingress and shard leader during a 100k-item map, resume p99 < 10 s | unverified | the localhost test uses 300 calls; the 100k-item map and resume percentiles are not measured yet |
-| Killing 1 of 3 voters keeps admission at ≥ 80% throughput | unverified | not measured |
+| Killing 1 of 3 voters keeps admission at ≥ 80% throughput | fail (local) | 3 founders + 1 spare, release build, 5,000 no-op calls per sample, a founder SIGKILLed at 20 s: median 8,629 calls/s before, 6,213 (72%) in the 20 s after, 5,071 (59%) after the replacement (one peer's executors fewer, shared laptop; a first run gave 11,986 / 5,588 / 4,121). Found and fixed on the way: a peer hosting no replica of a group kept the plan's voter list and spent a 1 s connect timeout on the dead voter for every result watch |
 | Simulation invariants over 10k seeds | unverified | no turmoil harness yet |
 | Durable actor: a repeated command returns its first reply; the same id with other arguments is `CommandConflict` | pass (local) | `test_durable.py`: deposits 5 then 2 (state 7); repeating op-1 returns 5 and state stays 7; op-1 with 9 raises `CommandConflict` |
 | Durable actor: a call that raises commits nothing; a killed process resumes from the committed state | pass (local) | state unchanged after a raising call; after SIGKILL of the actor's process the next call sees the committed total, on a new pid, without `__init__` |
@@ -155,8 +155,49 @@ connections without `TCP_NODELAY` (tonic's builder flag does not reach a
 listener the caller supplies), so raft replies waited out delayed ACKs, about
 160 ms per 64-call submission commit, and the ingress commits one session's
 submissions one at a time. Both are fixed (accepted sockets set nodelay; the
-client keeps 2 submissions in flight and coalesces up to 8,192 calls
-meanwhile); a rerun is below when it exists.
+client keeps 2 submissions in flight and coalesces up to 4,096 calls
+meanwhile). Rerun with both fixes (job `prodjob_3vat62mbqmvbbwb3rcwch8sydb`,
+tree diff `e6e2bad21fbdee8d`), same machines and sizes:
+
+| Workload | Ray | Chimaera | Better |
+|---|---:|---:|---|
+| Independent no-op tasks | 7,035/s | 2,675/s | Ray, 2.6x |
+| CPU scaling efficiency (64 CPUs) | 0.667 | 0.660 | parity |
+| Map of tiny items, naive | 7,275/s | 194,071/s | Chimaera, 27x |
+| 512 MiB object to 128 readers | 3.052 s | 2.388 s (4 nodes) | Chimaera |
+| 32 MiB array passed straight to 128 calls | 3.074 s | 2.229 s | Chimaera |
+| 10 calls on a 256 MiB value just made | 1.097 s | 0.386 s | Chimaera |
+| Actor calls, 32 actors on 4 hosts | 11,239/s | 4,688/s | Ray, 2.4x |
+| Nested tasks, 256 parents | 3.318 s | 1.715 s | Chimaera |
+| Shuffle, 3.2M pairs | 1.493 s | 0.620 s | Chimaera |
+| A node killed under 256 one-second tasks | 8.686 s | 6.470 s | Chimaera |
+
+Per-call throughput rose 6–10x but is still behind Ray across machines. A
+3.5 ms fsync injected on three laptop peers does not reproduce the gap (they
+still run 8–13k calls/s), so the next run recorded per-peer CPU and repeated
+tasks and actor calls with raft fsync off (job
+`prodjob_hrjyprp6y491c2sct9lmq7455f`, same machines, single samples):
+
+| Workload | Ray | Chimaera, fsync per commit | Chimaera, replicas only |
+|---|---:|---:|---:|
+| Independent no-op tasks | 7,228/s | 2,681/s | 17,547/s |
+| Actor calls, 32 actors on 4 hosts | 10,700/s | 3,820/s | 18,687/s |
+
+With fsync the busiest peer used 0.3 cores: every peer was waiting on the
+volume (an fsync costs about 3.5 ms there). Without it the busiest used 2.0.
+Every other workload in that run favored Chimaera: CPU scaling 0.703 vs 0.675,
+naive map 201,882 vs 7,294 items/s, broadcast 1.19 vs 3.00 s (4 nodes
+reached), large argument 0.088 vs 3.101 s, follow-input 0.403 vs 1.177 s,
+nested 2.094 vs 3.350 s, shuffle 0.655 vs 1.561 s, node loss 6.42 vs 9.38 s.
+
+Peers now choose: fsync where it costs under a millisecond, replicas only on
+slower volumes, and a peer that ran unsynced and whose machine rebooted
+without a clean shutdown rejoins under a new identity
+(`crates/chimaera-peer/src/durability.rs`; `test_cluster.py::
+test_an_unsynced_peer_whose_machine_rebooted_rejoins_as_a_new_member`, which
+also caught a starting peer being declared dead while its core was not yet
+answering pings, and a dead identity kept alive by a new one answering at its
+address).
 
 ## Smart defaults: learned reservations, memory, large values
 
@@ -178,7 +219,9 @@ was shared with other builds and test runs during these measurements.
 | Nested calls do not deadlock on a small pool | pass (local) | `test_memory.py`: 6 parents × 3 children under 512 MiB |
 | A leaking worker is replaced | pass (local) | `test_memory.py`: 40 MiB leaked per call; the worker changes and a `leaks` decision is recorded |
 | Memory the allocator kept after frees goes back before the leak check | pass (Linux container) | `test_memory.py::test_memory_a_call_freed_goes_back_to_the_system`: 400k 1 KiB blocks with every 50th kept leave the worker at 423 MiB without `malloc_trim`, under 200 MiB with it; fails with the trim disabled |
+| NumPy arrays in the Linux arena count toward memory | pass (Linux container) | Arrays allocated as tmpfs files (`.arena/<pid>`) are not private memory: each worker is charged its arena files, the plane's pre-zeroed reserve counts as object memory, and the leak check counts shared memory held past the arena's 256 MiB reuse cache. `test_memory.py` actor charge (300 MiB actor was charged 81 MiB before) and leak tests; `test_values.py` stored-once now counts files by inode, since the arena links one file under a name per use |
 | A call queued at an actor whose method waits says how to overlap them | pass (local) | `test_learning.py`: after 12 calls of a 100 ms sleep, a call behind 25 others suggests `@ch.method(concurrency=N) on fetch`. Every call of a batch now counts toward its function's profile (at most 64 per batch), not only the last |
+| New calls wait when the objects' disk is nearly full | pass (unit; Linux container) | `budget.rs` test; on a 700 MiB tmpfs object directory with 399 MiB free, a new call waited with "the filesystem holding objects (...) has 399 MiB free; new calls wait for room" while the running one finished |
 | A full disk is named in the error | pass (local, unit) | `test_values.py::test_a_full_disk_is_named_in_the_error`; objects are now written natively (`chimaera-py/src/objects.rs`), which owns removing a partial file on failure |
 | A memory or CPU limit on a parent cgroup is honored | pass (unit) | `topology.rs::chain_tests`: the pool, CPU capacity and available memory take the tightest limit from the process's cgroup up to the root (systemd slices and some runtimes leave the process's own cgroup unlimited) |
 | A local peer running an older binary is reported | pass (local) | `test_defaults.py::test_a_program_warns_when_the_local_peer_runs_another_binary`: the peer records its binary (path, size, mtime) at start; a program that would start a different one warns CH111 |

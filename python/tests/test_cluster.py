@@ -321,13 +321,44 @@ print("EXACT", values == list(range(400)))
 """,
         )
         time.sleep(1.0)
-        c.signal(1, signal.SIGSTOP)  # long enough to be declared dead and retired
-        time.sleep(6)
+        c.signal(1, signal.SIGSTOP)  # past the 6 s suspicion floor: declared dead and retired
+        time.sleep(10)
         c.signal(1, signal.SIGCONT)
         out, err = driver.communicate(timeout=300)
         assert driver.returncode == 0, out[-2000:] + err[-3000:]
         assert "EXACT True" in out
         assert "retiring it" in c.log(0) + c.log(2), "the pause should have retired peer 1's incarnation"
+    finally:
+        c.close()
+
+
+def test_a_briefly_stalled_peer_is_not_retired():
+    # Overloaded is not dead: a peer that stops answering for a few seconds
+    # (paging, a saturated disk) keeps its incarnation, and its clients with it.
+    c = Cluster(3)
+    try:
+        driver = c.driver(
+            1,
+            WHERE
+            + """
+@ch.remote
+def work(i):
+    time.sleep(0.1)
+    return i
+
+futs = [work.remote(i) for i in range(200)]
+values = ch.gather(*futs, timeout=300)
+print("EXACT", values == list(range(200)))
+""",
+        )
+        time.sleep(1.0)
+        c.signal(1, signal.SIGSTOP)  # the driver's own peer
+        time.sleep(3)
+        c.signal(1, signal.SIGCONT)
+        out, err = driver.communicate(timeout=300)
+        assert driver.returncode == 0, out[-2000:] + err[-3000:]
+        assert "EXACT True" in out
+        assert "retiring it" not in c.log(0) + c.log(2), "a 3 s stall must not retire the peer"
     finally:
         c.close()
 
@@ -358,6 +389,40 @@ print("SUM", sum(ch.gather(*(add.remote(i, i) for i in range(50)), timeout=120))
             timeout=180,
         )
         assert lines(out, "SUM") == [str(sum(2 * i for i in range(50)))]
+    finally:
+        c.close()
+
+
+@pytest.mark.slow
+def test_an_unsynced_peer_whose_machine_rebooted_rejoins_as_a_new_member(monkeypatch):
+    # Without fsync a voter's log lives in the page cache: after a reboot it
+    # may have forgotten its vote, so it must not vote again under its old id.
+    monkeypatch.setenv("CHIMAERA_RAFT_SYNC", "none")
+    c = Cluster(3, spares=1)
+    add = """
+import chimaera as ch
+
+@ch.remote
+def add(a, b):
+    return a + b
+
+print("SUM", sum(ch.gather(*(add.remote(i, i) for i in range(60)), timeout=120)))
+"""
+    try:
+        assert lines(c.run(0, add), "SUM") == [str(sum(2 * i for i in range(60)))]
+        c.signal(2, signal.SIGKILL)
+        marker = os.path.join(c.dir(2), "raft-boot")
+        boot, *rest = open(marker).read().splitlines()
+        assert rest == ["unsynced", "running"], rest
+        with open(marker, "w") as f:  # as if the machine had rebooted since
+            f.write("\n".join(["another-boot", *rest]) + "\n")
+        old_id = open(os.path.join(c.dir(2), "peer-id")).read()
+        c.start(2)
+        c.wait_ready([2])
+        assert "joining again as a new member" in c.log(2)
+        assert open(os.path.join(c.dir(2), "peer-id")).read() != old_id
+        # The cluster keeps serving, through the rejoined peer too.
+        assert lines(c.run(2, add, timeout=180), "SUM") == [str(sum(2 * i for i in range(60)))]
     finally:
         c.close()
 

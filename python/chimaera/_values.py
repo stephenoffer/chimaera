@@ -175,6 +175,32 @@ def store(value: Any, run: bytes, sink: LocalBlobSink, inline_limit: int) -> tup
     return object_id, None, size, []
 
 
+# (run dir, inode) -> the first blob id an arena array was claimed under.
+_first_claims: dict[tuple[str, int], bytes] = {}
+
+
+def _same_claim(run_dir: str, claimed: tuple[bytes, int]) -> tuple[bytes, int]:
+    """An arena array passed again unchanged links the same file (a changed
+    one is not claimed at all): reuse the name it got first, so other peers
+    see one object and fetch it once instead of once per call."""
+    blob, off = claimed
+    path = os.path.join(run_dir, blob.hex())
+    try:
+        inode = os.stat(path).st_ino
+    except OSError:
+        return claimed
+    first = _first_claims.get((run_dir, inode))
+    if first is not None and first != blob:
+        try:
+            if os.stat(os.path.join(run_dir, first.hex())).st_ino == inode:
+                os.unlink(path)
+                return first, off
+        except OSError:
+            pass  # the first name is gone: this one becomes the first
+    _first_claims[(run_dir, inode)] = blob
+    return claimed
+
+
 def encode_frame(frame: tuple[tuple[Any, ...], dict[str, Any]], run: bytes, sink: LocalBlobSink) -> Encoded:
     """Encode `(args, kwargs)`, moving large buffers and arguments into blobs."""
     t0 = time.perf_counter()
@@ -188,6 +214,7 @@ def encode_frame(frame: tuple[tuple[Any, ...], dict[str, Any]], run: bytes, sink
         if local_dir is not None:
             claimed = _objects.claim(view, local_dir)  # an arena array: linked, not hashed or copied
             if claimed is not None:
+                claimed = _same_claim(local_dir, claimed)
                 blobs[claimed[0]] = view.nbytes
                 return claimed
         bid = blob_id_of(view)

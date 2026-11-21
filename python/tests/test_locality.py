@@ -112,3 +112,35 @@ print("RESERVED", f.explain()["attempts"][-1]["reservation"])
     )
     reservation = lines(second, "RESERVED")[0]
     assert "learned" in reservation, f"peer 2 never ran it, so this came from peer 0: {reservation}"
+
+
+def test_readers_spread_to_other_peers_once_the_holder_is_busy(zoned):
+    # Following an input is right until its holder's queue costs more than
+    # moving the input once to another peer. The same 36 readers of 0.2 s,
+    # kept on the holder, are the yardstick (both runs see the same load).
+    out = zoned.run(
+        0,
+        WHERE
+        + """
+import numpy as np
+
+@ch.remote
+def read(a):
+    time.sleep(0.2)
+    return peer_name()
+
+v = ch.put(np.ones(64 * 2**20 // 8))
+read.remote(v).result(timeout=60)  # its duration is learned
+held = read.options(placement=ch.Placement(require={"zone": "a"}))
+t = time.perf_counter()
+ch.gather(*[held.remote(v) for _ in range(36)], timeout=120)
+print("PINNED", time.perf_counter() - t)
+t = time.perf_counter()
+ran = ch.gather(*[read.remote(v) for _ in range(36)], timeout=120)
+print("FREE", time.perf_counter() - t)
+print("PEERS", len(set(ran)))
+""",
+    )
+    assert int(lines(out, "PEERS")[0]) >= 2, out.stdout
+    pinned, free = float(lines(out, "PINNED")[0]), float(lines(out, "FREE")[0])
+    assert free < 0.8 * pinned, f"spreading should beat staying on the holder: {free:.2f}s vs {pinned:.2f}s"

@@ -52,6 +52,29 @@ def _pad(n: int) -> int:
     return (-n) % _ALIGN
 
 
+class _MainRefused(pickle.PicklingError):
+    pass
+
+
+class _Pickler(pickle.Pickler):
+    """The standard pickler, refusing classes and functions of ``__main__``:
+    by reference, ``__main__.X`` names the driver's script (or a notebook's
+    namespace), which the worker does not have, so cloudpickle ships those by
+    value. Checked as objects are pickled, which costs nothing for the plain
+    types pickle never asks about (and so never scans a large pickle)."""
+
+    def reducer_override(self, obj: Any) -> Any:
+        if isinstance(obj, (type, types.FunctionType)) and getattr(obj, "__module__", None) == "__main__":
+            raise _MainRefused("refers to __main__")
+        return NotImplemented
+
+
+# Containers at least this long are checked for plain data (see plain_tree).
+_FAST_MIN = 1024
+_ATOMS = (bytes, bytearray, str, int, float, bool, type(None))
+_plain = getattr(_native, "plain_tree", lambda _: False)  # absent from older builds
+
+
 def _pickle(value: Any, pickler_cls: type, buffer_callback: Callable[[pickle.PickleBuffer], bool]) -> bytes:
     from ._values import torch_reducers
 
@@ -60,8 +83,28 @@ def _pickle(value: Any, pickler_cls: type, buffer_callback: Callable[[pickle.Pic
     extra = torch_reducers()
     if extra:
         p.dispatch_table = {**copyreg.dispatch_table, **getattr(p, "dispatch_table", {}), **extra}
+    if (
+        pickler_cls is _Pickler
+        and type(value) in (dict, list, tuple)
+        and len(value) >= _FAST_MIN
+        and _plain(value)
+    ):
+        # Plain data with no shared containers: the memo would change nothing
+        # but cost most of the time (6x for a dict of a million strings).
+        p.fast = True
     p.dump(value)
     return f.getvalue()
+
+
+def _big_bytes(b: bytes | bytearray) -> Any:
+    """A large top-level bytes value pickled out of band (pickle always copies
+    bytes into the stream): its buffer goes straight into the object file."""
+
+    class Reduced:
+        def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
+            return (type(b), (pickle.PickleBuffer(b),))
+
+    return Reduced()
 
 
 def dumps_parts(
@@ -73,6 +116,14 @@ def dumps_parts(
     (blob id, offset of the buffer in that blob); it stores the bytes itself.
     Claimed buffers are referenced, not copied.
     """
+    t = type(value)
+    if t in _ATOMS or (t in (list, tuple, dict) and len(value) < _FAST_MIN and _plain(value)):
+        if t not in (bytes, bytearray, str) or len(value) < _OOB_MIN:
+            # Small plain data: no buffers to move and nothing from __main__,
+            # so the stock pickler's one call does (about 3x less overhead).
+            main = pickle.dumps(value, protocol=5)
+            head = _HEAD.pack(MAGIC, 0, 0, 0, len(main))
+            return [head, b"\0" * _pad(len(head)), main], len(head) + _pad(len(head)) + len(main), 0
     buffers: list[tuple[memoryview, bytes, int]] = []
 
     def keep(buf: pickle.PickleBuffer) -> bool:
@@ -86,14 +137,10 @@ def dumps_parts(
             buffers.append((raw, blob or _NO_BLOB, 0))
         return False
 
+    if type(value) in (bytes, bytearray) and len(value) >= _OOB_MIN:
+        value = _big_bytes(value)
     try:
-        main = _pickle(value, pickle.Pickler, keep)
-        if b"__main__" in main:
-            # By reference, `__main__.X` names the driver's script (or a
-            # notebook's namespace), which the worker does not have: cloudpickle
-            # ships such classes and functions by value. A value that merely
-            # contains the text costs one extra pass.
-            raise pickle.PicklingError("refers to __main__")
+        main = _pickle(value, _Pickler, keep)
     except (pickle.PicklingError, AttributeError, TypeError):
         buffers.clear()  # the failed attempt may have kept some already
         main = _pickle(value, cloudpickle.Pickler, keep)

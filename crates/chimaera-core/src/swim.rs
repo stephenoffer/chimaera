@@ -57,11 +57,15 @@ pub struct Config {
     pub retransmit: u32,
     /// Updates carried by one message.
     pub piggyback: usize,
+    /// Suspicion never runs out sooner than this: a peer that is alive but
+    /// stalled (paging, a long collection, a saturated disk) is not dead.
+    /// A process known to be gone is declared dead with `fail` instead.
+    pub suspicion_floor_ms: u64,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { period_ms: 1000, indirect: 3, suspicion: 4, retransmit: 4, piggyback: 8 }
+        Config { period_ms: 1000, indirect: 3, suspicion: 4, retransmit: 4, piggyback: 8, suspicion_floor_ms: 0 }
     }
 }
 
@@ -258,7 +262,7 @@ impl Swim {
 
     fn suspicion_ms(&self) -> u64 {
         let n = (self.members.len() as f64 + 1.0).max(10.0);
-        (self.cfg.suspicion as f64 * n.log10() * self.cfg.period_ms as f64) as u64
+        ((self.cfg.suspicion as f64 * n.log10() * self.cfg.period_ms as f64) as u64).max(self.cfg.suspicion_floor_ms)
     }
 
     fn spread(&mut self, u: Update) {
@@ -452,6 +456,16 @@ impl Swim {
         }
         if m.state == State::Alive {
             self.set(now_ms, Update { node: target, inc: m.inc, state: State::Suspect });
+        }
+    }
+
+    /// Declare `node` dead now, without waiting out suspicion: the caller
+    /// knows its process is gone (its port refuses connections).
+    pub fn fail(&mut self, now_ms: u64, node: u64) {
+        if let Some(m) = self.members.get(&node)
+            && m.state != State::Dead
+        {
+            self.set(now_ms, Update { node, inc: m.inc, state: State::Dead });
         }
     }
 
@@ -689,5 +703,21 @@ mod tests {
         // A member first heard of through gossip is news, and is passed on.
         a.merge(10, &[Update { node: 900, inc: 1, state: State::Alive }]);
         assert!(a.outgoing().iter().any(|u| u.node == 900 && u.state == State::Alive));
+    }
+
+    #[test]
+    fn a_stalled_member_outlives_the_floor_and_a_gone_one_fails_at_once() {
+        let cfg = Config { period_ms: 300, suspicion_floor_ms: 6_000, ..Config::default() };
+        let mut a = Swim::new(1, 1, 3, cfg);
+        a.add(0, 2, 1);
+        a.add(0, 3, 1);
+        a.probed(0, 2, false);
+        a.expire(5_000);
+        assert_eq!(a.state_of(2), Some((1, State::Suspect)), "5 s of silence is a stall, not a death");
+        a.expire(6_000);
+        assert_eq!(a.state_of(2), Some((1, State::Dead)));
+        a.fail(6_100, 3);
+        assert_eq!(a.state_of(3), Some((1, State::Dead)), "refused connections: dead now");
+        assert!(a.outgoing().iter().any(|u| u.node == 3 && u.state == State::Dead), "and everyone is told");
     }
 }

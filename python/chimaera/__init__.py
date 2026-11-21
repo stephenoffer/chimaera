@@ -12,7 +12,7 @@
 
 from ._context import context
 from ._devices import device, devices
-from ._gang import Gang, GangActor, GangFailed, Group
+from ._gang import Gang, GangActor, GangFailed, Group, GroupHandle, group
 from ._reserve import Reservation, reserve
 from ._errors import (
     ActorDied,
@@ -38,7 +38,7 @@ from ._errors import (
     WorkerCrashed,
     WorkflowDivergence,
 )
-from ._future import Future, ObjectRef, Outcome, Results, Stream, as_completed, gather, put
+from ._future import Future, ObjectRef, Outcome, Results, Stream, as_completed, gather, handles, put
 from ._batch import Batch
 from ._options import Placement, State, auto, options
 from ._remote import Actor, ActorClass, Pool, RemoteFunction, actor, method, remote
@@ -109,6 +109,7 @@ __all__ = [
     "GangActor",
     "GangFailed",
     "Group",
+    "GroupHandle",
     "Infeasible",
     "InfrastructureFailure",
     "LeaseLost",
@@ -142,6 +143,7 @@ __all__ = [
     "WorkflowDivergence",
     "actor",
     "as_completed",
+    "handles",
     "attach",
     "auto",
     "cluster",
@@ -151,6 +153,7 @@ __all__ = [
     "devices",
     "ext",
     "gather",
+    "group",
     "init",
     "map",
     "method",

@@ -68,12 +68,16 @@ def fmt(s: float | None) -> str:
 def report(out: str) -> str:
     rows = [json.loads(ln) for ln in open(os.path.join(out, "results.jsonl"))]
     table: dict[tuple, dict[str, dict]] = defaultdict(dict)
+    checks: dict[tuple, dict[str, str]] = defaultdict(dict)
     failures = []
     for r in rows:
         if "failed" in r:
             failures.append(r)
             continue
         if "op" not in r:
+            continue
+        if "result" in r:
+            checks[(r["kind"], r["size"], r["op"])][r["runtime"]] = str(r["result"])
             continue
         table[(r["scenario"], r["kind"], r["size"], r["op"])][r["runtime"]] = r
     lines = ["| scenario | type | size | op | Ray | Chimaera | speedup |", "|---|---|---|---|---:|---:|---:|"]
@@ -97,6 +101,10 @@ def report(out: str) -> str:
                       f"{os.cpu_count()} CPUs. Speedup = Ray time / Chimaera time (above 1: Chimaera faster). "
                       "Times are medians; `return`/`pipeline` rows subtract the same call carrying None.", "",
                       "## Summary", "", *summary, "", "## All rows", "", *lines])
+    if checks:
+        text += "\n\n## Usability checks\n\n| check | Ray | Chimaera |\n|---|---|---|\n" + "\n".join(
+            f"| {op} ({kind} {size}) | {v.get('ray', '-')} | {v.get('chimaera', '-')} |"
+            for (kind, size, op), v in checks.items())
     if failures:
         text += "\n\n## Failures\n\n" + "\n".join(f"- {f['runtime']} {f['scenario']}: exit {f['failed']}: "
                                                    f"`{f['stderr'][-400:]}`" for f in failures)

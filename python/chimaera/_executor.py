@@ -134,6 +134,9 @@ class Executor:
         self.credit_cond = threading.Condition()
         self.lanes: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
         self.batchers: dict[str, _batch.Batcher | None] = {}  # @ch.method(batch=...) methods
+        # The actor class's lane limits, computed once: scanning the class costs
+        # more than the rest of a small call (see lane).
+        self.lane_limits: dict[type, dict[str, int]] = {}
         # While a batch runs: starts its next call when the current one waits.
         self.on_block: Any = None
         self.running: dict[bytes, _context.TaskContext] = {}
@@ -167,7 +170,7 @@ class Executor:
         frame_args, frame_kwargs = self.value(args_ref)
         resolved: dict[int, Any] = {}
 
-        def sub(x: Any) -> Any:
+        def one(x: Any) -> Any:
             if isinstance(x, _future.PartDep):
                 if x.dep not in resolved:
                     resolved[x.dep] = self.value(deps[x.dep])
@@ -177,6 +180,17 @@ class Executor:
                     resolved[x.index] = self.value(deps[x.index])
                 return resolved[x.index]
             return x
+
+        placeholder = (Dep, _future.PartDep)
+
+        def sub(x: Any) -> Any:
+            # One level inside list, tuple and dict values, as build_call puts them.
+            kind = type(x)
+            if deps and (kind is list or kind is tuple) and any(isinstance(e, placeholder) for e in x):
+                return kind(one(e) for e in x)
+            if deps and kind is dict and any(isinstance(v, placeholder) for v in x.values()):
+                return {k: one(v) for k, v in x.items()}
+            return one(x)
 
         return tuple(sub(a) for a in frame_args), {k: sub(v) for k, v in frame_kwargs.items()}
 
@@ -407,7 +421,9 @@ class Executor:
 
         total = int(msg["policy"].get("concurrency") or 1)
         cls = type(self.instance)
-        limits = _lane_limits(cls)
+        limits = self.lane_limits.get(cls)
+        if limits is None:
+            limits = self.lane_limits[cls] = _lane_limits(cls)
         if not limits and total == 1:
             return None
         declared = getattr(getattr(cls, msg["method"], None), "__chimaera_method__", None) or {}

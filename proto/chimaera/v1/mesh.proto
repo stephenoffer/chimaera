@@ -32,7 +32,20 @@ service Mesh {
   rpc PutCode(MeshPutCode) returns (PutCodeReply);
   // Output of calls that ran on the sender, for the run's home peer.
   rpc PushLogs(PushLogsRequest) returns (PushLogsReply);
+  // Keep a copy of an object the sender just stored (on the target's disk),
+  // so the object outlives the sender. Answered at once; the copy follows.
+  rpc Replicate(ReplicateRequest) returns (ReplicateReply);
 }
+
+message ReplicateRequest {
+  string cluster = 1;
+  bytes run = 2;
+  bytes object_id = 3;
+  uint64 size = 4;
+  uint64 from_node = 5;  // the sender, which holds the object
+}
+
+message ReplicateReply {}
 
 message PushLogsRequest {
   string cluster = 1;
@@ -164,6 +177,7 @@ message FetchChunk {
   bytes data = 1;
   uint64 total = 2;      // set on the first chunk: bytes in the requested range
   bytes checksum = 3;    // blake3 of `data`, first 16 bytes
+  uint64 object_size = 4;  // set on the first chunk: the whole object's size
 }
 
 message WatchRequest {

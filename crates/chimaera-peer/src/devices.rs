@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chimaera_core::devices::{
-    Device, Inventory, Kind, Selector, SysFs, discover_cuda, discover_rocm, discover_tpu, mps_device, visibility_env,
+    Device, Inventory, Kind, Selector, SysFs, discover_cuda, discover_hpu, discover_neuron, discover_rocm,
+    discover_tpu, discover_xpu, mps_device, visibility_env,
 };
 
 /// The host filesystem under `root`, read as absolute paths.
@@ -57,7 +58,8 @@ impl SysFs for HostFs {
 pub fn discover(root: &Path, env: &BTreeMap<String, String>) -> Inventory {
     let fs = HostFs::new(root);
     let mut inv = Inventory::default();
-    for part in [discover_cuda(&fs, env), discover_rocm(&fs, env), discover_tpu(&fs, env)] {
+    let parts = [discover_cuda, discover_rocm, discover_tpu, discover_neuron, discover_hpu, discover_xpu];
+    for part in parts.map(|discover| discover(&fs, env)) {
         inv.devices.extend(part.devices);
         inv.links.extend(part.links);
         inv.domain = inv.domain.or(part.domain);
@@ -379,6 +381,26 @@ mod tests {
         let cpu: BTreeMap<_, _> = grant_env(&inv, &[]).into_iter().collect();
         assert_eq!(cpu["CUDA_VISIBLE_DEVICES"].as_deref(), Some(""), "a CPU call sees no GPU");
         assert_eq!(cpu["CHIMAERA_DEVICES"].as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn an_intel_and_a_gaudi_grant_name_their_cards_the_way_their_runtimes_count() {
+        let root = fixture("intel-max1550-igpu");
+        let mut devs = Devices::new(discover(&root, &BTreeMap::new()));
+        // Two Max 1550s; the integrated GPU is never granted.
+        assert!(matches!(devs.key_for(3.0, "xpu", "py|1"), Want::Infeasible(_)));
+        let Want::Key(key) = devs.key_for(1.0, "", "py|1") else { panic!() };
+        devs.hold(1, &key);
+        let env: BTreeMap<_, _> = devs.env_for_key(&key).into_iter().collect();
+        assert_eq!(env["ZE_AFFINITY_MASK"].as_deref(), Some("1"), "Level Zero's ordinal, counting the integrated GPU");
+        assert_eq!(env["ZE_FLAT_DEVICE_HIERARCHY"].as_deref(), Some("COMPOSITE"));
+        assert!(env["CHIMAERA_DEVICES"].as_deref().unwrap().contains("\"torch\":\"xpu:0\""));
+
+        let root = fixture("gaudi2");
+        let inv = discover(&root, &BTreeMap::new());
+        let env: BTreeMap<_, _> = grant_env(&inv, &inv.devices[1..]).into_iter().collect();
+        assert_eq!(env["HABANA_VISIBLE_MODULES"].as_deref(), Some("5"));
+        assert!(env["CHIMAERA_DEVICES"].as_deref().unwrap().contains("\"torch\":\"hpu\""));
     }
 
     #[test]

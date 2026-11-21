@@ -232,8 +232,69 @@ fn visibility_env_for_the_other_kinds() {
     assert_eq!(visibility_env(Kind::Hpu, &[&a, &b], 8), set(&[("HABANA_VISIBLE_MODULES", Some("3,1"))]));
     assert_eq!(visibility_env(Kind::Hpu, &[], 8), set(&[("HABANA_VISIBLE_MODULES", Some(""))]));
     let a = unit(Kind::Xpu, 2, None);
-    assert_eq!(visibility_env(Kind::Xpu, &[&a], 4), set(&[("ZE_AFFINITY_MASK", Some("2"))]));
-    assert_eq!(visibility_env(Kind::Xpu, &[], 4), set(&[("ZE_AFFINITY_MASK", Some(""))]));
+    let xpu = |mask| {
+        set(&[
+            ("ZE_AFFINITY_MASK", Some(mask)),
+            ("ZE_ENABLE_PCI_ID_DEVICE_ORDER", Some("1")),
+            ("ZE_FLAT_DEVICE_HIERARCHY", Some("COMPOSITE")),
+            ("ONEAPI_DEVICE_SELECTOR", None),
+        ])
+    };
+    assert_eq!(visibility_env(Kind::Xpu, &[&a], 4), xpu("2"));
+    assert_eq!(visibility_env(Kind::Xpu, &[], 4), xpu(""));
     let mps = mps_device("arm64", "Apple M3 Max", 1 << 30).unwrap();
     assert!(visibility_env(Kind::Mps, &[&mps], 1).is_empty());
+}
+
+#[test]
+fn neuron_cores_of_the_mounted_devices_pair_up_on_trn2() {
+    let fs = Fixture::new("neuron-trn2-pod");
+    let inv = discover_neuron(&fs, &BTreeMap::new());
+    // neuron1 is on the host but not mounted; 8 physical cores pair into 4 logical ones.
+    assert_eq!(
+        ids(&inv),
+        ["neuron0:0", "neuron0:1", "neuron0:2", "neuron0:3", "neuron2:0", "neuron2:1", "neuron2:2", "neuron2:3"]
+    );
+    assert_eq!(indices(&inv), (0..8).collect::<Vec<_>>());
+    let d = &inv.devices[5];
+    assert_eq!((d.kind, d.model.as_str(), d.name.as_str()), (Kind::Neuron, "trn2", "Trainium2"));
+    assert_eq!((d.memory_bytes, d.labels["device"].as_str()), (24 << 30, "2"));
+    assert_eq!(discover_neuron(&fs, &env(&[("NEURON_LOGICAL_NC_CONFIG", "1")])).devices.len(), 16);
+    // An inherited core list (ranges too) narrows without renumbering: a grant's list replaces it.
+    let narrowed = discover_neuron(&fs, &env(&[("NEURON_RT_VISIBLE_CORES", "1-2,6")]));
+    assert_eq!((ids(&narrowed), indices(&narrowed)), (vec!["neuron0:1", "neuron0:2", "neuron2:2"], vec![1, 2, 6]));
+    assert!(discover_neuron(&fs, &env(&[("NEURON_RT_VISIBLE_CORES", "")])).devices.is_empty());
+}
+
+#[test]
+fn gaudi_cards_are_usable_mounted_habana_ones_in_module_order() {
+    let fs = Fixture::new("gaudi2");
+    let inv = discover_hpu(&fs, &BTreeMap::new());
+    // accel2 needs a reset, accel3 is not mounted, accel4 is an Intel NPU.
+    assert_eq!(ids(&inv), ["hpu:4", "hpu:5"]);
+    assert_eq!(indices(&inv), [0, 1]);
+    let d = &inv.devices[0];
+    assert_eq!((d.model.as_str(), d.name.as_str(), d.numa), ("gaudi2", "GAUDI2", Some(0)));
+    assert_eq!(d.labels["pci"], "0000:1a:00.0");
+    let one = discover_hpu(&fs, &env(&[("HABANA_VISIBLE_MODULES", "5,7")]));
+    assert_eq!(ids(&one), ["hpu:5"]);
+    let grant: Vec<&Device> = one.devices.iter().collect();
+    assert_eq!(visibility_env(Kind::Hpu, &grant, 2), set(&[("HABANA_VISIBLE_MODULES", Some("5"))]));
+    assert!(Selector::parse("hpu:gaudi2").unwrap().matches(d));
+}
+
+#[test]
+fn intel_cards_are_numbered_in_pci_order_and_the_integrated_gpu_is_skipped() {
+    let fs = Fixture::new("intel-max1550-igpu");
+    let inv = discover_xpu(&fs, &BTreeMap::new());
+    // Level Zero numbers the integrated GPU (00:02.0) 0; renderD132 is not mounted; renderD131 is AMD.
+    assert_eq!(ids(&inv), ["xpu:0000:29:00.0", "xpu:0000:9a:00.0"]);
+    assert_eq!(indices(&inv), [1, 2]);
+    assert_eq!((inv.devices[0].model.as_str(), inv.devices[0].numa), ("Max 1550", Some(0)));
+    assert!(Selector::parse("xpu:max").unwrap().matches(&inv.devices[1]));
+    // An inherited mask by card or by tile keeps the card and its ordinal.
+    for mask in ["2", "2.0,2.1"] {
+        let narrowed = discover_xpu(&fs, &env(&[("ZE_AFFINITY_MASK", mask)]));
+        assert_eq!((ids(&narrowed), indices(&narrowed)), (vec!["xpu:0000:9a:00.0"], vec![2]));
+    }
 }

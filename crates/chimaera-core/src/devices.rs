@@ -10,9 +10,9 @@
 //!
 //! Every vendor fact here except CUDA's documented `CUDA_VISIBLE_DEVICES=""`
 //! (hides every GPU) is unverified on hardware here. The TPU and Intel
-//! environment rules follow Ray 2.60's accelerator managers. Neuron, Gaudi
-//! (`hpu`) and Intel (`xpu`) discovery is not in this phase; Ray reads those
-//! from vendor tools.
+//! environment rules follow Ray 2.60's accelerator managers. Ray finds Neuron,
+//! Gaudi (`hpu`) and Intel (`xpu`) devices with vendor tools; here they are
+//! read from the files their drivers document, also unverified on hardware.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -267,7 +267,14 @@ pub fn visibility_env(kind: Kind, granted: &[&Device], on_host: usize) -> Vec<(&
             "HABANA_VISIBLE_MODULES",
             list(&|d| d.labels.get("module_id").cloned().unwrap_or_else(|| d.index.to_string())),
         )],
-        Kind::Xpu => vec![("ZE_AFFINITY_MASK", indices)],
+        // Card ordinals in PCI order, one device per card (see `discover_xpu`);
+        // a SYCL-level selector would filter again on top of the mask.
+        Kind::Xpu => vec![
+            ("ZE_AFFINITY_MASK", indices),
+            ("ZE_ENABLE_PCI_ID_DEVICE_ORDER", Some("1".to_string())),
+            ("ZE_FLAT_DEVICE_HIERARCHY", Some("COMPOSITE".to_string())),
+            ("ONEAPI_DEVICE_SELECTOR", None),
+        ],
         // One device that cannot be hidden.
         Kind::Mps => Vec::new(),
     }
@@ -486,6 +493,189 @@ pub fn discover_tpu(fs: &dyn SysFs, env: &BTreeMap<String, String>) -> Inventory
         })
         .collect();
     Inventory { devices, links: Vec::new(), domain: env.get("TPU_NAME").cloned() }
+}
+
+/// A sysfs PCI id file such as `vendor` (`0x1da3`).
+fn pci_id(fs: &dyn SysFs, path: &str) -> Option<u64> {
+    u64::from_str_radix(fs.read(path)?.trim().trim_start_matches("0x"), 16).ok()
+}
+
+/// `0-3,8` → `0,1,2,3,8`; other entries stay as they are.
+fn expand_ranges(list: &str) -> String {
+    let range = |e: &str| {
+        let (a, b) = e.split_once('-')?;
+        Some(a.trim().parse::<u32>().ok()?..=b.trim().parse::<u32>().ok()?)
+    };
+    let entries = list.split(',').map(str::trim);
+    entries
+        .flat_map(|e| range(e).map_or_else(|| vec![e.to_string()], |r| r.map(|i| i.to_string()).collect()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+const NEURON: &str = "/sys/devices/virtual/neuron_device";
+
+/// AWS Neuron NeuronCores (the unit, as Ray counts them): each
+/// `neuron_device/neuron<N>` with a `/dev/neuron<N>` node, split into its
+/// cores. `core_count` is physical; Trn2 and Trn3 pair them into logical cores
+/// by default (`NEURON_LOGICAL_NC_CONFIG`, 1 or 2), and then a logical core is
+/// the unit. Cores are numbered across the kept devices in device order, then
+/// narrowed by an inherited `NEURON_RT_VISIBLE_CORES` (indices or `a-b`
+/// ranges) without renumbering, because a grant's own list replaces it. The
+/// model is the instance family (`info/architecture/instance_type`, `trn2`);
+/// memory is the device's HBM (`neuron_soc/hbm_capacity`, GiB) over its cores.
+pub fn discover_neuron(fs: &dyn SysFs, env: &BTreeMap<String, String>) -> Inventory {
+    let mut numbers: Vec<u32> = fs.list(NEURON).iter().filter_map(|d| d.strip_prefix("neuron")?.parse().ok()).collect();
+    numbers.sort_unstable();
+    let hbm = fs.read("/sys/class/neuron_device/neuron_soc/hbm_capacity").and_then(|g| g.trim().parse::<u64>().ok());
+    let mut cores = Vec::new();
+    for n in numbers.into_iter().filter(|n| fs.exists(&format!("/dev/neuron{n}"))) {
+        let read = |file: &str| fs.read(&format!("{NEURON}/neuron{n}/{file}")).unwrap_or_default().trim().to_string();
+        let family = read("info/architecture/instance_type").to_ascii_lowercase();
+        let family = family.split('.').next().unwrap_or_default().to_string();
+        let pairs = match env.get("NEURON_LOGICAL_NC_CONFIG").map(|v| v.trim()) {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ if family.starts_with("trn2") || family.starts_with("trn3") => 2,
+            _ => 1,
+        };
+        let logical = read("core_count").parse::<u64>().unwrap_or(0) / pairs;
+        let name = read("info/architecture/device_name");
+        for core in 0..logical {
+            cores.push(Device {
+                kind: Kind::Neuron,
+                id: format!("neuron{n}:{core}"),
+                index: 0,
+                model: if family.is_empty() { name.to_ascii_lowercase() } else { family.clone() },
+                name: name.clone(),
+                memory_bytes: hbm.map_or(0, |gib| (gib << 30) / logical),
+                numa: None,
+                labels: BTreeMap::from([("device".to_string(), n.to_string())]),
+            });
+        }
+    }
+    let visible = env.get("NEURON_RT_VISIBLE_CORES").map(|v| expand_ranges(v));
+    Inventory { devices: inherited(numbered(cores), visible.as_ref()), ..Inventory::default() }
+}
+
+/// Habana PCI device id → model, from the pciutils `pci.ids` database.
+const HABANA_MODELS: [(u64, &str); 5] =
+    [(0x1000, "gaudi"), (0x1010, "gaudi"), (0x1020, "gaudi2"), (0x1060, "gaudi3"), (0x1063, "gaudi3")];
+
+/// Habana Gaudi cards: `/sys/class/accel/accel<N>` entries whose PCI vendor
+/// is Habana (0x1da3), kept only if `/dev/accel/accel<N>` exists and the
+/// driver's `status` (when it has one) is `operational`. They are ordered by
+/// `module_id` (what `HABANA_VISIBLE_MODULES` lists; stable across reboots,
+/// unlike indices) and narrowed by an inherited `HABANA_VISIBLE_MODULES`. The
+/// model comes from the PCI device id, else the driver's `device_type`.
+pub fn discover_hpu(fs: &dyn SysFs, env: &BTreeMap<String, String>) -> Inventory {
+    let mut cards: Vec<Device> = fs
+        .list("/sys/class/accel")
+        .iter()
+        .filter_map(|entry| {
+            let n: u32 = entry.strip_prefix("accel")?.parse().ok()?;
+            let dir = format!("/sys/class/accel/{entry}/device");
+            let read = |file: &str| fs.read(&format!("{dir}/{file}")).map(|s| s.trim().to_string());
+            let usable = read("status").is_none_or(|s| s.eq_ignore_ascii_case("operational"));
+            if pci_id(fs, &format!("{dir}/vendor")) != Some(0x1da3)
+                || !fs.exists(&format!("/dev/accel/{entry}"))
+                || !usable
+            {
+                return None;
+            }
+            let device = pci_id(fs, &format!("{dir}/device")).unwrap_or(0);
+            let kind = read("device_type");
+            let model = HABANA_MODELS.iter().find(|(id, _)| *id == device).map(|(_, m)| m.to_string());
+            let module = read("module_id").unwrap_or_else(|| n.to_string());
+            let mut labels = BTreeMap::from([("module_id".to_string(), module.clone())]);
+            labels.extend(read("pci_addr").map(|p| ("pci".to_string(), p.to_ascii_lowercase())));
+            Some(Device {
+                kind: Kind::Hpu,
+                id: format!("hpu:{module}"),
+                index: 0,
+                model: model
+                    .or_else(|| kind.as_ref().map(|k| k.to_ascii_lowercase()))
+                    .unwrap_or_else(|| format!("{device:04x}")),
+                name: kind.unwrap_or_else(|| format!("1da3:{device:04x}")),
+                memory_bytes: 0,
+                numa: numa_node(fs, &format!("{dir}/numa_node")),
+                labels,
+            })
+        })
+        .collect();
+    cards.sort_by_key(|d| d.labels["module_id"].parse::<u32>().unwrap_or(u32::MAX));
+    if let Some(list) = env.get("HABANA_VISIBLE_MODULES") {
+        let keep: BTreeSet<&str> = list.split(',').map(str::trim).collect();
+        cards.retain(|d| keep.contains(d.labels["module_id"].as_str()));
+    }
+    Inventory { devices: numbered(cards), ..Inventory::default() }
+}
+
+/// Intel GPU PCI device id → model, from the pciutils `pci.ids` database.
+const INTEL_MODELS: [(u64, &str); 16] = [
+    (0x0bd4, "Max 1550VG"),
+    (0x0bd5, "Max 1550"),
+    (0x0bd6, "Max 1550"),
+    (0x0bd7, "Max 1350"),
+    (0x0bd8, "Max 1350"),
+    (0x0bd9, "Max 1100"),
+    (0x0bda, "Max 1100"),
+    (0x0bdb, "Max 1100"),
+    (0x56a0, "Arc A770"),
+    (0x56a1, "Arc A750"),
+    (0x56c0, "Flex 170"),
+    (0x56c1, "Flex 140"),
+    (0xe20b, "Arc B580"),
+    (0xe20c, "Arc B570"),
+    (0xe211, "Arc Pro B60"),
+    (0xe212, "Arc Pro B50"),
+];
+
+/// Where Intel puts the integrated GPU, on every platform.
+const INTEL_INTEGRATED: &str = "0000:00:02.0";
+
+/// Intel GPUs: DRM render nodes whose PCI vendor is Intel (0x8086), kept only
+/// if `/dev/dri/renderD<minor>` exists, numbered in PCI address order (Level
+/// Zero's order under `ZE_ENABLE_PCI_ID_DEVICE_ORDER=1`, which grants set),
+/// then narrowed by an inherited `ZE_AFFINITY_MASK` (card ordinals; a
+/// `card.tile` entry counts as its card) without renumbering, because a
+/// grant's mask replaces it. The unit is a card: grants set
+/// `ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE`, so a two-tile Max 1550 is one device.
+/// The integrated GPU takes an ordinal (Level Zero lists it) but is not an
+/// accelerator here, so `gpus=1` never lands on it.
+pub fn discover_xpu(fs: &dyn SysFs, env: &BTreeMap<String, String>) -> Inventory {
+    let mut gpus: Vec<Device> = fs
+        .list("/sys/class/drm")
+        .iter()
+        .filter_map(|entry| {
+            let minor = entry.strip_prefix("renderD")?;
+            let dir = format!("/sys/class/drm/{entry}/device");
+            if pci_id(fs, &format!("{dir}/vendor")) != Some(0x8086) || !fs.exists(&format!("/dev/dri/{entry}")) {
+                return None;
+            }
+            let uevent = fs.read(&format!("{dir}/uevent"))?;
+            let pci = uevent.lines().find_map(|l| l.strip_prefix("PCI_SLOT_NAME="))?.trim().to_ascii_lowercase();
+            let device = pci_id(fs, &format!("{dir}/device")).unwrap_or(0);
+            let model = INTEL_MODELS.iter().find(|(id, _)| *id == device).map(|(_, m)| m.to_string());
+            Some(Device {
+                kind: Kind::Xpu,
+                id: format!("xpu:{pci}"),
+                index: 0,
+                model: model.unwrap_or_else(|| format!("{device:04x}")),
+                name: format!("8086:{device:04x}"),
+                memory_bytes: 0,
+                numa: numa_node(fs, &format!("{dir}/numa_node")),
+                labels: BTreeMap::from([("pci".to_string(), pci), ("minor".to_string(), minor.to_string())]),
+            })
+        })
+        .collect();
+    gpus.sort_by(|a, b| a.labels["pci"].cmp(&b.labels["pci"]));
+    let mask = env
+        .get("ZE_AFFINITY_MASK")
+        .map(|m| m.split(',').map(|e| e.trim().split('.').next().unwrap_or_default()).collect::<Vec<_>>().join(","));
+    let mut gpus = inherited(numbered(gpus), mask.as_ref());
+    gpus.retain(|d| d.labels["pci"] != INTEL_INTEGRATED);
+    Inventory { devices: gpus, ..Inventory::default() }
 }
 
 /// The Apple GPU, given `uname -m`, the CPU brand string and `hw.memsize`

@@ -35,7 +35,7 @@ WORKLOADS = ["tasks", "cpu_scaling", "map_small", "broadcast", "naive_big_arg", 
 # ---- launching Chimaera peers on every node (runs under Ray) -------------------
 
 
-def launch_peers(dist: str) -> tuple[list[str], str]:
+def launch_peers(dist: str, peer_env: dict[str, str] | None = None) -> tuple[list[str], str]:
     """Start one Chimaera peer per alive Ray node; return (addresses, head address).
 
     Each peer runs under a detached actor that stays alive with it: Ray reaps
@@ -53,7 +53,7 @@ def launch_peers(dist: str) -> tuple[list[str], str]:
 
     @ray.remote(num_cpus=0)
     class PeerHost:
-        def __init__(self, files: dict[str, bytes], seeds: str, groups: int) -> None:
+        def __init__(self, files: dict[str, bytes], seeds: str, groups: int, peer_env: dict[str, str]) -> None:
             import glob
             import socket
 
@@ -67,7 +67,7 @@ def launch_peers(dist: str) -> tuple[list[str], str]:
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", wheel], check=True)
             ip = ray.util.get_node_ip_address()
             cpus = os.cpu_count() or 1
-            env = dict(os.environ, CHIMAERA_PYTHON=sys.executable)
+            env = dict(os.environ, CHIMAERA_PYTHON=sys.executable, **peer_env)
             log = open("/tmp/chimaera-peer.log", "ab")
             self.proc = subprocess.Popen(
                 [os.path.join(here, "chimaera"), "--dir", PEER_DIR, "peer", "start", "--listen", f"{ip}:{PORT}",
@@ -86,20 +86,41 @@ def launch_peers(dist: str) -> tuple[list[str], str]:
         def log_tail(self) -> str:
             return open("/tmp/chimaera-peer.log", errors="replace").read()[-3000:]
 
-        def stop(self) -> None:
+        def settings(self) -> str:
+            """What the peer chose for itself (raft sync and why)."""
+            with open("/tmp/chimaera-peer.log", errors="replace") as f:
+                found = [ln for ln in f if "raft sync" in ln]
+            return found[-1].strip()[-120:] if found else "(not logged yet)"
+
+        def cpu_seconds(self) -> float:
+            """CPU time the peer process has used (user + system)."""
+            try:
+                with open(f"/proc/{self.proc.pid}/stat") as f:
+                    fields = f.read().rsplit(")", 1)[1].split()
+                return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+            except OSError:  # no /proc (macOS smoke runs)
+                t = subprocess.run(["ps", "-o", "time=", "-p", str(self.proc.pid)], capture_output=True, text=True, check=False).stdout
+                parts = [float(x) for x in t.strip().replace("-", ":").split(":")] or [0.0]
+                return sum(v * 60 ** i for i, v in enumerate(reversed(parts)))
+
+        def stop(self, wipe: bool = False) -> None:
             if self.proc.poll() is None:
                 self.proc.terminate()
                 try:
                     self.proc.wait(timeout=60)
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
+            if wipe:  # the next launch founds a new cluster
+                import shutil
+
+                shutil.rmtree(PEER_DIR, ignore_errors=True)
 
     groups = max(8, 2 * len(ips))
     hosts = [
         PeerHost.options(
             name=f"chimaera-peer-{n['NodeID']}", lifetime="detached", get_if_exists=True,
             scheduling_strategy=NodeAffinitySchedulingStrategy(n["NodeID"], soft=False),
-        ).remote(files, seeds, groups)
+        ).remote(files, seeds, groups, peer_env or {})
         for n in nodes
     ]
     print("peers:", ray.get([h.describe.remote() for h in hosts]), flush=True)
@@ -127,16 +148,51 @@ def peer_logs() -> str:
     return "\n----\n".join(out)
 
 
-def stop_peers() -> None:
+def peer_settings() -> list[str]:
     import ray
 
     ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
+    try:
+        return [ray.get(h.settings.remote(), timeout=30) for h in peer_hosts()]
+    except Exception as e:  # noqa: BLE001
+        return [f"(unavailable: {e})"]
+    finally:
+        ray.shutdown()
+
+
+def peer_cpu() -> list[float]:
+    """CPU seconds used so far by each peer process."""
+    import ray
+
+    ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
+    try:
+        return [ray.get(h.cpu_seconds.remote(), timeout=30) for h in peer_hosts()]
+    except Exception:  # noqa: BLE001
+        return []
+    finally:
+        ray.shutdown()
+
+
+def stop_peers(wipe: bool = False) -> None:
+    import ray
+
+    ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
+    names = [f"chimaera-peer-{n['NodeID']}" for n in ray.nodes() if n["Alive"]]
     for h in peer_hosts():
         try:
-            ray.get(h.stop.remote(), timeout=90)
+            ray.get(h.stop.remote(wipe), timeout=90)
             ray.kill(h)
         except Exception as e:  # noqa: BLE001
             print("stop:", e)
+    # The next launch reuses these names: wait until they are free.
+    deadline = time.time() + 60
+    for name in names:
+        while time.time() < deadline:
+            try:
+                ray.get_actor(name)
+            except ValueError:
+                break
+            time.sleep(0.5)
     ray.shutdown()
 
 
@@ -167,22 +223,57 @@ def where() -> str:
     return socket.gethostname()
 
 
+# Each workload repeats its timed section until MIN_SECONDS have passed (at
+# least MIN_REPS times) after one uncounted warm-up, and reports the spread.
+MIN_SECONDS = float(os.environ.get("EVAL_MIN_SECONDS", "120"))
+MIN_REPS = 3
+# The headline number of a rep: the first of these keys it has.
+METRICS = ("tasks_per_s", "calls_per_s", "naive_items_per_s", "efficiency", "seconds")
+
+
+def repeat_workload(rt: str, name: str) -> dict:
+    if name == "node_loss":  # takes a node down: once only
+        return run_workload(rt, name)
+    run_workload(rt, name)  # warm-up: executors start, code and values ship
+    reps: list[dict] = []
+    t0 = time.perf_counter()
+    while len(reps) < MIN_REPS or time.perf_counter() - t0 < MIN_SECONDS:
+        reps.append(run_workload(rt, name))
+    key = next(k for k in METRICS if k in reps[0])
+    xs = sorted(r[key] for r in reps)
+
+    def q(f: float) -> float:
+        return xs[min(len(xs) - 1, int(f * len(xs)))]
+
+    out = dict(reps[-1])
+    out[key] = xs[len(xs) // 2]
+    out.update({"metric": key, "reps": len(xs), "p10": q(0.1), "p90": q(0.9)})
+    return out
+
+
+_INIT = False
+
+
 def run_workload(rt: str, name: str) -> dict:
+    global _INIT
     if rt == "ray":
         import ray
 
-        ray.init(address="auto", log_to_driver=False)
+        if not _INIT:
+            ray.init(address="auto", log_to_driver=False)
         remote = ray.remote
         get = ray.get
     else:
         import chimaera as ch
 
-        ch.init()
+        if not _INIT:
+            ch.init()
         remote = ch.remote
 
         def get(x, timeout=None):
             return ch.gather(*x, timeout=timeout) if isinstance(x, list) else x.result(timeout)
 
+    _INIT = True
     cpus = total_cpus(rt)
     t0 = time.perf_counter()
 
@@ -300,6 +391,9 @@ def run_workload(rt: str, name: str) -> dict:
         out = get(futs)
         dt = time.perf_counter() - t0
         assert max(out) == calls
+        if rt == "chimaera":  # its actors live until closed or the run ends; reps repeat
+            for a in actors:
+                a.close()
         return {"calls_per_s": round(k * calls / dt), "actors": k, "hosts": len(set(hosts))}
 
     if name == "nested":
@@ -416,24 +510,34 @@ def main() -> None:
     ap.add_argument("--only", default="")
     a = ap.parse_args()
     if a.workload:  # child process: run one workload, print one JSON line
-        res = run_workload(a.runtime, a.workload)
+        res = repeat_workload(a.runtime, a.workload)
         print(json.dumps({"runtime": a.runtime, "workload": a.workload, "result": res}), flush=True)
         return
     os.makedirs(a.out, exist_ok=True)
-    peers, head = launch_peers(a.dist)
-    deadline = time.time() + 120
     from chimaera._native import socket_path
 
-    while not os.path.exists(socket_path(PEER_DIR, "peer.sock")):
-        assert time.time() < deadline, peer_logs()
-        time.sleep(0.5)
-    time.sleep(5)  # every founder joined and elected
     names = [w for w in WORKLOADS if not a.only or w in a.only.split(",")]
-    # node_loss last for each runtime: it takes a node's runtime down.
+    # Extra Chimaera passes with other peer settings, before the main one:
+    # EVAL_CHIMAERA_VARIANTS="CHIMAERA_RAFT_SYNC=none" (";" between variants,
+    # "," between variables), each running EVAL_VARIANT_WORKLOADS.
+    variants = [dict(kv.split("=", 1) for kv in v.split(",")) for v in os.environ.get("EVAL_CHIMAERA_VARIANTS", "").split(";") if v]
+    subset = [w for w in os.environ.get("EVAL_VARIANT_WORKLOADS", "tasks,actors").split(",") if w in names]
+    passes = [("chimaera", v, subset) for v in variants] + [("chimaera", {}, names), ("ray", {}, names)]
     results = []
-    for rt in ("chimaera", "ray"):
-        for w in names:
+    peers, head = [], ""
+    for rt, peer_env, workloads in passes:
+        if rt == "chimaera":
+            peers, head = launch_peers(a.dist, peer_env)
+            deadline = time.time() + 120
+            while not os.path.exists(socket_path(PEER_DIR, "peer.sock")):
+                assert time.time() < deadline, peer_logs()
+                time.sleep(0.5)
+            time.sleep(5)  # every founder joined and elected
+            print("peer settings:", peer_settings(), flush=True)
+        # node_loss last for each runtime: it takes a node's runtime down.
+        for w in workloads:
             env = dict(os.environ, CHIMAERA_HOME=PEER_DIR, RAY_ADDRESS="auto")
+            cpu0 = peer_cpu() if rt == "chimaera" and w != "node_loss" else []
             t0 = time.time()
             try:
                 p = subprocess.run([sys.executable, __file__, "--workload", w, "--runtime", rt], capture_output=True,
@@ -444,19 +548,27 @@ def main() -> None:
             except subprocess.TimeoutExpired:
                 rec = {"runtime": rt, "workload": w, "error": "timed out"}
             rec["wall_s"] = round(time.time() - t0, 1)
+            if peer_env:
+                rec["variant"] = peer_env
+            cpu1 = peer_cpu() if cpu0 else []
+            if cpu0 and len(cpu1) == len(cpu0):
+                # Cores each peer process kept busy over the workload: one
+                # near 1.0 or more while others idle points at a serial bottleneck.
+                rec["peer_cores"] = sorted((round((b - a) / max(rec["wall_s"], 0.1), 2) for a, b in zip(cpu0, cpu1)), reverse=True)
             if "error" in rec and rt == "chimaera":
                 rec["peer_logs"] = peer_logs()[-4000:]
             print(json.dumps(rec), flush=True)
             results.append(rec)
-    try:
-        stop_peers()
-    except Exception as e:  # noqa: BLE001
-        print("stopping peers:", e)
+        if rt == "chimaera":
+            try:
+                stop_peers(wipe=True)
+            except Exception as e:  # noqa: BLE001
+                print("stopping peers:", e)
     with open(os.path.join(a.out, "multi_results.json"), "w") as f:
         json.dump({"peers": peers, "head": head, "results": results}, f, indent=2)
     rows = ["| Workload | Ray | Chimaera |", "|---|---|---|"]
     for w in names:
-        cell = {r["runtime"]: json.dumps(r.get("result", {"error": r.get("error", "")[:120]})) for r in results if r["workload"] == w}
+        cell = {r["runtime"]: json.dumps(r.get("result", {"error": r.get("error", "")[:120]})) for r in results if r["workload"] == w and "variant" not in r}
         rows.append(f"| {w} | {cell.get('ray', '')} | {cell.get('chimaera', '')} |")
     report = f"# Ray vs Chimaera, {len(peers)} nodes\n\n" + "\n".join(rows) + "\n"
     with open(os.path.join(a.out, "multi_report.md"), "w") as f:

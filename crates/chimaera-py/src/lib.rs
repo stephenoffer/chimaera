@@ -33,7 +33,7 @@ const BATCH_WINDOW: Duration = Duration::from_micros(200);
 /// fsync, a remote group leader) instead of staying at `BATCH_MAX`.
 const SUBMITS_IN_FLIGHT: u64 = 2;
 /// A batch this large goes even while submissions are in flight.
-const BATCH_HARD: usize = 8192;
+const BATCH_HARD: usize = 4096;
 const MAX_FRAME: usize = 1 << 30;
 
 fn runtime() -> &'static tokio::runtime::Runtime {

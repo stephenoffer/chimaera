@@ -631,32 +631,10 @@ fn doctor(dir: &std::path::Path) -> u8 {
             "unavailable: accounting=\"isolated\" fails preflight here; measurements are process-scoped".to_string()
         }
     );
-    match fsync_p50_us(dir) {
+    match chimaera_peer::durability::fsync_p50_us(dir, 50) {
         // Cluster peers sync every raft commit; a call needs about three.
         Ok(us) => println!("fsync p50 {us:.0} µs in {} (cluster peers pay this per commit)", dir.display()),
         Err(e) => println!("fsync probe failed in {}: {e}", dir.display()),
     }
     0
-}
-
-/// Median latency of a small write followed by fsync in `dir`.
-fn fsync_p50_us(dir: &std::path::Path) -> std::io::Result<f64> {
-    use std::io::Write;
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(".fsync-probe");
-    let mut f = std::fs::File::create(&path)?;
-    let mut samples = Vec::with_capacity(50);
-    for i in 0..50u8 {
-        let t = std::time::Instant::now();
-        f.write_all(&[i; 4096])?;
-        // Plain fsync, as the cluster backend issues (not macOS F_FULLFSYNC).
-        // SAFETY: the descriptor is owned by `f` and open for the call.
-        if unsafe { libc::fsync(std::os::fd::AsRawFd::as_raw_fd(&f)) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        samples.push(t.elapsed().as_secs_f64() * 1e6);
-    }
-    let _ = std::fs::remove_file(&path);
-    samples.sort_by(f64::total_cmp);
-    Ok(samples[samples.len() / 2])
 }

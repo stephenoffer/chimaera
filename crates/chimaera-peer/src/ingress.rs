@@ -117,6 +117,27 @@ impl Ingress {
         None
     }
 
+    /// Propose a submission, waiting out a group that is busy or electing:
+    /// task ids are deterministic, so a repeat after an ambiguous failure
+    /// lands on the same tasks. The session submits one batch at a time, so
+    /// this wait is the client's backpressure; only a group that stays
+    /// unavailable fails the calls.
+    async fn propose_patiently(
+        &self,
+        v: u16,
+        body: pb::shard_cmd::Body,
+    ) -> Result<pb::ShardReply, chimaera_raft::ProposeError> {
+        let started = std::time::Instant::now();
+        loop {
+            match self.router.propose(v, body.clone()).await {
+                Err(chimaera_raft::ProposeError::Unavailable { .. }) if started.elapsed() < SUBMIT_PATIENCE => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
     async fn submit(&self, s: pb::SubmitTasks) -> pb::TaskAcks {
         let mut acks = Vec::with_capacity(s.tasks.len());
         // Keyed by (vshard, stream): generator calls run on this peer, where
@@ -152,7 +173,7 @@ impl Ingress {
             let grant_to = (!self.router.is_cluster() || stream).then(|| self.router.identity.pb());
             let batch: Vec<Tk> = tasks.iter().filter_map(|t| t.key.as_ref().and_then(Tk::parse)).collect();
             let body = pb::shard_cmd::Body::SubmitTasks(pb::SubmitTasks { tasks, grant_to });
-            match self.router.propose(v, body).await {
+            match self.propose_patiently(v, body).await {
                 Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(t)) }) => {
                     for a in t.acks {
                         if let Some(tk) = a.task.as_ref().and_then(Tk::parse) {
@@ -183,6 +204,9 @@ impl Ingress {
         pb::TaskAcks { acks }
     }
 }
+
+/// How long a submission waits for its group before the calls fail.
+const SUBMIT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::SessionEvent, Status>> + Send>>;
 

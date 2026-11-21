@@ -125,6 +125,11 @@ impl Router {
         self.leader_hint.lock().expect("lock").insert(group, node);
     }
 
+    /// The last leader this peer heard of for `group`.
+    pub fn leader_hint(&self, group: u32) -> Option<u64> {
+        self.leader_hint.lock().expect("lock").get(&group).copied()
+    }
+
     /// Run `f` over the local replica of the group owning `vshard`, if hosted.
     /// A follower's view may lag the leader's.
     pub fn read<T>(&self, vshard: u16, f: impl FnOnce(&dyn KvRead) -> T) -> Option<T> {

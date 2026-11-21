@@ -149,12 +149,15 @@ bound is there. With it, the worst case fell to 88–112 ms and throughput held.
 divided by the backups' apply rate, so a smaller bound gives a smaller window. The prototype leaves out the API layer, placement, accounting and failover, so its numbers are the
 floor the real path builds on, not Chimaera's.
 
-**First step on the runtime.** [bench/proto/local-group](../bench/proto/local-group/RESULTS.md) is a patch, not yet
-applied, that removes the Raft log from a local peer's group:
-- **Startup:** the peer recovers through Raft, then applies commands in one durable redb transaction per batch.
-- **Speed:** local task and actor round trips fall by about 190 µs, to 295–337 µs p50.
-- **Tests:** a crash test checks that every command that got a reply survives the process dying.
-- **Snapshots:** the peer no longer writes Raft snapshots.
+**First steps on the runtime.** These are in the tree; see
+[bench/proto/local-group](../bench/proto/local-group/RESULTS.md).
+- **Startup:** a local peer recovers through Raft, then applies commands with no log.
+- **Durability:** an attached run's per-call commands commit non-durably. The next durable commit, at most 500 ms
+  later, persists them, because redb makes durability a prefix. Everything else commits durably.
+- **Speed:** local task and actor round trips halved, to 257–319 µs p50.
+- **Tests:** crash tests check both halves of the contract: a detached run's calls survive an immediate abort, and
+  an attached run's calls survive once the checkpoint window has passed.
+- **Snapshots:** local peers no longer write Raft snapshots.
 
 The journal reuses the shard state machine that exists today (`crates/chimaera-core/src/shard`). The transitions,
 fencing and exactly-one-winner rules are the same; only the replication changes. Raft groups apply commands from a

@@ -280,6 +280,24 @@ class _Part(Future[Any]):
         return (_Part, (self._parent, self._index, self._count))
 
 
+class Handles:
+    """``ch.handles(value)``: an argument whose futures reach the call as
+    futures (handles to wait on), not as their values."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+def handles(value: T) -> T:
+    """Pass `value` with the futures in it unresolved: the call receives them
+    as futures. Otherwise a future passed to a call, directly or one level
+    inside a list, tuple or dict argument, arrives as its value, and the call
+    starts once it is ready."""
+    return Handles(value)  # type: ignore[return-value]
+
+
 class PartDep:
     """Call-frame placeholder: value ``index`` of dependency ``dep``, a call returning ``count`` values."""
 
@@ -485,6 +503,9 @@ def _resolved_future(run: bytes, object_id: bytes, inline: bytes | None, size: i
     return f
 
 
+PUT_INLINE = 256 << 10
+
+
 def put(value: Any) -> Future[Any]:
     """Store `value` once and return a finished future for it. Pass the
     future to any number of calls: each reads the stored value instead of
@@ -495,7 +516,9 @@ def put(value: Any) -> Future[Any]:
     ctx = _context.current_task()
     run = ctx.run if ctx is not None else rt.run
     assert run is not None
-    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, rt.inline_limit)
+    # Small values travel in the handle itself (as Ray's below 100 KB): up to
+    # this size a file costs more than carrying the bytes.
+    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, max(rt.inline_limit, PUT_INLINE))
     f = _resolved_future(run, object_id, inline, size)
     if owned:
         f._escaped, f._owned = False, owned

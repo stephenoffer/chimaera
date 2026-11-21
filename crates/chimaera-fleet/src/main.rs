@@ -244,6 +244,7 @@ fn run_cell(a: &Args, cell: u32, peers: u32, seed: u64) -> CellRun {
         suspicion: 4,
         retransmit: 4,
         piggyback: 8,
+        suspicion_floor_ms: 0,
     };
     let mut swims: Vec<Swim> =
         (0..peers).map(|p| Swim::new(p as u64 + 1, 1 << 32, seed ^ (p as u64 + 7), cfg)).collect();
