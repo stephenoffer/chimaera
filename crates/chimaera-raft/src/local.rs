@@ -280,7 +280,7 @@ impl<T: ReadableTable<&'static [u8], &'static [u8]>> KvRead for View<'_, T> {
             let (key, value) = if from_overlay {
                 let (k, v) = over.next().expect("peeked");
                 if next_base.as_ref().is_some_and(|(bk, _)| bk == k) {
-                    // mutant: shadow not skipped
+                    next_base = base.next(); // shadowed by the overlay
                 }
                 match v {
                     Some(v) => (k.clone(), v.clone()),
