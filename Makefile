@@ -36,3 +36,16 @@ linux-check: linux-image
 linux-pytest: linux-image
 	docker run --rm --privileged --cgroupns=private -v "$(CURDIR)":/src -v chimaera-target:/target \
 		-v chimaera-cargo:/usr/local/cargo/registry chimaera-dev:latest deploy/dev/linux-test.sh
+
+# Launcher gates: each builds the runtime image (deploy/images) and runs a
+# real cluster in Docker. kind-test also needs kind and kubectl.
+.PHONY: kind-test slurm-test ssh-test
+
+kind-test:
+	deploy/k8s/kind-test.sh
+
+slurm-test:
+	deploy/slurm/slurm-test.sh
+
+ssh-test:
+	deploy/compose/ssh-test.sh

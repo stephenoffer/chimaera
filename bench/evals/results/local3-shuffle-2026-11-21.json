@@ -1,0 +1,89 @@
+{
+  "meta": {
+    "machine": "macOS-14.5-arm64-arm-64bit-Mach-O 12 cpus",
+    "nodes": 3,
+    "cpus_per_node": 4,
+    "rounds": 3,
+    "load_avg_after": [
+      8.25244140625,
+      14.6025390625,
+      14.67236328125
+    ]
+  },
+  "summary": {
+    "shuffle": {
+      "ray": {
+        "seconds": 1.372,
+        "pairs": 960000,
+        "runs": 3
+      },
+      "chimaera": {
+        "seconds": 1.401,
+        "pairs": 960000,
+        "runs": 3
+      }
+    }
+  },
+  "records": [
+    {
+      "runtime": "ray",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 0.36,
+        "pairs": 960000
+      },
+      "wall_s": 2.4,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 1.401,
+        "pairs": 960000
+      },
+      "wall_s": 1.6,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 1.235,
+        "pairs": 960000
+      },
+      "wall_s": 1.4,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 1.372,
+        "pairs": 960000
+      },
+      "wall_s": 2.7,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 1.38,
+        "pairs": 960000
+      },
+      "wall_s": 2.8,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 1.545,
+        "pairs": 960000
+      },
+      "wall_s": 1.7,
+      "round": 2
+    }
+  ]
+}

@@ -315,6 +315,48 @@ A real rollout also measures reader contention, queue delay, memory already held
 | The same Python exception occurs on healthy hosts | Matching traceback and code/input identity | Return the original failure. Repeated automatic attempts cannot repair the user’s code. |
 | Telemetry disappears during a slowdown | Collector gap while agent queue ages continue advancing | Freeze speculative policy changes, record missing coverage, and continue within the last safe local envelope. |
 
+#### Learned reservations and one memory pool (as built)
+
+A call that sets no `cpus` or `memory` gets them from what earlier calls of the
+same function used. Each peer keeps, per function, the last 64 attempts'
+wall time, CPU seconds, private memory peak (anonymous memory, so a shared
+input mapped by many readers is counted once, as object bytes), input and
+output bytes. After three calls, memory is reserved at the p95 peak × 1.2,
+1.5 or 2.0 by its variation, or by a linear fit when peak tracks input size
+(R² ≥ 0.8), and never below 1.5× a peak at which a call of that size was
+killed, though no more than the larger of that peak and 4× what such calls
+use when they succeed. Each 8 successful calls after a kill halve the bound's
+excess over what they used, so one kill fades out rather than holding every
+later call to it (the killed call's own retry always gets 1.5× its peak). Before that, a function's first finished call (or a call running two
+seconds) gives a provisional reservation of 2× what it used. A function with
+nothing measured yet runs a quarter of the CPUs' worth of calls at once, plus
+one more for each 4 GiB free in the pool: a fresh function starts at full
+width on a roomy host, and a 3 GiB-per-call function cannot overcommit a
+36 GiB one. A queued call keeps the CPU-trial arm it was given, so the
+control arm is not starved by canaries that fit sooner. Calls of a map run
+several items per call; each such call is profiled as the mapped function,
+per item. Profiles are written
+to the peer's directory, reloaded on restart, and sent to other peers with
+liveness replies; a profile from different hardware carries its memory but
+not its CPU use.
+
+Each peer has one memory pool: usable memory minus a reserve for the agent
+(10%, between 0.5 and 10 GiB). Running calls are charged their reservation or
+what they hold, whichever is more; a call waiting on others, and an idle
+worker, what they hold; objects, when they live in tmpfs, their bytes. Work
+starts only if it fits the pool and the host has that much available. Work
+behind a head that waits for memory may start first, for at most 30 seconds.
+Past 80% of the pool, the oldest objects move to disk; under host pressure
+(Linux PSI, or under 10% available) admission pauses, and under 5% the peer
+stops the call furthest over its reservation.
+
+Changes that protect a run apply at once: more memory, more CPU for a function
+using more than its grant, replacing a worker whose memory between calls
+rises (Mann–Kendall trend, p < 0.01, with at least 128 MiB of growth). A
+change that only saves resources, a smaller CPU grant, is tried on half the
+calls first and kept if completions per reserved core-second rise (the
+canary judge above). Every change is a decision record.
+
 ### 6. Observability that can answer “how much did this task use?”
 
 Every started invocation has a logical task ID and an attempt ID. The agent writes a compact attempt record with run/stage, attempt generation, placement, start/end reason, clock scope, resource request and grant, counter values, measurement method, coverage, and policy version. A timeline can join retries and a producing partition without labeling every monitoring time series with a unique task ID.

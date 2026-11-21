@@ -54,10 +54,17 @@ async fn wait_leader(g: &Group) {
 }
 
 async fn setup_run(g: &Group, v: u16) {
-    let r = g
-        .propose(&cmd(v, pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards: vec![v as u32], epoch: 1 })))
-        .await
-        .unwrap();
+    // Just after an election leadership can still move: retry until it settles.
+    let adopt = cmd(v, pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards: vec![v as u32], epoch: 1 }));
+    let mut r = g.propose(&adopt).await;
+    for _ in 0..40 {
+        if r.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        r = g.propose(&adopt).await;
+    }
+    let r = r.unwrap();
     assert!(matches!(r.body, Some(pb::shard_reply::Body::Count(1))));
     let run = pb::RunRecord { run: run_id(v).to_vec(), tenant: "t".into(), ..Default::default() };
     g.propose(&cmd(v, pb::shard_cmd::Body::RunCreate(pb::RunCreate { run: Some(run) }))).await.unwrap();
@@ -217,4 +224,127 @@ async fn measure_single_voter_propose_latency() {
     while set.join_next().await.is_some() {}
     let el = t.elapsed();
     println!("concurrent: {n} proposals in {el:?} = {:.0}/s", n as f64 / el.as_secs_f64());
+}
+
+/// Reads racing the disk writer must never see a gap: an entry being
+/// flushed is either still in the unflushed tail or already on disk.
+/// (A gap made openraft's replication assert and stall the group.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 10)]
+async fn reads_racing_flushes_never_see_a_gap() {
+    use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
+    use openraft::testing::blank_ent;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let log_db = Arc::new(open_db(&dir.path().join("log.redb"), DiskDurability::Process).unwrap());
+    let sm_db = Arc::new(open_db(&dir.path().join("sm.redb"), DiskDurability::Process).unwrap());
+    create_tables(&log_db, &sm_db).unwrap();
+    let writer = DiskWriter::start(log_db.clone()).unwrap();
+    let mut log = LogStore::new(3, log_db, writer);
+    let last = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for _ in 0..8 {
+        let mut reader = log.get_log_reader().await;
+        let (last, stop) = (last.clone(), stop.clone());
+        readers.push(tokio::spawn(async move {
+            let mut reads = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let hi = last.load(Ordering::Acquire);
+                if hi < 2 {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                let lo = hi.saturating_sub(3).max(1);
+                let got = reader.try_get_log_entries(lo..=hi).await.unwrap();
+                let idx: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+                let want: Vec<u64> = (lo..=hi).collect();
+                assert_eq!(idx, want, "a read of {lo}..={hi} saw a gap");
+                reads += 1;
+            }
+            reads
+        }));
+    }
+    let mut next = 1u64;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(8) {
+        let n = 1 + next % 3;
+        let entries: Vec<_> = (next..next + n).map(|i| blank_ent::<TypeConfig>(1, 1, i)).collect();
+        log.append(entries, IOFlushed::noop()).await.unwrap();
+        next += n;
+        last.store(next - 1, Ordering::Release);
+    }
+    stop.store(true, Ordering::Relaxed);
+    let mut total = 0;
+    for r in readers {
+        total += r.await.unwrap();
+    }
+    assert!(total > 1000, "only {total} reads raced the writer");
+}
+
+/// Commits per second with many proposals in flight: one voter vs three, with
+/// and without fsync. Run with `--ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "measurement: run with --ignored --nocapture"]
+async fn measure_concurrent_commit_throughput() {
+    let only = std::env::var("MEASURE_ONLY").unwrap_or_default();
+    for (voters, durability) in [
+        (1usize, DiskDurability::Os),
+        (3, DiskDurability::Os),
+        (1, DiskDurability::Process),
+        (3, DiskDurability::Process),
+    ] {
+        if !only.is_empty() && only != format!("{voters}{durability:?}") {
+            continue;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let net = Arc::new(LocalNet::default());
+        *net.scratch.lock().unwrap() = Some(dir.path().to_path_buf());
+        let ids: Vec<NodeId> = (1..=voters as u64).collect();
+        let mut hosts = Vec::new();
+        for &id in &ids {
+            let (host, rx) = RaftHost::open(&dir.path().join(format!("n{id}")), id, net.clone(), durability).unwrap();
+            std::mem::forget(rx);
+            let g = host.start_group(0, members(&ids), id == 1).await.unwrap();
+            net.nodes.lock().unwrap().insert(id, g);
+            hosts.push(host);
+        }
+        let leader = net.nodes.lock().unwrap().get(&1).cloned().unwrap();
+        wait_leader(&leader).await;
+        setup_run(&leader, 9).await;
+        eprintln!("voters={voters} {durability:?}: leader ready");
+        let next = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let lat = Arc::new(Mutex::new(Vec::new()));
+        let t0 = std::time::Instant::now();
+        let mut joins = Vec::new();
+        for _ in 0..64 {
+            let (g, next, lat) = (leader.clone(), next.clone(), lat.clone());
+            joins.push(tokio::spawn(async move {
+                while t0.elapsed() < Duration::from_secs(3) {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let t = std::time::Instant::now();
+                    tokio::time::timeout(Duration::from_secs(10), g.propose(&submit(9, 1000 + i)))
+                        .await
+                        .expect("a proposal hung for 10 s")
+                        .unwrap();
+                    lat.lock().unwrap().push(t.elapsed().as_micros() as u64);
+                }
+            }));
+        }
+        for j in joins {
+            j.await.unwrap();
+        }
+        let mut l = lat.lock().unwrap().clone();
+        l.sort();
+        let dt = t0.elapsed().as_secs_f64();
+        eprintln!(
+            "voters={voters} {durability:?}: {:.0} commits/s, p50 {} us, p99 {} us",
+            l.len() as f64 / dt,
+            l[l.len() / 2],
+            l[l.len() * 99 / 100]
+        );
+        let groups: Vec<Group> = net.nodes.lock().unwrap().values().cloned().collect();
+        for g in groups {
+            g.shutdown().await;
+        }
+    }
 }

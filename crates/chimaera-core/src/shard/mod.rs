@@ -16,6 +16,7 @@
 
 mod actors;
 pub mod keys;
+pub mod store;
 #[cfg(test)]
 mod tests;
 
@@ -204,6 +205,14 @@ fn effects(rec: &pb::TaskRecord) -> pb::Effects {
 
 /// The error a dependent records when its prerequisite failed: the root
 /// cause's type, message and pickled exception, pointing at the producer.
+/// The cancellation kind of a cancelled or expired outcome.
+fn cancelled_kind(o: &pb::Outcome) -> Option<Kind> {
+    match &o.value {
+        Some(pb::outcome::Value::Err(e)) if matches!(e.kind(), Kind::Cancelled | Kind::Deadline) => Some(e.kind()),
+        _ => None,
+    }
+}
+
 fn causal(producer: Tk, root: &pb::Outcome) -> pb::Outcome {
     let mut e = match &root.value {
         Some(pb::outcome::Value::Err(e)) => e.clone(),
@@ -276,6 +285,8 @@ impl ShardState {
             Body::ActorCommit(a) => self.actor_commit(cx, v, a),
             Body::ActorCheckpoint(a) => self.actor_checkpoint(cx, v, a),
             Body::RunFinish(r) => self.run_finish(cx, v, r),
+            Body::StoreWrite(w) => reply(pb::shard_reply::Body::Store(store::write(cx, v, w))),
+            Body::StoreRead(r) => reply(pb::shard_reply::Body::Store(store::read(cx.kv, v, r, cx.now))),
             Body::AdoptVshard(_) | Body::Retire(_) | Body::OutboxAck(_) | Body::Gc(_) => unreachable!(),
         }
     }
@@ -370,10 +381,15 @@ impl ShardState {
                 // A run expires together with all of its tasks, in bounded steps.
                 let v = u16::from_be_bytes([target[0], target[1]]);
                 let run = Id::from_slice(&target[3..]).expect("16-byte run id");
-                let tasks = cx.kv.scan_prefix(&keys::tasks_of_run(v, &run), budget - deleted);
-                for (tkey, _) in &tasks {
-                    cx.kv.delete(tkey);
-                    deleted += 1;
+                for prefix in [
+                    keys::tasks_of_run(v, &run),
+                    keys::pairs_of_run(v, keys::CHILD, &run),
+                    keys::pairs_of_run(v, keys::FORWARD, &run),
+                ] {
+                    for (k, _) in cx.kv.scan_prefix(&prefix, budget - deleted) {
+                        cx.kv.delete(&k);
+                        deleted += 1;
+                    }
                 }
                 if deleted < budget {
                     if let Some(r) = load::<pb::RunRecord>(cx.kv, &target) {
@@ -484,6 +500,18 @@ impl ShardState {
                 continue;
             }
             if let Some(rec) = load::<pb::TaskRecord>(cx.kv, &tk.key()) {
+                // A replayed workflow asks for its calls again under the same
+                // keys; one that asks for something else at a step diverged.
+                let stored = rec.spec.as_ref().map_or(&[][..], |s| s.command_fingerprint.as_slice());
+                if !stored.is_empty() && !spec.command_fingerprint.is_empty() && stored != spec.command_fingerprint {
+                    let mut a = ack_rec(tk, Status::Rejected, &rec);
+                    a.reason = "workflow divergence: on replay this step made a different call than the run recorded \
+                                (a workflow must make the same calls in the same order; use ch.workflow.now/random/record \
+                                for anything that varies)"
+                        .into();
+                    acks.push(a);
+                    continue;
+                }
                 acks.push(ack_rec(tk, Status::Duplicate, &rec));
                 continue;
             }
@@ -496,9 +524,12 @@ impl ShardState {
                     continue;
                 }
             }
-            // One pin for the submitting client, plus one per dependent that
-            // arrived before this producer did.
-            let early = cx.kv.scan_prefix(&keys::of_producer(v, keys::DEPENDENT, tk.pair()), usize::MAX).len() as u32;
+            // One pin for the submitting client, plus one per dependent or
+            // forwarder that arrived before this producer did.
+            let early = [keys::DEPENDENT, keys::FORWARD]
+                .iter()
+                .map(|tag| cx.kv.scan_prefix(&keys::of_producer(v, *tag, tk.pair()), usize::MAX).len() as u32)
+                .sum::<u32>();
             let mut rec = pb::TaskRecord {
                 spec: Some(spec.clone()),
                 next_attempt: 1,
@@ -507,12 +538,27 @@ impl ShardState {
                 ..Default::default()
             };
             rec.set_state(TState::Pending);
-            let mut failed_dep: Option<pb::Outcome> = None;
+            // Cancelling a call cancels what it submitted, including calls a
+            // cancelled body submits afterwards (cancellation is cooperative).
+            let parent = spec.parent.as_ref().and_then(Tk::parse).filter(|p| p.v() == v);
+            if let Some(p) = parent {
+                cx.kv.put(keys::pair(v, keys::CHILD, p.pair(), tk.pair()), Vec::new());
+            }
+            let mut failed_dep: Option<pb::Outcome> = parent
+                .and_then(|p| load::<pb::TaskRecord>(cx.kv, &p.key())?.outcome)
+                .and_then(|o| cancelled_kind(&o))
+                .map(|k| err_outcome(k, "the call that submitted this one was cancelled"));
+            let mut seen = std::collections::BTreeSet::new();
             for dep in &spec.deps {
                 let Some(d) = Tk::parse(dep) else {
                     failed_dep.get_or_insert_with(|| err_outcome(Kind::DataLost, "malformed dependency key"));
                     continue;
                 };
+                // The same producer passed twice is one dependency: its index
+                // entry is one key, so it is counted and pinned once.
+                if !seen.insert(d) {
+                    continue;
+                }
                 // Every local dependency is pinned exactly once here and
                 // unpinned exactly once when this task completes.
                 self.pin(cx, v, d);
@@ -715,10 +761,9 @@ impl ShardState {
         let (Some(tk), Some(peer)) = (Tk::parse(&key), peer_of(&e.peer)) else {
             return ack(&key, Status::Rejected);
         };
-        let Some(mut outcome) = e.outcome.clone().filter(|o| o.value.is_some()) else {
-            return ack(&key, Status::Rejected);
-        };
-        if tk.v() != v || e.attempt == 0 {
+        let forward = e.forward_to.as_ref().and_then(Tk::parse);
+        let outcome = e.outcome.clone().filter(|o| o.value.is_some());
+        if (forward.is_none() && outcome.is_none()) || tk.v() != v || e.attempt == 0 {
             return ack(&key, Status::Rejected);
         }
         let Some(mut rec) = load::<pb::TaskRecord>(cx.kv, &tk.key()) else {
@@ -761,6 +806,10 @@ impl ShardState {
         if effects(&rec) == pb::Effects::External && rec.external_started_attempt != e.attempt {
             return stale(tk, &rec, "attempt did not consume the external start");
         }
+        if let Some(f) = forward {
+            return self.forward(cx, tk, rec, f);
+        }
+        let mut outcome = outcome.expect("checked above");
         outcome.attempt = e.attempt;
         outcome.peer = Some(peer_pb(peer));
         let rec = self.finish(cx, tk, rec, outcome);
@@ -796,6 +845,16 @@ impl ShardState {
             return single(stale(tk, &rec, "dependencies are not satisfied; this task cannot have run"));
         }
         let external = effects(&rec) == pb::Effects::External;
+        if f.kind() == pb::record_failure::Kind::Requeued {
+            let live =
+                rec.attempts.iter().any(|a| a.attempt == f.attempt && !a.revoked && peer_of(&a.peer) == Some(peer));
+            if !live {
+                return single(stale(tk, &rec, "only a live attempt can be given back"));
+            }
+            if external && rec.external_started_attempt == f.attempt {
+                return single(stale(tk, &rec, "the attempt's external effect may have started"));
+            }
+        }
         match rec.attempts.iter().position(|a| a.attempt == f.attempt && peer_of(&a.peer) == Some(peer)) {
             Some(i) if rec.attempts[i].revoked => return single(stale(tk, &rec, "attempt was already revoked")),
             Some(i) => rec.attempts[i].revoked = true,
@@ -835,9 +894,11 @@ impl ShardState {
         memory_peak: u64,
     ) -> pb::TaskRecord {
         use pb::record_failure::Kind as F;
-        rec.failure_history.push(err.clone());
-        if rec.failure_history.len() > MAX_FAILURE_HISTORY {
-            rec.failure_history.remove(0);
+        if kind != F::Requeued {
+            rec.failure_history.push(err.clone());
+            if rec.failure_history.len() > MAX_FAILURE_HISTORY {
+                rec.failure_history.remove(0);
+            }
         }
         if live_attempts(&rec) > 0 {
             store(cx.kv, tk.key(), &rec);
@@ -857,6 +918,8 @@ impl ShardState {
                 format!("attempt {attempt} was lost after its external effect may have started: {}", err.message),
             )),
             F::RetryableUser if external => Some(terminal_err(Kind::User, err.message.clone())),
+            // Given back unstarted: ready again, nothing counted.
+            F::Requeued => None,
             F::Infra if external => {
                 rec.infra_failures += 1;
                 (rec.infra_failures >= EXTERNAL_PRESTART_RETRIES).then(|| {
@@ -910,6 +973,35 @@ impl ShardState {
         }
     }
 
+    /// `tk`'s attempt returned the future of `f`: `tk` completes with `f`'s
+    /// outcome. If `f` is not done, `tk` waits without a grant (its worker is
+    /// free) and `cascade` completes it. `f` stays pinned for the run's
+    /// lifetime, because `tk`'s outcome will name `f`'s result.
+    fn forward(&self, cx: &mut Cx, tk: Tk, mut rec: pb::TaskRecord, f: Tk) -> pb::TaskAck {
+        if f == tk {
+            return stale(tk, &rec, "a call cannot forward to its own result");
+        }
+        self.pin(cx, tk.v(), f);
+        if let Some(o) = self.known_outcome(cx.kv, tk.v(), f) {
+            let rec = self.finish(cx, tk, rec, o);
+            return ack_rec(tk, Status::Published, &rec);
+        }
+        for a in &rec.attempts {
+            if let Some(p) = peer_of(&a.peer) {
+                cx.kv.delete(&keys::grant(tk.v(), &p.0, p.1, &tk.run, &tk.task, a.attempt));
+            }
+        }
+        cx.kv.delete(&keys::ready(tk.v(), &tk.run, &tk.task));
+        rec.set_state(TState::Pending);
+        rec.forwarded_to = Some(f.pb());
+        cx.kv.put(keys::pair(tk.v(), keys::FORWARD, f.pair(), tk.pair()), Vec::new());
+        if f.v() != tk.v() {
+            cx.events.push(Event::Subscribe { producer: f, subscriber_vshard: tk.v() });
+        }
+        store(cx.kv, tk.key(), &rec);
+        ack_rec(tk, Status::Published, &rec)
+    }
+
     fn cancel(&self, cx: &mut Cx, v: u16, c: &pb::Cancel) -> pb::ShardReply {
         let key = c.task.clone().unwrap_or_default();
         let single = |a: pb::TaskAck| reply(pb::shard_reply::Body::Tasks(pb::TaskAcks { acks: vec![a] }));
@@ -923,11 +1015,24 @@ impl ShardState {
             return single(ack_rec(tk, Status::Existing, &rec));
         }
         let kind = match c.reason() {
-            k @ (Kind::Deadline | Kind::ActorDied | Kind::Infeasible) => k,
+            k @ (Kind::Deadline | Kind::ActorDied | Kind::Infeasible | Kind::Oom) => k,
             _ => Kind::Cancelled,
         };
         let msg = if c.message.is_empty() { "cancelled".to_string() } else { c.message.clone() };
         let rec = self.finish(cx, tk, rec, err_outcome(kind, msg));
+        // Then everything it submitted, transitively, that has not finished.
+        let mut parents = vec![tk];
+        while let Some(p) = parents.pop() {
+            for (ckey, _) in cx.kv.scan_prefix(&keys::of_producer(v, keys::CHILD, p.pair()), usize::MAX) {
+                let (run, task) = keys::trailing_pair(&ckey);
+                let child = Tk { run, task };
+                parents.push(child);
+                if let Some(crec) = load::<pb::TaskRecord>(cx.kv, &child.key()).filter(|r| r.state() != TState::Done) {
+                    let why = format!("the call that submitted it ({}) was cancelled", tk.task.hex());
+                    self.finish(cx, child, crec, err_outcome(kind, why));
+                }
+            }
+        }
         single(ack_rec(tk, Status::Accepted, &rec))
     }
 
@@ -980,7 +1085,8 @@ impl ShardState {
         // A completed dependent stops waiting and no longer needs its local
         // producers' results. Removing its entries keeps a later-submitted
         // producer from counting it as a pin.
-        let deps: Vec<Tk> = rec.spec.as_ref().map_or(Vec::new(), |s| s.deps.iter().filter_map(Tk::parse).collect());
+        let deps: std::collections::BTreeSet<Tk> =
+            rec.spec.as_ref().map_or_else(Default::default, |s| s.deps.iter().filter_map(Tk::parse).collect());
         for d in deps {
             cx.kv.delete(&keys::pair(tk.v(), keys::DEPENDENT, d.pair(), tk.pair()));
             if d.v() == tk.v() {
@@ -1015,6 +1121,15 @@ impl ShardState {
                     let c = causal(p, &o);
                     self.complete(cx, d, drec, c.clone());
                     work.push((d.v(), d, c));
+                }
+            }
+            for (fkey, _) in cx.kv.scan_prefix(&keys::of_producer(v, keys::FORWARD, p.pair()), usize::MAX) {
+                cx.kv.delete(&fkey);
+                let (run, task) = keys::trailing_pair(&fkey);
+                let f = Tk { run, task };
+                if let Some(frec) = load::<pb::TaskRecord>(cx.kv, &f.key()).filter(|r| r.state() != TState::Done) {
+                    self.complete(cx, f, frec, o.clone());
+                    work.push((f.v(), f, o.clone()));
                 }
             }
             if p.v() != v {

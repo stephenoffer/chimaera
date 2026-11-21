@@ -67,6 +67,10 @@ type Tail = Arc<Mutex<BTreeMap<u64, (u64, Vec<u8>)>>>;
 pub struct DiskWriter {
     tx: mpsc::Sender<Op>,
     tails: Arc<Mutex<BTreeMap<u32, Tail>>>,
+    /// Append sequence numbers, unique across every store on this writer:
+    /// two store instances of one group (sharing its tail) can never trim
+    /// each other's entries.
+    seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DiskWriter {
@@ -75,7 +79,7 @@ impl DiskWriter {
         let tails: Arc<Mutex<BTreeMap<u32, Tail>>> = Arc::default();
         let t2 = tails.clone();
         std::thread::Builder::new().name("chimaera-raft-disk".into()).spawn(move || run_writer(&db, &rx, &t2))?;
-        Ok(DiskWriter { tx, tails })
+        Ok(DiskWriter { tx, tails, seq: Arc::default() })
     }
 
     fn tail(&self, group: u32) -> Tail {
@@ -168,13 +172,12 @@ pub struct LogStore {
     db: Arc<Database>,
     writer: DiskWriter,
     tail: Tail,
-    seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LogStore {
     pub fn new(group: u32, db: Arc<Database>, writer: DiskWriter) -> LogStore {
         let tail = writer.tail(group);
-        LogStore { group, db, writer, tail, seq: Arc::default() }
+        LogStore { group, db, writer, tail }
     }
 
     fn read_meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -221,20 +224,50 @@ impl RaftLogReader<TypeConfig> for LogStore {
         if start >= end {
             return Ok(Vec::new());
         }
-        let mut out: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-        {
-            let txn = self.db.begin_read().map_err(io_err)?;
-            let t = txn.open_table(LOG).map_err(io_err)?;
-            for r in t.range((self.group, start)..(self.group, end)).map_err(io_err)? {
-                let (k, v) = r.map_err(io_err)?;
-                out.insert(k.value().1, v.value().to_vec());
+        // The tail first, then the disk: the writer trims an entry from the
+        // tail only after committing it, so an entry missing from this tail
+        // copy was committed before the read transaction below began. (Disk
+        // first lets an entry flush and leave the tail between the two reads,
+        // and the read returns a gap that openraft's replication asserts on.)
+        for _ in 0..3 {
+            let mut out: BTreeMap<u64, Vec<u8>> =
+                self.tail.lock().expect("tail lock").range(start..end).map(|(i, (_, e))| (*i, e.clone())).collect();
+            {
+                let txn = self.db.begin_read().map_err(io_err)?;
+                let t = txn.open_table(LOG).map_err(io_err)?;
+                for r in t.range((self.group, start)..(self.group, end)).map_err(io_err)? {
+                    let (k, v) = r.map_err(io_err)?;
+                    // Unflushed entries are newer than anything on disk at the same index.
+                    out.entry(k.value().1).or_insert_with(|| v.value().to_vec());
+                }
+            }
+            // No hole between the first entry found and the last. (A range
+            // may legitimately begin before the log does: index 0, or a
+            // purged prefix.)
+            let first = out.keys().next().copied().unwrap_or(start);
+            let contiguous = out.keys().copied().eq(first..first + out.len() as u64);
+            // Starting late is only legal where purge removed the prefix.
+            let late = first > start && !out.is_empty() && {
+                let purged: Option<LogIdOf<TypeConfig>> = self.read_meta("purged")?.map(|b| dec(&b)).transpose()?;
+                purged.is_none_or(|p| first > p.index + 1) && start > 0
+            };
+            if late {
+                tracing::warn!(
+                    group = self.group,
+                    start,
+                    first,
+                    "log read began after its start above the purge point; reading again"
+                );
+                continue;
+            }
+            if contiguous {
+                return out.values().map(|b| dec(b)).collect();
             }
         }
-        // Unflushed entries are newer than anything on disk at the same index.
-        for (idx, (_, e)) in self.tail.lock().expect("tail lock").range(start..end) {
-            out.insert(*idx, e.clone());
-        }
-        out.values().map(|b| dec(b)).collect()
+        Err(io_err(format!(
+            "group {}: log entries {start}..{end} are not contiguous on disk and in memory",
+            self.group
+        )))
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<TypeConfig>>, io::Error> {
@@ -280,7 +313,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I: IntoIterator<Item = EntryOf<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = self.writer.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let encoded: Vec<(u64, Vec<u8>)> =
             entries.into_iter().map(|e| Ok((e.log_id.index, enc(&e)?))).collect::<io::Result<_>>()?;
         {

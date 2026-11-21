@@ -104,6 +104,58 @@ message Policy {
   map<string, string> require = 14;   // hard placement predicates
   repeated string prefer = 15;        // soft placement preferences
   string source = 16;                 // "file.py:line" of the call view, for explanations
+  // module.qualname[.method]: a learned profile carries over when the code
+  // (and so its digest) changes.
+  string fn_name = 17;
+  // ch.auto(min=, max=) bounds on learned values; 0 = unbounded.
+  double cpus_min = 18;
+  double cpus_max = 19;
+  uint64 memory_min = 20;
+  uint64 memory_max = 21;
+  int32 priority = 22;            // higher starts first among ready calls on a peer; never preempts
+  uint32 max_in_flight = 23;      // generator calls: items yielded ahead of the consumer; 0 = default
+  // A map chunk: the function it runs over its items, and how many items, so
+  // the peer learns per-item time and CPU under that function's profile.
+  bytes profile_digest = 24;
+  uint32 items = 25;
+}
+
+// What a function's recent calls used (chimaera_core::profile::Summary).
+// Persisted by each peer and gossiped between peers; soft state.
+message ProfileSummary {
+  bytes fn_digest = 1;
+  string method = 2;
+  string name = 3;
+  uint64 hw_class = 4;
+  uint64 n = 5;
+  double cores_mean = 6;
+  double cores_cv = 7;
+  double cpus_granted = 8;
+  double wall_p50_s = 9;
+  double wall_p90_s = 10;
+  uint64 peak_n = 11;
+  uint64 peak_p95 = 12;
+  double peak_cv = 13;
+  uint64 max_arg_bytes = 14;
+  bool has_fit = 15;
+  double fit_a = 16;
+  double fit_b = 17;
+  double fit_r2 = 18;
+  double fit_resid_cv = 19;
+  repeated SizeBucket buckets = 20;
+  repeated SizeBucket oom_bounds = 21;
+  uint64 out_p90 = 22;
+  double learned_cpus = 23;   // CPU grant learned for the function; 0 = none
+}
+
+message SizeBucket {
+  uint32 bucket = 1;   // log2 size class of the input
+  uint64 bytes = 2;
+  uint32 samples = 3;
+}
+
+message ProfileSnapshot {
+  repeated ProfileSummary profiles = 1;
 }
 
 // How executors start for a run: interpreter, working directory, import path

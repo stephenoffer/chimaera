@@ -71,7 +71,12 @@ impl Node {
         let identity = Identity::load(dir)?;
         let shape = crate::topology::discover();
         let capacity = cpus.unwrap_or_else(|| shape.usable_cores());
-        let objects = ObjectStore::open(object_dir(dir, &identity))?;
+        let mut objects = ObjectStore::open(object_dir(dir, &identity))?;
+        crate::objplane::start(objects.dir().to_path_buf());
+        if crate::budget::is_tmpfs(objects.dir()) {
+            // Objects in memory move to disk under pressure (see Core).
+            objects = objects.with_spill(dir.join("spill"));
+        }
         let code = CodeStore::open(dir.join("code"))?;
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(65536);
         Ok((Node { dir: dir.to_path_buf(), identity, shape, capacity, objects, code, core_tx, core_rx }, lock))
@@ -101,16 +106,26 @@ pub async fn run_local(cfg: PeerConfig) -> io::Result<()> {
             .await
             .map_err(io::Error::other)?;
     }
-    serve(node, router, raft_events, cfg.idle_timeout).await
+    serve(node, router, raft_events, cfg.idle_timeout, None).await
+}
+
+/// A TCP listener for drivers on other machines.
+pub struct ClientListen {
+    pub addr: std::net::SocketAddr,
+    /// The cluster token every call must carry (None: no check, `--insecure`).
+    pub token: Option<String>,
+    pub tls: Option<tonic::transport::ServerTlsConfig>,
 }
 
 /// Run the executors, the core and the client service of a peer whose groups
-/// are up, until shutdown (signal, Shutdown RPC or idle timeout).
+/// are up, until shutdown (signal, Shutdown RPC or idle timeout). The client
+/// service always listens on the local socket, and on TCP with `clients`.
 pub async fn serve(
     node: Node,
     router: Arc<Router>,
     mut raft_events: mpsc::Receiver<chimaera_raft::GroupEvents>,
     idle_timeout: Option<Duration>,
+    clients: Option<ClientListen>,
 ) -> io::Result<()> {
     let Node { dir, identity, shape, capacity, objects, code, core_tx, core_rx } = node;
     let client_socket = chimaera_proto::uds::socket_path(&dir, CLIENT_SOCKET);
@@ -140,6 +155,14 @@ pub async fn serve(
         None
     };
     let isolated_available = isolation.is_some();
+    let budget = memory_budget(&shape, &objects)?;
+    let nofile = crate::budget::raise_nofile();
+    tracing::info!(budget = %budget.describe(), ?nofile, "automatic settings");
+    let profiles_path = dir.join("profiles.pb");
+    let mut profiles = crate::profiles::Profiles::load_file(&profiles_path);
+    profiles.hw_class = crate::profiles::hw_class(&shape);
+    // A bad quota setting stops the peer rather than leaving tenants unlimited.
+    crate::quotas::Quotas::from_env().map_err(io::Error::other)?;
     let core = Core::new(
         core_tx.clone(),
         router.clone(),
@@ -149,8 +172,12 @@ pub async fn serve(
         capacity,
         client_socket.display().to_string(),
         isolation,
+        budget,
+        profiles,
+        profiles_path,
     );
     tokio::spawn(core.run(core_rx));
+    crate::prom::spawn_from_env(core_tx.clone())?;
     let c2 = core_tx.clone();
     tokio::spawn(async move {
         while let Some(ev) = raft_events.recv().await {
@@ -190,18 +217,61 @@ pub async fn serve(
         shutdown.clone(),
         isolated_available,
     ));
+    if let Some(c) = clients {
+        let svc = pb::peer_server::PeerServer::new(crate::ingress::Service(ingress.clone()))
+            .max_decoding_message_size(256 << 20);
+        let svc =
+            tonic::service::interceptor::InterceptedService::new(svc, crate::mesh::CheckToken::new(c.token.as_deref()));
+        let mut builder = tonic::transport::Server::builder();
+        let tls = c.tls.is_some();
+        if let Some(cfg) = c.tls {
+            builder = builder.tls_config(cfg).map_err(|e| io::Error::other(format!("client TLS: {e}")))?;
+        }
+        let tcp = tokio::net::TcpListener::bind(c.addr).await?;
+        tracing::info!(addr = %c.addr, tls, token = c.token.is_some(), "listening for clients");
+        let incoming = tonic::transport::server::TcpIncoming::from(tcp).with_nodelay(Some(true));
+        let server = builder.add_service(svc).serve_with_incoming(incoming);
+        tokio::spawn(async move {
+            if let Err(e) = server.await {
+                tracing::error!("client listener stopped: {e}");
+            }
+        });
+    }
     let _ = std::fs::remove_file(&client_socket);
     let listener = tokio::net::UnixListener::bind(&client_socket)?;
     crate::executor::restrict_to_owner(&client_socket)?;
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+    let stopping = Arc::new(Notify::new());
+    let stop_signal = {
+        let (stopping, signal) = (stopping.clone(), wait_for_stop(shutdown.clone(), core_tx, idle_timeout));
+        async move {
+            signal.await;
+            stopping.notify_one();
+        }
+    };
     let server = tonic::transport::Server::builder()
         .add_service(
             pb::peer_server::PeerServer::new(crate::ingress::Service(ingress)).max_decoding_message_size(256 << 20),
         )
-        .serve_with_incoming_shutdown(incoming, wait_for_stop(shutdown.clone(), core_tx, idle_timeout));
+        .serve_with_incoming_shutdown(incoming, stop_signal);
     tracing::info!(peer = %identity.peer.hex(), incarnation = identity.incarnation, capacity, "peer ready");
     std::fs::write(dir.join("peer.pid"), std::process::id().to_string())?;
-    server.await.map_err(io::Error::other)?;
+    // Which binary this peer runs, so a program that would start a different
+    // (rebuilt, upgraded) one can say so instead of silently using this one.
+    if let Some(desc) = binary_description() {
+        let _ = std::fs::write(dir.join("peer.binary"), desc);
+    }
+    // Graceful shutdown waits for every open stream, and a connected driver's
+    // session stream stays open until that driver exits: a stopped peer would
+    // live as long as its longest client. Work is drained and state persisted
+    // before the stop signal fires, so open sessions get a short grace only.
+    tokio::select! {
+        r = server => r.map_err(io::Error::other)?,
+        () = async {
+            stopping.notified().await;
+            tokio::time::sleep(SESSION_GRACE).await;
+        } => tracing::info!("stopping with client sessions still open"),
+    }
     for g in router.hosted_groups() {
         g.shutdown().await;
     }
@@ -209,31 +279,41 @@ pub async fn serve(
     Ok(())
 }
 
-/// Smallest /dev/shm worth using for objects; containers often mount 64 MiB.
-const MIN_SHM_BYTES: u64 = 2 << 30;
-
-/// Objects live in shared memory on Linux when it has room, else on disk.
-fn object_dir(dir: &Path, id: &Identity) -> PathBuf {
-    let shm = Path::new("/dev/shm");
-    if cfg!(target_os = "linux") && shm.is_dir() && free_bytes(shm).is_some_and(|b| b >= MIN_SHM_BYTES) {
-        return shm.join(format!("chimaera-{}", &id.peer.hex()[..16]));
+/// This peer's memory pool: usable memory minus the agent's reserve, shared by
+/// executors and (in tmpfs) objects. `CHIMAERA_MEMORY_POOL` (e.g. `8 GiB`)
+/// sets it explicitly.
+fn memory_budget(
+    shape: &chimaera_core::topology::HostShape,
+    objects: &ObjectStore,
+) -> io::Result<crate::budget::Budget> {
+    let budget = crate::budget::Budget::plan(shape.memory_bytes, crate::budget::is_tmpfs(objects.dir()));
+    match std::env::var("CHIMAERA_MEMORY_POOL") {
+        Ok(v) => crate::budget::parse_size(&v).map(|pool| budget.with_pool(pool)).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("CHIMAERA_MEMORY_POOL={v:?}: expected a size like 8GiB"),
+            )
+        }),
+        Err(_) => Ok(budget),
     }
-    dir.join("objects")
 }
 
-fn free_bytes(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs writes one struct into `st`; `c` is NUL-terminated.
-    unsafe {
-        let mut st: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
-            return None;
-        }
-        // Field widths differ by platform (u32 vs u64), hence the casts.
-        #[allow(clippy::unnecessary_cast)]
-        Some(st.f_bavail as u64 * st.f_frsize as u64)
-    }
+/// `path size mtime_ns` of the running binary (what `_runtime` compares).
+fn binary_description() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let m = std::fs::metadata(&exe).ok()?;
+    let mtime_ns = m.mtime() as i128 * 1_000_000_000 + i128::from(m.mtime_nsec());
+    Some(format!("{}\n{}\n{}\n", exe.display(), m.len(), mtime_ns))
+}
+
+/// How long open client sessions may hold a stopping peer.
+const SESSION_GRACE: Duration = Duration::from_secs(3);
+
+/// Objects live in shared memory on Linux when it has room, else on disk
+/// (see objplane).
+fn object_dir(dir: &Path, id: &Identity) -> PathBuf {
+    crate::objplane::object_dir(dir, &id.peer.hex())
 }
 
 async fn wait_leader(group: &chimaera_raft::Group) -> io::Result<()> {
@@ -279,6 +359,15 @@ async fn drain(core: &mpsc::Sender<CoreMsg>) {
 }
 
 async fn wait_for_stop(shutdown: Arc<Notify>, core: mpsc::Sender<CoreMsg>, idle: Option<Duration>) {
+    wait_for_stop_signal(shutdown, &core, idle).await;
+    // What the peer learned outlives it: the next run starts right-sized.
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    if core.send(CoreMsg::Persist { reply }).await.is_ok() {
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx).await;
+    }
+}
+
+async fn wait_for_stop_signal(shutdown: Arc<Notify>, core: &mpsc::Sender<CoreMsg>, idle: Option<Duration>) {
     let notified = shutdown.notified();
     tokio::pin!(notified);
     let mut idle_since = Instant::now();
@@ -290,12 +379,24 @@ async fn wait_for_stop(shutdown: Arc<Notify>, core: mpsc::Sender<CoreMsg>, idle:
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()).expect("SIGUSR2 handler")
         }
     };
+    // SIGUSR1 drains too: srun forwards it to its tasks (it answers SIGTERM by
+    // killing them), so slurm-launch and `sbatch --signal=USR1@...` use it.
+    let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()).ok();
     loop {
         tokio::select! {
             _ = &mut notified => return,
             _ = tokio::signal::ctrl_c() => return,
             _ = term.recv() => {
-                drain(&core).await;
+                drain(core).await;
+                return;
+            }
+            Some(()) = async {
+                match usr1.as_mut() {
+                    Some(s) => s.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                drain(core).await;
                 return;
             }
             _ = tick.tick() => {

@@ -1,0 +1,227 @@
+{
+ "ray": [
+  {
+   "rates": {
+    "1:1 actor calls sync": 5838.688905088133,
+    "1:1 actor calls async": 18697.363014098682,
+    "n:n actor calls async": 24117.510886958175
+   },
+   "latency": {
+    "ray": {
+     "p50_us": 180.875,
+     "p99_us": 935.625
+    }
+   },
+   "load_avg_1m": 14.06591796875,
+   "python": "3.12.13",
+   "ray": "2.60.0",
+   "n_cpu_actors": 6,
+   "cpu_count": 12
+  },
+  {
+   "rates": {
+    "1:1 actor calls sync": 5980.206856553058,
+    "1:1 actor calls async": 21074.832627689273,
+    "n:n actor calls async": 26435.508403151864
+   },
+   "latency": {
+    "ray": {
+     "p50_us": 166.583,
+     "p99_us": 558.209
+    }
+   },
+   "load_avg_1m": 19.73291015625,
+   "python": "3.12.13",
+   "ray": "2.60.0",
+   "n_cpu_actors": 6,
+   "cpu_count": 12
+  },
+  {
+   "rates": {
+    "1:1 actor calls sync": 5690.371327090671,
+    "1:1 actor calls async": 19142.898094059456,
+    "n:n actor calls async": 28671.831286658697
+   },
+   "latency": {
+    "ray": {
+     "p50_us": 165.125,
+     "p99_us": 525.084
+    }
+   },
+   "load_avg_1m": 10.4736328125,
+   "python": "3.12.13",
+   "ray": "2.60.0",
+   "n_cpu_actors": 6,
+   "cpu_count": 12
+  }
+ ],
+ "proto": [
+  {
+   "rates": {
+    "1:1 actor calls sync": 32977.656971350545,
+    "1:1 actor calls async": 592910.0623311456,
+    "1:1 actor calls sync, effects=external": 27476.641327757647,
+    "n:n actor calls async": 1629758.238403452
+   },
+   "latency": {
+    "agent": {
+     "p50_us": 17.792,
+     "p99_us": 35.0
+    },
+    "agent, effects=external": {
+     "p50_us": 32.708,
+     "p99_us": 93.625
+    },
+    "direct, no agent": {
+     "p50_us": 9.167,
+     "p99_us": 66.875
+    }
+   },
+   "journal": {
+    "calls": 20869589,
+    "journal_bytes": 4090439444,
+    "batches": 297955,
+    "lag_us_p50": 24,
+    "lag_us_p99": 1542,
+    "lag_us_max": 257903
+   },
+   "load_avg_1m": 18.05517578125,
+   "python": "3.12.13",
+   "n_cpu_actors": 6
+  },
+  {
+   "rates": {
+    "1:1 actor calls sync": 50390.11250902946,
+    "1:1 actor calls async": 578889.6030742669,
+    "1:1 actor calls sync, effects=external": 27139.377403325314,
+    "n:n actor calls async": 1616284.789473148
+   },
+   "latency": {
+    "agent": {
+     "p50_us": 18.958,
+     "p99_us": 27.875
+    },
+    "agent, effects=external": {
+     "p50_us": 32.583,
+     "p99_us": 92.625
+    },
+    "direct, no agent": {
+     "p50_us": 7.666,
+     "p99_us": 59.541
+    }
+   },
+   "journal": {
+    "calls": 21206902,
+    "journal_bytes": 4156552792,
+    "batches": 293567,
+    "lag_us_p50": 24,
+    "lag_us_p99": 1528,
+    "lag_us_max": 255879
+   },
+   "load_avg_1m": 11.77197265625,
+   "python": "3.12.13",
+   "n_cpu_actors": 6
+  },
+  {
+   "rates": {
+    "1:1 actor calls sync": 59217.2405073784,
+    "1:1 actor calls async": 658478.2503212342,
+    "1:1 actor calls sync, effects=external": 29622.64921993196,
+    "n:n actor calls async": 1737237.2471794768
+   },
+   "latency": {
+    "agent": {
+     "p50_us": 14.5,
+     "p99_us": 25.208
+    },
+    "agent, effects=external": {
+     "p50_us": 32.125,
+     "p99_us": 42.041
+    },
+    "direct, no agent": {
+     "p50_us": 12.5,
+     "p99_us": 17.625
+    }
+   },
+   "journal": {
+    "calls": 23192382,
+    "journal_bytes": 4545706872,
+    "batches": 311095,
+    "lag_us_p50": 23,
+    "lag_us_p99": 1526,
+    "lag_us_max": 198363
+   },
+   "load_avg_1m": 8.07568359375,
+   "python": "3.12.13",
+   "n_cpu_actors": 6
+  }
+ ],
+ "proto_bounded": [
+  {
+   "rates": {
+    "1:1 actor calls sync": 52016.43188334761,
+    "1:1 actor calls async": 280948.38769699,
+    "1:1 actor calls sync, effects=external": 20954.051112741072,
+    "n:n actor calls async": 1856652.938164052
+   },
+   "latency": {
+    "agent": {
+     "p50_us": 18.334,
+     "p99_us": 27.042
+    },
+    "agent, effects=external": {
+     "p50_us": 34.625,
+     "p99_us": 44.333
+    },
+    "direct, no agent": {
+     "p50_us": 12.916,
+     "p99_us": 22.083
+    }
+   },
+   "journal": {
+    "calls": 20612158,
+    "journal_bytes": 4039982968,
+    "batches": 226884,
+    "lag_us_p50": 26,
+    "lag_us_p99": 1838,
+    "lag_us_max": 112342
+   },
+   "load_avg_1m": 7.6552734375,
+   "python": "3.12.13",
+   "n_cpu_actors": 6
+  },
+  {
+   "rates": {
+    "1:1 actor calls sync": 59422.21832325015,
+    "1:1 actor calls async": 619128.307561965,
+    "1:1 actor calls sync, effects=external": 31005.498976013445,
+    "n:n actor calls async": 1888168.8627090557
+   },
+   "latency": {
+    "agent": {
+     "p50_us": 14.916,
+     "p99_us": 25.291
+    },
+    "agent, effects=external": {
+     "p50_us": 32.25,
+     "p99_us": 68.792
+    },
+    "direct, no agent": {
+     "p50_us": 12.916,
+     "p99_us": 18.333
+    }
+   },
+   "journal": {
+    "calls": 23845954,
+    "journal_bytes": 4673806984,
+    "batches": 327502,
+    "lag_us_p50": 22,
+    "lag_us_p99": 1528,
+    "lag_us_max": 88429
+   },
+   "load_avg_1m": 6.36962890625,
+   "python": "3.12.13",
+   "n_cpu_actors": 6
+  }
+ ]
+}

@@ -12,6 +12,12 @@ pub fn discover() -> HostShape {
         ..Default::default()
     };
     platform::fill(&mut shape);
+    // Every accelerator kind (crate::devices); nvidia-smi above stays the
+    // fallback where /proc/driver/nvidia is not visible.
+    let found = crate::devices::shape_gpus();
+    if !found.is_empty() {
+        shape.gpus = found;
+    }
     if shape.cpus.is_empty() {
         let n = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
         shape.cpus = (0..n).collect();
@@ -33,6 +39,21 @@ pub fn own_cgroup_dir() -> Option<PathBuf> {
     dir.join("cgroup.controllers").exists().then_some(dir)
 }
 
+/// This process's cgroup and the ones above it, innermost first. A limit on
+/// any of them applies: systemd slices and some container runtimes set it on
+/// a parent and leave the process's own cgroup unlimited.
+pub fn own_cgroup_chain() -> Vec<PathBuf> {
+    own_cgroup_dir().map_or_else(Vec::new, |dir| cgroup_chain(&dir, Path::new("/sys/fs/cgroup")))
+}
+
+/// `dir` and its ancestors below `root` (`root` itself only when `dir` is
+/// it, as inside a container's cgroup namespace).
+fn cgroup_chain(dir: &Path, root: &Path) -> Vec<PathBuf> {
+    let mut chain = vec![dir.to_path_buf()];
+    chain.extend(dir.ancestors().skip(1).take_while(|d| d.starts_with(root) && *d != root).map(Path::to_path_buf));
+    chain
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
@@ -42,11 +63,16 @@ mod platform {
         shape.cpus = affinity_cpus();
         let host_mem = read("/proc/meminfo").and_then(|m| t::parse_memtotal(&m)).unwrap_or(0);
         shape.memory_bytes = host_mem;
-        if let Some(dir) = own_cgroup_dir() {
-            shape.cpu_quota = read(dir.join("cpu.max")).and_then(|c| t::parse_cpu_max(&c));
+        // The tightest limit on the way up applies.
+        for dir in own_cgroup_chain() {
+            if let Some(q) = read(dir.join("cpu.max")).and_then(|c| t::parse_cpu_max(&c)) {
+                shape.cpu_quota = Some(shape.cpu_quota.map_or(q, |prev| prev.min(q)));
+            }
             if let Some(limit) = read(dir.join("memory.max")).and_then(|c| t::parse_memory_max(&c)) {
                 shape.memory_bytes = shape.memory_bytes.min(limit);
             }
+        }
+        if let Some(dir) = own_cgroup_dir() {
             shape.cgroup_delegated = can_delegate(&dir);
         }
         shape.numa = numa_nodes(&shape.cpus);
@@ -163,5 +189,26 @@ mod tests {
         assert!(s.numa.iter().all(|n| !n.cpus.is_empty()));
         assert!(s.usable_cores() > 0.0);
         println!("{s:#?}");
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    #[test]
+    fn limits_above_the_process_cgroup_are_looked_at() {
+        let root = Path::new("/sys/fs/cgroup");
+        let own = root.join("user.slice/user-1000.slice/session-2.scope");
+        assert_eq!(
+            cgroup_chain(&own, root),
+            [own.clone(), root.join("user.slice/user-1000.slice"), root.join("user.slice")],
+            "the process's cgroup, then each parent below the root"
+        );
+        assert_eq!(
+            cgroup_chain(root, root),
+            [root.to_path_buf()],
+            "inside a container its cgroup is the namespace root"
+        );
     }
 }

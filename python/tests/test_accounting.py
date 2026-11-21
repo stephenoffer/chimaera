@@ -3,6 +3,7 @@ cgroup readings (and enforced limits) where Linux delegation is available."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -40,11 +41,20 @@ def _measure(f, name):
 
 
 def test_busy_loop_uses_one_core_and_a_sleep_uses_none():
-    value, scope, method = _measure(busy.remote(0.5), "mean_cores")
+    f = busy.remote(0.5)
+    cpu, scope, method = _measure(f, "cpu_seconds")
     assert scope in ("process", "attempt") and method in ("rusage", "cgroup")
-    assert 0.95 <= value <= 1.05, value
-    value, _, _ = _measure(nap.remote(0.3), "mean_cores")
-    assert value < 0.02, value
+    # The loop burns 0.5 s of CPU whatever else the host runs.
+    assert 0.48 <= cpu <= 0.55, cpu
+    cores, _, _ = _measure(f, "mean_cores")
+    # A whole core per second of wall time only when the host has one free:
+    # on an oversubscribed host the same loop truly gets less.
+    if os.getloadavg()[0] < (os.cpu_count() or 1) * 0.75:
+        assert 0.95 <= cores <= 1.05, cores
+    else:
+        assert cores <= 1.05, cores
+    nap_cpu, _, _ = _measure(nap.remote(0.3), "cpu_seconds")
+    assert nap_cpu < 0.006, nap_cpu
 
 
 isolated = pytest.mark.skipif(

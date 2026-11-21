@@ -37,8 +37,12 @@ This is early software. What works today and what does not:
 | Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |
 | Restarting the peer mid-run and reattaching with `ch.attach(run_id)` | Working |
 | Several peers: replicated shard groups, placement across peers, objects fetched between peers, failover, dead voters replaced | Working on localhost clusters; not yet run across real machines |
-| Peer authentication (tokens, mTLS) | Not yet: run clusters only on a trusted network |
-| Streaming generators, durable actors and workflows, GPU gangs, shuffles | Not yet |
+| Peer authentication: cluster token, mutual TLS | Working on localhost clusters |
+| Durable actors (`state=ch.State()`): committed state, idempotent command ids, restart from the committed state | Working |
+| Learned reservations, memory-aware admission, large values stored once ([details](#what-chimaera-does-for-you)) | Working on one machine; placement across peers weighs input locality and memory |
+| Streaming generator calls (`ch.Stream`, bounded ahead of the consumer, replayed after a worker dies) | Working |
+| Durable workflows (`workflow="durable"`): replay answered from the run's record, divergence detected | Working |
+| GPU gangs, shuffles | Not yet |
 
 The design and the plan are in [docs/design.md](docs/design.md). What has been
 measured so far is in [docs/qualification.md](docs/qualification.md).
@@ -59,14 +63,26 @@ The first `.remote()` call starts a local peer in the background
 
 ## Run a cluster
 
+Make a cluster CA and token once, and a certificate per peer:
+
+```bash
+chimaera cluster init --out ca/                      # ca.pem, ca.key, token
+chimaera cluster cert --ca ca/ --name host1 --out host1-tls/
+```
+
 Start one peer per machine. The founders are the addresses in `--seeds`; a
 peer started later with the same seeds joins as a spare that runs work and
 replaces a founder that dies.
 
 ```bash
 chimaera --dir /var/lib/chimaera peer start \
-    --listen 10.0.0.1:7100 --seeds 10.0.0.1:7100,10.0.0.2:7100,10.0.0.3:7100
+    --listen 10.0.0.1:7100 --seeds 10.0.0.1:7100,10.0.0.2:7100,10.0.0.3:7100 \
+    --token-file ca/token --tls-dir host1-tls/
 ```
+
+Peers refuse calls without the token and connections from certificates
+another CA signed. `--insecure` skips the token; leaving out `--tls-dir`
+sends peer traffic in plain text.
 
 Point a program at the peer on its machine with `CHIMAERA_HOME=/var/lib/chimaera`.
 Work spreads over every peer; any peer can attach to any run. A peer that
@@ -74,9 +90,9 @@ stops answering for three seconds is retired and its work runs elsewhere.
 `SIGTERM` drains a peer: it takes no new work and stops once its running
 calls finish (up to `CHIMAERA_DRAIN_SECONDS`, default 30).
 
-Peers do not authenticate each other yet, so keep the listen port on a
-trusted network. Results stored on a peer that dies are lost with it; their
-tasks are not re-run to rebuild them.
+Programs reach their peer through a local socket only it and its user can
+open; there is no network client endpoint yet. Results stored on a peer that
+dies are lost with it; their tasks are not re-run to rebuild them.
 
 ## A short tour
 
@@ -160,6 +176,40 @@ labeled with how and over what scope it was measured. A request that no
 machine can satisfy fails at once with `ch.Infeasible` and the shape it asked
 for.
 
+## What Chimaera does for you
+
+Code written the obvious way should not need tuning. Each row is a trap Ray
+users hit and what
+Chimaera does instead, with no option to set.
+
+| Ray trap | What Chimaera does |
+|---|---|
+| The same large argument passed to many calls is copied into the object store every time | Arguments of 1 MiB or more are stored once by content: a 16 MiB array passed to 50 calls is written once |
+| Arrays read from the object store are read-only (`assignment destination is read-only`) | Arrays arrive writable and zero-copy; a write stays in its own call |
+| `num_cpus` and `memory` are guesses nobody checks; too many memory-heavy tasks start together and get OOM-killed | Each function's private memory peak is measured; after three calls later calls reserve it (scaled with input size when memory tracks input), and calls wait for memory instead of overcommitting it. A function not yet measured runs a few calls at a time (full width where the pool has 4 GiB free per call) until its first call finishes |
+| OOM kills retry the same mistake | A call killed for memory is retried with 1.5x the memory it reached, and waits until that fits; if no peer's pool can fit it, it fails at once with `ch.OutOfMemory` |
+| A task that mostly waits on I/O holds a whole core | After ten calls the runtime tries a quarter core on half of them and keeps it only if it is faster per core |
+| A leaking worker grows until the node OOMs, unless you find `max_calls` | A worker whose memory between calls keeps rising is replaced, and the decision is recorded. On Linux, memory the allocator kept after frees is handed back first, so it is not mistaken for a leak |
+| Library thread pools oversubscribe or stick at one thread | OpenMP, BLAS, Polars and Numba pools are sized to the call's CPU grant; core dumps are off; glibc arenas are capped on Linux |
+| A module edited between runs is served stale by a warm worker | Runs whose source files differ never share workers |
+| The driver and the cluster run different versions, and it shows up as odd failures | A program that would start a different (rebuilt or upgraded) peer binary than the one serving it warns once and says how to switch (CH111) |
+| Submitting millions of calls in a loop fills memory | `.remote()` waits for room once unfinished calls hold half the peer's memory in arguments, and says so (CH110) |
+| A task that cannot be scheduled hangs with the reason in a log on another machine | `.result()` prints why after a minute (needs memory, needs CPU, waiting for an executor) |
+| An actor whose method waits on I/O runs its calls one at a time, and nothing says why they queue | A call queued at an actor says how many are ahead; when that method is learned to mostly wait, it suggests `@ch.method(concurrency=N)` |
+| A full disk shows up as a bare `No space left on device` deep in a worker, leaving partial files | The error names the disk, its free space and what to do; the partial file is removed |
+| `logging` inside tasks goes nowhere | Task log records reach the driver at the driver's log level |
+| The object store's directory fills the disk with what finished jobs left behind | A run's stored arguments and `ch.put` values are deleted when the run ends; its results are kept for a day so `ch.attach` can read them |
+| In a container, the object store and memory monitor are sized from host memory, or from the wrong cgroup | The memory pool and CPU capacity come from the tightest limit on the process's cgroup and every cgroup above it |
+| Everything learned is lost with the cluster | Profiles are saved by each peer, reloaded on restart, and shared between peers on the same hardware |
+
+What was learned and why is in `chimaera explain RUN --decisions`; each
+attempt's reservation and where it came from is in `future.explain()`.
+Explicit `cpus=` and `memory=` always win, `ch.auto(min=, max=)` bounds what is
+learned, and `adaptive="observe"` (records only) or `"frozen"` turn learning
+off. Under host memory pressure on Linux the peer stops the attempt furthest
+over its reservation (`bench/evals/gotchas`, `runaway` trap); that path is not
+exercised by the test suite.
+
 ## The `chimaera` command
 
 ```bash
@@ -167,6 +217,7 @@ chimaera status                          # CPU in use, queue, why work is waitin
 chimaera inspect RUN                     # a run's calls by state
 chimaera explain RUN --task TASK         # one call: attempts, measurements, waiting reason
 chimaera explain RUN --decisions         # what the runtime tuned, and why
+chimaera profiles [--fn NAME]            # what was learned per function, and what its next call reserves
 chimaera doctor                          # what this host supports
 chimaera stop                            # stop the local peer
 ```

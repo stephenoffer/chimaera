@@ -6,6 +6,7 @@ members = [
     "crates/chimaera-peer",
     "crates/chimaera-raft",
     "crates/chimaera-py",
+    "crates/chimaera-fleet",
 ]
 
 [workspace.package]
@@ -24,7 +25,7 @@ prost = "0.14"
 tonic = { version = "0.14.9", default-features = false }
 tonic-prost = "0.14.9"
 tonic-prost-build = "0.14.9"
-blake3 = "1.8"
+blake3 = { version = "1.8", features = ["rayon"] }
 lz4_flex = "0.14"
 zstd = "0.14"
 thiserror = "2"

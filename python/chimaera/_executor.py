@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import concurrent.futures
 import inspect
 import io
+import logging
 import os
 import pickle
 import queue
@@ -25,9 +27,58 @@ from typing import Any
 
 import cloudpickle
 
-from . import _context, _future, _serde
+from . import _batch, _context, _future, _objects, _project, _serde
 from ._native import ExecConn, blake3_digest, child_id
 from ._serde import Dep
+
+CODE_CACHE = 256
+# Growth in a worker's anonymous memory after which freed memory glibc keeps
+# in its arenas is handed back (malloc_trim) before the call is reported, so
+# the peer's leak check (R4) sees only memory that is really held.
+TRIM_GROWTH = 256 << 20
+
+
+def _rss_anon() -> int | None:
+    """This process's anonymous resident memory, bytes (Linux)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+class _Trimmer:
+    """Gives glibc's freed-but-kept memory back once the worker has grown
+    TRIM_GROWTH past its baseline. Checked after every call of 10 ms or more
+    (growing by that much takes longer), else at most once a second, so tiny
+    calls do not pay for reading /proc."""
+
+    def __init__(self) -> None:
+        self.trim = None
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes
+
+                self.trim = ctypes.CDLL("libc.so.6").malloc_trim
+            except (OSError, AttributeError):  # musl and other libcs have none
+                pass
+        self.base = _rss_anon() if self.trim else None
+        self.checked = 0.0
+
+    def __call__(self, call_s: float) -> None:
+        if self.trim is None or (call_s < 0.01 and time.monotonic() - self.checked < 1.0):
+            return
+        self.checked = time.monotonic()
+        anon = _rss_anon()
+        if anon is None or self.base is None or anon < self.base:
+            self.base = anon
+            return
+        if anon - self.base >= TRIM_GROWTH:
+            self.trim(0)
+            self.base = _rss_anon() or anon  # what is still held is the new baseline
 
 CALL_FUNCTION, CALL_ACTOR_CTOR, CALL_ACTOR_METHOD, CALL_MAP_ITEM = 0, 1, 2, 3
 
@@ -66,14 +117,25 @@ class _TaskOutput(io.TextIOBase):
 class Executor:
     def __init__(self, conn: ExecConn) -> None:
         self.conn = conn
+        self.trimmer = _Trimmer()
         w = conn.welcome
         self.object_dir: str = w["object_dir"]
+        _objects.enable(self.object_dir)
         self.code_dir: str = w["code_dir"]
         self.inline_limit: int = w["inline_limit"]
-        self.code: dict[bytes, Any] = {}
+        # Callables by digest, least recently used first. Bounded: functions
+        # defined in a loop each have their own digest.
+        self.code: collections.OrderedDict[bytes, Any] = collections.OrderedDict()
         self.instance: Any = None
         self.actor_loop: asyncio.AbstractEventLoop | None = None
-        self.pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self.loop_lock = threading.Lock()
+        # Generator calls: how far each consumer has read (from ExecCredit).
+        self.credit: dict[bytes, int] = {}
+        self.credit_cond = threading.Condition()
+        self.lanes: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+        self.batchers: dict[str, _batch.Batcher | None] = {}  # @ch.method(batch=...) methods
+        # While a batch runs: starts its next call when the current one waits.
+        self.on_block: Any = None
         self.running: dict[bytes, _context.TaskContext] = {}
         self.inbox: queue.Queue[tuple[Any, ...] | None] = queue.Queue()
 
@@ -85,6 +147,10 @@ class Executor:
             with open(os.path.join(self.code_dir, digest.hex()), "rb") as f:
                 fn = _serde.load_code(f.read())
             self.code[digest] = fn
+            if len(self.code) > CODE_CACHE:
+                self.code.popitem(last=False)
+        else:
+            self.code.move_to_end(digest)
         return fn
 
     def value(self, outcome: tuple[Any, ...]) -> Any:
@@ -92,7 +158,7 @@ class Executor:
             raise RuntimeError(f"prerequisite has no value: {outcome[:4]}")
         _, inline, run, obj, _size, _oob = outcome
         if inline is not None:
-            return _serde.loads(inline)
+            return _serde.loads(inline, _serde.run_dir(self.object_dir, run))
         from ._runtime import read_object
 
         return read_object(self.object_dir, run, obj)
@@ -102,6 +168,10 @@ class Executor:
         resolved: dict[int, Any] = {}
 
         def sub(x: Any) -> Any:
+            if isinstance(x, _future.PartDep):
+                if x.dep not in resolved:
+                    resolved[x.dep] = self.value(deps[x.dep])
+                return _future.pick(resolved[x.dep], x.index, x.count)
             if isinstance(x, Dep):
                 if x.index not in resolved:
                     resolved[x.index] = self.value(deps[x.index])
@@ -113,9 +183,19 @@ class Executor:
     # ---- outputs ----------------------------------------------------------
 
     def ok(self, key: bytes, attempt: int, value: Any) -> tuple[Any, ...]:
-        parts, size, oob = _serde.dumps_parts(value)
         run = key[:16]
-        obj = child_id(run, [key[16:], attempt.to_bytes(4, "little")])
+        return self.ok_object(run, child_id(run, [key[16:], attempt.to_bytes(4, "little")]), value)
+
+    def ok_object(self, run: bytes, obj: bytes, value: Any) -> tuple[Any, ...]:
+        """Store `value` as object `obj` of `run` (inline when small). Arena
+        arrays in it are linked, not copied (see _objects); their blobs carry
+        the run's prefix, so they live as long as the result itself."""
+        rdir = _serde.run_dir(self.object_dir, run)
+
+        def claim(view: memoryview) -> tuple[bytes, int] | None:
+            return _objects.claim(view, rdir, run[:4]) if view.nbytes >= _objects.ARENA_MIN else None
+
+        parts, size, oob = _serde.dumps_parts(value, external=claim)
         if size <= self.inline_limit:
             data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts)
             return ("ok", run, obj, size, data, oob)
@@ -151,9 +231,19 @@ class Executor:
         self.running[key] = ctx
         token = _context.set_task(ctx)
         entry = time.time_ns()
-        retryable, fingerprint = False, b""
+        retryable, fingerprint, state = False, b"", b""
         try:
-            outcome = self.ok(key, attempt, self.invoke(msg, args_ref, deps))
+            result = self.invoke(msg, args_ref, deps)
+            if isinstance(result, _future.Future):
+                # Returning a future forwards it: this call resolves to that
+                # call's outcome, and this worker is free meanwhile.
+                result._escaped = True  # the shard now pins it for the run
+                result._rt.client.flush()
+                outcome = ("forward", result.key)
+            else:
+                outcome = self.ok(key, attempt, result)
+                if msg.get("durable"):
+                    state = _durable_state(self.instance)
         except BaseException as exc:  # user code may raise anything, including SystemExit
             outcome = self.err(exc)
             retryable = _matches(exc, msg["retry_exception_types"])
@@ -165,7 +255,8 @@ class Executor:
             sys.stderr.flush()
             _context.reset(token)
             self.running.pop(key, None)
-        self.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns())
+        self.trimmer((time.time_ns() - entry) / 1e9)
+        self.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
 
     def invoke(self, msg: dict[str, Any], args_ref: tuple[Any, ...], deps: list[tuple[Any, ...]]) -> Any:
         kind = msg["kind"]
@@ -178,38 +269,154 @@ class Executor:
             if self.instance is None:
                 raise RuntimeError("actor method called before its constructor ran")
             result = getattr(self.instance, msg["method"])(*args, **kwargs)
-            if inspect.isawaitable(result):
+            # A returned future is forwarded by run_one, never awaited here:
+            # awaiting would hold this worker until the other call finishes.
+            if inspect.isawaitable(result) and not isinstance(result, _future.Future):
                 return asyncio.run_coroutine_threadsafe(_awaitable(result), self._actor_loop()).result()
             return result
         fn = self.load(msg["fn_digest"])
+        if getattr(fn, "__chimaera_workflow__", False):
+            ctx = _context.current_task()
+            if ctx is not None:
+                ctx.workflow = True
         result = fn(*args, **kwargs)
-        if inspect.isawaitable(result):
+        if inspect.isgenerator(result) or inspect.isasyncgen(result):
+            return self.stream(msg, result)
+        if inspect.isawaitable(result) and not isinstance(result, _future.Future):
             return asyncio.run(_awaitable(result))
-        if inspect.isgenerator(result):
-            raise TypeError(
-                "generator functions cannot be called remotely yet; return a list, or use fn.map over the inputs"
-            )
         return result
 
+    def stream(self, msg: dict[str, Any], gen: Any) -> int:
+        """Send a generator's items as it yields them, at most a window ahead
+        of the consumer. The call's result is the number of items."""
+        from ._runtime import STREAM_WINDOW
+
+        ctx = _context.current_task()
+        assert ctx is not None
+        key = ctx.run + ctx.task
+        window = int(msg["policy"].get("max_in_flight") or STREAM_WINDOW)
+        sent = 0
+
+        def put(item: Any) -> bool:
+            nonlocal sent
+            with self.credit_cond:
+                while sent >= self.credit.get(key, 0) + window:
+                    if ctx._cancelled.is_set():
+                        return False
+                    self.credit_cond.wait(0.5)
+            index = sent
+            run = key[:16]
+            obj = child_id(run, [key[16:], ctx.attempt.to_bytes(4, "little"), b"item", index.to_bytes(8, "little")])
+            self.conn.send_yield(key, ctx.attempt, index, self.ok_object(run, obj, item))
+            sent += 1
+            return not ctx._cancelled.is_set()
+
+        try:
+            if inspect.isasyncgen(gen):
+
+                async def drain() -> None:
+                    async for item in gen:
+                        if not put(item):
+                            break
+
+                asyncio.run(drain())
+            else:
+                for item in gen:
+                    if not put(item):
+                        gen.close()
+                        break
+        finally:
+            with self.credit_cond:
+                self.credit.pop(key, None)
+        return sent
+
     def _actor_loop(self) -> asyncio.AbstractEventLoop:
-        if self.actor_loop is None:
-            loop = asyncio.new_event_loop()
-            threading.Thread(target=loop.run_forever, name="actor-loop", daemon=True).start()
-            self.actor_loop = loop
-        return self.actor_loop
+        # Calls in several lanes arrive at once: create the one loop under a lock,
+        # or two threads could each make one and split the actor's coroutines.
+        with self.loop_lock:
+            if self.actor_loop is None:
+                loop = asyncio.new_event_loop()
+                threading.Thread(target=loop.run_forever, name="actor-loop", daemon=True).start()
+                self.actor_loop = loop
+            return self.actor_loop
 
     def handle(self, msg: dict[str, Any]) -> None:
-        concurrency = int(msg["policy"].get("concurrency") or 1)
-        if msg["kind"] == CALL_ACTOR_METHOD and concurrency > 1:
-            # Overlapping calls: the peer sends up to `concurrency` at once;
-            # they start in arrival order and may finish in any order.
-            if self.pool is None:
-                self.pool = concurrent.futures.ThreadPoolExecutor(concurrency, thread_name_prefix="actor-lane")
+        # A remote driver's project modules, before any of its code loads.
+        _project.ensure(self.object_dir, msg["items"][0][0][:16], os.path.join(os.path.dirname(self.code_dir), "projects"))
+        batcher = self.batcher(msg["method"]) if msg["kind"] == CALL_ACTOR_METHOD else None
+        if batcher is not None:
             for item in msg["items"]:
-                self.pool.submit(self.run_one, msg, item).add_done_callback(_report_failure)
+                batcher.submit(msg, item)
             return
-        for item in msg["items"]:
-            self.run_one(msg, item)
+        lane = self.lane(msg) if msg["kind"] == CALL_ACTOR_METHOD else None
+        if lane is not None:
+            for item in msg["items"]:
+                lane.submit(self.run_one, msg, item).add_done_callback(_report_failure)
+            return
+        self.run_batch(msg)
+
+    def run_batch(self, msg: dict[str, Any]) -> None:
+        """Run a batch of calls one after another. When one waits (on a future,
+        a queue, a lock, a barrier...), the next starts on another thread: calls
+        of a batch may be waiting on each other, so running them strictly in
+        turn could deadlock. Returns when every call has finished."""
+        pending = collections.deque(msg["items"])
+        lock = threading.Lock()
+        helpers: list[threading.Thread] = []
+
+        def take() -> Any:
+            with lock:
+                return pending.popleft() if pending else None
+
+        def work() -> None:
+            while (item := take()) is not None:
+                self.run_one(msg, item)
+
+        def on_block() -> None:
+            with lock:
+                if not pending:
+                    return
+            t = threading.Thread(target=work, name="batch-item", daemon=True)
+            helpers.append(t)
+            t.start()
+
+        self.on_block = on_block
+        try:
+            work()
+            for t in helpers:  # the list only grows while items still run
+                t.join()
+        finally:
+            self.on_block = None
+
+    def batcher(self, method: str) -> _batch.Batcher | None:
+        if method not in self.batchers:
+            declared = getattr(getattr(type(self.instance), method, None), "__chimaera_method__", None) or {}
+            batch = declared.get("batch")
+            self.batchers[method] = _batch.Batcher(self, method, batch) if batch is not None else None
+        return self.batchers[method]
+
+    def lane(self, msg: dict[str, Any]) -> concurrent.futures.ThreadPoolExecutor | None:
+        """The pool an actor method runs in, or None to run it here, one call at a time.
+
+        The actor's concurrency (what the peer may send at once) is shared by
+        its lanes: each concurrency group, each method declared with its own
+        ``concurrency``, and the default lane, which gets the rest. Calls in a
+        lane start in arrival order; lanes do not wait on each other.
+        """
+        from ._remote import _lane_limits
+
+        total = int(msg["policy"].get("concurrency") or 1)
+        cls = type(self.instance)
+        limits = _lane_limits(cls)
+        if not limits and total == 1:
+            return None
+        declared = getattr(getattr(cls, msg["method"], None), "__chimaera_method__", None) or {}
+        name = declared.get("group") or (f"method:{msg['method']}" if f"method:{msg['method']}" in limits else "")
+        size = limits[name] if name else max(1, total - sum(limits.values()))
+        pool = self.lanes.get(name)
+        if pool is None:
+            pool = self.lanes[name] = concurrent.futures.ThreadPoolExecutor(size, thread_name_prefix=f"actor-{name or 'lane'}")
+        return pool
 
     def read_loop(self) -> None:
         while True:
@@ -221,7 +428,12 @@ class Executor:
                 ctx = self.running.get(m[1])
                 if ctx is not None:
                     ctx._cancelled.set()
-            elif m[0] == "execute":
+            elif m[0] == "credit":
+                with self.credit_cond:
+                    self.credit[m[1]] = max(self.credit.get(m[1], 0), m[2])
+                    self.credit_cond.notify_all()
+            elif m[0] in ("execute", "restore"):
+                # In order: a restore lands between the calls it separates.
                 self.inbox.put(m)
 
     def serve(self) -> None:
@@ -230,7 +442,24 @@ class Executor:
             m = self.inbox.get()
             if m is None:
                 return
-            self.handle(m[1])
+            if m[0] == "restore":
+                self.restore(m[1])
+            else:
+                self.handle(m[1])
+
+    def restore(self, msg: dict[str, Any]) -> None:
+        """Make the actor instance equal to its committed state, without
+        running ``__init__``."""
+        if not msg["state"]:
+            return
+        cls = self.load(msg["fn_digest"])
+        obj = cls.__new__(cls)
+        state = pickle.loads(msg["state"])
+        if getattr(type(obj), "__setstate__", None) is not None:
+            obj.__setstate__(state)
+        elif state is not None:
+            obj.__dict__.update(state)
+        self.instance = obj
 
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -247,6 +476,12 @@ def _report_failure(f: concurrent.futures.Future[Any]) -> None:
     exc = f.exception()
     if exc is not None:  # reporting the result itself failed (e.g. the peer went away)
         sys.__stderr__.write(f"chimaera executor: could not report a result: {exc!r}\n")
+
+
+def _durable_state(instance: Any) -> bytes:
+    """A durable actor's state: what ``__getstate__`` returns (its attributes
+    by default), pickled."""
+    return cloudpickle.dumps(instance.__getstate__(), protocol=5)
 
 
 async def _awaitable(x: Any) -> Any:
@@ -269,11 +504,25 @@ def main() -> None:
     ex = Executor(conn)
     sys.stdout = _TaskOutput(conn, "stdout", sys.__stdout__)
     sys.stderr = _TaskOutput(conn, "stderr", sys.__stderr__)
+    # Log records from tasks reach the driver at the driver's level (Ray's
+    # workers drop them unless each task configures logging itself).
+    level = os.environ.get("CHIMAERA_LOG_LEVEL")
+    if level and not logging.getLogger().handlers:
+        logging.basicConfig(level=level, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 
     def blocked(ctx: _context.TaskContext, is_blocked: bool, waiting: list[bytes]) -> None:
         conn.send_blocked(ctx.run + ctx.task, is_blocked, waiting)
+        if is_blocked and ex.on_block is not None:
+            ex.on_block()
 
     _future._executor_hook = blocked
+
+    def localize(run: bytes, obj: bytes) -> None:
+        from ._runtime import Runtime
+
+        Runtime.get().client.localize(run, obj)
+
+    _serde.localize_hook = localize
     ex.serve()
 
 

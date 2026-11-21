@@ -9,30 +9,76 @@
 //! outcomes in batches (one proposal per vshard per flush).
 
 use crate::accounting::{self, IsoUsage, Isolation, Reading};
+use crate::budget::{self, Budget};
+use crate::devices::Want;
 use crate::executor::{ExecEnv, ExecEvent, Supervisor};
+use crate::mesh::MeshClient;
+use crate::profiles::{self, FnKey, Profiles, Request, Source};
 use crate::router::{Router, now_ns};
 use crate::stores::{CodeStore, ObjectStore, hex};
 use chimaera_core::hlc;
 use chimaera_core::ids::Id;
 use chimaera_core::pb;
+use chimaera_core::profile::{LeakWatch, Sample};
 use chimaera_core::shard::{Event, Tk, read};
 use chimaera_raft::GroupEvents;
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 type Kind = pb::error_record::Kind;
 
-/// Largest auto-batched range (A1).
-const MAX_BATCH: usize = 256;
-/// Target wall time of an auto-batched range (A1).
-const BATCH_TARGET_S: f64 = 0.2;
-/// Items faster than this are worth batching (A1).
-const BATCH_BELOW_S: f64 = 0.05;
+/// Work behind the head of the queue that may start while the head waits for
+/// memory (backfill), and how long the head waits before it is owed the memory.
+const BACKFILL: usize = 64;
+const HEAD_WAIT: Duration = Duration::from_secs(30);
+/// A function never measured runs a few calls at a time until one finishes or
+/// has run this long (its memory is then known).
+const PROBE_FOR: Duration = Duration::from_secs(2);
+/// Free pool memory per call of a not-yet-measured function admitted beyond
+/// the base probe width: a first wave of calls up to this size cannot
+/// overcommit the pool.
+const PROBE_SLOT: u64 = 4 << 30;
+/// Memory pressure (R1): below PAUSE_BELOW of usable memory available (or PSI
+/// `some avg10` above PSI_PAUSE) stop admitting until RESUME_ABOVE; below
+/// KILL_BELOW stop the attempt furthest over its reservation.
+const PAUSE_BELOW: f64 = 0.10;
+const RESUME_ABOVE: f64 = 0.15;
+const KILL_BELOW: f64 = 0.05;
+const PSI_PAUSE: f64 = 20.0;
+/// Memory kills this recent veto smaller CPU grants (C3).
+const KILLS_RECENT: Duration = Duration::from_secs(60);
+const PROFILES_SAVE_EVERY: Duration = Duration::from_secs(30);
+/// Objects in a memory-backed store move to disk past this share of the pool.
+const SPILL_ABOVE: f64 = 0.8;
+/// Calls queued at one actor before a waiting call's reason suggests
+/// declaring concurrency on a method whose calls mostly wait.
+const ACTOR_HINT_QUEUE: usize = 16;
+const OBJECTS_SCAN_EVERY: Duration = Duration::from_secs(1);
+const MIB: u64 = 1 << 20;
+/// Profiles sent with one ping reply.
+const GOSSIP_MAX: usize = 64;
+/// Inputs smaller than this never sway placement.
+const LOCALITY_MIN_BYTES: u64 = 1 << 20;
+/// Assumed transfer rate from a peer not yet measured (bytes/s).
+const DEFAULT_BANDWIDTH: f64 = 200e6;
 const FLUSH_AT: usize = 256;
 const ATTEMPT_LOG_CAP: usize = 200_000;
+/// Events kept per peer for `Events` long polls.
+const EVENT_LOG_CAP: usize = 10_000;
+/// Queued work waits this long here before it may move to a peer with room.
+const SPILL_AFTER: Duration = Duration::from_secs(1);
+/// Executors started for a run's environment when it registers.
+const PRESTART: usize = 4;
+/// Calls of a one-at-a-time actor sent to its executor in one Execute.
+const ACTOR_BATCH: usize = 64;
+/// Publish proposals this peer keeps in flight per vshard. Results finishing
+/// meanwhile wait and go in the next one, so under load each commit carries
+/// many results instead of one or two (a lone result still goes at once).
+const PUBLISH_IN_FLIGHT: u32 = 2;
 const IDLE_EXECUTOR_TTL: Duration = Duration::from_secs(60);
 
 pub enum CoreMsg {
@@ -62,9 +108,19 @@ pub enum CoreMsg {
         task: Tk,
         force: bool,
     },
+    /// The consumer of a generator call has taken items below `up_to`.
+    StreamCredit {
+        task: Tk,
+        up_to: u64,
+    },
     /// The session's driver is exiting normally: finish its run.
     FinishSessionRun {
         session: u64,
+    },
+    /// Finish or cancel a run by id (`Run.finish()` / `Run.cancel()`).
+    EndRun {
+        run: Id,
+        cancel: bool,
     },
     /// End an actor on purpose (never restarted).
     CloseActor {
@@ -77,6 +133,16 @@ pub enum CoreMsg {
     },
     /// Result of committing an external-effect attempt's start.
     StartResult {
+        work: Box<Work>,
+        accepted: bool,
+    },
+    /// A publish proposal for this vshard was answered (or failed).
+    Published {
+        v: u16,
+    },
+    /// Result of giving back an unstarted attempt (spillback). Refused or
+    /// unknown: the work runs here after all.
+    GaveBack {
         work: Box<Work>,
         accepted: bool,
     },
@@ -114,12 +180,50 @@ pub enum CoreMsg {
     },
     /// Tasks that ended elsewhere, objects to drop, runs that ended.
     Forget(pb::ForgetRequest),
-    /// Load summary for a liveness ping.
+    /// Output of calls another peer ran, for runs created here.
+    RemoteLogs {
+        run: Vec<u8>,
+        lines: Vec<pb::LogEvent>,
+    },
+    /// Load summary for a liveness ping from peer `from` (node id), with the
+    /// profiles learned here since that peer last asked.
     Load {
+        from: u64,
         reply: oneshot::Sender<pb::PingReply>,
     },
     /// Stop taking new work (the peer is shutting down).
     Drain,
+    /// Record an event seen outside the core (membership changes).
+    Event(pb::ClusterEvent),
+    /// Events with seq >= `since` of `kinds`; with `wait`, answer only once
+    /// there is one (the caller bounds the wait).
+    Events {
+        kinds: Vec<String>,
+        since: u64,
+        wait: bool,
+        reply: oneshot::Sender<Vec<pb::ClusterEvent>>,
+    },
+    /// Write learned profiles to disk now (clean shutdown).
+    Persist {
+        reply: oneshot::Sender<()>,
+    },
+    /// A durable actor call's commit was answered.
+    Committed {
+        actor: Id,
+        work: Box<Work>,
+        ack: Commit,
+        reply: Box<pb::Outcome>,
+        state: Vec<u8>,
+    },
+}
+
+/// How a durable actor call's commit ended.
+pub enum Commit {
+    Answered(Box<pb::ActorAck>),
+    /// The call raised: nothing was proposed.
+    Raised,
+    /// No answer (leader lost, timeout): it may or may not have committed.
+    Unknown(String),
 }
 
 /// One granted attempt waiting for, or running on, an executor.
@@ -137,12 +241,160 @@ pub struct Work {
     publish: bool,
     /// For external-effect calls: the at-most-once start is committed.
     start_consumed: bool,
+    /// Memory reserved, bytes (0 = not known yet: the probe admits it).
+    mem: u64,
+    /// Memory an earlier attempt was killed at: it needs at least this.
+    mem_floor: u64,
+    /// Where `cpus` and `mem` came from, for the attempt record.
+    cpus_source: String,
+    mem_source: String,
+    /// In a CPU trial: Some(true) for the canary, Some(false) for the control.
+    arm: Option<bool>,
+    /// Bytes the call reads: arguments, blobs and dependency values.
+    read_bytes: u64,
+    /// Spillback was refused for this attempt: it runs here.
+    stays: bool,
+}
+
+/// Whether the shard took a give-back (spillback) of an unstarted attempt, so
+/// this peer must not run it. Existing: the task already has its outcome.
+/// Anything else (refused, fenced, unknown, or no answer) leaves it here.
+fn give_back_taken<E>(reply: &Result<pb::ShardReply, E>) -> bool {
+    use pb::task_ack::Status::{Accepted, Existing};
+    match reply {
+        Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(t)) }) => {
+            t.acks.first().is_some_and(|a| matches!(a.status(), Accepted | Existing))
+        }
+        _ => false,
+    }
 }
 
 impl Work {
+    fn new(tk: Tk, attempt: u32, spec: pb::TaskSpec, policy: pb::Policy, deps: Vec<pb::Outcome>) -> Work {
+        let cpus = if policy.cpus > 0.0 { policy.cpus } else { 1.0 };
+        Work {
+            tk,
+            attempt,
+            spec,
+            policy,
+            deps,
+            cpus,
+            ready_at: Instant::now(),
+            publish: true,
+            start_consumed: false,
+            mem: 0,
+            mem_floor: 0,
+            cpus_source: "default".into(),
+            mem_source: "default".into(),
+            arm: None,
+            read_bytes: 0,
+            stays: false,
+        }
+    }
+
     fn kind(&self) -> pb::CallKind {
         self.spec.kind()
     }
+
+    fn key(&self) -> FnKey {
+        profile_key(&self.spec, &self.policy)
+    }
+
+    /// Runs inside an actor's process and grant.
+    fn in_actor(&self) -> bool {
+        matches!(self.kind(), pb::CallKind::CallActorCtor | pb::CallKind::CallActorMethod)
+    }
+
+    /// CPU and memory reserved, and where each came from.
+    fn reservation(&self) -> String {
+        let mem = if self.mem > 0 { format!("{} MiB", self.mem.div_ceil(MIB)) } else { "not known yet".into() };
+        format!("cpus {} ({}); memory {mem} ({})", self.cpus, self.cpus_source, self.mem_source)
+    }
+
+    /// Memory to learn from the function's profile: no value was set, none
+    /// is known yet, and learning is on.
+    fn learns_memory(&self) -> bool {
+        self.mem == 0 && self.policy.memory == 0 && self.policy.adaptive() == pb::policy::Adaptive::On
+    }
+
+    /// Fast calls of one function that can share an executor round trip
+    /// (granularity, A1).
+    fn batchable(&self) -> bool {
+        match self.kind() {
+            pb::CallKind::CallMapItem => !self.policy.interactive,
+            pb::CallKind::CallFunction => {
+                !self.policy.interactive
+                    && self.spec.deps.is_empty()
+                    && self.spec.effects() != pb::Effects::External
+                    && self.arm.is_none()
+            }
+            _ => false,
+        }
+    }
+
+    fn batches_with(&self, other: &Work) -> bool {
+        other.batchable()
+            && other.kind() == self.kind()
+            && other.spec.fn_digest == self.spec.fn_digest
+            && other.tk.run == self.tk.run
+            && other.policy == self.policy
+            && other.spec.retry_exception_types == self.spec.retry_exception_types
+    }
+}
+
+/// The profile a call's measurements belong to: for a map chunk, the function
+/// it runs over its items; otherwise the code it was submitted with.
+fn profile_key(spec: &pb::TaskSpec, policy: &pb::Policy) -> FnKey {
+    let digest = if policy.profile_digest.is_empty() { &spec.fn_digest } else { &policy.profile_digest };
+    FnKey::new(digest, &spec.method)
+}
+
+/// What a call's placement weighs besides load (see `Core::extra_cost`).
+struct PlaceCost {
+    inputs: Vec<pb::ObjectRef>,
+    total: u64,
+    est_s: f64,
+    need: u64,
+    /// Peers holding the largest input.
+    holders: Vec<u64>,
+}
+
+/// An attempt's private memory peak and how it was measured: its cgroup's
+/// peak when isolated, else the largest of the 100 ms samples and the reading
+/// at the end (on macOS also the process's lifetime peak, when this attempt
+/// raised it).
+#[allow(clippy::too_many_arguments)]
+fn attempt_peak(
+    sampled: u64,
+    end_private: Option<u64>,
+    start: Option<Reading>,
+    end: Option<Reading>,
+    iso: Option<&IsoUsage>,
+    hwm_reset: bool,
+    mapped_inputs: u64,
+) -> Option<(u64, &'static str, &'static str)> {
+    if let Some(u) = iso {
+        return u.memory_peak.map(|p| (p, "attempt", "cgroup"));
+    }
+    let mut peak = sampled.max(end_private.unwrap_or(0));
+    // A call shorter than the 100 ms sampling is caught by the process's
+    // peak: on Linux the high-water mark reset when the attempt started (less
+    // its mapped inputs, which are shared, not private); on macOS the
+    // lifetime peak of the physical footprint when this attempt raised it.
+    if let Some(b) = end {
+        if hwm_reset {
+            let hwm = b.peak_rss_bytes.saturating_sub(mapped_inputs);
+            if hwm > peak {
+                return Some((hwm, "attempt", "vmhwm"));
+            }
+        } else if cfg!(target_os = "macos")
+            && let Some(a) = start
+            && b.peak_rss_bytes > a.peak_rss_bytes
+        {
+            peak = peak.max(b.peak_rss_bytes);
+        }
+    }
+    (peak > 0).then_some((peak, "sampled", "sampled"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -167,6 +419,16 @@ struct Exec {
     idle_since: Instant,
     /// Set when the peer killed it for exceeding its memory limit.
     killed_for_memory: Option<(u64, u64)>,
+    /// Why the peer killed it for memory, when not for its own limit.
+    kill_note: Option<String>,
+    /// Private memory at the last sample, bytes.
+    private: u64,
+    /// Memory between calls, to replace a leaking executor (R4).
+    leak: LeakWatch,
+    /// The function and run of its last call: an idle executor that already
+    /// loaded a function's code (and its imports) is preferred for it.
+    last_fn: Vec<u8>,
+    last_run: Option<Id>,
 }
 
 struct Running {
@@ -177,6 +439,16 @@ struct Running {
     blocked: bool,
     start: Option<Reading>,
     dispatched_ns: u64,
+    /// Memory reserved for these items (the largest item's).
+    mem: u64,
+    /// Largest private memory sampled while they ran.
+    peak: u64,
+    started: Instant,
+    /// The executor's peak-RSS mark was reset when these started (Linux).
+    hwm_reset: bool,
+    /// Calls of this batch that finished before its CPU could be measured
+    /// (that takes the whole batch): learned from when it ends.
+    unlearned: Vec<(Work, pb::ExecDone, u64)>,
 }
 
 #[derive(Default)]
@@ -196,13 +468,14 @@ struct ActorHost {
     placing: Option<u64>,
     restart: pb::actor_spec::Restart,
     detached: bool,
-}
-
-#[derive(Default)]
-struct Profile {
-    samples: u64,
-    ewma_s: f64,
-    batch: usize,
+    /// Durable actor: its committed state and version, and the class digest
+    /// to rebuild an instance from them.
+    durable: bool,
+    state_version: u64,
+    durable_state: Vec<u8>,
+    class_digest: Vec<u8>,
+    /// A call's commit is in flight: the next call waits for it.
+    committing: bool,
 }
 
 struct RunInfo {
@@ -233,9 +506,31 @@ pub struct Core {
     runs: HashMap<Id, RunInfo>,
     pending_grants: BTreeMap<u16, Vec<pb::Grant>>,
     pending_publish: BTreeMap<u16, Vec<pb::PublishEntry>>,
+    /// Publish proposals in flight, per vshard (see PUBLISH_IN_FLIGHT).
+    publishing: BTreeMap<u16, u32>,
     attempts: HashMap<Tk, Vec<pb::AttemptRecord>>,
     attempt_order: VecDeque<Tk>,
-    profiles: HashMap<Vec<u8>, Profile>,
+    profiles: Profiles,
+    profiles_path: PathBuf,
+    profiles_saved: Instant,
+    budget: Budget,
+    /// Memory the OS can hand out now (last sample).
+    available: Option<u64>,
+    /// Bytes of objects in the pool (tmpfs only), rescanned every second.
+    object_bytes: u64,
+    objects_scanned: Instant,
+    /// Admission paused by memory pressure.
+    mem_paused: bool,
+    /// When this peer last killed attempts for memory.
+    mem_kills: VecDeque<Instant>,
+    /// Functions without an estimate yet: the largest peak of a finished
+    /// call, or the most private memory a call running past the probe held.
+    live_floor: HashMap<FnKey, u64>,
+    epoch: Instant,
+    /// Per peer (node id): the profile version last sent to it.
+    gossip_cursor: HashMap<u64, u64>,
+    /// A spill to disk is running.
+    spilling: Arc<std::sync::atomic::AtomicBool>,
     decisions: VecDeque<pb::Decision>,
     peer_socket: String,
     isolation: Option<Isolation>,
@@ -245,6 +540,13 @@ pub struct Core {
     /// Recent grant-to-handoff latencies (µs) of attempts that found a warm
     /// executor waiting, for the dispatch-latency gate.
     dispatch_us: VecDeque<f64>,
+    /// Recent events (bounded) and long-poll waiters for them.
+    events: VecDeque<pb::ClusterEvent>,
+    event_seq: u64,
+    event_waiters: Vec<(Vec<String>, u64, oneshot::Sender<Vec<pb::ClusterEvent>>)>,
+    /// Last (generation, state) reported per actor, so updates that change
+    /// neither are not events.
+    actor_seen: HashMap<Id, (u64, i32)>,
     /// Attempts granted to other peers, sent with the next flush (by node id).
     pending_dispatch: BTreeMap<u64, Vec<pb::RemoteWork>>,
     /// Attempts waiting for their objects to be fetched.
@@ -267,6 +569,14 @@ pub struct Core {
     finished_at: HashMap<u64, VecDeque<Instant>>,
     /// Proposals sent and not yet answered (a draining peer waits for them).
     in_flight: Arc<std::sync::atomic::AtomicU64>,
+    /// Accelerators, and which executors hold them (`gpus=`, `device=`).
+    devices: crate::devices::Devices,
+    /// Each run's output on this peer (`chimaera logs`).
+    run_logs: crate::runlogs::RunLogs,
+    /// Output bound for runs whose driver is on another peer.
+    log_ship: crate::logship::LogShip,
+    /// Per-tenant CPU quotas on this peer (CHIMAERA_TENANT_QUOTAS).
+    quotas: crate::quotas::Quotas,
 }
 
 impl Core {
@@ -280,9 +590,17 @@ impl Core {
         capacity: f64,
         peer_socket: String,
         isolation: Option<Isolation>,
+        budget: Budget,
+        profiles: Profiles,
+        profiles_path: PathBuf,
     ) -> Core {
         Core {
             me_tx,
+            devices: crate::devices::Devices::discover(),
+            run_logs: Default::default(),
+            log_ship: Default::default(),
+            // Validated before the core starts (runtime::serve).
+            quotas: crate::quotas::Quotas::from_env().unwrap_or_default(),
             router,
             sup,
             objects,
@@ -298,15 +616,32 @@ impl Core {
             runs: HashMap::new(),
             pending_grants: BTreeMap::new(),
             pending_publish: BTreeMap::new(),
+            publishing: BTreeMap::new(),
             attempts: HashMap::new(),
             attempt_order: VecDeque::new(),
-            profiles: HashMap::new(),
+            profiles,
+            profiles_path,
+            profiles_saved: Instant::now(),
+            budget,
+            available: None,
+            object_bytes: 0,
+            objects_scanned: Instant::now() - OBJECTS_SCAN_EVERY,
+            mem_paused: false,
+            mem_kills: VecDeque::new(),
+            live_floor: HashMap::new(),
+            epoch: Instant::now(),
+            gossip_cursor: HashMap::new(),
+            spilling: Arc::default(),
             decisions: VecDeque::new(),
             peer_socket,
             isolation,
             iso_seq: 0,
             iso_waiting: HashMap::new(),
             dispatch_us: VecDeque::new(),
+            events: VecDeque::new(),
+            event_seq: 0,
+            event_waiters: Vec::new(),
+            actor_seen: HashMap::new(),
             pending_dispatch: BTreeMap::new(),
             localizing: HashSet::new(),
             remote_watched: HashSet::new(),
@@ -345,7 +680,10 @@ impl Core {
                         }
                         self.flush();
                     }
-                    None => return,
+                    None => {
+                        self.save_profiles();
+                        return;
+                    }
                 },
                 _ = house.tick() => {
                     self.housekeeping();
@@ -369,6 +707,20 @@ impl Core {
                 tracing::warn!("proposal failed: {e}");
             }
             in_flight.fetch_sub(1, Relaxed);
+        });
+    }
+
+    /// Propose results; the answer reopens the vshard's publish window.
+    fn propose_publish(&self, v: u16, entries: Vec<pb::PublishEntry>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (router, tx, in_flight) = (self.router.clone(), self.me_tx.clone(), self.in_flight.clone());
+        in_flight.fetch_add(1, Relaxed);
+        tokio::spawn(async move {
+            if let Err(e) = router.propose(v, pb::shard_cmd::Body::Publish(pb::PublishResults { entries })).await {
+                tracing::warn!("publish proposal failed: {e}");
+            }
+            in_flight.fetch_sub(1, Relaxed);
+            let _ = tx.send(CoreMsg::Published { v }).await;
         });
     }
 
@@ -414,8 +766,16 @@ impl Core {
         for (v, grants) in std::mem::take(&mut self.pending_grants) {
             self.propose_grants(v, grants);
         }
-        for (v, entries) in std::mem::take(&mut self.pending_publish) {
-            self.propose(v, pb::shard_cmd::Body::Publish(pb::PublishResults { entries }));
+        let open: Vec<u16> = self
+            .pending_publish
+            .keys()
+            .copied()
+            .filter(|v| self.publishing.get(v).copied().unwrap_or(0) < PUBLISH_IN_FLIGHT)
+            .collect();
+        for v in open {
+            let entries = self.pending_publish.remove(&v).expect("listed above");
+            *self.publishing.entry(v).or_default() += 1;
+            self.propose_publish(v, entries);
         }
         let Some(mesh) = self.router.mesh.clone() else { return };
         for (node, work) in std::mem::take(&mut self.pending_dispatch) {
@@ -483,16 +843,53 @@ impl Core {
                 }
             }
             CoreMsg::Place { task } => self.place(task),
-            CoreMsg::Drain => self.draining = true,
+            CoreMsg::Drain => {
+                self.draining = true;
+                let node = self.router.identity.peer.to_vec();
+                self.record(pb::ClusterEvent {
+                    kind: "drain".into(),
+                    node,
+                    message: "draining: no new work; stopping once running calls finish".into(),
+                    ..Default::default()
+                });
+            }
+            CoreMsg::Event(e) => self.record(e),
+            CoreMsg::Events { kinds, since, wait, reply } => {
+                let found = self.events_since(&kinds, since);
+                if found.is_empty() && wait {
+                    self.event_waiters.push((kinds, since, reply));
+                } else {
+                    let _ = reply.send(found);
+                }
+            }
+            CoreMsg::Committed { actor, work, ack, reply, state } => {
+                self.on_committed(actor, *work, ack, *reply, state);
+                self.dispatch();
+            }
+            CoreMsg::Persist { reply } => {
+                self.save_profiles();
+                let _ = reply.send(());
+            }
             CoreMsg::Forget(f) => self.forget(f),
-            CoreMsg::Load { reply } => {
+            CoreMsg::RemoteLogs { lines, .. } => self.on_remote_logs(lines),
+            CoreMsg::Load { from, reply } => {
+                let since = self.gossip_cursor.get(&from).copied().unwrap_or(0);
+                let (profiles, next) = self.profiles.changed_since(since, GOSSIP_MAX);
+                self.gossip_cursor.insert(from, next);
+                let recent_blobs = self.router.mesh.as_ref().map(|m| m.recent_objects()).unwrap_or_default();
                 let _ = reply.send(pb::PingReply {
+                    profiles,
+                    recent_blobs,
                     cpus: self.capacity,
                     cpu_used: self.cpu_used,
                     queued: self.queue.len() as u32,
                     running: self.running.len() as u32,
                     actors: self.execs.values().filter(|e| e.actor.is_some()).count() as u32,
                     draining: self.draining,
+                    memory_pool: self.budget.pool,
+                    memory_used: self.memory_used(),
+                    memory_available: self.available.unwrap_or(0),
+                    object_bytes: self.object_bytes,
                     ..Default::default()
                 });
             }
@@ -513,10 +910,23 @@ impl Core {
             }
             CoreMsg::CloseSession { id } => self.close_session(id),
             CoreMsg::RegisterRun { run, env, detached } => {
+                self.prestart(&env);
                 self.runs.entry(run).or_insert(RunInfo { env, detached, sessions: BTreeSet::new() });
             }
             CoreMsg::Watch { session, tasks } => self.watch(session, tasks),
             CoreMsg::Cancel { task, force } => self.cancel(task, force),
+            CoreMsg::StreamCredit { task, up_to } => self.on_stream_credit(task, up_to),
+            CoreMsg::EndRun { run, cancel } => {
+                let body = if cancel {
+                    pb::shard_cmd::Body::CancelRun(pb::CancelRun {
+                        run: run.to_vec(),
+                        message: "cancelled by its owner".into(),
+                    })
+                } else {
+                    pb::shard_cmd::Body::RunFinish(pb::RunFinish { run: run.to_vec(), state: 0 })
+                };
+                self.propose(run.vshard(), body);
+            }
             CoreMsg::FinishSessionRun { session } => {
                 let run = self.sessions.get_mut(&session).and_then(|s| s.run.take());
                 if let Some(run) = run {
@@ -541,6 +951,22 @@ impl Core {
                 }
                 // Denied or stale: another attempt owns the start, or the task
                 // finished; its outcome arrives through the shard.
+            }
+            CoreMsg::Published { v } => {
+                if let Some(n) = self.publishing.get_mut(&v) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        self.publishing.remove(&v);
+                    }
+                }
+            }
+            CoreMsg::GaveBack { work, accepted } => {
+                if !accepted {
+                    let mut w = *work;
+                    w.stays = true;
+                    self.enqueue(w);
+                    self.dispatch();
+                }
             }
             CoreMsg::CloseActor { actor, reason } => self.close_actor(actor, &reason),
             CoreMsg::Explain { req, reply } => {
@@ -610,6 +1036,7 @@ impl Core {
             Event::RunEnded(run) => {
                 if leader {
                     self.end_run_actors(run);
+                    self.drop_run_values(run);
                     self.broadcast_forget(pb::ForgetRequest {
                         run: run.to_vec(),
                         run_ended: true,
@@ -631,6 +1058,22 @@ impl Core {
         for actor in ending {
             self.close_actor(actor, "its run ended");
         }
+    }
+
+    /// A run ended: its stored arguments and `ch.put` values go now, not when
+    /// the run expires a day later. A detached actor of the run hosted here
+    /// may be constructed again from them, so they stay while it lives.
+    fn drop_run_values(&self, run: Id) {
+        if self.actors.values().any(|h| h.run == Some(run) && h.detached && !h.dead) {
+            return;
+        }
+        let objects = self.objects.clone();
+        tokio::task::spawn_blocking(move || {
+            let freed = objects.delete_values(&run);
+            if freed > 0 {
+                tracing::debug!(run = %run.hex(), freed, "deleted an ended run's stored arguments");
+            }
+        });
     }
 
     fn broadcast_forget(&self, req: pb::ForgetRequest) {
@@ -677,6 +1120,7 @@ impl Core {
         if let Ok(run) = Id::from_slice(&f.run) {
             if f.run_ended {
                 self.end_run_actors(run);
+                self.drop_run_values(run);
             }
             if f.run_expired {
                 self.objects.delete_run(&run);
@@ -841,18 +1285,37 @@ impl Core {
         let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
         let cpus = if policy.cpus > 0.0 { policy.cpus } else { 1.0 };
         let mesh = self.router.mesh.clone()?;
+        let cost = self.place_cost(tk, &spec, &policy, rec.memory_hint, &mesh);
         let here = self.cpu_used + self.queue.len() as f64;
-        let mine = self.pressure(self.router.node_id(), here, None, self.capacity);
-        let fits_here = !self.draining && self.capacity + 1e-9 >= cpus;
-        let mut best = fits_here.then(|| (mine, self.router.identity.pb()));
-        let others: Vec<_> = mesh.live_others().into_iter().filter(|p| p.member.cpus + 1e-9 >= cpus).collect();
+        let mine = self.pressure(self.router.node_id(), here, None, self.capacity)
+            + self.extra_cost(&mesh, &cost, mesh.me.node_id, self.memory_used(), self.budget.pool);
+        // Placement(require=...) keeps only peers with every label; each
+        // prefer entry a peer matches lowers its cost by half a core's load.
+        let allowed = |m: &pb::Member| crate::labels::satisfies(&m.labels, &policy.require);
+        let bonus = |m: &pb::Member| 0.5 * crate::labels::preferred(&m.labels, &policy.prefer) as f64;
+        let fits_here = !self.draining && self.capacity + 1e-9 >= cpus && allowed(&mesh.me);
+        let mut best = fits_here.then(|| (mine - bonus(&mesh.me), self.router.identity.pb()));
+        let others: Vec<_> =
+            mesh.live_others().into_iter().filter(|p| p.member.cpus + 1e-9 >= cpus && allowed(&p.member)).collect();
         if !others.is_empty() {
-            // Two random choices: near-least-loaded without a global view.
+            // Two random choices (near-least-loaded without a global view),
+            // plus the peers that hold the call's largest input.
             let seed = (tk.task.0[0] as usize) ^ (now_ns() as usize);
-            for i in 0..2.min(others.len()) {
-                let p = &others[(seed + i * 7919) % others.len()];
+            let mut picks: Vec<usize> = (0..2.min(others.len())).map(|i| (seed + i * 7919) % others.len()).collect();
+            for h in &cost.holders {
+                if let Some(i) = others.iter().position(|p| p.member.node_id == *h)
+                    && !picks.contains(&i)
+                {
+                    picks.push(i);
+                }
+            }
+            for i in picks {
+                let p = &others[i];
                 let reported = p.load.as_ref().map_or(0.0, |l| l.cpu_used + l.queued as f64);
-                let score = self.pressure(p.member.node_id, reported, p.last_ok, p.member.cpus);
+                let (used, pool) = p.load.as_ref().map_or((0, 0), |l| (l.memory_used, l.memory_pool));
+                let score = self.pressure(p.member.node_id, reported, p.last_ok, p.member.cpus)
+                    + self.extra_cost(&mesh, &cost, p.member.node_id, used, pool)
+                    - bonus(&p.member);
                 if best.as_ref().is_none_or(|(b, _)| score < *b) {
                     best = Some((score, pb::PeerInc { peer: p.member.peer.clone(), inc: p.member.incarnation }));
                 }
@@ -875,6 +1338,59 @@ impl Core {
             "placement"
         );
         best.map(|(_, p)| Some(p))
+    }
+
+    /// What placing a call weighs besides load: its inputs (to fetch where
+    /// they are missing), how long it runs, and its memory.
+    fn place_cost(&self, tk: Tk, spec: &pb::TaskSpec, policy: &pb::Policy, hint: u64, mesh: &MeshClient) -> PlaceCost {
+        let deps = self.dep_outcomes(tk, spec);
+        let dep_objects = deps.iter().filter_map(|o| match &o.value {
+            Some(pb::outcome::Value::Ok(obj)) => Some(obj.clone()),
+            _ => None,
+        });
+        let inputs: Vec<pb::ObjectRef> = spec
+            .args
+            .iter()
+            .cloned()
+            .chain(spec.blobs.iter().cloned())
+            .chain(dep_objects)
+            .filter(|o| o.inline_data.is_empty() && !o.run.is_empty())
+            .collect();
+        let total = inputs.iter().map(|o| o.size).sum();
+        let key = profile_key(spec, policy);
+        let est_s = self.profiles.summary(&key).map(|s| s.wall_p50_s).filter(|s| *s > 0.0).unwrap_or(1.0);
+        let need = self.profiles.memory_estimate(&key, total).map_or(0, |m| m.bytes).max(hint);
+        let holders = inputs.iter().max_by_key(|o| o.size).map(|o| mesh.holders(o)).unwrap_or_default();
+        PlaceCost { inputs, total, est_s, need, holders }
+    }
+
+    /// Cost beyond load of running the call on `node`: inputs it lacks (only
+    /// when over 30% of them would move, so locality is a preference, never a
+    /// pin) and a pool it would overflow.
+    fn extra_cost(&self, mesh: &MeshClient, c: &PlaceCost, node: u64, mem_used: u64, mem_pool: u64) -> f64 {
+        let mut extra = 0.0;
+        if c.total >= LOCALITY_MIN_BYTES {
+            let missing: u64 = c.inputs.iter().filter(|o| !self.holds(mesh, node, o)).map(|o| o.size).sum();
+            if missing as f64 > 0.3 * c.total as f64 {
+                // A peer holding the input wins unless it is saturated (the
+                // missing share costs up to one full core's queue), plus the
+                // time to move the bytes, in units of the call's duration.
+                let bw = c.holders.iter().filter_map(|h| mesh.bandwidth(*h)).fold(0.0, f64::max);
+                let bw = if bw > 0.0 { bw } else { DEFAULT_BANDWIDTH };
+                extra += missing as f64 / c.total as f64 + missing as f64 / bw / c.est_s;
+            }
+        }
+        if c.need > 0 && mem_pool > 0 && mem_used + c.need > mem_pool {
+            extra += 1.0 + (mem_used + c.need - mem_pool) as f64 / mem_pool as f64;
+        }
+        extra
+    }
+
+    fn holds(&self, mesh: &MeshClient, node: u64, o: &pb::ObjectRef) -> bool {
+        if node == mesh.me.node_id {
+            return self.objects.path(&o.run, &o.object_id).exists();
+        }
+        mesh.holders(o).contains(&node) || mesh.member(node).is_some_and(|p| p.recently_has(&o.object_id))
     }
 
     /// Where `actor` lives, if known. Unknown hosts are resolved in the
@@ -926,9 +1442,14 @@ impl Core {
                 return;
             };
             let run = self.router.read(tk.v(), |kv| read::run(kv, tk.run)).flatten();
+            let key = profile_key(&spec, &pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default());
+            let reads = spec.args.as_ref().map_or(0, |a| a.size) + spec.blobs.iter().map(|b| b.size).sum::<u64>();
+            let memory = self.profiles.memory_estimate(&key, reads).map_or(0, |m| m.bytes).max(rec.memory_hint);
             let rw = pb::RemoteWork {
                 task: Some(tk.pb()),
                 attempt,
+                cpus: self.profiles.learned_cpus(&key),
+                memory,
                 spec: Some(spec),
                 deps,
                 env: run.as_ref().and_then(|r| r.exec_env.clone()),
@@ -939,18 +1460,8 @@ impl Core {
             return;
         }
         let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-        let cpus = if policy.cpus > 0.0 { policy.cpus } else { 1.0 };
-        let work = Work {
-            tk,
-            attempt,
-            spec,
-            policy,
-            deps,
-            cpus,
-            ready_at: Instant::now(),
-            publish: true,
-            start_consumed: false,
-        };
+        let mut work = Work::new(tk, attempt, spec, policy, deps);
+        self.reserve(&mut work, rec.memory_hint, 0.0, 0);
         if self.env_of(&tk.run).is_none() {
             self.fail_infeasible(&work, "the run has no executor environment on record");
             return;
@@ -981,20 +1492,17 @@ impl Core {
         }
         let spec = rw.spec.unwrap_or_default();
         let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-        let cpus = if policy.cpus > 0.0 { policy.cpus } else { 1.0 };
-        // A replayed constructor rebuilds a restarted actor's state; its
-        // outcome is already published and it runs inside the actor's CPU.
-        self.admit(Work {
-            tk,
-            attempt,
-            spec,
-            policy,
-            deps: rw.deps,
-            cpus: if rw.replay { 0.0 } else { cpus },
-            ready_at: Instant::now(),
-            publish: !rw.replay,
-            start_consumed: rw.replay,
-        });
+        let mut work = Work::new(tk, attempt, spec, policy, rw.deps);
+        if rw.replay {
+            // A replayed constructor rebuilds a restarted actor's state; its
+            // outcome is already published and it runs inside the actor's CPU.
+            work.cpus = 0.0;
+            work.publish = false;
+            work.start_consumed = true;
+        } else {
+            self.reserve(&mut work, 0, rw.cpus, rw.memory);
+        }
+        self.admit(work);
     }
 
     /// Queue an attempt once its code and every object it reads are in the
@@ -1005,7 +1513,7 @@ impl Core {
             return;
         };
         let mut missing: Vec<pb::ObjectRef> = Vec::new();
-        let args = w.spec.args.iter();
+        let args = w.spec.args.iter().chain(w.spec.blobs.iter());
         let deps = w.deps.iter().filter_map(|o| match &o.value {
             Some(pb::outcome::Value::Ok(obj)) => Some(obj),
             _ => None,
@@ -1033,7 +1541,7 @@ impl Core {
             }
             for obj in missing.iter().filter(|_| error.is_none()) {
                 let holders = mesh.holders(obj);
-                if let Err(e) = mesh.localize(&store, &obj.run, &obj.object_id, &holders).await {
+                if let Err(e) = mesh.localize(&store, &obj.run, &obj.object_id, obj.size, &holders).await {
                     error = Some(format!("cannot fetch input object {}: {e}", hex(&obj.object_id)));
                     break;
                 }
@@ -1045,8 +1553,100 @@ impl Core {
     fn enqueue(&mut self, w: Work) {
         match w.kind() {
             pb::CallKind::CallActorCtor | pb::CallKind::CallActorMethod => self.route_to_actor(w),
-            _ => self.queue.push_back(w),
+            // Higher `priority` first; equal priorities keep arrival order.
+            // Ordering only: nothing running is preempted.
+            _ if self.queue.back().is_none_or(|b| b.policy.priority >= w.policy.priority) => self.queue.push_back(w),
+            _ => {
+                let at =
+                    self.queue.iter().position(|q| q.policy.priority < w.policy.priority).unwrap_or(self.queue.len());
+                self.queue.insert(at, w);
+            }
         }
+    }
+
+    /// Spillback: work that has waited here while other peers have room goes
+    /// back to its group leader to be placed again. Placement happens once,
+    /// with what the leader knew then; peers that joined later or freed up
+    /// since would otherwise never see work already queued here.
+    fn spill(&mut self) {
+        let Some(mesh) = self.router.mesh.clone() else { return };
+        let waited = |w: &Work| w.ready_at.elapsed() >= SPILL_AFTER;
+        if self.draining || !self.queue.iter().any(waited) {
+            return;
+        }
+        // Room elsewhere, as peers last reported it (minus what this peer
+        // already sent them since).
+        let room: f64 = mesh
+            .live_others()
+            .iter()
+            .filter_map(|p| p.load.as_ref().map(|l| (p, l)))
+            .map(|(p, l)| (p.member.cpus - l.cpu_used - l.queued as f64 - p.placed_since_report as f64).max(0.0))
+            .sum();
+        if room < 1.0 {
+            return;
+        }
+        // Newest first: the oldest stay, to run here next.
+        let mut budget = room.floor() as usize;
+        let picks: Vec<(Tk, u32)> = self
+            .queue
+            .iter()
+            .rev()
+            .filter(|w| {
+                waited(w) && !w.stays && matches!(w.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem)
+            })
+            .take_while(|_| {
+                let go = budget > 0;
+                budget = budget.saturating_sub(1);
+                go
+            })
+            .map(|w| (w.tk, w.attempt))
+            .collect();
+        for (tk, attempt) in picks {
+            self.requeue(tk, attempt);
+        }
+    }
+
+    /// Give back a queued attempt that has not started here, so the task's
+    /// group leader places it again (on a peer with room). Nothing is counted
+    /// against the task's retries. The work is kept until the shard accepts:
+    /// if it refuses, or the answer is lost, the attempt runs here (a give-back
+    /// that did commit revokes this attempt, so its publish is fenced). False
+    /// if it is not queued here (it started, finished, or was never here).
+    pub(crate) fn requeue(&mut self, tk: Tk, attempt: u32) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(i) = self.queue.iter().position(|w| w.tk == tk && w.attempt == attempt) else { return false };
+        if !self.queue[i].publish || self.queue[i].start_consumed {
+            // A replayed constructor, or an external effect whose start is
+            // committed, must stay where it is.
+            return false;
+        }
+        let w = self.queue.remove(i).expect("index in range");
+        self.unplace(tk);
+        let body = pb::shard_cmd::Body::RecordFailure(pb::RecordFailure {
+            task: Some(tk.pb()),
+            attempt,
+            peer: Some(self.router.identity.pb()),
+            kind: pb::record_failure::Kind::Requeued as i32,
+            error: Some(pb::ErrorRecord {
+                message: "given back unstarted to run elsewhere".into(),
+                attempt,
+                ..Default::default()
+            }),
+            fingerprint: Vec::new(),
+            memory_peak: 0,
+        });
+        let (router, tx, in_flight) = (self.router.clone(), self.me_tx.clone(), self.in_flight.clone());
+        in_flight.fetch_add(1, Relaxed);
+        tokio::spawn(async move {
+            let reply = router.propose(tk.v(), body).await;
+            if let Err(e) = &reply {
+                tracing::warn!("give-back of {tk:?} failed, running it here: {e}");
+            }
+            let accepted = give_back_taken(&reply);
+            in_flight.fetch_sub(1, Relaxed);
+            let _ = tx.send(CoreMsg::GaveBack { work: Box::new(w), accepted }).await;
+        });
+        true
     }
 
     /// Report an attempt that could not run here; the shard retries it.
@@ -1115,6 +1715,15 @@ impl Core {
 
     fn on_done(&mut self, tk: Tk, outcome: pb::Outcome, leader: bool) {
         self.unplace_as(tk, true);
+        if leader && let Some(pb::outcome::Value::Err(e)) = &outcome.value {
+            self.record(pb::ClusterEvent {
+                kind: "task_failed".into(),
+                run: tk.run.to_vec(),
+                task: Some(tk.pb()),
+                message: format!("{:?}: {}", e.kind(), e.message.lines().next().unwrap_or("")),
+                ..Default::default()
+            });
+        }
         self.notify_watchers(tk, &outcome);
         // A queued attempt whose task already finished (cancelled, or another
         // attempt won) is dropped; a running one is told to stop.
@@ -1122,6 +1731,15 @@ impl Core {
         let rec = self.router.read(tk.v(), |kv| read::task(kv, tk)).flatten();
         if let Some(spec) = rec.as_ref().and_then(|r| r.spec.as_ref()) {
             self.actor_call_ended(spec);
+            // The call's own argument file is not needed once it has an
+            // outcome. Constructor arguments stay until the run ends: a
+            // restarted actor runs its constructor again.
+            if leader
+                && spec.kind() != pb::CallKind::CallActorCtor
+                && let Some(args) = spec.args.clone().filter(|a| a.inline_data.is_empty() && !a.object_id.is_empty())
+            {
+                self.drop_object(args);
+            }
         }
         // The leader tells other peers about endings they cannot see: an
         // attempt to stop, or an actor call that never reached its host.
@@ -1271,6 +1889,12 @@ impl Core {
 
     /// The run's executor environment: registered by its client, or (after a
     /// peer restart) loaded from the replicated run record.
+    /// The run's tenant (for quotas), read once from its record.
+    fn tenant_of(&mut self, run: Id) -> String {
+        let router = self.router.clone();
+        self.quotas.tenant(run, || router.read(run.vshard(), |kv| read::run(kv, run)).flatten().map(|r| r.tenant))
+    }
+
     fn env_of(&mut self, run: &Id) -> Option<ExecEnv> {
         if let Some(r) = self.runs.get(run) {
             return Some(r.env.clone());
@@ -1281,45 +1905,300 @@ impl Core {
         Some(env)
     }
 
+    /// Start queued work that fits: CPU in queue order, memory with bounded
+    /// backfill (work behind a head that waits for memory may start if it
+    /// fits, until the head has waited HEAD_WAIT).
     fn dispatch(&mut self) {
-        while let Some(head) = self.queue.front() {
-            let cpus = head.cpus;
+        let mut i = 0;
+        while i < self.queue.len() && i <= BACKFILL {
+            self.refresh_cpus(i);
+            let w = &self.queue[i];
+            let (cpus, floor, waited) = (w.cpus, w.mem_floor, w.ready_at.elapsed());
             if cpus > self.capacity + 1e-9 {
-                let w = self.queue.pop_front().expect("head exists");
+                let w = self.queue.remove(i).expect("index in range");
                 let why = format!("needs {cpus} CPUs; this peer offers {} (largest feasible shape)", self.capacity);
                 self.fail_infeasible(&w, &why);
+                continue;
+            }
+            if floor > self.budget.pool {
+                // It ran out of memory: its retry needs more than the pool.
+                let w = self.queue.remove(i).expect("index in range");
+                self.propose(
+                    w.tk.v(),
+                    pb::shard_cmd::Body::Cancel(pb::Cancel {
+                        task: Some(w.tk.pb()),
+                        reason: Kind::Oom as i32,
+                        message: format!(
+                            "out of memory: an attempt was killed for memory and its retry needs {} MiB, \
+                             more than this peer's memory pool of {} MiB",
+                            floor / MIB,
+                            self.budget.pool / MIB
+                        ),
+                    }),
+                );
                 continue;
             }
             if self.cpu_used + cpus > self.capacity + 1e-9 {
                 return;
             }
-            if head.spec.effects() == pb::Effects::External && !head.start_consumed {
+            if self.quotas.enabled() {
+                let tenant = self.tenant_of(self.queue[i].tk.run);
+                match self.quotas.admit(&tenant, cpus) {
+                    crate::quotas::Admit::Yes => {}
+                    crate::quotas::Admit::Wait(_) => {
+                        i += 1; // other tenants' work may go ahead
+                        continue;
+                    }
+                    crate::quotas::Admit::Never(why) => {
+                        let w = self.queue.remove(i).expect("index in range");
+                        self.fail_infeasible(&w, &why);
+                        continue;
+                    }
+                }
+            }
+            self.refresh_memory(i);
+            if self.memory_wait(&self.queue[i]).is_some() {
+                if i == 0 && waited > HEAD_WAIT {
+                    return;
+                }
+                i += 1;
+                continue;
+            }
+            let w = &self.queue[i];
+            if w.spec.effects() == pb::Effects::External && !w.start_consumed {
                 // User code with external effects starts only after its start
                 // is committed: a later loss then reports OutcomeUnknown.
-                let w = self.queue.pop_front().expect("head exists");
+                let w = self.queue.remove(i).expect("index in range");
                 self.consume_start(w);
                 continue;
             }
-            if head.policy.accounting() == pb::policy::Accounting::Isolated {
-                let w = self.queue.pop_front().expect("head exists");
+            if w.policy.accounting() == pb::policy::Accounting::Isolated {
+                let w = self.queue.remove(i).expect("index in range");
                 self.start_isolated(w);
                 continue;
             }
-            let run = head.tk.run;
+            let (run, gpus, device) = (w.tk.run, w.policy.gpus, w.policy.device.clone());
             let Some(env) = self.env_of(&run) else {
-                let w = self.queue.pop_front().expect("head exists");
+                let w = self.queue.remove(i).expect("index in range");
                 self.fail_infeasible(&w, "no executor environment is registered for this run");
                 continue;
             };
-            let threads = cpus.ceil() as u32;
-            let key = env.key(threads);
-            let Some(exec) = self.idle_exec(&key) else {
-                self.ensure_executor(&env, threads, &key);
-                return;
+            let threads = cpus.ceil().max(1.0) as u32;
+            let key = match self.devices.key_for(gpus, &device, &env.key(threads)) {
+                Want::None => env.key(threads),
+                Want::Key(key) => key,
+                Want::Wait => {
+                    i += 1;
+                    continue;
+                }
+                Want::Infeasible(why) => {
+                    let w = self.queue.remove(i).expect("index in range");
+                    self.fail_infeasible(&w, &why);
+                    continue;
+                }
             };
-            let batch = self.take_batch();
+            let (digest, run) = (self.queue[i].spec.fn_digest.clone(), self.queue[i].tk.run);
+            let Some(exec) = self.idle_exec(&key, &digest, run) else {
+                // Other pools need not wait for this one's executor to start.
+                self.ensure_executor(&env, threads, &key, cpus);
+                i += 1;
+                continue;
+            };
+            let batch = self.take_batch(i);
+            self.devices.hold(exec, &key);
             self.start(exec, batch);
         }
+    }
+
+    /// CPU and memory for an attempt: the caller's values, else what this
+    /// function's calls have used (profiles), within `ch.auto` bounds and
+    /// raised to an OOM retry's hint. `placer_*`: what the placing peer
+    /// reserved, used when this peer has not seen the function.
+    fn reserve(&mut self, w: &mut Work, hint: u64, placer_cpus: f64, placer_mem: u64) {
+        let dep_bytes: u64 = w
+            .deps
+            .iter()
+            .filter_map(|o| match &o.value {
+                Some(pb::outcome::Value::Ok(obj)) => Some(obj.size),
+                _ => None,
+            })
+            .sum();
+        let blob_bytes: u64 = w.spec.blobs.iter().map(|b| b.size).sum();
+        w.read_bytes = w.spec.args.as_ref().map_or(0, |a| a.size) + blob_bytes + dep_bytes;
+        if matches!(w.kind(), pb::CallKind::CallActorCtor | pb::CallKind::CallActorMethod) {
+            return; // runs inside the actor's own grant
+        }
+        let p = &w.policy;
+        let req = Request { cpus: p.cpus, memory: p.memory, adaptive: p.adaptive() };
+        let r = self.profiles.reserve(&w.key(), &p.fn_name, w.read_bytes, req);
+        let clip = |x: f64, lo: f64, hi: f64| {
+            let x = if lo > 0.0 { x.max(lo) } else { x };
+            if hi > 0.0 { x.min(hi) } else { x }
+        };
+        let mut cpus = r.cpus;
+        if r.cpus_source != Source::User {
+            if r.cpus_source == Source::Default && placer_cpus > 0.0 {
+                cpus = placer_cpus;
+            }
+            // A learned value never makes a call infeasible here.
+            cpus = clip(cpus, p.cpus_min, p.cpus_max).min(self.capacity.max(0.25));
+        }
+        let mut mem = r.memory;
+        if r.memory_source != Source::User {
+            mem = clip(mem as f64, p.memory_min as f64, p.memory_max as f64) as u64;
+        }
+        let mem = mem.max(hint).max(placer_mem);
+        w.mem_source = if hint > 0 && hint >= mem {
+            "raised after an attempt was killed for memory".to_string()
+        } else {
+            r.memory_source.describe()
+        };
+        w.cpus_source = r.cpus_source.describe();
+        (w.cpus, w.mem, w.mem_floor, w.arm) = (cpus, mem, hint, r.arm);
+    }
+
+    /// Queued work takes the CPU grant learning has now (a trial's next arm,
+    /// or a learned grant): a burst submitted before the function was
+    /// measured would otherwise all run at the default.
+    fn refresh_cpus(&mut self, i: usize) {
+        let w = &self.queue[i];
+        if w.policy.cpus > 0.0
+            || !w.publish
+            || matches!(w.kind(), pb::CallKind::CallActorCtor | pb::CallKind::CallActorMethod)
+        {
+            return;
+        }
+        let req = Request { cpus: w.policy.cpus, memory: w.policy.memory, adaptive: w.policy.adaptive() };
+        let (lo, hi) = (w.policy.cpus_min, w.policy.cpus_max);
+        let Some((cpus, source, arm)) = self.profiles.cpus_now(&w.key(), req, w.arm) else { return };
+        let cpus = if hi > 0.0 { cpus.min(hi) } else { cpus }.max(lo).min(self.capacity.max(0.25));
+        let w = &mut self.queue[i];
+        (w.cpus, w.arm, w.cpus_source) = (cpus, arm, source.describe());
+    }
+
+    /// Queued work admitted before its function had a memory estimate takes
+    /// one as soon as the profile has it.
+    fn refresh_memory(&mut self, i: usize) {
+        let w = &self.queue[i];
+        if !w.learns_memory() {
+            return;
+        }
+        let Some(m) = self.profiles.memory_estimate(&w.key(), w.read_bytes) else { return };
+        let (lo, hi) = (w.policy.memory_min, w.policy.memory_max);
+        let w = &mut self.queue[i];
+        w.mem = if hi > 0 { m.bytes.min(hi) } else { m.bytes }.max(lo);
+        w.mem_source = Source::Learned(m.evidence).describe();
+    }
+
+    /// Memory charged against the pool now: each executor its reservation
+    /// while it runs (or what it holds, if more), what it holds while idle or
+    /// while its call waits on others, plus objects in tmpfs.
+    fn memory_used(&self) -> u64 {
+        let mut used = if self.budget.objects_in_pool { self.object_bytes } else { 0 };
+        for (id, e) in &self.execs {
+            let reserved = self
+                .running
+                .iter()
+                .filter(|r| r.exec == *id && !r.blocked)
+                .map(|r| {
+                    // A call admitted before its function had an estimate is
+                    // charged the estimate once there is one: a just-started
+                    // executor reads 0 until its first sample.
+                    let w = &r.items[0];
+                    if r.mem > 0 {
+                        r.mem
+                    } else {
+                        self.profiles.memory_estimate(&w.key(), w.read_bytes).map_or(0, |m| m.bytes)
+                    }
+                })
+                .max()
+                .unwrap_or(0);
+            used += reserved.max(e.private);
+        }
+        used
+    }
+
+    /// Memory to reserve for `w` now: its estimate or, for a function without
+    /// one yet, 2× its live floor (one finished call's peak, or what a call
+    /// running past the probe holds; the margin for an unknown spread).
+    fn need(&self, w: &Work) -> u64 {
+        if w.in_actor() {
+            return 0; // charged as the actor's process, whatever its calls hold
+        }
+        let m = if w.mem > 0 { w.mem } else { self.live_floor.get(&w.key()).map_or(0, |f| f.saturating_mul(2)) };
+        m.min(self.budget.pool)
+    }
+
+    /// Why `w` cannot start yet for lack of memory, or None.
+    fn memory_wait(&self, w: &Work) -> Option<String> {
+        // With nothing of ours running, waiting frees nothing: run it alone.
+        if !self.running.iter().any(|r| !r.blocked) {
+            return None;
+        }
+        if self.mem_paused {
+            return Some(format!(
+                "memory pressure on this host ({} MiB available); new work waits",
+                self.available.unwrap_or(0) / MIB
+            ));
+        }
+        let need = self.need(w);
+        if need == 0 {
+            // Nothing measured yet (no call has finished or run past
+            // PROBE_FOR): a few calls at a time.
+            // Beyond that, any function's probes may use the free pool at
+            // PROBE_SLOT each.
+            let key = w.key();
+            let limit = ((self.capacity / 4.0) as usize).max(1);
+            let probes = self.running.iter().filter(|r| r.mem == 0);
+            let (mine, all) = probes.fold((0, 0), |(m, a), r| (m + usize::from(r.items[0].key() == key), a + 1));
+            let slots = (self.budget.pool.saturating_sub(self.memory_used()) / PROBE_SLOT) as usize;
+            return (mine >= limit && all >= slots).then(|| {
+                format!("a function not yet measured runs {limit} call(s) at a time until its memory use is known")
+            });
+        }
+        let used = self.memory_used();
+        if used + need > self.budget.pool {
+            return Some(format!(
+                "needs {} MiB of memory ({}); {} of {} MiB in use",
+                need / MIB,
+                w.reservation(),
+                used / MIB,
+                self.budget.pool / MIB
+            ));
+        }
+        if let Some(avail) = self.available
+            && avail < need + self.budget.pool / 20
+        {
+            return Some(format!("needs {} MiB of memory; {} MiB available on this host", need / MIB, avail / MIB));
+        }
+        None
+    }
+
+    /// Why queued work `w` has not started.
+    fn wait_reason(&self, w: &Work) -> String {
+        if self.cpu_used + w.cpus > self.capacity + 1e-9 {
+            // Actors given cpus= keep them while idle: name that, since it is
+            // the usual reason work waits forever.
+            let holders: Vec<f64> =
+                self.execs.values().filter(|e| e.actor.is_some() && e.held_cpus > 0.0).map(|e| e.held_cpus).collect();
+            let by_actors = if holders.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {:.2} of it held by {} actor(s) for as long as they live (their cpus= setting)",
+                    holders.iter().sum::<f64>(),
+                    holders.len()
+                )
+            };
+            return format!(
+                "needs {} CPU ({}); {:.2} of {:.2} in use{by_actors}",
+                w.cpus,
+                w.reservation(),
+                self.cpu_used,
+                self.capacity
+            );
+        }
+        self.memory_wait(w).unwrap_or_else(|| "waiting for an executor to start".into())
     }
 
     fn consume_start(&self, w: Work) {
@@ -1360,10 +2239,20 @@ impl Core {
             }
         };
         let threads = w.cpus.ceil() as u32;
-        let key = format!("isolated-{}", self.iso_seq);
-        let extra = [("CHIMAERA_PEER_SOCKET", self.peer_socket.clone())];
+        let base = format!("isolated-{}", self.iso_seq);
+        let key = match self.devices.key_for_actor(w.policy.gpus, &w.policy.device, &base) {
+            Want::Infeasible(why) => {
+                self.fail_infeasible(&w, &why);
+                return;
+            }
+            Want::Key(key) => key,
+            Want::None | Want::Wait => base,
+        };
+        let mut extra = vec![("CHIMAERA_PEER_SOCKET", Some(self.peer_socket.clone()))];
+        extra.extend(self.devices.env_for_key(&key));
         match self.sup.spawn(&env, threads, &extra, Some(&group)) {
             Ok((id, pid)) => {
+                self.devices.hold(id, &key);
                 self.cpu_used += w.cpus;
                 self.execs.insert(
                     id,
@@ -1377,6 +2266,11 @@ impl Core {
                         actor: None,
                         idle_since: Instant::now(),
                         killed_for_memory: None,
+                        kill_note: None,
+                        last_fn: Vec::new(),
+                        last_run: None,
+                        private: 0,
+                        leak: LeakWatch::default(),
                     },
                 );
                 self.iso_waiting.insert(id, w);
@@ -1388,17 +2282,37 @@ impl Core {
         }
     }
 
-    fn idle_exec(&self, key: &str) -> Option<u32> {
+    /// An idle pooled executor for `key`: one that last ran this function,
+    /// else one that last ran a call of this run (its modules are loaded),
+    /// else the oldest.
+    fn idle_exec(&self, key: &str, fn_digest: &[u8], run: Id) -> Option<u32> {
         self.execs
             .iter()
             .filter(|(_, e)| e.actor.is_none() && e.state == ExecState::Idle && e.env_key == key)
+            .min_by_key(|(id, e)| (e.last_fn.as_slice() != fn_digest, e.last_run != Some(run), **id))
             .map(|(id, _)| *id)
-            .min()
     }
 
-    fn ensure_executor(&mut self, env: &ExecEnv, threads: u32, key: &str) {
+    /// A new run's first calls should find warm executors: start a few
+    /// single-thread ones for its environment now (Ray starts one per CPU at
+    /// boot; a few keeps idle processes cheap, and demand grows the pool).
+    fn prestart(&mut self, env: &ExecEnv) {
+        let key = env.key(1);
+        let have = self.execs.values().filter(|e| e.actor.is_none() && e.env_key == key).count();
+        let want = (self.capacity.floor() as usize).clamp(1, PRESTART);
+        for _ in have..want {
+            self.spawn_exec(env, 1, &key, None);
+        }
+    }
+
+    /// Start executors for a pool with queued work, several at once: as many
+    /// as the queued work that free CPU could run now (an interpreter takes
+    /// 100 ms to seconds to start, so one at a time serializes a cold burst).
+    fn ensure_executor(&mut self, env: &ExecEnv, threads: u32, key: &str, cpus: f64) {
         let starting = self.execs.values().filter(|e| e.state == ExecState::Starting && e.env_key == key).count();
-        if starting > 0 {
+        let queued = self.queue.iter().filter(|w| w.cpus.ceil().max(1.0) as u32 == threads).count();
+        let free = ((self.capacity - self.cpu_used) / cpus.max(0.01)).floor().max(1.0) as usize;
+        if starting >= queued.min(free).max(1) {
             return;
         }
         // Make room: retire an idle executor of another environment.
@@ -1419,7 +2333,8 @@ impl Core {
     }
 
     fn spawn_exec(&mut self, env: &ExecEnv, threads: u32, key: &str, actor: Option<Id>) -> Option<u32> {
-        let extra = [("CHIMAERA_PEER_SOCKET", self.peer_socket.clone())];
+        let mut extra = vec![("CHIMAERA_PEER_SOCKET", Some(self.peer_socket.clone()))];
+        extra.extend(self.devices.env_for_key(key));
         match self.sup.spawn(env, threads, &extra, None) {
             Ok((id, pid)) => {
                 self.execs.insert(
@@ -1434,6 +2349,11 @@ impl Core {
                         actor,
                         idle_since: Instant::now(),
                         killed_for_memory: None,
+                        kill_note: None,
+                        last_fn: Vec::new(),
+                        last_run: None,
+                        private: 0,
+                        leak: LeakWatch::default(),
                     },
                 );
                 Some(id)
@@ -1454,20 +2374,21 @@ impl Core {
 
     /// Head of the queue plus, for fast map items of the same function, more
     /// of the same (granularity controller A1).
-    fn take_batch(&mut self) -> Vec<Work> {
-        let first = self.queue.pop_front().expect("caller checked");
+    /// The work at `at` plus, for fast calls of the same function, more of the
+    /// same right behind it (granularity, A1).
+    fn take_batch(&mut self, at: usize) -> Vec<Work> {
+        let first = self.queue.remove(at).expect("caller checked");
+        // The profile's batch counts calls of the function; a map chunk is
+        // already `items` of them.
+        let k = if first.batchable() {
+            (self.profiles.batch(&first.key()) / first.policy.items.max(1) as usize).clamp(1, profiles::MAX_BATCH)
+        } else {
+            1
+        };
         let mut batch = vec![first];
-        let head = &batch[0];
-        if head.kind() != pb::CallKind::CallMapItem || head.policy.interactive {
-            return batch;
-        }
-        let k = self.profiles.get(&head.spec.fn_digest).map_or(1, |p| p.batch.max(1));
-        let (digest, run) = (head.spec.fn_digest.clone(), head.tk.run);
         while batch.len() < k {
-            match self.queue.front() {
-                Some(w) if w.kind() == pb::CallKind::CallMapItem && w.spec.fn_digest == digest && w.tk.run == run => {
-                    batch.push(self.queue.pop_front().expect("front exists"));
-                }
+            match self.queue.get(at) {
+                Some(w) if batch[0].batches_with(w) => batch.push(self.queue.remove(at).expect("present")),
                 _ => break,
             }
         }
@@ -1476,6 +2397,10 @@ impl Core {
 
     fn start(&mut self, exec: u32, items: Vec<Work>) {
         let head = items[0].clone();
+        if let Some(e) = self.execs.get_mut(&exec) {
+            e.last_fn.clone_from(&head.spec.fn_digest);
+            e.last_run = Some(head.tk.run);
+        }
         // Calls on an actor run inside the CPU the actor already holds.
         let cpus = if self.execs.get(&exec).is_some_and(|e| e.actor.is_some() || e.cgroup.is_some()) {
             0.0
@@ -1501,7 +2426,18 @@ impl Core {
             deadline_unix_ms: if head.spec.deadline_hlc == 0 { 0 } else { hlc::wall_ms(head.spec.deadline_hlc) },
             run: head.tk.run.to_vec(),
             retry_exception_types: head.spec.retry_exception_types.clone(),
+            // A durable actor's constructor and methods return its state too.
+            durable: matches!(head.kind(), pb::CallKind::CallActorMethod | pb::CallKind::CallActorCtor)
+                && Id::from_slice(&head.spec.actor).ok().and_then(|a| self.actors.get(&a)).is_some_and(|h| h.durable),
         };
+        let pid = self.execs.get(&exec).map_or(0, |e| e.pid);
+        let alone = !self.running.iter().any(|r| r.exec == exec);
+        // Linux: reset the executor's peak-RSS mark, so this attempt's own peak
+        // can be read when it ends (clear_refs, kernel 4.0+).
+        let hwm_reset = cfg!(target_os = "linux")
+            && alone
+            && pid > 0
+            && std::fs::write(format!("/proc/{pid}/clear_refs"), "5").is_ok();
         if !self.sup.send(exec, pb::PeerToExec { msg: Some(pb::peer_to_exec::Msg::Execute(msg)) }) {
             // Executor vanished between ready and dispatch; requeue.
             for w in items.into_iter().rev() {
@@ -1510,8 +2446,11 @@ impl Core {
             self.execs.remove(&exec);
             return;
         }
-        let pid = self.execs.get(&exec).map_or(0, |e| e.pid);
         self.cpu_used += cpus;
+        if self.quotas.enabled() {
+            let tenant = self.tenant_of(head.tk.run);
+            self.quotas.take((head.tk.run, head.tk.task), &tenant, cpus);
+        }
         let waited = head.ready_at.elapsed().as_secs_f64() * 1e6;
         self.dispatch_us.push_back(waited);
         if self.dispatch_us.len() > 10_000 {
@@ -1520,8 +2459,24 @@ impl Core {
         let remaining = items.len();
         // Overlapping calls on one process share its CPU counters, so a delta
         // is only exact when the call runs alone.
-        let start = if self.running.iter().any(|r| r.exec == exec) { None } else { accounting::read(pid) };
-        self.running.push(Running { exec, items, remaining, cpus, blocked: false, start, dispatched_ns: now_ns() });
+        let start = if alone { accounting::read(pid) } else { None };
+        // Charged from the start: calls admitted on a live floor read 0
+        // until their first sample, and one pass may admit many.
+        let mem = items.iter().map(|w| self.need(w)).max().unwrap_or(0);
+        self.running.push(Running {
+            exec,
+            items,
+            remaining,
+            cpus,
+            blocked: false,
+            start,
+            dispatched_ns: now_ns(),
+            mem,
+            peak: 0,
+            started: Instant::now(),
+            hwm_reset,
+            unlearned: Vec::new(),
+        });
         let inflight = self.running.iter().filter(|r| r.exec == exec).count();
         if let Some(e) = self.execs.get_mut(&exec)
             && inflight >= e.concurrency
@@ -1565,6 +2520,7 @@ impl Core {
                     && r.blocked != msg.blocked
                 {
                     r.blocked = msg.blocked;
+                    let head = r.items.first().map(|w| (w.tk.run, w.tk.task));
                     // A task waiting on other futures lends out its CPU so the
                     // work it waits for can run (it keeps its memory charge).
                     if msg.blocked {
@@ -1572,31 +2528,93 @@ impl Core {
                     } else {
                         self.cpu_used += r.cpus;
                     }
+                    if let Some(call) = head {
+                        if msg.blocked {
+                            self.quotas.pause(call);
+                        } else {
+                            self.quotas.resume(call);
+                        }
+                    }
                 }
             }
             ExecEvent::Log { exec, log } => self.forward_log(exec, log),
+            ExecEvent::Yield { item, .. } => self.on_yield(item),
             ExecEvent::Exited { exec, detail, signal } => self.on_exec_exit(exec, detail, signal),
         }
     }
 
-    fn forward_log(&self, exec: u32, log: pb::ExecLog) {
-        let run = log.task.as_ref().and_then(Tk::parse).map(|t| t.run);
-        let Some(run) = run else { return };
-        let pid = self.execs.get(&exec).map_or(0, |e| e.pid);
+    /// Hand a generator's item to the sessions watching the call. Generator
+    /// calls run on their consumer's peer, so the watchers are local.
+    fn on_yield(&mut self, item: pb::ExecYield) {
+        let Some(tk) = item.task.as_ref().and_then(Tk::parse) else { return };
+        let Some(ids) = self.watchers.get(&tk) else { return };
         let ev = pb::SessionEvent {
             seq: 0,
-            event: Some(pb::session_event::Event::Log(pb::LogEvent {
-                task: log.task.clone(),
-                stream: log.stream.clone(),
-                text: log.text.clone(),
-                pid,
+            event: Some(pb::session_event::Event::StreamItem(pb::StreamItem {
+                task: item.task.clone(),
+                attempt: item.attempt,
+                index: item.index,
+                value: item.value,
             })),
         };
-        if let Some(r) = self.runs.get(&run) {
+        for id in ids {
+            if let Some(s) = self.sessions.get(id) {
+                let _ = s.tx.send(ev.clone());
+            }
+        }
+    }
+
+    /// Pass the consumer's progress to the executor running the generator.
+    fn on_stream_credit(&mut self, tk: Tk, up_to: u64) {
+        let Some(exec) = self.running.iter().find(|r| r.items.iter().any(|w| w.tk == tk)).map(|r| r.exec) else {
+            return;
+        };
+        let credit = pb::ExecCredit { task: Some(tk.pb()), up_to };
+        self.sup.send(exec, pb::PeerToExec { msg: Some(pb::peer_to_exec::Msg::Credit(credit)) });
+    }
+
+    fn forward_log(&mut self, exec: u32, log: pb::ExecLog) {
+        let Some(tk) = log.task.as_ref().and_then(Tk::parse) else { return };
+        let pid = self.execs.get(&exec).map_or(0, |e| e.pid);
+        let ev = pb::LogEvent { task: log.task, stream: log.stream, text: log.text, pid };
+        self.deliver_log(tk, &ev);
+        // The run's driver may be on another peer: send the output there too.
+        let (router, mesh) = (self.router.clone(), self.router.mesh.clone());
+        let home = self.log_ship.home(tk.run, || {
+            let home = router.read(tk.v(), |kv| read::run(kv, tk.run)).flatten()?.home?;
+            if home.peer == router.identity.peer.to_vec() {
+                return None;
+            }
+            mesh?.member_by_peer(&home.peer).map(|p| p.member.node_id)
+        });
+        if let Some(node) = home
+            && self.log_ship.add(node, &tk.run.0, ev)
+            && let Some(mesh) = &self.router.mesh
+        {
+            self.log_ship.flush(mesh);
+        }
+    }
+
+    /// Keep a run's output for `chimaera logs` and pass it to its drivers here.
+    fn deliver_log(&mut self, tk: Tk, ev: &pb::LogEvent) {
+        if let Err(e) = self.run_logs.append(&self.code, &tk.run.0, &tk.task.0, &ev.stream, &ev.text) {
+            tracing::warn!("cannot keep run output: {e}");
+        }
+        let msg = pb::SessionEvent { seq: 0, event: Some(pb::session_event::Event::Log(ev.clone())) };
+        if let Some(r) = self.runs.get(&tk.run) {
             for s in &r.sessions {
                 if let Some(sess) = self.sessions.get(s) {
-                    let _ = sess.tx.send(ev.clone());
+                    let _ = sess.tx.send(msg.clone());
                 }
+            }
+        }
+    }
+
+    /// Output another peer pushed here: this is its run's home.
+    fn on_remote_logs(&mut self, lines: Vec<pb::LogEvent>) {
+        for ev in lines {
+            if let Some(tk) = ev.task.as_ref().and_then(Tk::parse) {
+                self.deliver_log(tk, &ev);
             }
         }
     }
@@ -1618,26 +2636,80 @@ impl Core {
         let batch_len = run.items.len();
         let alone = self.running.iter().filter(|r| r.exec == exec).count() == 1;
         let end = if finished && alone { accounting::read(pid) } else { None };
+        let end_private = if finished && alone { budget::private_bytes(pid) } else { None };
         let start = self.running[idx].start;
         let dispatched_ns = self.running[idx].dispatched_ns;
+        let sampled_peak = self.running[idx].peak;
+        let hwm_reset = self.running[idx].hwm_reset && finished && alone;
+        let mut unlearned = Vec::new();
         if finished {
-            let r = self.running.remove(idx);
+            let mut r = self.running.remove(idx);
+            unlearned = std::mem::take(&mut r.unlearned);
             if !r.blocked {
                 self.cpu_used -= r.cpus;
+            }
+            if let Some(w) = r.items.first() {
+                self.quotas.give((w.tk.run, w.tk.task));
             }
             if let Some(x) = self.execs.get_mut(&exec) {
                 x.state = ExecState::Idle;
                 x.idle_since = Instant::now();
+                if x.actor.is_none() {
+                    // A pooled executor's devices go back; an actor keeps its own.
+                    self.devices.release(exec);
+                }
             }
         }
         let cgroup = self.execs.get(&exec).and_then(|e| e.cgroup.clone());
         let iso = cgroup.as_deref().and_then(Isolation::read);
-        self.record_attempt(&work, &done, exec, start, end, dispatched_ns, batch_len, iso);
+        let peak = attempt_peak(sampled_peak, end_private, start, end, iso.as_ref(), hwm_reset, work.read_bytes);
+        let cores = self.record_attempt(&work, &done, exec, start, end, dispatched_ns, batch_len, iso, peak);
         if cgroup.is_some() {
             // One attempt per isolated executor: retire it (its cgroup goes with it).
             self.retire_exec(exec);
+        } else if let Some(p) = end_private {
+            self.check_leak(exec, p);
         }
-        self.learn(&work, &done);
+        let peak_bytes = peak.map_or(0, |p| p.0);
+        if cores.is_none() && !finished && batch_len > 1 {
+            let mine =
+                |r: &&mut Running| r.exec == exec && r.items.iter().any(|w| w.tk == tk && w.attempt == done.attempt);
+            if let Some(r) = self.running.iter_mut().find(mine) {
+                r.unlearned.push((work.clone(), done.clone(), peak_bytes));
+            }
+        } else {
+            // The calls of a finished batch, at the cores the batch used: the
+            // last that fit a profile's sample ring (older ones would only be
+            // pushed out of it, at a summary's cost each).
+            let skip = unlearned.len().saturating_sub(chimaera_core::profile::RING - 1);
+            for (w, d, p) in unlearned.into_iter().skip(skip) {
+                self.learn(&w, &d, cores, p);
+            }
+            self.learn(&work, &done, cores, peak_bytes);
+        }
+        // A durable actor's constructor commits the first state (version 1),
+        // so a later call that raises always has a committed state to go back to.
+        let durable_actor = self.execs.get(&exec).and_then(|e| e.actor).filter(|a| {
+            matches!(work.kind(), pb::CallKind::CallActorMethod | pb::CallKind::CallActorCtor)
+                && self.actors.get(a).is_some_and(|h| h.durable)
+        });
+        let mut done = done;
+        if let Some(pb::Outcome { value: Some(pb::outcome::Value::Ok(obj)), .. }) = done.outcome.as_mut()
+            && obj.inline_data.is_empty()
+            && obj.locations.is_empty()
+        {
+            // Other peers fetch the bytes from here.
+            obj.locations.push(self.router.identity.pb());
+        }
+        if let Some(actor) = durable_actor
+            && work.publish
+            && !done.retryable
+            && done.forward_to.is_none()
+        {
+            // The reply goes out only after the state it leaves is committed.
+            self.commit_command(actor, work, done);
+            return;
+        }
         if work.publish {
             if done.retryable {
                 self.propose(
@@ -1655,18 +2727,131 @@ impl Core {
                         memory_peak: 0,
                     }),
                 );
-            } else if let Some(outcome) = done.outcome {
+            } else if done.outcome.is_some() || done.forward_to.is_some() {
                 self.pending_publish.entry(tk.v()).or_default().push(pb::PublishEntry {
                     task: Some(tk.pb()),
                     attempt: done.attempt,
                     peer: Some(self.router.identity.pb()),
-                    outcome: Some(outcome),
+                    outcome: done.outcome,
+                    forward_to: done.forward_to,
                 });
             }
         }
         if let Some(actor) = self.execs.get(&exec).and_then(|e| e.actor) {
             self.actor_after_call(actor, &work, finished);
         }
+    }
+
+    /// Commit a durable actor call: its command id, argument fingerprint and
+    /// the state it left. A call that raised commits nothing; its error goes
+    /// out and the committed state is put back.
+    fn commit_command(&mut self, actor: Id, w: Work, done: pb::ExecDone) {
+        let reply = done.outcome.clone().unwrap_or_default();
+        let Some(host) = self.actors.get_mut(&actor) else { return };
+        host.committing = true;
+        let Some(pb::outcome::Value::Ok(obj)) = reply.value.clone() else {
+            self.on_committed(actor, w, Commit::Raised, reply, Vec::new());
+            return;
+        };
+        // Default command id: the call itself (its retries share it).
+        let call_id = [w.tk.run.0, w.tk.task.0].concat();
+        let cmd_id = if w.spec.command_id.is_empty() { call_id.clone() } else { w.spec.command_id.clone() };
+        let fingerprint = if w.spec.command_fingerprint.is_empty() {
+            blake3::hash(&call_id).as_bytes().to_vec()
+        } else {
+            w.spec.command_fingerprint.clone()
+        };
+        let body = pb::shard_cmd::Body::ActorCommit(pb::ActorCommandCommit {
+            actor: actor.to_vec(),
+            generation: host.generation,
+            cmd_id,
+            fingerprint,
+            prev_version: host.state_version,
+            new_state: done.durable_state.clone(),
+            reply: Some(obj),
+        });
+        let (router, tx, state) = (self.router.clone(), self.me_tx.clone(), done.durable_state);
+        tokio::spawn(async move {
+            let ack = match router.propose(actor.vshard(), body).await {
+                Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Actor(a)) }) => Commit::Answered(Box::new(a)),
+                Ok(other) => Commit::Unknown(format!("unexpected commit reply: {other:?}")),
+                Err(e) => Commit::Unknown(e.to_string()),
+            };
+            let _ = tx.send(CoreMsg::Committed { actor, work: Box::new(w), ack, reply: Box::new(reply), state }).await;
+        });
+    }
+
+    /// Publish a durable call's outcome according to its commit, and keep
+    /// the instance's state equal to the committed one.
+    fn on_committed(&mut self, actor: Id, w: Work, commit: Commit, reply: pb::Outcome, state: Vec<u8>) {
+        use pb::actor_ack::Status as A;
+        let err = |kind: Kind, message: String| pb::Outcome {
+            value: Some(pb::outcome::Value::Err(pb::ErrorRecord { kind: kind as i32, message, ..Default::default() })),
+            ..Default::default()
+        };
+        // (outcome to publish, whether to put the committed state back)
+        let (outcome, restore) = match &commit {
+            Commit::Answered(a) if a.status() == A::Ok => {
+                if let Some(h) = self.actors.get_mut(&actor) {
+                    h.state_version = a.version;
+                    h.durable_state = state;
+                }
+                (Some(reply), false)
+            }
+            Commit::Raised => (Some(reply), true),
+            Commit::Answered(a) if a.status() == A::Duplicate => {
+                let stored = a.reply.clone().unwrap_or_default();
+                (Some(pb::Outcome { value: Some(pb::outcome::Value::Ok(stored)), ..Default::default() }), true)
+            }
+            Commit::Answered(a) if a.status() == A::Conflict => (
+                Some(err(
+                    Kind::CommandConflict,
+                    "this command id was already used with different arguments; its first result stands".into(),
+                )),
+                true,
+            ),
+            Commit::Answered(a) if a.status() == A::Rejected => {
+                (Some(err(Kind::User, format!("durable state refused: {}", a.reason))), true)
+            }
+            Commit::Answered(a) => {
+                // Stale generation or version: another instance moved on. Run
+                // the call again there; this instance restarts from the record.
+                let why = format!("commit refused: {:?} {}", a.status(), a.reason);
+                self.fail_attempt(&w, pb::record_failure::Kind::Infra, &why);
+                (None, true)
+            }
+            Commit::Unknown(e) => {
+                // It may have committed: the retry finds out (a repeat returns
+                // the stored reply). This instance's state is suspect.
+                self.fail_attempt(&w, pb::record_failure::Kind::Infra, &format!("commit not confirmed: {e}"));
+                if let Some(exec) = self.actors.get(&actor).and_then(|h| h.exec) {
+                    self.sup.kill(exec);
+                }
+                (None, false)
+            }
+        };
+        if let Some(outcome) = outcome {
+            self.pending_publish.entry(w.tk.v()).or_default().push(pb::PublishEntry {
+                task: Some(w.tk.pb()),
+                attempt: w.attempt,
+                peer: Some(self.router.identity.pb()),
+                outcome: Some(outcome),
+                forward_to: None,
+            });
+        }
+        if let Some(h) = self.actors.get_mut(&actor) {
+            h.committing = false;
+            if restore && let Some(exec) = h.exec {
+                let msg = pb::ExecRestore {
+                    actor: actor.to_vec(),
+                    fn_digest: h.class_digest.clone(),
+                    state: h.durable_state.clone(),
+                    version: h.state_version,
+                };
+                self.sup.send(exec, pb::PeerToExec { msg: Some(pb::peer_to_exec::Msg::Restore(msg)) });
+            }
+        }
+        self.actor_after_call(actor, &w, true);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1680,12 +2865,21 @@ impl Core {
         dispatched_ns: u64,
         batch_len: usize,
         iso: Option<IsoUsage>,
-    ) {
+        peak: Option<(u64, &'static str, &'static str)>,
+    ) -> Option<f64> {
         let mut measures = HashMap::new();
+        let mut cpu_measured = None;
         let wall_s = done.exit_unix_ns.saturating_sub(done.entry_unix_ns) as f64 / 1e9;
+        if let Some((bytes, scope, method)) = peak {
+            measures.insert(
+                "memory_private_peak_bytes".into(),
+                pb::Measure { value: bytes as f64, scope: scope.into(), method: method.into(), coverage: 1.0 },
+            );
+        }
         if let Some(u) = iso {
             // Charged to the attempt's own cgroup: scope "attempt".
             let m = |value: f64| pb::Measure { value, scope: "attempt".into(), method: "cgroup".into(), coverage: 1.0 };
+            // Includes the dedicated interpreter's start: not learned from.
             let cpu_s = u.cpu_ns as f64 / 1e9;
             measures.insert("cpu_seconds".into(), m(cpu_s));
             if wall_s > 0.0 {
@@ -1700,6 +2894,9 @@ impl Core {
             let scope = if batch_len > 1 { "batch" } else { "process" };
             let cpu_s = b.cpu_ns.saturating_sub(a.cpu_ns) as f64 / 1e9;
             let span_s = now_ns().saturating_sub(dispatched_ns) as f64 / 1e9;
+            // Cores over the whole attempt, decoding and reporting included:
+            // a call of microseconds otherwise looks like many cores.
+            cpu_measured = (span_s > 0.0).then(|| cpu_s / span_s);
             measures.insert(
                 "cpu_seconds".into(),
                 pb::Measure { value: cpu_s, scope: scope.into(), method: "rusage".into(), coverage: 1.0 },
@@ -1737,6 +2934,7 @@ impl Core {
             Some(pb::outcome::Value::Ok(_)) => "ok",
             Some(pb::outcome::Value::Err(_)) if done.retryable => "user_error_retryable",
             Some(pb::outcome::Value::Err(_)) => "user_error",
+            None if done.forward_to.is_some() => "forwarded",
             None => "unknown",
         };
         let rec = pb::AttemptRecord {
@@ -1756,8 +2954,10 @@ impl Core {
             end_reason: end_reason.into(),
             detail: String::new(),
             placement_reason: "local peer had a warm executor and free CPU".into(),
+            reservation: w.reservation(),
         };
         self.push_attempt(w.tk, rec);
+        cpu_measured
     }
 
     fn push_attempt(&mut self, tk: Tk, rec: pb::AttemptRecord) {
@@ -1770,53 +2970,122 @@ impl Core {
         }
     }
 
-    /// Granularity controller (A1): learn per-function item time and size
-    /// batches of fast map items toward `BATCH_TARGET_S`.
-    fn learn(&mut self, w: &Work, done: &pb::ExecDone) {
-        if w.kind() != pb::CallKind::CallMapItem {
-            return;
-        }
-        let item_s = done.exit_unix_ns.saturating_sub(done.entry_unix_ns) as f64 / 1e9;
-        let p = self.profiles.entry(w.spec.fn_digest.clone()).or_default();
-        p.samples += 1;
-        p.ewma_s = if p.samples == 1 { item_s } else { 0.8 * p.ewma_s + 0.2 * item_s };
-        if p.samples < 3 {
-            return;
-        }
-        let want = if p.ewma_s < BATCH_BELOW_S {
-            ((BATCH_TARGET_S / p.ewma_s.max(1e-6)).ceil() as usize).clamp(1, MAX_BATCH)
-        } else {
-            1
+    /// Learn from a finished attempt: memory, CPU and batching per function
+    /// (profiles). Attempts whose CPU could not be measured alone are skipped,
+    /// as are failures (they stop early).
+    fn learn(&mut self, w: &Work, done: &pb::ExecDone, cores: Option<f64>, peak: u64) {
+        let out_bytes = match done.outcome.as_ref().and_then(|o| o.value.as_ref()) {
+            Some(pb::outcome::Value::Ok(obj)) => obj.size,
+            _ => return,
         };
-        // Move toward the target by doubling or halving, one step per sample.
-        let next = if want > p.batch.max(1) { (p.batch.max(1) * 2).min(want) } else { want };
-        if next != p.batch {
-            let old = p.batch;
-            p.batch = next;
-            let ewma = p.ewma_s;
-            self.decide(pb::Decision {
-                at_unix_ns: now_ns(),
-                controller: "granularity".into(),
-                knob: "range_size".into(),
-                scope: format!("fn {}", &hex(&w.spec.fn_digest)[..12]),
-                old_value: old.max(1).to_string(),
-                new_value: next.to_string(),
-                outcome: "adopted".into(),
-                evidence: format!(
-                    "{} samples, ewma item time {:.3} ms",
-                    self.profiles[&w.spec.fn_digest].samples,
-                    ewma * 1e3
-                ),
-                reason: format!(
-                    "items under {} ms are batched toward {} ms per range",
-                    BATCH_BELOW_S * 1e3,
-                    BATCH_TARGET_S * 1e3
-                ),
-            });
+        if peak > 0 && !w.in_actor() {
+            // One finished call ends the probe: later calls are admitted by
+            // memory (need()), as wide as the pool allows.
+            let floor = self.live_floor.entry(w.key()).or_default();
+            *floor = (*floor).max(peak);
+        }
+        let Some(cores) = cores else { return };
+        if !w.publish {
+            return;
+        }
+        // A map chunk ran `items` calls one after another: time, CPU and
+        // output are per item; its peak and inputs are the chunk's.
+        let items = w.policy.items.max(1) as f64;
+        let wall_s = done.exit_unix_ns.saturating_sub(done.entry_unix_ns) as f64 / 1e9 / items;
+        let sample = Sample {
+            wall_s,
+            cpu_s: cores * wall_s,
+            peak,
+            arg_bytes: w.read_bytes,
+            out_bytes: (out_bytes as f64 / items) as u64,
+            cpus: w.cpus,
+            oom: false,
+        };
+        let req = Request { cpus: w.policy.cpus, memory: w.policy.memory, adaptive: w.policy.adaptive() };
+        let kills = self.mem_kills.back().is_some_and(|t| t.elapsed() < KILLS_RECENT);
+        let now = self.epoch.elapsed().as_secs_f64();
+        for d in self.profiles.record(&w.key(), &w.policy.fn_name, sample, w.arm, req, kills, now, now_ns()) {
+            self.decide(d);
         }
     }
 
+    /// Replace a pooled executor whose memory between calls keeps rising (R4).
+    fn check_leak(&mut self, exec: u32, private: u64) {
+        let Some(e) = self.execs.get_mut(&exec) else { return };
+        e.private = private;
+        if e.actor.is_some() {
+            return;
+        }
+        let Some(why) = e.leak.after_call(private) else { return };
+        let pid = e.pid;
+        self.retire_exec(exec);
+        self.decide(pb::Decision {
+            at_unix_ns: now_ns(),
+            controller: "leaks".into(),
+            knob: "executor".into(),
+            scope: format!("executor {exec} (pid {pid})"),
+            old_value: "running".into(),
+            new_value: "replaced".into(),
+            outcome: "adopted".into(),
+            evidence: why,
+            reason: "its memory between calls keeps growing; a fresh process starts clean (more memory would only \
+                     hide the leak)"
+                .into(),
+        });
+    }
+
+    fn save_profiles(&mut self) {
+        self.profiles_saved = Instant::now();
+        if self.profiles.take_dirty().is_empty() {
+            return;
+        }
+        if let Err(e) = self.profiles.save(&self.profiles_path) {
+            tracing::warn!("cannot save profiles to {}: {e}", self.profiles_path.display());
+        }
+    }
+
+    /// Append an event (bounded) and answer long polls waiting for it.
+    fn record(&mut self, mut e: pb::ClusterEvent) {
+        self.event_seq += 1;
+        e.seq = self.event_seq;
+        e.at_unix_ms = now_ns() / 1_000_000;
+        self.events.push_back(e);
+        while self.events.len() > EVENT_LOG_CAP {
+            self.events.pop_front();
+        }
+        let waiters = std::mem::take(&mut self.event_waiters);
+        for (kinds, since, reply) in waiters {
+            if reply.is_closed() {
+                continue;
+            }
+            let found = self.events_since(&kinds, since);
+            if found.is_empty() {
+                self.event_waiters.push((kinds, since, reply));
+            } else {
+                let _ = reply.send(found);
+            }
+        }
+    }
+
+    fn events_since(&self, kinds: &[String], since: u64) -> Vec<pb::ClusterEvent> {
+        self.events
+            .iter()
+            .filter(|e| e.seq >= since && (kinds.is_empty() || kinds.contains(&e.kind)))
+            .take(1000)
+            .cloned()
+            .collect()
+    }
+
     fn decide(&mut self, d: pb::Decision) {
+        self.record(pb::ClusterEvent {
+            kind: "decision".into(),
+            message: format!("{} {}: {} -> {} ({})", d.controller, d.knob, d.old_value, d.new_value, d.outcome),
+            detail_json: format!(
+                "{{\"scope\": {:?}, \"reason\": {:?}, \"evidence\": {:?}}}",
+                d.scope, d.reason, d.evidence
+            ),
+            ..Default::default()
+        });
         self.decisions.push_back(d);
         while self.decisions.len() > 10_000 {
             self.decisions.pop_front();
@@ -1826,11 +3095,13 @@ impl Core {
     fn on_exec_exit(&mut self, exec: u32, detail: String, signal: Option<i32>) {
         let info = self.execs.remove(&exec);
         self.sup.forget(exec);
+        self.devices.release(exec);
         if let Some(e) = &info {
             self.cpu_used -= e.held_cpus;
         }
         self.iso_waiting.remove(&exec);
         let mut oom = info.as_ref().and_then(|e| e.killed_for_memory);
+        let note = info.as_ref().and_then(|e| e.kill_note.clone());
         if let Some(group) = info.as_ref().and_then(|e| e.cgroup.clone()) {
             // The kernel enforces memory.max: an OOM kill shows in memory.events.
             if let Some(u) = Isolation::read(&group)
@@ -1854,16 +3125,58 @@ impl Core {
             if !r.blocked {
                 self.cpu_used -= r.cpus;
             }
+            if let Some(w) = r.items.first() {
+                self.quotas.give((w.tk.run, w.tk.task));
+            }
             let actor_exec = info.as_ref().and_then(|e| e.actor).is_some();
             for w in r.items.iter().filter(|w| w.publish) {
                 let reason = match (oom, signal) {
+                    (Some(_), _) if note.is_some() => note.clone().unwrap_or_default(),
                     (Some((peak, limit)), _) => {
                         format!("killed for exceeding its memory limit: peak {peak} > limit {limit} bytes")
                     }
                     (None, Some(sig)) => format!("executor process died with signal {sig} ({detail})"),
                     (None, None) => format!("executor process exited ({detail})"),
                 };
-                if actor_exec && w.kind() == pb::CallKind::CallActorMethod {
+                // A durable actor's call left nothing committed, and its command
+                // id makes a replay safe: it is retried on the restarted instance.
+                let durable = w.kind() == pb::CallKind::CallActorMethod
+                    && Id::from_slice(&w.spec.actor).ok().and_then(|a| self.actors.get(&a)).is_some_and(|h| h.durable);
+                if durable && let Some(h) = Id::from_slice(&w.spec.actor).ok().and_then(|a| self.actors.get_mut(&a)) {
+                    // Its retry keeps its sequence number: let the handle's
+                    // order wait for it again rather than skip past it.
+                    h.inflight.remove(&(w.spec.handle, w.spec.seq));
+                    let next = h.next_seq.entry(w.spec.handle).or_insert(0);
+                    *next = (*next).min(w.spec.seq);
+                }
+                if actor_exec && w.kind() == pb::CallKind::CallActorMethod && !durable {
+                    let actor = Id::from_slice(&w.spec.actor).ok();
+                    let pending = actor
+                        .and_then(|a| self.actors.get(&a))
+                        .is_some_and(|h| h.inflight.contains(&(w.spec.handle, w.spec.seq)));
+                    if !pending {
+                        continue; // it finished before the process died
+                    }
+                    // In a batch only the earliest unfinished call had started;
+                    // the ones after it go to the next instance, in order.
+                    let first_unfinished = r
+                        .items
+                        .iter()
+                        .find(|x| {
+                            actor
+                                .and_then(|a| self.actors.get(&a))
+                                .is_some_and(|h| h.inflight.contains(&(x.spec.handle, x.spec.seq)))
+                        })
+                        .map(|x| (x.spec.handle, x.spec.seq));
+                    if first_unfinished != Some((w.spec.handle, w.spec.seq))
+                        && let Some(h) = actor.and_then(|a| self.actors.get_mut(&a))
+                    {
+                        h.inflight.remove(&(w.spec.handle, w.spec.seq));
+                        let next = h.next_seq.entry(w.spec.handle).or_insert(0);
+                        *next = (*next).min(w.spec.seq);
+                        h.mailbox.insert((w.spec.handle, w.spec.seq), w.clone());
+                        continue;
+                    }
                     // A started actor call is not replayed on a fresh instance.
                     self.propose(
                         w.tk.v(),
@@ -1879,6 +3192,17 @@ impl Core {
                     Some((peak, _)) => (pb::record_failure::Kind::Oom, peak),
                     None => (pb::record_failure::Kind::Infra, 0),
                 };
+                if oom.is_some() {
+                    // Censored: it needed at least `peak`; later calls of this
+                    // size or larger reserve 1.5× that.
+                    let sample =
+                        Sample { peak, arg_bytes: w.read_bytes, cpus: w.cpus, oom: true, ..Default::default() };
+                    let req = Request { cpus: w.policy.cpus, memory: w.policy.memory, adaptive: w.policy.adaptive() };
+                    let now = self.epoch.elapsed().as_secs_f64();
+                    for d in self.profiles.record(&w.key(), &w.policy.fn_name, sample, None, req, true, now, now_ns()) {
+                        self.decide(d);
+                    }
+                }
                 self.push_attempt(
                     w.tk,
                     pb::AttemptRecord {
@@ -1923,13 +3247,33 @@ impl Core {
     /// host (this peer or another) informed of its record.
     fn on_actor_changed(&mut self, actor: Id) {
         let Some(Some(rec)) = self.router.read(actor.vshard(), |kv| read::actor(kv, actor)) else { return };
+        if self.actor_seen.get(&actor) != Some(&(rec.generation, rec.state)) {
+            self.actor_seen.insert(actor, (rec.generation, rec.state));
+            let message = match rec.state() {
+                pb::actor_record::State::Pending => "created; waiting for a host".to_string(),
+                pb::actor_record::State::Alive => format!("alive (generation {})", rec.generation),
+                pb::actor_record::State::Restarting => format!("restarting (restart {})", rec.restarts),
+                pb::actor_record::State::Dead => {
+                    format!("dead: {}", rec.death.as_ref().map_or("", |d| d.message.as_str()))
+                }
+            };
+            let run = rec.spec.as_ref().and_then(|s| s.ctor.as_ref()).map(|c| c.run.clone()).unwrap_or_default();
+            self.record(pb::ClusterEvent {
+                kind: "actor".into(),
+                actor: actor.to_vec(),
+                run,
+                node: rec.host.as_ref().map(|h| h.peer.clone()).unwrap_or_default(),
+                message,
+                ..Default::default()
+            });
+        }
         let spec = rec.spec.clone().unwrap_or_default();
         if matches!(rec.state(), pb::actor_record::State::Pending | pb::actor_record::State::Restarting) {
             let host = self.actors.entry(actor).or_default();
             if host.placing != Some(rec.generation) {
                 host.placing = Some(rec.generation);
                 let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-                match self.choose_actor_host(policy.cpus.max(0.0)) {
+                match self.choose_actor_host(&policy) {
                     Some(target) => self.propose(
                         actor.vshard(),
                         pb::shard_cmd::Body::ActorPlace(pb::ActorPlace {
@@ -1986,6 +3330,7 @@ impl Core {
                 env: env.clone(),
                 detached: spec.detached,
                 replay: true,
+                ..Default::default()
             });
         }
         let req = pb::DispatchRequest { cluster: mesh.cluster.clone(), work, actors: vec![rec], actor_env: env };
@@ -2003,18 +3348,24 @@ impl Core {
 
     /// Where a new actor instance goes: this peer or the least loaded of two
     /// sampled live peers with room for its CPU.
-    fn choose_actor_host(&self, cpus: f64) -> Option<pb::PeerInc> {
+    fn choose_actor_host(&self, policy: &pb::Policy) -> Option<pb::PeerInc> {
+        let cpus = policy.cpus.max(0.0);
         let me = self.router.identity.pb();
         let Some(mesh) = &self.router.mesh else { return Some(me) };
+        // Placement(require=, prefer=), as for tasks (choose_peer).
+        let allowed = |m: &pb::Member| crate::labels::satisfies(&m.labels, &policy.require);
+        let bonus = |m: &pb::Member| 0.5 * crate::labels::preferred(&m.labels, &policy.prefer) as f64;
         let hosted = self.execs.values().filter(|e| e.actor.is_some()).count() as f64;
         let mine = (self.cpu_used + self.queue.len() as f64 + 0.25 * hosted) / self.capacity.max(1e-9);
-        let mut best = (!self.draining && self.capacity + 1e-9 >= cpus).then_some((mine, me));
-        let others: Vec<_> = mesh.live_others().into_iter().filter(|p| p.member.cpus + 1e-9 >= cpus).collect();
+        let fits_here = !self.draining && self.capacity + 1e-9 >= cpus && allowed(&mesh.me);
+        let mut best = fits_here.then(|| (mine - bonus(&mesh.me), me));
+        let others: Vec<_> =
+            mesh.live_others().into_iter().filter(|p| p.member.cpus + 1e-9 >= cpus && allowed(&p.member)).collect();
         let seed = now_ns() as usize;
         for i in 0..2.min(others.len()) {
             let p = &others[(seed + i * 7919) % others.len()];
             let actors = p.load.as_ref().map_or(0, |l| l.actors) as f64;
-            let score = p.pressure() + 0.25 * actors / p.member.cpus.max(1e-9);
+            let score = p.pressure() + 0.25 * actors / p.member.cpus.max(1e-9) - bonus(&p.member);
             if best.as_ref().is_none_or(|(b, _)| score < *b) {
                 best = Some((score, pb::PeerInc { peer: p.member.peer.clone(), inc: p.member.incarnation }));
             }
@@ -2045,6 +3396,12 @@ impl Core {
         let host = self.actors.entry(actor).or_default();
         host.restart = spec.restart();
         host.detached = spec.detached;
+        host.durable = spec.durable;
+        host.class_digest = spec.class_digest.clone();
+        if rec.state_version >= host.state_version {
+            host.state_version = rec.state_version;
+            host.durable_state = rec.durable_state.clone();
+        }
         host.run = run;
         match rec.state() {
             pb::actor_record::State::Pending | pb::actor_record::State::Restarting => {}
@@ -2060,8 +3417,15 @@ impl Core {
                     let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
                     let threads = if policy.cpus > 0.0 { policy.cpus.ceil() as u32 } else { 1 };
                     if let Some(env) = env {
-                        let key = env.key(threads);
+                        // An actor holds its devices for its life (as the CPU it asked for).
+                        let key = match self.devices.key_for_actor(policy.gpus, &policy.device, &env.key(threads)) {
+                            Want::Key(key) => key,
+                            Want::None | Want::Wait | Want::Infeasible(_) => env.key(threads),
+                        };
                         let exec = self.spawn_exec(&env, threads, &key, Some(actor));
+                        if let Some(id) = exec {
+                            self.devices.hold(id, &key);
+                        }
                         // An actor holds only the CPU it asked for: idle actors
                         // must not starve tasks (Ray's default is the same).
                         let cpus = policy.cpus.max(0.0);
@@ -2093,25 +3457,53 @@ impl Core {
         }
     }
 
+    /// End an actor wherever it runs. The death is committed against the
+    /// record's current generation, read from this peer's replica of its
+    /// group or from another peer's; the leader then tells the host, which
+    /// stops the process and fails its queued calls.
     fn close_actor(&mut self, actor: Id, reason: &str) {
-        let Some(host) = self.actors.get(&actor) else { return };
-        if host.dead {
+        if self.actors.get(&actor).is_some_and(|h| h.dead) {
             return;
         }
-        let generation = host.generation;
-        self.propose(
-            actor.vshard(),
-            pb::shard_cmd::Body::ActorDied(pb::ActorDied {
-                actor: actor.to_vec(),
-                generation,
-                reason: Some(pb::ErrorRecord {
-                    kind: Kind::ActorDied as i32,
-                    message: format!("actor closed: {reason}"),
-                    ..Default::default()
-                }),
-                terminal: true,
-            }),
-        );
+        let router = self.router.clone();
+        let message = format!("actor closed: {reason}");
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                let local = router.read(actor.vshard(), |kv| read::actor(kv, actor)).flatten();
+                let rec = match (local, &router.mesh) {
+                    (Some(r), _) => Some(r),
+                    (None, Some(mesh)) => {
+                        let req = pb::ReadRequest { actor: actor.to_vec(), linearizable: true, ..Default::default() };
+                        mesh.read_group(router.group_of(actor.vshard()), req).await.ok().and_then(|r| r.actor)
+                    }
+                    (None, None) => None,
+                };
+                let Some(rec) = rec else { return };
+                if rec.state() == pb::actor_record::State::Dead {
+                    return;
+                }
+                let body = pb::shard_cmd::Body::ActorDied(pb::ActorDied {
+                    actor: actor.to_vec(),
+                    generation: rec.generation,
+                    reason: Some(pb::ErrorRecord {
+                        kind: Kind::ActorDied as i32,
+                        message: message.clone(),
+                        ..Default::default()
+                    }),
+                    terminal: true,
+                });
+                match router.propose(actor.vshard(), body).await {
+                    // A follower's copy can lag a restart: read again.
+                    Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Actor(ack)) })
+                        if ack.status() == pb::actor_ack::Status::StaleGeneration => {}
+                    Ok(_) => return,
+                    Err(e) => {
+                        tracing::warn!("closing actor {}: {e}", actor.hex());
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
     }
 
     fn cancel_actor_call(&self, tk: Tk, why: &str) {
@@ -2143,8 +3535,23 @@ impl Core {
         self.actor_pump(actor);
     }
 
-    fn actor_exec_ready(&mut self, actor: Id, _exec: u32) {
+    fn actor_exec_ready(&mut self, actor: Id, exec: u32) {
         let Some(host) = self.actors.get_mut(&actor) else { return };
+        if host.durable && host.state_version > 0 && !host.constructed {
+            // A durable actor resumes from its last committed state; its
+            // constructor ran once, before the first command.
+            host.ctor = None;
+            host.constructed = true;
+            let msg = pb::ExecRestore {
+                actor: actor.to_vec(),
+                fn_digest: host.class_digest.clone(),
+                state: host.durable_state.clone(),
+                version: host.state_version,
+            };
+            self.sup.send(exec, pb::PeerToExec { msg: Some(pb::peer_to_exec::Msg::Restore(msg)) });
+            self.actor_pump(actor);
+            return;
+        }
         if host.constructed || host.ctor.is_some() {
             self.actor_pump(actor);
             return;
@@ -2165,17 +3572,10 @@ impl Core {
         {
             let deps = self.dep_outcomes(tk, &spec);
             let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-            let w = Work {
-                tk,
-                attempt: 0,
-                spec,
-                policy,
-                deps,
-                cpus: 0.0,
-                ready_at: Instant::now(),
-                publish: false,
-                start_consumed: true,
-            };
+            let mut w = Work::new(tk, 0, spec, policy, deps);
+            w.cpus = 0.0;
+            w.publish = false;
+            w.start_consumed = true;
             if let Some(h) = self.actors.get_mut(&actor) {
                 h.ctor = Some(w);
             }
@@ -2188,6 +3588,9 @@ impl Core {
     /// earlier calls have all started or finished.
     fn actor_pump(&mut self, actor: Id) {
         loop {
+            if self.actors.get(&actor).is_some_and(|h| h.committing) {
+                return;
+            }
             let Some(exec) = self.actors.get(&actor).and_then(|h| h.exec) else { return };
             let Some(e) = self.execs.get(&exec) else { return };
             let inflight = self.running.iter().filter(|r| r.exec == exec).count();
@@ -2206,26 +3609,41 @@ impl Core {
     }
 
     fn actor_start_next(&mut self, actor: Id, exec: u32) -> bool {
+        // An actor that runs one call at a time gets the calls ready after
+        // the first in the same Execute (same method and options), which the
+        // executor runs back to back in order: no peer round trip between
+        // them. Durable actors commit between calls, so they go one by one.
+        let one_at_a_time = self.execs.get(&exec).is_some_and(|e| e.concurrency <= 1);
         let Some(host) = self.actors.get_mut(&actor) else { return false };
-        let next = if let Some(ctor) = host.ctor.take() {
-            Some(ctor)
+        let limit = if one_at_a_time && !host.durable { ACTOR_BATCH } else { 1 };
+        let mut batch: Vec<Work> = Vec::new();
+        if let Some(ctor) = host.ctor.take() {
+            batch.push(ctor);
         } else if host.constructed {
-            let key = host.mailbox.keys().find(|(h, s)| host.next_seq.get(h).copied().unwrap_or(0) == *s).copied();
-            key.and_then(|k| host.mailbox.remove(&k)).inspect(|w| {
+            while batch.len() < limit {
+                let key = host.mailbox.keys().find(|(h, s)| host.next_seq.get(h).copied().unwrap_or(0) == *s).copied();
+                let Some(key) = key else { break };
+                let fits = batch.first().is_none_or(|head| {
+                    let w = &host.mailbox[&key];
+                    w.spec.method == head.spec.method
+                        && w.spec.policy == head.spec.policy
+                        && w.spec.deadline_hlc == head.spec.deadline_hlc
+                });
+                if !fits {
+                    break;
+                }
+                let w = host.mailbox.remove(&key).expect("key found above");
                 host.next_seq.insert(w.spec.handle, w.spec.seq + 1);
                 host.inflight.insert((w.spec.handle, w.spec.seq));
                 advance(host, w.spec.handle);
-            })
-        } else {
-            None
-        };
-        match next {
-            Some(w) => {
-                self.start(exec, vec![w]);
-                true
+                batch.push(w);
             }
-            None => false,
         }
+        if batch.is_empty() {
+            return false;
+        }
+        self.start(exec, batch);
+        true
     }
 
     fn actor_after_call(&mut self, actor: Id, w: &Work, finished: bool) {
@@ -2287,6 +3705,10 @@ impl Core {
     // ---- housekeeping -----------------------------------------------------
 
     fn housekeeping(&mut self) {
+        self.spill();
+        if let Some(mesh) = &self.router.mesh {
+            self.log_ship.flush(mesh);
+        }
         let now_hlc = self.router.hlc();
         // Deadlines: cancel queued or running work past its deadline.
         let mut expired = Vec::new();
@@ -2323,7 +3745,17 @@ impl Core {
             if let Some(e) = self.execs.get_mut(&exec) {
                 e.killed_for_memory = Some((peak, limit));
             }
+            self.mem_kills.push_back(Instant::now());
             self.sup.kill(exec);
+        }
+        self.sample_memory();
+        if let Some(mesh) = self.router.mesh.clone() {
+            for (node, p) in mesh.take_profiles() {
+                self.profiles.merge_remote(node, &p);
+            }
+        }
+        if self.profiles_saved.elapsed() > PROFILES_SAVE_EVERY {
+            self.save_profiles();
         }
         // Reap executors idle for too long.
         let idle: Vec<u32> = self
@@ -2337,6 +3769,101 @@ impl Core {
         for id in idle {
             self.retire_exec(id);
         }
+        // Probes end, pressure lifts and heads age without any event.
+        self.dispatch();
+    }
+
+    /// Memory readings each housekeeping tick: every executor's private
+    /// memory, the host's availability, and the pressure response (R1).
+    fn sample_memory(&mut self) {
+        for (id, e) in &mut self.execs {
+            if let Some(p) = budget::private_bytes(e.pid) {
+                e.private = p;
+            }
+            for r in self.running.iter_mut().filter(|r| r.exec == *id) {
+                r.peak = r.peak.max(e.private);
+            }
+        }
+        for r in &self.running {
+            if r.mem == 0
+                && r.started.elapsed() >= PROBE_FOR
+                && let Some(e) = self.execs.get(&r.exec)
+            {
+                let floor = self.live_floor.entry(r.items[0].key()).or_default();
+                *floor = (*floor).max(e.private);
+            }
+        }
+        if self.objects_scanned.elapsed() >= OBJECTS_SCAN_EVERY {
+            self.objects_scanned = Instant::now();
+            self.object_bytes = if self.budget.objects_in_pool { self.objects.bytes_used() } else { 0 };
+            // Objects in memory past SPILL_ABOVE of the pool move to disk
+            // (oldest first), off the core's thread.
+            let over = self.memory_used().saturating_sub((SPILL_ABOVE * self.budget.pool as f64) as u64);
+            if over > 0 && self.object_bytes > 0 && !self.spilling.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let (objects, flag) = (self.objects.clone(), self.spilling.clone());
+                tokio::task::spawn_blocking(move || {
+                    match objects.spill_oldest(over) {
+                        Ok(n) if n > 0 => {
+                            tracing::info!("memory pool over {SPILL_ABOVE}: moved {n} bytes of objects to disk")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("cannot spill objects to disk: {e}"),
+                    }
+                    flag.store(false, std::sync::atomic::Ordering::Release);
+                });
+            }
+        }
+        self.available = budget::available_bytes();
+        let usable = self.budget.usable as f64;
+        let avail = self.available.map(|a| a as f64);
+        let psi = budget::memory_pressure();
+        let low = avail.is_some_and(|a| a < PAUSE_BELOW * usable) || psi.is_some_and(|p| p > PSI_PAUSE);
+        let recovered = avail.is_none_or(|a| a > RESUME_ABOVE * usable) && psi.is_none_or(|p| p <= PSI_PAUSE);
+        if low && !self.mem_paused {
+            self.mem_paused = true;
+            tracing::warn!(available = ?self.available, ?psi, "memory pressure: pausing admission");
+        } else if recovered && self.mem_paused {
+            self.mem_paused = false;
+        }
+        if avail.is_some_and(|a| a < KILL_BELOW * usable)
+            && self.mem_kills.back().is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+        {
+            self.kill_for_pressure();
+        }
+        while self.mem_kills.front().is_some_and(|t| t.elapsed() > KILLS_RECENT) {
+            self.mem_kills.pop_front();
+        }
+    }
+
+    /// Host memory is nearly gone: stop the running attempt furthest over its
+    /// reservation, never chosen by recency (Ray's monitor killed a 0.22 GB
+    /// producer and spared a 147 GB writer). Actors and started external
+    /// effects go last. Its retry waits until 1.5× its peak fits.
+    fn kill_for_pressure(&mut self) {
+        let victim = self
+            .running
+            .iter()
+            .filter(|r| !r.blocked)
+            .filter_map(|r| {
+                let e = self.execs.get(&r.exec)?;
+                let over = e.private.saturating_sub(r.mem);
+                let last = e.actor.is_some() || r.items.iter().any(|w| w.spec.effects() == pb::Effects::External);
+                (over > 0).then_some((last, std::cmp::Reverse(over), r.exec, e.private, r.mem))
+            })
+            .min();
+        let Some((_, _, exec, private, reserved)) = victim else { return };
+        let available = self.available.unwrap_or(0) / MIB;
+        if let Some(e) = self.execs.get_mut(&exec) {
+            e.killed_for_memory = Some((private, reserved));
+            e.kill_note = Some(format!(
+                "killed under host memory pressure ({available} MiB available): it held {} MiB with {} MiB reserved, \
+                 the most over its reservation; the retry waits until 1.5x that fits",
+                private / MIB,
+                reserved / MIB
+            ));
+        }
+        self.mem_kills.push_back(Instant::now());
+        self.sup.kill(exec);
     }
 
     // ---- queries ----------------------------------------------------------
@@ -2380,13 +3907,23 @@ impl Core {
             pb::task_record::State::Ready => "ready; waiting to be granted".into(),
             pb::task_record::State::Running => {
                 if let Some(pos) = self.queue.iter().position(|w| w.tk == tk) {
-                    let w = &self.queue[pos];
-                    format!(
-                        "queued at position {pos}: needs {} CPU, {:.2} of {:.2} in use",
-                        w.cpus, self.cpu_used, self.capacity
-                    )
-                } else if self.running.iter().any(|r| r.items.iter().any(|w| w.tk == tk)) {
-                    "running".into()
+                    format!("queued at position {pos}: {}", self.wait_reason(&self.queue[pos]))
+                } else if let Some(r) = self.running.iter().find(|r| r.items.iter().any(|w| w.tk == tk)) {
+                    // An actor runs a batch's calls in order: one not yet
+                    // reached is waiting behind the ones before it.
+                    let pos = r.items.iter().position(|w| w.tk == tk).expect("found above");
+                    let done = r.items.len() - r.remaining;
+                    let at_actor = self.execs.get(&r.exec).is_some_and(|e| e.actor.is_some());
+                    if at_actor && pos > done {
+                        self.actor_queue_reason(&r.items[pos], pos - done)
+                    } else {
+                        "running".into()
+                    }
+                } else if let Some(w) = self.actors.values().flat_map(|h| h.mailbox.values()).find(|w| w.tk == tk) {
+                    let host = self.actors.values().find(|h| h.mailbox.values().any(|x| x.tk == tk)).expect("found");
+                    let running =
+                        self.running.iter().filter(|r| host.exec == Some(r.exec)).map(|r| r.remaining).sum::<usize>();
+                    self.actor_queue_reason(w, host.mailbox.len() - 1 + running)
                 } else {
                     "granted; waiting for an actor or executor".into()
                 }
@@ -2394,17 +3931,72 @@ impl Core {
         }
     }
 
+    /// A call queued at its actor: how many are queued there, and when that
+    /// method's calls mostly wait on I/O, how to let them overlap (an actor
+    /// runs one call at a time unless its method declares concurrency).
+    fn actor_queue_reason(&self, w: &Work, ahead: usize) -> String {
+        let mut why = format!("queued at its actor behind {ahead} call(s); an actor runs its calls in order");
+        if ahead >= ACTOR_HINT_QUEUE
+            && let Some(s) = self.profiles.summary(&w.key()).filter(|s| s.io_bound())
+        {
+            why += &format!(
+                ". Its {} calls mostly wait ({:.2} cores over {:.2} s on average): \
+                 @ch.method(concurrency=N) on {} lets N of them overlap",
+                w.spec.method, s.cores_mean, s.wall_p50_s, w.spec.method
+            );
+        }
+        why
+    }
+
+    /// What this peer knows of the cluster's members, itself included.
+    fn nodes(&self) -> Vec<pb::ClusterNode> {
+        let me = self.router.identity.peer.to_vec();
+        let own = |cpus: f64, memory_bytes: u64, addr: String| pb::ClusterNode {
+            peer: me.clone(),
+            addr,
+            cpus,
+            memory_bytes,
+            alive: true,
+            cpu_used: self.cpu_used,
+            queued: self.queue.len() as u64,
+            this_peer: true,
+            ..Default::default()
+        };
+        let Some(mesh) = self.router.mesh.as_ref() else {
+            let labels = crate::labels::own(&me).into_iter().collect();
+            return vec![pb::ClusterNode { labels, ..own(self.capacity, self.budget.pool, String::new()) }];
+        };
+        mesh.members()
+            .into_iter()
+            .map(|v| {
+                if v.member.peer == me {
+                    return pb::ClusterNode {
+                        gpus: v.member.gpus.clone(),
+                        labels: v.member.labels.clone(),
+                        ..own(v.member.cpus, v.member.memory_bytes, v.member.addr.clone())
+                    };
+                }
+                pb::ClusterNode {
+                    peer: v.member.peer.clone(),
+                    addr: v.member.addr.clone(),
+                    cpus: v.member.cpus,
+                    memory_bytes: v.member.memory_bytes,
+                    gpus: v.member.gpus.clone(),
+                    alive: !v.dead,
+                    cpu_used: v.load.as_ref().map_or(0.0, |l| l.cpu_used),
+                    queued: v.load.as_ref().map_or(0, |l| u64::from(l.queued)),
+                    this_peer: false,
+                    labels: v.member.labels.clone(),
+                }
+            })
+            .collect()
+    }
+
     fn status(&self) -> pb::StatusReply {
         let busy = self.execs.values().filter(|e| e.state == ExecState::Busy).count() as u32;
         let mut reasons = Vec::new();
         if let Some(w) = self.queue.front() {
-            reasons.push(format!(
-                "{} attempt(s) queued; head needs {} CPU with {:.2} of {:.2} in use",
-                self.queue.len(),
-                w.cpus,
-                self.cpu_used,
-                self.capacity
-            ));
+            reasons.push(format!("{} attempt(s) queued; the first {}", self.queue.len(), self.wait_reason(w)));
         }
         pb::StatusReply {
             peer: None,
@@ -2424,6 +4016,20 @@ impl Core {
             proposals_in_flight: self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
                 + self.pending_publish.values().map(|v| v.len() as u64).sum::<u64>()
                 + self.pending_grants.values().map(|v| v.len() as u64).sum::<u64>(),
+            memory_pool: self.budget.pool,
+            memory_used: self.memory_used(),
+            memory_available: self.available.unwrap_or(0),
+            links: self.router.mesh.as_ref().map(|m| m.links()).unwrap_or_default(),
+            nodes: self.nodes(),
+            automatic: vec![
+                self.budget.describe(),
+                format!("cpu capacity {:.2}", self.capacity),
+                format!(
+                    "{} learned function profile(s), saved in {}",
+                    self.profiles.len(),
+                    self.profiles_path.display()
+                ),
+            ],
         }
     }
 }
@@ -2444,5 +4050,27 @@ fn advance(host: &mut ActorHost, handle: u64) {
         while done.remove(next) {
             *next += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acked(status: pb::task_ack::Status) -> Result<pb::ShardReply, ()> {
+        let ack = pb::TaskAck { status: status as i32, ..Default::default() };
+        Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(pb::TaskAcks { acks: vec![ack] })) })
+    }
+
+    #[test]
+    fn only_an_accepted_give_back_moves_the_work_away() {
+        use pb::task_ack::Status;
+        assert!(give_back_taken(&acked(Status::Accepted)));
+        assert!(give_back_taken(&acked(Status::Existing)));
+        for refused in [Status::Stale, Status::Rejected, Status::NotFound, Status::Denied] {
+            assert!(!give_back_taken(&acked(refused)), "{refused:?} must keep the work here");
+        }
+        assert!(!give_back_taken::<()>(&Err(())), "a lost answer must keep the work here");
+        assert!(!give_back_taken::<()>(&Ok(pb::ShardReply { body: None })));
     }
 }

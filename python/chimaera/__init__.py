@@ -11,15 +11,21 @@
 """
 
 from ._context import context
+from ._devices import device, devices
+from ._gang import Gang, GangActor, GangFailed, Group
+from ._reserve import Reservation, reserve
 from ._errors import (
     ActorDied,
     Cancelled,
     ChimaeraError,
+    Closed,
     CommandConflict,
     DataLost,
     DeadlineExceeded,
     Infeasible,
     InfrastructureFailure,
+    LeaseLost,
+    NotFound,
     OptionsError,
     OutcomeUnknown,
     OutOfMemory,
@@ -28,14 +34,22 @@ from ._errors import (
     RemoteError,
     SerializationError,
     StreamInterrupted,
+    VersionConflict,
     WorkerCrashed,
     WorkflowDivergence,
 )
-from ._future import Future, ObjectRef, Outcome, Results, as_completed, gather, put
-from ._options import Placement, auto, options
-from ._remote import Actor, ActorClass, Pool, RemoteFunction, method, remote
+from ._future import Future, ObjectRef, Outcome, Results, Stream, as_completed, gather, put
+from ._batch import Batch
+from ._options import Placement, State, auto, options
+from ._remote import Actor, ActorClass, Pool, RemoteFunction, actor, method, remote
 from ._run import Run, attach, current_run
 from ._runtime import Runtime
+from . import workflow  # noqa: E402 -- ch.workflow.now/random/sleep/record
+from ._coord import Queue, Subscription, Topic  # noqa: E402 -- builds on _remote
+from ._store import Store
+from ._cluster import cluster
+from . import ext  # noqa: E402 -- sources, sinks, serializers
+from ._data import Partition, Partitioned, partitions
 
 
 def submit(fn, /, *args, **kwargs) -> Future:
@@ -49,63 +63,102 @@ def map(fn, /, *sources, ordered: bool = True) -> Results:  # noqa: A001 -- mirr
     return f.map(*sources, ordered=ordered)
 
 
-def init(*, detach: bool = False, env: dict[str, str] | None = None) -> str:
-    """Connect now (normally the first submission does) and return the run id.
+def init(
+    cluster: str | None = None, *, detach: bool = False, env: dict[str, str] | None = None, tenant: str | None = None
+) -> Run:
+    """Connect now (normally the first submission does) and return the run.
+    A ``Run`` is its id string, so it can be printed, stored and passed to
+    ``ch.attach`` from another process.
+
+    `cluster` selects where the work runs: a profile name from
+    ``~/.config/chimaera/clusters.toml`` or ``tcp://host:port``. Without it,
+    ``$CHIMAERA_CLUSTER``, ``$CHIMAERA_ADDRESS`` or the profile default apply,
+    else a local peer starts on demand.
 
     `env` adds environment variables for this run's executors. By default a run
     ships only locale settings and PYTHONHASHSEED; name more client variables in
     CHIMAERA_ENV_PASSTHROUGH (comma-separated, wildcards allowed). Do not pass
     secrets: the run's variables are stored with the run. Executors get secrets
     from their peer's own environment.
+
+    `tenant` (default ``$CHIMAERA_TENANT``, else "default") is who the run's
+    work is charged to: peers with ``CHIMAERA_TENANT_QUOTAS`` hold a tenant's
+    calls back while its running calls use its quota of CPUs.
     """
     with Runtime._lock:
         if Runtime._instance is None:
-            Runtime._instance = Runtime(detached=detach, env=env)
-        elif env is not None:
-            raise RuntimeError("ch.init(env=...) must come before the first submission")
-    return Runtime._instance.run_id
+            Runtime._instance = Runtime(detached=detach, env=env, cluster=cluster, tenant=tenant)
+        elif env is not None or cluster is not None or tenant is not None:
+            raise RuntimeError("ch.init(cluster=..., env=..., tenant=...) must come before the first submission")
+    return current_run()
 
 
 __all__ = [
     "Actor",
     "ActorClass",
     "ActorDied",
+    "Batch",
     "Cancelled",
     "ChimaeraError",
+    "Closed",
     "CommandConflict",
     "DataLost",
     "DeadlineExceeded",
     "Future",
+    "Gang",
+    "GangActor",
+    "GangFailed",
+    "Group",
     "Infeasible",
     "InfrastructureFailure",
+    "LeaseLost",
+    "NotFound",
     "ObjectRef",
     "OptionsError",
-    "OutOfMemory",
     "Outcome",
     "OutcomeUnknown",
+    "OutOfMemory",
     "Overloaded",
+    "Partition",
+    "Partitioned",
     "Placement",
+    "Reservation",
     "Pool",
     "PreflightError",
+    "Queue",
     "RemoteError",
     "RemoteFunction",
-    "Run",
     "Results",
+    "Run",
     "SerializationError",
+    "State",
+    "Store",
+    "Stream",
     "StreamInterrupted",
+    "Subscription",
+    "Topic",
+    "VersionConflict",
     "WorkerCrashed",
     "WorkflowDivergence",
+    "actor",
     "as_completed",
     "attach",
-    "current_run",
     "auto",
+    "cluster",
     "context",
+    "current_run",
+    "device",
+    "devices",
+    "ext",
     "gather",
     "init",
     "map",
     "method",
     "options",
+    "partitions",
     "put",
     "remote",
+    "reserve",
     "submit",
+    "workflow",
 ]

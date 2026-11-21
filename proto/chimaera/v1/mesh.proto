@@ -28,7 +28,19 @@ service Mesh {
   rpc Ping(PingRequest) returns (PingReply);
   // Stop work on tasks that ended elsewhere, and drop objects.
   rpc Forget(ForgetRequest) returns (ForgetReply);
+  // Store a code blob here too, so the code outlives the peer it came in on.
+  rpc PutCode(MeshPutCode) returns (PutCodeReply);
+  // Output of calls that ran on the sender, for the run's home peer.
+  rpc PushLogs(PushLogsRequest) returns (PushLogsReply);
 }
+
+message PushLogsRequest {
+  string cluster = 1;
+  bytes run = 2;
+  repeated LogEvent lines = 3;
+}
+
+message PushLogsReply {}
 
 message Member {
   bytes peer = 1;
@@ -38,6 +50,7 @@ message Member {
   double cpus = 5;
   uint64 memory_bytes = 6;
   repeated string gpus = 7;
+  map<string, string> labels = 8;   // for Placement(require=, prefer=)
 }
 
 message JoinRequest {
@@ -120,6 +133,9 @@ message RemoteWork {
   bool detached = 6;
   // Re-run a restarted actor's committed constructor without publishing.
   bool replay = 7;
+  // The reservation the placer chose (learned or requested); 0 = unknown.
+  double cpus = 8;
+  uint64 memory = 9;
 }
 
 message DispatchRequest {
@@ -139,11 +155,15 @@ message FetchRequest {
   bytes run = 2;
   bytes object_id = 3;   // or, with `code`, the code blob's digest
   bool code = 4;
+  // A byte range (parallel fetches of large objects); len 0 = to the end.
+  uint64 offset = 5;
+  uint64 len = 6;
 }
 
 message FetchChunk {
   bytes data = 1;
-  uint64 total = 2;   // set on the first chunk
+  uint64 total = 2;      // set on the first chunk: bytes in the requested range
+  bytes checksum = 3;    // blake3 of `data`, first 16 bytes
 }
 
 message WatchRequest {
@@ -154,6 +174,20 @@ message WatchRequest {
 message PingRequest {
   string cluster = 1;
   uint64 from_node = 2;
+  // SWIM membership claims gossiped with the probe.
+  repeated SwimUpdate updates = 3;
+  // Indirect probe: the receiver probes this node and reports `relay_ok`.
+  uint64 relay_to = 4;
+}
+
+// A membership claim. `inc` is the process incarnation in the high 32 bits
+// and refutations in the low 32. Alive claims carry the member record, so a
+// peer can reach a member it learns of by gossip.
+message SwimUpdate {
+  uint64 node = 1;
+  uint64 inc = 2;
+  uint32 state = 3;   // 0 alive, 1 suspect, 2 dead
+  Member member = 4;
 }
 
 message PingReply {
@@ -166,6 +200,17 @@ message PingReply {
   repeated uint32 leading = 7;   // groups the target leads
   uint32 actors = 8;             // actor instances hosted
   bool draining = 9;             // shutting down: place nothing new there
+  // Memory pool (executor charges plus objects in tmpfs), in bytes.
+  uint64 memory_pool = 10;
+  uint64 memory_used = 11;
+  uint64 memory_available = 12;  // what the OS can hand out now
+  uint64 object_bytes = 13;
+  // Profiles changed since the last reply to the asking peer.
+  repeated ProfileSummary profiles = 14;
+  // Blobs this peer fetched or wrote recently (locality hints).
+  repeated bytes recent_blobs = 15;
+  repeated SwimUpdate updates = 16;
+  bool relay_ok = 17;    // indirect probe: the target answered the relay
 }
 
 message ForgetRequest {
@@ -180,3 +225,9 @@ message ForgetRequest {
 }
 
 message ForgetReply {}
+
+message MeshPutCode {
+  string cluster = 1;
+  bytes digest = 2;
+  bytes code = 3;
+}

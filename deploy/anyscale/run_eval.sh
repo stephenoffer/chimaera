@@ -17,7 +17,10 @@ if ! command -v protoc >/dev/null; then
   else apt-get update -qq && apt-get install -y -qq protobuf-compiler >/dev/null; fi
 fi
 if ! command -v cargo >/dev/null; then
-  curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain none
+  # rustup-init downloaded to a file and run, rather than a script piped to sh.
+  curl -sSfo /tmp/rustup-init "https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"
+  chmod +x /tmp/rustup-init
+  /tmp/rustup-init -y -q --profile minimal --default-toolchain none
   # shellcheck disable=SC1091
   source "$HOME/.cargo/env"
 fi

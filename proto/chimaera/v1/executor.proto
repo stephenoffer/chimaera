@@ -44,6 +44,8 @@ message Execute {
   uint64 deadline_unix_ms = 7;   // 0 = none
   bytes run = 8;
   repeated string retry_exception_types = 9;
+  // A durable actor's call: return the instance's state with the result.
+  bool durable = 10;
 }
 
 message ExecDone {
@@ -56,6 +58,20 @@ message ExecDone {
   bytes fingerprint = 5;
   uint64 entry_unix_ns = 6;
   uint64 exit_unix_ns = 7;
+  // The call returned another call's future: publish that call's outcome
+  // when it lands (`outcome` is unset).
+  TaskKey forward_to = 8;
+  // Durable actors: the instance's state after the call, to commit.
+  bytes durable_state = 9;
+}
+
+// Durable actors: set the instance's state to the committed one (a restart,
+// or a call whose commit was refused and must not leave its effects).
+message ExecRestore {
+  bytes actor = 1;
+  bytes fn_digest = 2;     // the actor's class
+  bytes state = 3;
+  uint64 version = 4;
 }
 
 // The task is blocked waiting on other futures (CPU grant can be lent out).
@@ -111,5 +127,6 @@ message PeerToExec {
     ExecCancel cancel = 3;
     ExecShutdown shutdown = 4;
     ExecCredit credit = 5;
+    ExecRestore restore = 6;
   }
 }

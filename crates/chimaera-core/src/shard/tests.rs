@@ -103,6 +103,7 @@ impl Harness {
                     attempt,
                     peer: Some(peer_pb(p)),
                     outcome: Some(o),
+                    forward_to: None,
                 }],
             }),
             tk.v(),
@@ -450,6 +451,7 @@ fn a_result_stays_pinned_until_its_dependents_complete() {
                 attempt: 1,
                 peer: Some(peer_pb(p)),
                 outcome: Some(obj(2)),
+                forward_to: None,
             }],
         }),
         V,
@@ -695,6 +697,7 @@ fn run_case(defs: &[TaskDef], ops: &[Op], sm: ShardState) -> Result<(), TestCase
                             attempt: *attempt,
                             peer: Some(peer_pb(pi)),
                             outcome: Some(o),
+                            forward_to: None,
                         }],
                     }),
                     tks[*t].v(),
@@ -978,4 +981,344 @@ fn coverage_report() {
             }
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Forwarding and subtree cancellation
+// ---------------------------------------------------------------------------
+
+fn forward(h: &mut Harness, tk: Tk, attempt: u32, p: PeerInc, to: Tk) -> pb::TaskAck {
+    let r = h.raw(
+        Body::Publish(pb::PublishResults {
+            entries: vec![pb::PublishEntry {
+                task: Some(tk.pb()),
+                attempt,
+                peer: Some(peer_pb(p)),
+                outcome: None,
+                forward_to: Some(to.pb()),
+            }],
+        }),
+        tk.v(),
+    );
+    first_ack(&r.reply)
+}
+
+fn child_of(tk: Tk, parent: Tk) -> pb::TaskSpec {
+    pb::TaskSpec { parent: Some(parent.pb()), ..spec(tk, &[], pb::Effects::None, 3) }
+}
+
+#[test]
+fn a_forwarded_call_waits_without_a_worker_and_takes_the_target_outcome() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (a, f, b) = (task_id(V, 0), task_id(V, 1), task_id(V, 2));
+    h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
+    h.submit(spec(f, &[], pb::Effects::None, 3), Some(p));
+    h.submit(spec(b, &[a], pb::Effects::None, 3), None);
+    assert_eq!(status(&forward(&mut h, a, 1, p, f)), Status::Published);
+    let rec = h.task(a).unwrap();
+    assert_eq!((rec.state(), rec.forwarded_to.clone()), (TState::Pending, Some(f.pb())));
+    let grants = h.a.scan_prefix(&keys::grants_of(V, &p.0, p.1), usize::MAX);
+    assert!(grants.iter().all(|(k, _)| !k.windows(16).any(|w| w == a.task.0)), "the waiting forwarder holds no grant");
+    // A late publication from the same attempt is refused: the call is waiting, not running.
+    assert_eq!(status(&h.publish(a, 1, p, obj(9))), Status::Stale);
+    let done = h.raw(
+        Body::Publish(pb::PublishResults {
+            entries: vec![pb::PublishEntry {
+                task: Some(f.pb()),
+                attempt: 1,
+                peer: Some(peer_pb(p)),
+                outcome: Some(obj(7)),
+                forward_to: None,
+            }],
+        }),
+        V,
+    );
+    let f_outcome = h.task(f).unwrap().outcome;
+    assert_eq!(h.task(a).unwrap().outcome, f_outcome, "the forwarder resolves to the target's result");
+    assert!(done.events.iter().any(|e| matches!(e, Event::Done { task, .. } if *task == a)));
+    assert_eq!(h.task(b).unwrap().state(), TState::Ready, "dependents of the forwarder are released");
+    assert!(h.task(f).unwrap().pins >= 2, "the target stays pinned for the forwarder");
+}
+
+#[test]
+fn forwarding_to_a_finished_or_failed_call_completes_at_once() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (a, f, c, g) = (task_id(V, 0), task_id(V, 1), task_id(V, 2), task_id(V, 3));
+    for t in [a, f, c, g] {
+        h.submit(spec(t, &[], pb::Effects::None, 3), Some(p));
+    }
+    h.publish(f, 1, p, obj(3));
+    forward(&mut h, a, 1, p, f);
+    assert_eq!(h.task(a).unwrap().outcome, h.task(f).unwrap().outcome);
+    h.publish(g, 1, p, user_err("KeyError: k"));
+    forward(&mut h, c, 1, p, g);
+    assert_eq!(err_kind(&h.task(c).unwrap()), Some(Kind::User), "the target's own error, not a causal one");
+    assert_eq!(status(&forward(&mut h, task_id(V, 4), 1, p, a)), Status::NotFound);
+}
+
+#[test]
+fn forwarding_to_a_call_not_yet_submitted_resolves_when_it_finishes() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (a, f) = (task_id(V, 0), task_id(V, 1));
+    h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
+    forward(&mut h, a, 1, p, f);
+    let (ack, _) = h.submit(spec(f, &[], pb::Effects::None, 3), Some(p));
+    assert_eq!(status(&ack), Status::Granted);
+    assert_eq!(h.task(f).unwrap().pins, 2, "the early forwarder pins the target");
+    h.publish(f, 1, p, obj(5));
+    assert_eq!(h.task(a).unwrap().outcome, h.task(f).unwrap().outcome);
+}
+
+#[test]
+fn cancelling_a_call_cancels_everything_it_submitted() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (root, c1, c2, g, other) = (task_id(V, 0), task_id(V, 1), task_id(V, 2), task_id(V, 3), task_id(V, 4));
+    h.submit(spec(root, &[], pb::Effects::None, 3), Some(p));
+    h.submit(child_of(c1, root), Some(p));
+    h.submit(child_of(c2, root), None);
+    h.submit(child_of(g, c1), Some(p));
+    h.submit(spec(other, &[], pb::Effects::None, 3), Some(p));
+    h.publish(c1, 1, p, obj(1)); // finished, but its own child is still running
+    assert_eq!(status(&h.cancel(root)), Status::Accepted);
+    assert_eq!(err_kind(&h.task(root).unwrap()), Some(Kind::Cancelled));
+    assert_eq!(err_kind(&h.task(c2).unwrap()), Some(Kind::Cancelled));
+    assert_eq!(err_kind(&h.task(g).unwrap()), Some(Kind::Cancelled), "grandchildren under a finished child too");
+    assert_eq!(err_kind(&h.task(c1).unwrap()), None, "a finished child keeps its result");
+    assert_eq!(h.task(other).unwrap().state(), TState::Running, "unrelated work is untouched");
+    // A cancelled body may still submit: its late child is cancelled at once.
+    let late = task_id(V, 5);
+    let (ack, _) = h.submit(child_of(late, root), Some(p));
+    assert_eq!((ack.state(), err_kind(&h.task(late).unwrap())), (TState::Done, Some(Kind::Cancelled)));
+}
+
+#[test]
+fn child_and_forward_entries_expire_with_their_run() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (root, c, a, f) = (task_id(V, 0), task_id(V, 1), task_id(V, 2), task_id(V, 3));
+    h.submit(spec(root, &[], pb::Effects::None, 3), Some(p));
+    h.submit(child_of(c, root), Some(p));
+    h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
+    forward(&mut h, a, 1, p, f); // f never arrives
+    h.raw(Body::RunFinish(pb::RunFinish { run: run_id(V).to_vec(), state: 0 }), V);
+    h.hlc += hlc::from_ms(DEFAULT_RUN_RETENTION_MS + 1);
+    h.raw(Body::Gc(pb::Gc { max_keys: 1000 }), V);
+    for tag in [keys::CHILD, keys::FORWARD] {
+        assert!(h.a.scan_prefix(&keys::pairs_of_run(V, tag, &run_id(V)), usize::MAX).is_empty(), "tag {tag}");
+    }
+}
+
+#[test]
+fn the_same_producer_passed_twice_is_one_dependency() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (a, b) = (task_id(V, 0), task_id(V, 1));
+    h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
+    h.submit(spec(b, &[a, a], pb::Effects::None, 3), None);
+    assert_eq!(h.task(b).unwrap().deps_remaining, 1);
+    assert_eq!(h.task(a).unwrap().pins, 2, "the client's pin plus one for the dependent");
+    h.publish(a, 1, p, obj(1));
+    assert_eq!(h.task(b).unwrap().state(), TState::Ready, "a duplicated dependency must not block forever");
+    h.grant(b, p, false);
+    h.publish(b, 1, p, obj(2));
+    assert_eq!(h.task(a).unwrap().pins, 1, "unpinned once when the dependent completes");
+}
+
+// ---------------------------------------------------------------------------
+// ch.Store
+// ---------------------------------------------------------------------------
+
+fn store_write(h: &mut Harness, w: pb::StoreWrite) -> pb::StoreReply {
+    let v = store::vshard_of(&w.tenant, &w.namespace);
+    h.raw(Body::AdoptVshard(pb::AdoptVShard { vshards: vec![v as u32], epoch: EPOCH }), v);
+    match h.raw(Body::StoreWrite(w), v).reply.body {
+        Some(pb::shard_reply::Body::Store(r)) => r,
+        other => panic!("expected a store reply, got {other:?}"),
+    }
+}
+
+fn store_read(h: &mut Harness, r: pb::StoreRead) -> pb::StoreReply {
+    let v = store::vshard_of(&r.tenant, &r.namespace);
+    match h.raw(Body::StoreRead(r), v).reply.body {
+        Some(pb::shard_reply::Body::Store(r)) => r,
+        other => panic!("expected a store reply, got {other:?}"),
+    }
+}
+
+fn w(op: pb::store_write::Op, key: &str) -> pb::StoreWrite {
+    pb::StoreWrite { tenant: "t".into(), namespace: "ns".into(), op: op as i32, key: key.into(), ..Default::default() }
+}
+
+fn rd(kind: pb::store_read::Kind, key: &str) -> pb::StoreRead {
+    pb::StoreRead {
+        tenant: "t".into(),
+        namespace: "ns".into(),
+        kind: kind as i32,
+        key: key.into(),
+        ..Default::default()
+    }
+}
+
+use pb::store_read::Kind as RK;
+use pb::store_write::Op as SO;
+
+#[test]
+fn store_versions_make_compare_and_set() {
+    let mut h = Harness::new(ShardState::new());
+    let put = |value: &[u8], if_version: Option<u64>| pb::StoreWrite {
+        value: value.to_vec(),
+        has_if_version: if_version.is_some(),
+        if_version: if_version.unwrap_or(0),
+        ..w(SO::Put, "cfg")
+    };
+    let a = store_write(&mut h, put(b"a", Some(0)));
+    assert!(a.ok && a.entry.as_ref().unwrap().version == a.revision);
+    assert!(!store_write(&mut h, put(b"x", Some(0))).ok, "create-only must fail when the key exists");
+    let b = store_write(&mut h, put(b"b", Some(a.revision)));
+    assert!(b.ok && b.revision > a.revision);
+    let stale = store_write(&mut h, put(b"c", Some(a.revision)));
+    assert!(!stale.ok && stale.error.contains("version mismatch"));
+    assert_eq!(store_read(&mut h, rd(RK::Get, "cfg")).entry.unwrap().value, b"b");
+    let del = pb::StoreWrite { has_if_version: true, if_version: a.revision, ..w(SO::Delete, "cfg") };
+    assert!(!store_write(&mut h, del).ok);
+    assert!(store_write(&mut h, w(SO::Delete, "cfg")).ok);
+    assert!(!store_read(&mut h, rd(RK::Get, "cfg")).ok);
+    let big = pb::StoreWrite { value: vec![0; store::MAX_VALUE + 1], ..w(SO::Put, "big") };
+    assert!(store_write(&mut h, big).error.contains("1 MiB"));
+}
+
+#[test]
+fn store_counters_add_and_refuse_plain_values() {
+    let mut h = Harness::new(ShardState::new());
+    for _ in 0..3 {
+        store_write(&mut h, pb::StoreWrite { delta: 5, ..w(SO::Add, "seen") });
+    }
+    assert_eq!(store_read(&mut h, rd(RK::Get, "seen")).entry.unwrap().counter, 15);
+    store_write(&mut h, pb::StoreWrite { value: b"v".to_vec(), ..w(SO::Put, "plain") });
+    assert!(store_write(&mut h, pb::StoreWrite { delta: 1, ..w(SO::Add, "plain") }).error.contains("not a counter"));
+}
+
+#[test]
+fn store_leases_fence_a_holder_whose_lease_expired() {
+    let mut h = Harness::new(ShardState::new());
+    let lock = |holder: &str| pb::StoreWrite { holder: holder.into(), ttl_ms: 1000, ..w(SO::Lock, "leader") };
+    let a = store_write(&mut h, lock("a"));
+    let token_a = a.lease.as_ref().unwrap().token;
+    let refused = store_write(&mut h, lock("b"));
+    assert!(!refused.ok && refused.lease.unwrap().holder == "a");
+    let fenced = |token: u64| pb::StoreWrite {
+        value: b"x".to_vec(),
+        fence: Some(pb::StoreFence { lock: "leader".into(), token }),
+        ..w(SO::Put, "state")
+    };
+    assert!(store_write(&mut h, fenced(token_a)).ok, "the holder writes under its token");
+    assert!(
+        store_write(
+            &mut h,
+            pb::StoreWrite { holder: "a".into(), token: token_a, ttl_ms: 1000, ..w(SO::Renew, "leader") }
+        )
+        .ok
+    );
+    // a stalls past its lease; b takes over with a larger token.
+    h.hlc += hlc::from_ms(5_000);
+    let b = store_write(&mut h, lock("b"));
+    let token_b = b.lease.as_ref().unwrap().token;
+    assert!(b.ok && token_b > token_a);
+    let stale = store_write(&mut h, fenced(token_a));
+    assert!(!stale.ok && stale.error.starts_with("fenced"), "{}", stale.error);
+    assert!(
+        !store_write(
+            &mut h,
+            pb::StoreWrite { holder: "a".into(), token: token_a, ttl_ms: 1000, ..w(SO::Renew, "leader") }
+        )
+        .ok
+    );
+    assert_eq!(store_read(&mut h, rd(RK::Lease, "leader")).lease.unwrap().holder, "b");
+    assert!(store_write(&mut h, pb::StoreWrite { holder: "b".into(), token: token_b, ..w(SO::Unlock, "leader") }).ok);
+    assert!(!store_read(&mut h, rd(RK::Lease, "leader")).ok);
+}
+
+#[test]
+fn store_barrier_trips_when_every_party_arrives() {
+    let mut h = Harness::new(ShardState::new());
+    let arrive = || pb::StoreWrite { parties: 3, ..w(SO::Arrive, "epoch") };
+    for expected in [(1, 0), (2, 0), (0, 1)] {
+        let b = store_write(&mut h, arrive()).barrier.unwrap();
+        assert_eq!((b.arrived, b.generation), expected);
+    }
+    assert!(store_write(&mut h, pb::StoreWrite { parties: 2, ..w(SO::Arrive, "epoch") }).error.contains("3 parties"));
+}
+
+#[test]
+fn store_changes_serve_watches_and_report_compaction() {
+    let mut h = Harness::new(ShardState::new());
+    let first = store_write(&mut h, pb::StoreWrite { value: b"1".to_vec(), ..w(SO::Put, "jobs/a") });
+    store_write(&mut h, pb::StoreWrite { value: b"2".to_vec(), ..w(SO::Put, "other") });
+    store_write(&mut h, w(SO::Delete, "jobs/a"));
+    let ch = store_read(&mut h, pb::StoreRead { after_revision: first.revision - 1, ..rd(RK::Changes, "jobs/") });
+    let seen: Vec<(String, bool)> = ch.changes.iter().map(|c| (c.key.clone(), c.deleted)).collect();
+    assert_eq!(seen, [("jobs/a".to_string(), false), ("jobs/a".to_string(), true)]);
+    assert!(!ch.compacted);
+    for i in 0..4100 {
+        store_write(&mut h, pb::StoreWrite { value: vec![1], ..w(SO::Put, &format!("k{i}")) });
+    }
+    assert!(store_read(&mut h, pb::StoreRead { after_revision: 0, ..rd(RK::Changes, "") }).compacted);
+    let scan = store_read(&mut h, pb::StoreRead { limit: 10, ..rd(RK::Scan, "k1") });
+    assert!(scan.more && scan.entries.len() == 10 && scan.entries.iter().all(|e| e.key.starts_with("k1")));
+}
+
+#[test]
+fn store_ttl_entries_vanish_and_are_collected() {
+    let mut h = Harness::new(ShardState::new());
+    store_write(&mut h, pb::StoreWrite { value: b"t".to_vec(), ttl_ms: 1000, ..w(SO::Put, "session") });
+    assert!(store_read(&mut h, rd(RK::Get, "session")).ok);
+    let v = store::vshard_of("t", "ns");
+    let stored = |h: &Harness| h.a.scan_prefix(&keys::store(v, keys::STORE, &[], b""), usize::MAX).len();
+    h.hlc += hlc::from_ms(2_000);
+    assert!(!store_read(&mut h, rd(RK::Get, "session")).ok, "an expired entry is not visible");
+    assert_eq!(stored(&h), 1, "still stored until collected");
+    h.raw(Body::Gc(pb::Gc { max_keys: 100 }), V);
+    assert_eq!(stored(&h), 0, "gc removes the expired entry");
+}
+
+#[test]
+fn a_requeued_attempt_is_ready_again_without_spending_a_retry() {
+    let mut h = Harness::new(ShardState::new());
+    let tk = task_id(V, 900);
+    let (a, _) = h.submit(spec(tk, &[], pb::Effects::None, 1), Some((peer(1), 1)));
+    assert_eq!(status(&a), Status::Granted);
+    for round in 0..3 {
+        let attempt = h.task(tk).unwrap().attempts.iter().rev().find(|x| !x.revoked).map(|x| x.attempt).unwrap();
+        let ack = h.fail(tk, attempt, (peer(1), 1), pb::record_failure::Kind::Requeued, b"");
+        assert_eq!(status(&ack), Status::Accepted, "round {round}");
+        let rec = h.task(tk).unwrap();
+        assert_eq!(rec.state(), TState::Ready, "given back, not failed");
+        assert_eq!((rec.infra_failures, rec.failure_history.len()), (0, 0));
+        assert_eq!(status(&h.grant(tk, (peer(2), 1), false)), Status::Granted);
+        if round < 2 {
+            // Back to peer 1 for the next round.
+            let a2 = h.task(tk).unwrap().attempts.last().unwrap().attempt;
+            h.fail(tk, a2, (peer(2), 1), pb::record_failure::Kind::Requeued, b"");
+            assert_eq!(status(&h.grant(tk, (peer(1), 1), false)), Status::Granted);
+        }
+    }
+    // max_attempts = 1 and five give-backs later it can still finish.
+    let last = h.task(tk).unwrap().attempts.last().unwrap().attempt;
+    assert_eq!(status(&h.publish(tk, last, (peer(2), 1), obj(7))), Status::Published);
+}
+
+#[test]
+fn a_started_external_attempt_cannot_be_given_back() {
+    let mut h = Harness::new(ShardState::new());
+    let tk = task_id(V, 901);
+    h.submit(spec(tk, &[], pb::Effects::External, 3), Some((peer(1), 1)));
+    let attempt = h.task(tk).unwrap().attempts[0].attempt;
+    assert_eq!(status(&h.start(tk, attempt, (peer(1), 1))), Status::Accepted);
+    let ack = h.fail(tk, attempt, (peer(1), 1), pb::record_failure::Kind::Requeued, b"");
+    assert_eq!(status(&ack), Status::Stale);
+    assert_eq!(h.task(tk).unwrap().state(), TState::Running);
 }

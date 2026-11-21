@@ -8,11 +8,15 @@
 //! it; the others join through raft. A peer that is not a founder asks a seed
 //! for the plan and joins as a spare that runs work and can replace voters.
 //!
-//! Liveness: every peer pings every other peer. A peer silent for
-//! `DEAD_AFTER` is marked dead locally (no new placements), and the leader of
-//! each data group retires its incarnation there, which fences its grants and
-//! requeues them. A voter dead for `REPLACE_AFTER` is replaced by a live
-//! non-voter, so the group can lose another member later.
+//! Liveness: SWIM (chimaera-core::swim). Each period a peer probes a few
+//! members (all of them in a small cluster, at most `PROBE_FANOUT` in a large
+//! one) and gossips membership changes on every probe and reply. A member
+//! that misses a direct probe is probed through relays; if none reaches it,
+//! it is suspect (no new placements there) and, unless it refutes, dead after
+//! the suspicion timeout. The leader of each data group then retires the dead
+//! incarnation there, which fences its grants and requeues them. A voter dead
+//! for `REPLACE_AFTER` is replaced by a live non-voter, so the group can lose
+//! another member later.
 
 use crate::core::CoreMsg;
 use crate::mesh::{CheckToken, GroupStarter, MeshClient, MeshServer, MeshService, MeshTransport};
@@ -20,6 +24,7 @@ use crate::router::Router;
 use crate::runtime::{self, Node};
 use crate::stores::write_atomic;
 use chimaera_core::pb;
+use chimaera_core::swim::State as SwimState;
 use chimaera_raft::{BasicNode, DiskDurability, Group, RaftHost};
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,9 +38,11 @@ use tokio::sync::{Mutex, mpsc};
 
 const PLAN_FILE: &str = "cluster.plan";
 const HOSTED_FILE: &str = "hosted-groups";
-const PING_EVERY: Duration = Duration::from_millis(300);
+const PING_EVERY: Duration = Duration::from_millis(100);
 const PING_TIMEOUT: Duration = Duration::from_millis(800);
-pub const DEAD_AFTER: Duration = Duration::from_secs(3);
+/// Members probed per SWIM period: per-peer traffic stays bounded however
+/// large the cluster grows.
+const PROBE_FANOUT: usize = 8;
 const REPLACE_AFTER: Duration = Duration::from_secs(10);
 const DIRECTORY_VOTERS: usize = 5;
 const GROUP_VOTERS: usize = 3;
@@ -53,6 +60,11 @@ pub struct ClusterConfig {
     pub cpus: Option<f64>,
     /// Shared secret every mesh call must carry (None: peers do not authenticate).
     pub token: Option<String>,
+    /// Mutual TLS between peers (`--tls-dir`).
+    pub tls: Option<crate::tls::Tls>,
+    /// Where drivers on other machines connect (`--client-listen`); they must
+    /// present the cluster token, over TLS when `tls` is set.
+    pub client_listen: Option<SocketAddr>,
 }
 
 /// Deterministic plan from the founders' member records.
@@ -224,8 +236,14 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
         cpus: node.capacity,
         memory_bytes: node.shape.memory_bytes,
         gpus: node.shape.gpus.iter().map(|g| g.uuid.clone()).collect(),
+        labels: crate::labels::own(&node.identity.peer.0).into_iter().collect(),
     };
-    let mesh = Arc::new(MeshClient::new(cfg.cluster.clone(), me.clone(), cfg.token.as_deref())?);
+    let mesh = Arc::new(MeshClient::new(
+        cfg.cluster.clone(),
+        me.clone(),
+        cfg.token.as_deref(),
+        cfg.tls.as_ref().map(|t| t.client.clone()),
+    )?);
     if cfg.token.is_none() {
         tracing::warn!("no cluster token: anyone who can reach {} can join this cluster", cfg.listen);
     }
@@ -243,15 +261,22 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
         next_session: AtomicU64::new(1),
     });
     let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    // The builder's tcp_nodelay applies only to listeners tonic binds itself:
+    // accepted sockets need it set here, or replies (raft appends, forwarded
+    // proposals) wait out Nagle against the caller's delayed ACK.
+    let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
     let svc = tonic::service::interceptor::InterceptedService::new(
         pb::mesh_server::MeshServer::new(MeshService(server.clone()))
             .max_decoding_message_size(256 << 20)
             .max_encoding_message_size(256 << 20),
         CheckToken::new(cfg.token.as_deref()),
     );
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = &cfg.tls {
+        builder = builder.tls_config(tls.server.clone()).map_err(|e| io::Error::other(format!("mesh TLS: {e}")))?;
+    }
     tokio::spawn(async move {
-        let r = tonic::transport::Server::builder()
+        let r = builder
             .tcp_nodelay(true)
             .http2_adaptive_window(Some(true))
             .add_service(svc)
@@ -265,7 +290,20 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     // The plan: from disk after a restart, else formed with the founders.
     let plan_path = cfg.dir.join(PLAN_FILE);
     let plan = match std::fs::read(&plan_path).ok().and_then(|b| pb::ClusterPlan::decode(b.as_slice()).ok()) {
-        Some(p) => p,
+        Some(p) => {
+            // A restart: tell the seeds this incarnation exists (best effort;
+            // SWIM gossip spreads it too) and learn who joined meanwhile.
+            for seed in cfg.seeds.iter().filter(|s| **s != cfg.advertise) {
+                if let Ok(reply) = mesh.join(seed, cfg.seeds.len() as u32).await {
+                    for m in reply.members {
+                        if m.node_id != me.node_id {
+                            mesh.upsert(m);
+                        }
+                    }
+                }
+            }
+            p
+        }
         None => {
             let p = form(&mesh, &cfg).await?;
             write_atomic(&plan_path, &p.encode_to_vec())?;
@@ -347,46 +385,75 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
         "cluster peer ready"
     );
 
-    tokio::spawn(liveness(router.clone(), mesh.clone()));
-    runtime::serve(node, router, raft_events, None).await
+    tokio::spawn(liveness(router.clone(), mesh.clone(), node.core_tx.clone()));
+    let clients = cfg.client_listen.map(|addr| runtime::ClientListen {
+        addr,
+        token: cfg.token.clone(),
+        tls: cfg.tls.as_ref().map(|t| t.clients.clone()),
+    });
+    runtime::serve(node, router, raft_events, None, clients).await
 }
 
 /// Ping every member; mark silent ones dead; as a group leader, retire dead
 /// incarnations and replace dead voters.
-async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>) {
-    let me = mesh.me.node_id;
-    let started = Instant::now();
+async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>, core: mpsc::Sender<CoreMsg>) {
     let mut dead_since: BTreeMap<u64, Instant> = BTreeMap::new();
     let mut tick = tokio::time::interval(PING_EVERY);
     loop {
         tick.tick().await;
-        let peers: Vec<_> = mesh.members().into_iter().filter(|p| p.member.node_id != me).collect();
-        let pings = peers.iter().map(|p| {
+        let now = mesh.now_ms();
+        let targets = mesh.swim.lock().expect("lock").next_probes(now, PROBE_FANOUT);
+        let probes = targets.into_iter().map(|target| {
             let mesh = mesh.clone();
-            let node = p.member.node_id;
-            async move { (node, mesh.ping(node, PING_TIMEOUT).await.ok()) }
+            async move {
+                if let Ok(reply) = mesh.ping(target, PING_TIMEOUT).await {
+                    mesh.note_ping(target, Some(reply));
+                    return (target, true);
+                }
+                let relays = mesh.swim.lock().expect("lock").relays(target);
+                let tries = relays.into_iter().map(|r| {
+                    let mesh = mesh.clone();
+                    async move { mesh.ping_via(r, target, PING_TIMEOUT).await }
+                });
+                (target, futures_util::future::join_all(tries).await.into_iter().any(|ok| ok))
+            }
         });
-        for (node, reply) in futures_util::future::join_all(pings).await {
-            if reply.is_some() {
-                mesh.note_ping(node, reply);
-                dead_since.remove(&node);
+        let results = futures_util::future::join_all(probes).await;
+        let changes = {
+            let now = mesh.now_ms();
+            let mut swim = mesh.swim.lock().expect("lock");
+            for (target, reached) in results {
+                swim.probed(now, target, reached);
             }
-        }
-        for p in mesh.members() {
-            if p.member.node_id == me || p.dead {
-                continue;
-            }
-            let silent = match p.last_ok {
-                Some(t) => t.elapsed() > DEAD_AFTER,
-                None => started.elapsed() > DEAD_AFTER * 3,
+            swim.expire(now);
+            swim.take_changes()
+        };
+        for c in changes {
+            let peer = mesh.member(c.node).map(|p| p.member.peer).unwrap_or_default();
+            let what = match c.state {
+                SwimState::Alive => "alive",
+                SwimState::Suspect => "suspect: missed direct and indirect probes",
+                SwimState::Dead => "dead: retired",
             };
-            if !silent {
-                continue;
+            let event =
+                pb::ClusterEvent { kind: "member".into(), node: peer, message: what.into(), ..Default::default() };
+            let _ = core.try_send(CoreMsg::Event(event));
+            match c.state {
+                SwimState::Alive => {
+                    mesh.set_suspect(c.node, false);
+                    dead_since.remove(&c.node);
+                }
+                SwimState::Suspect => {
+                    tracing::info!(node = c.node, "peer is suspect: missed direct and indirect probes");
+                    mesh.set_suspect(c.node, true);
+                }
+                SwimState::Dead => {
+                    let Some(m) = mesh.mark_dead(c.node) else { continue };
+                    tracing::warn!(node = m.node_id, addr = %m.addr, incarnation = m.incarnation, "peer is unreachable; retiring it");
+                    dead_since.insert(m.node_id, Instant::now());
+                    retire_everywhere(&router, &m);
+                }
             }
-            let Some(m) = mesh.mark_dead(p.member.node_id) else { continue };
-            tracing::warn!(node = m.node_id, addr = %m.addr, incarnation = m.incarnation, "peer is unreachable; retiring it");
-            dead_since.insert(m.node_id, Instant::now());
-            retire_everywhere(&router, &m);
         }
         replace_voters(&router, &mesh, &dead_since).await;
     }

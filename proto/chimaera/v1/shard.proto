@@ -34,6 +34,18 @@ message TaskSpec {
   bool speculation_allowed = 16;  // effects NONE and deterministic
   uint32 max_oom_escalations = 17;
   repeated string retry_exception_types = 18;
+  // Content-addressed values the call reads (large arguments, put handles),
+  // so the peer that runs it can fetch them and placement can weigh them.
+  repeated ObjectRef blobs = 19;
+  // Durable actor calls: the command's idempotency key (default: the task
+  // key). Repeating it with the same arguments returns the stored reply.
+  bytes command_id = 20;
+  // Digest of the method and its pickled arguments: a reused command id
+  // with a different fingerprint is a CommandConflict.
+  bytes command_fingerprint = 21;
+  // A generator call: items stream to the caller as they are yielded; the
+  // outcome is the item count. Runs on the caller's peer.
+  bool stream = 22;
 }
 
 message Attempt {
@@ -66,6 +78,7 @@ message TaskRecord {
   bytes last_fingerprint = 14;
   uint64 memory_hint = 15;              // raised after OOM, bytes
   repeated ErrorRecord failure_history = 16;  // bounded, newest last
+  TaskKey forwarded_to = 17;            // waiting for this call's outcome (see PublishEntry.forward_to)
 }
 
 message RunRecord {
@@ -87,6 +100,8 @@ message RunRecord {
   bytes env_digest = 11;
   string description = 12;
   ExecEnvSpec exec_env = 13;
+  // The peer the run was created on: where its driver listens for output.
+  PeerInc home = 14;
 }
 
 message ActorSpec {
@@ -168,6 +183,8 @@ message ShardCmd {
     Gc gc = 28;
     AdoptVShard adopt_vshard = 29;
     CancelRun cancel_run = 30;
+    StoreWrite store_write = 31;
+    StoreRead store_read = 32;
   }
 }
 
@@ -202,6 +219,9 @@ message PublishEntry {
   uint32 attempt = 2;
   PeerInc peer = 3;
   Outcome outcome = 4;
+  // The attempt returned another call's future instead of a value: the task
+  // completes with that call's outcome, without holding a worker meanwhile.
+  TaskKey forward_to = 5;
 }
 
 message PublishResults {
@@ -213,6 +233,9 @@ message RecordFailure {
     INFRA = 0;
     OOM = 1;
     RETRYABLE_USER = 2;
+    // The peer gives back an attempt it never started (to move queued work
+    // to another peer): not a failure, nothing is counted.
+    REQUEUED = 3;
   }
   TaskKey task = 1;
   uint32 attempt = 2;
@@ -358,6 +381,7 @@ message ShardReply {
     ActorAck actor = 3;
     uint64 count = 4;
     string rejected = 5;  // envelope rejected: vshard not owned, stale epoch, retired issuer
+    StoreReply store = 6;
   }
 }
 
@@ -377,4 +401,102 @@ message OutboxEntry {
 message VShardOwnership {
   uint32 vshard = 1;
   uint64 epoch = 2;
+}
+
+// ---- ch.Store: replicated keys, leases, counters, barriers ----------------
+//
+// A namespace lives in one vshard (hash of tenant and namespace), so reads and
+// writes across its keys are linearizable. Every change bumps the namespace's
+// revision, which versions entries and positions watches.
+
+message StoreEntry {
+  string key = 1;
+  bytes value = 2;          // opaque to Rust (pickled by the client), at most 1 MiB
+  uint64 version = 3;       // namespace revision of its last change
+  uint64 created = 4;       // revision that created it
+  uint64 expires_hlc = 5;   // 0 = never
+  bool is_counter = 6;
+  int64 counter = 7;
+}
+
+message StoreLease {
+  string holder = 1;
+  uint64 token = 2;         // fencing token: grows with every grant
+  uint64 expires_hlc = 3;
+}
+
+message StoreBarrier {
+  uint32 parties = 1;
+  uint32 arrived = 2;
+  uint64 generation = 3;    // completed rounds
+}
+
+message StoreChange {
+  uint64 revision = 1;
+  string key = 2;
+  bool deleted = 3;
+  bytes value = 4;
+  bool is_counter = 5;
+  int64 counter = 6;
+}
+
+message StoreFence {
+  string lock = 1;
+  uint64 token = 2;
+}
+
+message StoreWrite {
+  enum Op {
+    PUT = 0;
+    DELETE = 1;
+    ADD = 2;      // counter += delta
+    LOCK = 3;
+    RENEW = 4;
+    UNLOCK = 5;
+    ARRIVE = 6;   // barrier
+  }
+  string tenant = 1;
+  string namespace = 2;
+  Op op = 3;
+  string key = 4;
+  bytes value = 5;
+  bool has_if_version = 6;
+  uint64 if_version = 7;    // 0 = the key must not exist
+  uint64 ttl_ms = 8;
+  int64 delta = 9;
+  string holder = 10;       // LOCK, RENEW, UNLOCK
+  uint64 token = 11;        // RENEW, UNLOCK
+  uint32 parties = 12;      // ARRIVE
+  StoreFence fence = 13;    // reject the write unless this lease is still held
+}
+
+message StoreRead {
+  enum Kind {
+    GET = 0;
+    SCAN = 1;
+    CHANGES = 2;   // changes with revision > after_revision (watch)
+    LEASE = 3;
+    BARRIER = 4;
+  }
+  string tenant = 1;
+  string namespace = 2;
+  Kind kind = 3;
+  string key = 4;           // GET, LEASE, BARRIER; SCAN and CHANGES: the prefix
+  uint64 after_revision = 5;
+  string start_after = 6;   // SCAN paging
+  uint32 limit = 7;
+  bool keys_only = 8;       // SCAN: leave values out
+}
+
+message StoreReply {
+  bool ok = 1;
+  string error = 2;         // why not: version mismatch, held, fenced, ...
+  uint64 revision = 3;      // the namespace's revision after this command
+  StoreEntry entry = 4;
+  repeated StoreEntry entries = 5;
+  StoreLease lease = 6;
+  StoreBarrier barrier = 7;
+  repeated StoreChange changes = 8;
+  bool compacted = 9;       // changes after after_revision were trimmed: scan again
+  bool more = 10;
 }

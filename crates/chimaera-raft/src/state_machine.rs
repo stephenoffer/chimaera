@@ -29,7 +29,11 @@ pub(crate) const SM: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sm");
 pub(crate) const SM_META: TableDefinition<(u32, &str), &[u8]> = TableDefinition::new("sm_meta");
 
 /// Durable checkpoint cadence, in applied entries.
-const CHECKPOINT_ENTRIES: u64 = 10_000;
+const CHECKPOINT_ENTRIES: u64 = 512;
+/// A durable checkpoint at least this often while entries are applied: redb
+/// cannot reuse pages freed by non-durable commits until a durable one, so a
+/// long run of them makes every later commit slower.
+const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Events emitted by one apply call of one group, delivered after the commit.
 #[derive(Debug)]
@@ -146,6 +150,7 @@ pub struct StateMachine {
     events: tokio::sync::mpsc::Sender<GroupEvents>,
     snapshot_dir: PathBuf,
     since_checkpoint: u64,
+    last_checkpoint: std::time::Instant,
 }
 
 impl StateMachine {
@@ -155,7 +160,15 @@ impl StateMachine {
         events: tokio::sync::mpsc::Sender<GroupEvents>,
         snapshot_dir: PathBuf,
     ) -> StateMachine {
-        StateMachine { group, db, shard: ShardState::new(), events, snapshot_dir, since_checkpoint: 0 }
+        StateMachine {
+            group,
+            db,
+            shard: ShardState::new(),
+            events,
+            snapshot_dir,
+            since_checkpoint: 0,
+            last_checkpoint: std::time::Instant::now(),
+        }
     }
 
     fn meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> io::Result<Option<T>> {
@@ -198,9 +211,10 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
             return Ok(());
         }
         self.since_checkpoint += batch.len() as u64;
-        let durable = self.since_checkpoint >= CHECKPOINT_ENTRIES;
+        let durable = self.since_checkpoint >= CHECKPOINT_ENTRIES || self.last_checkpoint.elapsed() >= CHECKPOINT_EVERY;
         if durable {
             self.since_checkpoint = 0;
+            self.last_checkpoint = std::time::Instant::now();
         }
         let (db, group, shard) = (self.db.clone(), self.group, self.shard.clone());
         let (replies, events) = tokio::task::spawn_blocking(move || apply_batch(&db, group, &shard, batch, durable))

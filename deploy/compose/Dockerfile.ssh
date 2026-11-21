@@ -1,0 +1,18 @@
+# SSH hosts and a "laptop" for deploy/compose/ssh-test.sh: the chimaera
+# runtime image plus OpenSSH. Test only: one key pair, generated at build,
+# that every container authorizes, and new host keys accepted on first use.
+ARG BASE=chimaera:dev
+FROM ${BASE}
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-server openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /run/sshd \
+ && usermod -p '*' chimaera
+USER 1000:1000
+RUN mkdir -m 700 ~/.ssh \
+ && ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/id_ed25519 \
+ && cp ~/.ssh/id_ed25519.pub ~/.ssh/authorized_keys \
+ && echo 'StrictHostKeyChecking accept-new' > ~/.ssh/config
+USER root
+CMD ["/usr/sbin/sshd", "-D", "-e"]

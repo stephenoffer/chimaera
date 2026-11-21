@@ -1,0 +1,11 @@
+[package]
+name = "hotpath"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone: not a member of the Chimaera workspace, no dependencies.
+[workspace]
+
+[profile.release]
+debug = false

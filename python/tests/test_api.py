@@ -133,7 +133,7 @@ def test_dependent_of_a_failure_never_runs_and_raises_the_cause():
 def test_infeasible_request_fails_immediately_with_the_shape():
     with pytest.raises(ch.Infeasible, match=r"cpus=64.*offers"):
         word_count.options(cpus=64).remote("x").result(timeout=10)
-    with pytest.raises(ch.Infeasible, match="GPU"):
+    with pytest.raises(ch.Infeasible, match="cuda"):
         word_count.options(device="cuda").remote("x").result(timeout=10)
 
 

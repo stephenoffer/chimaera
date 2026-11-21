@@ -70,11 +70,31 @@ impl ExecEnv {
 
 #[derive(Debug)]
 pub enum ExecEvent {
-    Ready { exec: u32 },
-    Done { exec: u32, done: Box<pb::ExecDone> },
-    Blocked { exec: u32, msg: pb::ExecBlocked },
-    Log { exec: u32, log: pb::ExecLog },
-    Exited { exec: u32, detail: String, signal: Option<i32> },
+    Ready {
+        exec: u32,
+    },
+    Done {
+        exec: u32,
+        done: Box<pb::ExecDone>,
+    },
+    Blocked {
+        exec: u32,
+        msg: pb::ExecBlocked,
+    },
+    Log {
+        exec: u32,
+        log: pb::ExecLog,
+    },
+    /// An item a generator call yielded.
+    Yield {
+        exec: u32,
+        item: pb::ExecYield,
+    },
+    Exited {
+        exec: u32,
+        detail: String,
+        signal: Option<i32>,
+    },
 }
 
 pub struct Supervisor {
@@ -127,7 +147,7 @@ impl Supervisor {
         &self,
         env: &ExecEnv,
         threads: u32,
-        extra_env: &[(&str, String)],
+        extra_env: &[(&str, Option<String>)],
         cgroup: Option<&Path>,
     ) -> io::Result<(u32, u32)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -168,14 +188,37 @@ impl Supervisor {
             "VECLIB_MAXIMUM_THREADS",
             "NUMEXPR_NUM_THREADS",
             "RAYON_NUM_THREADS",
+            // Pools that ignore OMP_NUM_THREADS.
+            "POLARS_MAX_THREADS",
+            "NUMBA_NUM_THREADS",
         ] {
             if !env.env.contains_key(var) {
                 cmd.env(var, &t);
             }
         }
-        for (k, v) in extra_env {
-            cmd.env(k, v);
+        let mut defaults = vec![];
+        if threads <= 1 {
+            // Hugging Face tokenizers otherwise start a pool per process.
+            defaults.push(("TOKENIZERS_PARALLELISM", "false"));
         }
+        if cfg!(target_os = "linux") {
+            // glibc keeps up to 8 arenas per core, holding freed memory in
+            // long-lived workers; a few arenas keep it returnable.
+            defaults.push(("MALLOC_ARENA_MAX", "4"));
+        }
+        for (k, v) in defaults {
+            if !env.env.contains_key(k) {
+                cmd.env(k, v);
+            }
+        }
+        // None removes the variable (a ROCm grant unsets CUDA_VISIBLE_DEVICES).
+        for (k, v) in extra_env {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        no_core_dumps(&mut cmd);
         if let Some(group) = cgroup {
             join_cgroup_before_exec(&mut cmd, group)?;
         }
@@ -250,6 +293,7 @@ impl Supervisor {
                 Some(pb::exec_to_peer::Msg::Done(done)) => ExecEvent::Done { exec, done: Box::new(done) },
                 Some(pb::exec_to_peer::Msg::Blocked(msg)) => ExecEvent::Blocked { exec, msg },
                 Some(pb::exec_to_peer::Msg::Log(log)) => ExecEvent::Log { exec, log },
+                Some(pb::exec_to_peer::Msg::YieldItem(item)) => ExecEvent::Yield { exec, item },
                 _ => continue,
             };
             if self.events.send(ev).await.is_err() {
@@ -278,6 +322,20 @@ pub fn check_same_user(stream: &UnixStream) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "connection from another user"));
     }
     Ok(())
+}
+
+/// Executors write no core dumps: a dump is the size of the process (they have
+/// reached terabytes and filled disks), and a crash is reported anyway.
+fn no_core_dumps(cmd: &mut tokio::process::Command) {
+    // SAFETY: runs in the forked child before exec and only calls setrlimit,
+    // which is async-signal-safe, on a struct built here.
+    unsafe {
+        cmd.pre_exec(|| {
+            let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            libc::setrlimit(libc::RLIMIT_CORE, &zero);
+            Ok(())
+        });
+    }
 }
 
 #[cfg(target_os = "linux")]

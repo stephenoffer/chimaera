@@ -1,0 +1,10 @@
+Model: 		 NVIDIA H100 80GB HBM3
+IRQ:   		 156
+GPU UUID: 	 GPU-91c4e2d7-1b3a-4c58-8e6f-2b3c4d5e6f70
+Video BIOS: 	 96.00.74.00.0d
+Bus Type: 	 PCIe
+DMA Size: 	 52 bits
+DMA Mask: 	 0xfffffffffffff
+Bus Location: 	 0000:2a:00.0
+Device Minor: 	 1
+GPU Excluded:	 No

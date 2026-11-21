@@ -13,6 +13,14 @@ pub const RUN: u8 = b'R';
 pub const SUBMISSION_KEY: u8 = b'K';
 pub const TASK: u8 = b'T';
 pub const DEPENDENT: u8 = b'D'; // producer -> dependent in this vshard
+pub const FORWARD: u8 = b'F'; // producer -> task that forwarded to it, in this vshard
+pub const CHILD: u8 = b'P'; // parent -> child submitted from inside it, in this vshard
+pub const STORE: u8 = b'S'; // ch.Store entry: namespace, key
+pub const STORE_REV: u8 = b'Y'; // ch.Store namespace revision
+pub const STORE_LEASE: u8 = b'L'; // ch.Store lock
+pub const STORE_BARRIER: u8 = b'Z'; // ch.Store barrier
+pub const STORE_LOG: u8 = b'J'; // ch.Store change log: namespace, revision
+pub const STORE_LOG_META: u8 = b'U'; // ch.Store change log bounds
 pub const SUBSCRIBER: u8 = b'B'; // producer -> remote subscriber vshard
 pub const NOTIFIED: u8 = b'N'; // remote producer outcome received
 pub const GRANT: u8 = b'G'; // live attempt by peer incarnation
@@ -103,6 +111,21 @@ pub fn grant(v: u16, peer: &Id, inc: u64, run: &Id, task: &Id, attempt: u32) -> 
     k.extend_from_slice(&run.0);
     k.extend_from_slice(&task.0);
     k.extend_from_slice(&attempt.to_be_bytes());
+    k
+}
+
+/// Every `tag` pair entry whose first task belongs to `run` (for run expiry).
+pub fn pairs_of_run(v: u16, tag: u8, run: &Id) -> Vec<u8> {
+    let mut k = base(v, tag, 16);
+    k.extend_from_slice(&run.0);
+    k
+}
+
+/// A ch.Store key: `tag`, the length-prefixed namespace id, then `key`.
+pub fn store(v: u16, tag: u8, namespace: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut k = base(v, tag, namespace.len() + key.len());
+    k.extend_from_slice(namespace);
+    k.extend_from_slice(key);
     k
 }
 

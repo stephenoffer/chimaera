@@ -14,10 +14,11 @@ crate-type = ["cdylib"]
 chimaera-core.workspace = true
 chimaera-proto = { workspace = true, features = ["grpc"] }
 prost.workspace = true
-tonic = { workspace = true, features = ["codegen", "transport"] }
+tonic = { workspace = true, features = ["codegen", "transport", "tls-ring"] }
 tokio.workspace = true
 tokio-stream = "0.1"
 blake3.workspace = true
+libc.workspace = true
 pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py311"] }
 
 [build-dependencies]

@@ -62,6 +62,33 @@ def test_precedence_view_over_scope_over_decorator():
     assert f.policy().get("cpus") == 1
 
 
+def test_resolved_options_follow_scopes_entered_after_an_earlier_call():
+    """Options are resolved once and reused while scopes are unchanged; a scope
+    entered or left must still take effect on the next call."""
+    from chimaera._remote import Actor
+
+    @ch.remote(cpus=1)
+    def f():
+        pass
+
+    @ch.remote
+    class A:
+        @ch.method(priority=2)
+        def m(self):
+            pass
+
+    handle = Actor(None, b"a" * 16, b"c" * 16, A._cls, A.policy())  # type: ignore[arg-type]
+    assert f.policy().get("cpus") == 1
+    assert handle.m._policy().get("deadline") is None
+    with ch.options(cpus=5, deadline="30s"):
+        assert f.policy().get("cpus") == 5
+        assert handle.m._policy().get("deadline") is not None
+        assert handle.m._policy().get("priority") == 2
+    assert f.policy().get("cpus") == 1
+    assert handle.m._policy().get("deadline") is None
+    assert f.policy() is f.policy(), "unchanged scopes reuse the resolved options"
+
+
 def test_scopes_do_not_leak_across_threads():
     import threading
 

@@ -12,25 +12,30 @@ import atexit
 import fnmatch
 import inspect
 import itertools
+import logging
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import warnings
 import weakref
 from typing import Any, Callable
 
-from . import _context, _serde
-from ._errors import ChimaeraError, DataLost, Infeasible, SerializationError
+from . import _cluster, _context, _objects, _project, _serde, _values
+from ._errors import ChimaeraError, DataLost, Infeasible, SerializationError, WorkflowDivergence
 from ._native import Client, blake3_digest, child_id, socket_path
 
 VERSION = "0.1.0"
 CALL_FUNCTION, CALL_ACTOR_CTOR, CALL_ACTOR_METHOD, CALL_MAP_ITEM = 0, 1, 2, 3
 EFFECTS_CODE = {"none": 0, "idempotent": 1, "external": 2}
+# Items a generator call may run ahead of its consumer (unless max_in_flight says).
+STREAM_WINDOW = 64
 MAX_CAPTURE_BYTES = 256 << 20
+MAX_PENDING_CALLS = 1_000_000
 WARN_CAPTURE_BYTES = 1 << 20
 
 
@@ -58,9 +63,36 @@ def peer_socket(home: str) -> str:
     return socket_path(home, "peer.sock")
 
 
+def _binary_description(path: str) -> str:
+    """`path size mtime_ns`, as the peer writes it to `peer.binary`."""
+    real = os.path.realpath(path)
+    st = os.stat(real)
+    return f"{real}\n{st.st_size}\n{st.st_mtime_ns}\n"
+
+
+def _check_peer_binary(home: str) -> None:
+    """Warn (CH111) when the running local peer is not the binary this
+    program would start: rebuilt or upgraded since, it keeps serving until it
+    idles out, and its behavior is the old one."""
+    try:
+        with open(os.path.join(home, "peer.binary")) as f:
+            running = f.read()
+        wanted = _binary_description(_peer_binary())
+    except (OSError, ChimaeraError):
+        return  # an older peer, or no binary here to compare with
+    if running != wanted:
+        warnings.warn(
+            f"CH111: the local peer in {home} runs {running.split(chr(10))[0]}, which is not the chimaera binary "
+            f"this program would start ({wanted.split(chr(10))[0]}, rebuilt or upgraded since?). It keeps serving "
+            "until it is idle for ten minutes; run `chimaera stop` to switch now (the next call starts the new one).",
+            stacklevel=4,
+        )
+
+
 def _ensure_local_peer(home: str) -> None:
     sock = peer_socket(home)
     if os.path.exists(sock):
+        _check_peer_binary(home)
         return
     with open(os.path.join(home, "peer.log"), "ab") as log:
         subprocess.Popen(
@@ -87,7 +119,7 @@ def read_object(object_dir: str, run: bytes, obj: bytes) -> Any:
     except FileNotFoundError:
         pass
     try:
-        Runtime.get().client.localize(run, obj)
+        Runtime.get().localize(run, obj)
     except FileNotFoundError as e:
         # The peer that held it is gone (or freed it); nothing rebuilds it.
         raise DataLost(f"value {obj.hex()} of run {run.hex()} is no longer stored on any live peer") from e
@@ -118,6 +150,38 @@ def run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def code_fingerprint() -> str:
+    """Identity of the driver's own source files (loaded modules outside the
+    interpreter and installed packages): path, size and modification time.
+    Executors are shared only by runs with the same fingerprint, so a module
+    edited between runs is never served from a warm executor's stale import.
+    Modules first imported inside tasks are not covered."""
+    paths = sysconfig.get_paths()
+    skip = tuple({paths[k] for k in ("stdlib", "platstdlib", "purelib", "platlib") if k in paths})
+    lines = []
+    for mod in list(sys.modules.values()):
+        path = getattr(mod, "__file__", None)
+        if not path or path.startswith(skip) or "site-packages" in path:
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        lines.append(f"{path}\0{st.st_size}\0{st.st_mtime_ns}")
+    return blake3_digest("\n".join(sorted(lines)).encode())[:16].hex()
+
+
+def _connect_remote(target: _cluster.Target, client_name: str) -> Client:
+    """Connect to the first reachable peer of a remote cluster."""
+    errors = []
+    for address in target.addresses:
+        try:
+            return Client(address, client_name, target.token, target.ca)
+        except ConnectionError as e:
+            errors.append(f"{address}: {e}")
+    raise ChimaeraError(f"cannot reach cluster {target.name!r}: " + "; ".join(errors))
+
+
 class Runtime:
     _instance: Runtime | None = None
     _lock = threading.Lock()
@@ -137,46 +201,65 @@ class Runtime:
         return cls._instance
 
     def __init__(
-        self, home: str | None = None, detached: bool | None = None, env: dict[str, str] | None = None
+        self,
+        home: str | None = None,
+        detached: bool | None = None,
+        env: dict[str, str] | None = None,
+        cluster: str | None = None,
+        tenant: str | None = None,
     ) -> None:
         self.home = home or default_home()
         self.in_executor = os.environ.get("CHIMAERA_EXECUTOR") == "1"
-        socket = os.environ.get("CHIMAERA_PEER_SOCKET") if self.in_executor else None
-        if socket is None:
-            _ensure_local_peer(self.home)
-            socket = peer_socket(self.home)
         client_name = f"python-{platform.python_version()} chimaera-{VERSION}"
-        try:
-            self.client = Client(socket, client_name)
-        except ConnectionError:
-            # A stale socket from a peer that died: remove it and start fresh.
-            if self.in_executor:
-                raise
-            try:
-                os.unlink(socket)
-            except FileNotFoundError:
-                pass
-            _ensure_local_peer(self.home)
-            self.client = Client(socket, client_name)
+        target = None if self.in_executor else _cluster.resolve(cluster)
+        self.remote = target is not None
+        if target is not None:
+            self.client = _connect_remote(target, client_name)
+        else:
+            self.client = self._connect_local(client_name)
         self.info = self.client.info
-        self.object_dir: str = self.info["object_dir"]
         self.inline_limit: int = self.info["inline_limit"]
+        if self.remote:
+            # The peer's store is on another machine: values are uploaded as
+            # blobs and fetched into a local cache to be read.
+            self.object_dir: str = os.path.join(self.home, "remote", self.info["peer"].hex(), "objects")
+            self.blob_sink: Any = _cluster.RemoteBlobSink(self.client)
+        else:
+            self.object_dir = self.info["object_dir"]
+            self.blob_sink = _values.LocalBlobSink(self.object_dir)
+            _objects.enable(self.object_dir)
+        # A blob another peer stored is fetched into this peer's store on read.
+        _serde.localize_hook = self.localize
         self._futures: weakref.WeakValueDictionary[bytes, Any] = weakref.WeakValueDictionary()
+        self._streams: weakref.WeakValueDictionary[bytes, Any] = weakref.WeakValueDictionary()
         self.cond = threading.Condition()
         self._code: dict[int, tuple[Any, bytes]] = {}
         self._registered: set[bytes] = set()
         self._seq = itertools.count()
         self._nonce = os.urandom(8)
         self._waiters: dict[int, list[Any]] = {}
+        # Driver backpressure (wait_for_room): arguments of unfinished calls.
+        self._pending_bytes = 0
+        self._pending_calls = 0
+        self._room_warned: set[str | None] = set()
         self._releases: list[bytes] = []
         self.run: bytes | None = None
         self.detached = False
         if not self.in_executor:
             want_detached = detached if detached is not None else os.environ.get("CHIMAERA_DETACH") == "1"
-            ship = run_env(env)
+            ship = {
+                **run_env(env),
+                "CHIMAERA_CODE_FINGERPRINT": code_fingerprint(),
+                # Executors log at the driver's level (stderr reaches the driver).
+                "CHIMAERA_LOG_LEVEL": logging.getLevelName(logging.getLogger().getEffectiveLevel()),
+            }
             sys_path = [p or os.getcwd() for p in sys.path]
+            # A remote peer has no copy of the project's own modules: ship them.
+            project = _project.pack(sys_path) if self.remote else None
+            if project is not None:
+                ship[_project.ENV] = project[0].hex()
             self.run, self.detached = self.client.create_run(
-                "default",
+                tenant or os.environ.get("CHIMAERA_TENANT") or "default",
                 "",
                 want_detached,
                 sys.executable,
@@ -185,6 +268,7 @@ class Runtime:
                 ship,
                 " ".join(sys.argv)[:200],
             )
+            _project.ship(self.blob_sink, self.run, project)
             self.client.attach(self.run)
             atexit.register(self._finish)
         self._dispatcher = threading.Thread(target=self._dispatch_loop, name="chimaera-events", daemon=True)
@@ -223,16 +307,57 @@ class Runtime:
         self._code[id(obj)] = (obj, digest)
         return digest
 
-    def pack(self, key: bytes, value: Any) -> dict[str, Any]:
-        """Encode a call frame: inline when small, else an object file."""
-        parts, size, oob = _serde.dumps_parts(value)
-        if size <= self.inline_limit:
-            data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts)
-            return {"args_inline": data, "args_object": None, "args_size": size, "args_oob": oob}
+    def _connect_local(self, client_name: str) -> Client:
+        socket = os.environ.get("CHIMAERA_PEER_SOCKET") if self.in_executor else None
+        if socket is None:
+            _ensure_local_peer(self.home)
+            socket = peer_socket(self.home)
+        try:
+            return Client(socket, client_name)
+        except ConnectionError:
+            # A stale socket from a peer that died: remove it and start fresh.
+            if self.in_executor:
+                raise
+            try:
+                os.unlink(socket)
+            except FileNotFoundError:
+                pass
+            _ensure_local_peer(self.home)
+            return Client(socket, client_name)
+
+    def localize(self, run: bytes, obj: bytes) -> None:
+        """Make an object readable at its path under ``object_dir``: the local peer
+        fetches it into its store; a remote client downloads it into its cache."""
+        if self.remote:
+            self.client.fetch_object(run, obj, _serde.object_path(self.object_dir, run, obj))
+        else:
+            self.client.localize(run, obj)
+
+    def pack(self, key: bytes, value: Any, site: str | None = None) -> dict[str, Any]:
+        """Encode a call frame by size: inline when small, else a file for this
+        call; large buffers and arguments become blobs shared by every call
+        that passes the same bytes (see _values)."""
         run = key[:16]
+        enc = _values.encode_frame(value, run, self.blob_sink)
+        _values.repeats.note(site, enc)
+        packed = {
+            "args_size": enc.size,
+            "args_oob": enc.oob,
+            "blobs": list(enc.blobs.items()),
+            "read_bytes": enc.total_bytes,
+        }
+        if enc.size <= self.inline_limit:
+            data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in enc.parts)
+            return {**packed, "args_inline": data, "args_object": None}
+        if self.remote:
+            # Uploaded like any blob: named by its content, read by the peer from its store.
+            data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in enc.parts)
+            obj = blake3_digest(data)[:16]
+            self.blob_sink.put(run, obj, data)
+            return {**packed, "args_inline": None, "args_object": obj}
         obj = child_id(run, [key[16:], b"args"])
-        _serde.write_file(_serde.object_path(self.object_dir, run, obj), parts)
-        return {"args_inline": None, "args_object": obj, "args_size": size, "args_oob": oob}
+        _serde.write_file(_serde.object_path(self.object_dir, run, obj), enc.parts)
+        return {**packed, "args_inline": None, "args_object": obj}
 
     def release_later(self, key: bytes) -> None:
         """A future was dropped: unpin its result (sent in batches)."""
@@ -245,7 +370,48 @@ class Runtime:
     def submit(self, specs: list[dict[str, Any]], futures: list[Any]) -> None:
         for s, f in zip(specs, futures):
             self._futures[s["key"]] = f
+            if not self.in_executor:
+                with self.cond:
+                    self._pending_bytes += f._arg_bytes
+                    self._pending_calls += 1
+                f.add_done_callback(self._release_room)
         self.client.submit(specs)
+
+    def _release_room(self, f: Any) -> None:
+        with self.cond:
+            self._pending_bytes -= f._arg_bytes
+            self._pending_calls -= 1
+            self.cond.notify_all()
+
+    def wait_for_room(self, nbytes: int, site: str | None) -> None:
+        """Driver backpressure: a loop submitting faster than calls finish
+        waits here while their unconsumed arguments would pass half the
+        peer's memory, or a million calls are outstanding (Ray has no bound;
+        its object store fills instead). Never inside a task: a waiting task
+        would hold its CPU."""
+        if self.in_executor or threading.current_thread() is self._dispatcher:
+            return  # a done-callback submitting more must not stop outcomes
+        limit = int(os.environ.get("CHIMAERA_MAX_PENDING_BYTES") or 0)
+        limit = limit or max(256 << 20, int(self.info["memory_bytes"]) // 2)
+        with self.cond:
+            if self._pending_calls < MAX_PENDING_CALLS and (
+                self._pending_bytes == 0 or self._pending_bytes + nbytes <= limit
+            ):
+                return
+        if site not in self._room_warned:
+            self._room_warned.add(site)
+            warnings.warn(
+                f"CH110: calls from {site} are submitted faster than they finish; {self._pending_calls} are "
+                f"outstanding with {self._pending_bytes >> 20} MiB of arguments, so .remote() waits for room. "
+                "Use fn.map(items) to stream them, or wait on results as they come (ch.as_completed).",
+                stacklevel=4,
+            )
+        self.client.flush()
+        with self.cond:
+            while self._pending_calls >= MAX_PENDING_CALLS or (
+                self._pending_bytes > 0 and self._pending_bytes + nbytes > limit
+            ):
+                self.cond.wait(1.0)
 
     def wait_actor(self, seq: int, timeout: float = 60.0) -> tuple[Any, ...]:
         box: list[Any] = []
@@ -285,12 +451,22 @@ class Runtime:
                         if f is None:
                             continue
                         if status == "Rejected":
-                            exc = Infeasible(reason) if reason.startswith("infeasible") else ChimaeraError(reason)
+                            if reason.startswith("infeasible"):
+                                exc: ChimaeraError = Infeasible(reason)
+                            elif reason.startswith("workflow divergence"):
+                                exc = WorkflowDivergence(reason)
+                            else:
+                                exc = ChimaeraError(reason)
                             f._set_exception(exc)
                             changed = True
                         elif outcome is not None:
                             f._set(outcome)
                             changed = True
+                elif tag == "stream_item":
+                    s = self._streams.get(ev[1])
+                    if s is not None:
+                        s._add(ev[3], ev[4])
+                        changed = True
                 elif tag == "log":
                     _, _key, stream, text, pid = ev
                     out = sys.stderr if stream == "stderr" else sys.stdout
@@ -311,7 +487,7 @@ class Runtime:
     def read_value(self, outcome: tuple[Any, ...]) -> Any:
         _, inline, run, obj, _size, _oob = outcome
         if inline is not None:
-            return _serde.loads(inline)
+            return _serde.loads(inline, _serde.run_dir(self.object_dir, run))
         return read_object(self.object_dir, run, obj)
 
     def _finish(self) -> None:

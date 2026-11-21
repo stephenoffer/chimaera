@@ -5,8 +5,11 @@
 
 use chimaera_core::ids::Id;
 use chimaera_core::pb;
+use chimaera_core::provider::ProviderKind;
+use chimaera_peer::launch;
 use chimaera_peer::runtime::{self, PeerConfig};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -41,6 +44,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// What a run's calls printed on this peer, kept after the driver has gone.
+    Logs {
+        run: String,
+        /// Keep waiting for more output (Ctrl-C to stop).
+        #[arg(long, short)]
+        follow: bool,
+    },
     /// Summary of a run: tasks by state.
     Inspect {
         run: String,
@@ -60,6 +70,15 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// What the peer has learned about each function: calls, time, cores,
+    /// memory, and the reservation the next call gets.
+    Profiles {
+        /// Only functions whose name contains this.
+        #[arg(long = "fn")]
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop the local peer.
     Stop,
     /// Cluster setup helpers.
@@ -69,11 +88,46 @@ enum Cmd {
     },
     /// Check what this host supports (cgroups, shared memory, Python).
     Doctor,
+    /// Kubernetes manifests (`chimaera k8s render --image IMG | kubectl apply -f -`).
+    K8s {
+        #[command(subcommand)]
+        action: K8sCmd,
+    },
+    /// Inside a Slurm allocation: start a peer on every node, run COMMAND on
+    /// this one against its peer, then stop the peers.
+    SlurmLaunch {
+        /// Peer port (default: 7700 + SLURM_JOB_ID % 1000).
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Start the peers of an SSH cluster profile in clusters.toml.
+    Up { name: String },
+    /// Stop the peers of an SSH cluster profile.
+    Down { name: String },
+}
+
+#[derive(Subcommand)]
+enum K8sCmd {
+    /// Print the Services, StatefulSet and PodDisruptionBudget of a cluster.
+    Render(launch::k8s::Spec),
 }
 
 #[derive(Subcommand)]
 enum PeerCmd {
     Start {
+        /// Where the founders and this peer's address come from: auto, local,
+        /// static (the flags), k8s, slurm, hpc (PBS/LSF) or sky. `auto`
+        /// treats --listen as static and --idle-timeout as local, else
+        /// detects the platform from its environment. Explicit flags win
+        /// over discovered values.
+        #[arg(long, default_value = "auto", value_parser = launch::PROVIDERS)]
+        provider: String,
+        /// Under k8s, slurm, hpc and sky: accept drivers on other machines on
+        /// this port (default: $CHIMAERA_CLIENT_PORT, else the peer port + 10).
+        #[arg(long)]
+        client_port: Option<u16>,
         /// CPU capacity to offer (default: this process's allocation).
         #[arg(long)]
         cpus: Option<f64>,
@@ -107,6 +161,13 @@ enum PeerCmd {
         /// Let peers join without a token (only on a network you trust).
         #[arg(long)]
         insecure: bool,
+        /// Directory with this peer's mutual-TLS files (`chimaera cluster cert`).
+        #[arg(long)]
+        tls_dir: Option<PathBuf>,
+        /// Also accept drivers on other machines at this address (host:port).
+        /// They must present the cluster token, and use TLS when --tls-dir is set.
+        #[arg(long)]
+        client_listen: Option<std::net::SocketAddr>,
     },
 }
 
@@ -114,6 +175,22 @@ enum PeerCmd {
 enum ClusterCmd {
     /// Print a new random cluster token.
     Token,
+    /// Create a cluster CA and token in OUT (ca.pem, ca.key, token).
+    Init {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Issue a peer certificate from the CA in --ca into OUT, the directory
+    /// that peer's --tls-dir names (ca.pem, peer.pem, peer.key).
+    Cert {
+        #[arg(long)]
+        ca: PathBuf,
+        /// A name for the peer (its host name, say); recorded in the certificate.
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -125,65 +202,116 @@ fn main() -> ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
-    let dir = cli.dir.clone().unwrap_or_else(runtime::default_local_dir);
+    let dir_flag = cli.dir.clone();
+    let dir = dir_flag.clone().unwrap_or_else(runtime::default_local_dir);
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
-    let result =
-        rt.block_on(async move {
-            match cli.cmd {
-                Cmd::Peer {
-                    action:
-                        PeerCmd::Start {
-                            cpus,
-                            idle_timeout,
-                            listen,
-                            advertise,
-                            seeds,
-                            bootstrap_expect,
-                            cluster,
-                            data_groups,
-                            token_file,
-                            insecure,
-                        },
-                } => match listen {
-                    None => {
-                        let cfg = PeerConfig { dir, cpus, idle_timeout: idle_timeout.map(Duration::from_secs) };
-                        runtime::run_local(cfg).await.map_err(|e| e.to_string()).map(|_| 0)
-                    }
-                    Some(listen) => {
-                        if seeds.is_empty() {
-                            return Err("--listen needs --seeds (the founding peers' addresses)".to_string());
-                        }
-                        if let Some(n) = bootstrap_expect
-                            && n != seeds.len()
-                        {
-                            return Err(format!("--bootstrap-expect {n} but --seeds lists {} addresses", seeds.len()));
-                        }
-                        let token = cluster_token(token_file.as_deref(), insecure)?;
-                        let cfg = chimaera_peer::cluster::ClusterConfig {
-                            dir,
-                            cluster,
-                            listen,
-                            advertise: advertise.unwrap_or_else(|| listen.to_string()),
-                            seeds,
-                            data_groups: data_groups.max(1),
-                            cpus,
-                            token,
-                        };
-                        chimaera_peer::cluster::run_cluster(cfg).await.map_err(|e| e.to_string()).map(|_| 0)
-                    }
-                },
-                Cmd::Run { detach, command } => run_program(&dir, detach, &command).await,
-                Cmd::Status { json } => status(&dir, json).await,
-                Cmd::Inspect { run, json } => inspect(&dir, &run, json).await,
-                Cmd::Explain { run, task, decisions, json } => explain(&dir, &run, task, decisions, json).await,
-                Cmd::Stop => stop(&dir).await,
-                Cmd::Cluster { action: ClusterCmd::Token } => {
-                    println!("{}", new_token().map_err(|e| e.to_string())?);
-                    Ok(0)
+    let result = rt.block_on(async move {
+        match cli.cmd {
+            Cmd::Peer {
+                action:
+                    PeerCmd::Start {
+                        provider,
+                        client_port,
+                        cpus,
+                        idle_timeout,
+                        listen,
+                        advertise,
+                        seeds,
+                        bootstrap_expect,
+                        cluster,
+                        data_groups,
+                        token_file,
+                        insecure,
+                        tls_dir,
+                        client_listen,
+                    },
+            } => {
+                let env: BTreeMap<String, String> = std::env::vars().collect();
+                let kind =
+                    launch::choose(&provider, &env, listen.is_some(), !seeds.is_empty(), idle_timeout.is_some());
+                if client_port.is_some() && matches!(kind, ProviderKind::Local | ProviderKind::Static) {
+                    return Err("--client-port applies to the k8s, slurm, hpc and sky providers; \
+                                use --client-listen"
+                        .into());
                 }
-                Cmd::Doctor => Ok(doctor(&dir)),
+                let addrs = match kind {
+                    ProviderKind::Local => {
+                        let cfg = PeerConfig { dir, cpus, idle_timeout: idle_timeout.map(Duration::from_secs) };
+                        return runtime::run_local(cfg).await.map_err(|e| e.to_string()).map(|_| 0);
+                    }
+                    ProviderKind::Static => {
+                        let Some(listen) = listen else {
+                            return Err("--seeds needs --listen (this peer's address)".into());
+                        };
+                        if seeds.is_empty() {
+                            return Err("--listen needs --seeds (the founding peers' addresses)".into());
+                        }
+                        let advertise = advertise.unwrap_or_else(|| listen.to_string());
+                        launch::Addrs { listen, advertise, seeds, client_listen }
+                    }
+                    kind => {
+                        let name = format!("{kind:?}").to_lowercase();
+                        let d = launch::discover(kind, &env).map_err(|e| format!("provider {name}: {e}"))?;
+                        tracing::info!(provider = %name, advertise = %d.advertise, seeds = ?d.seeds, pool = %d.pool, labels = ?d.labels, "discovered");
+                        let flags = launch::Flags { listen, advertise, seeds, client_listen, client_port };
+                        launch::platform_addrs(&d, flags, &env)?
+                    }
+                };
+                if let Some(n) = bootstrap_expect
+                    && n != addrs.seeds.len()
+                {
+                    return Err(format!("--bootstrap-expect {n} but there are {} seeds", addrs.seeds.len()));
+                }
+                let token = cluster_token(token_file.as_deref(), insecure)?;
+                let tls = tls_dir.as_deref().map(chimaera_peer::tls::load).transpose().map_err(|e| e.to_string())?;
+                let cfg = chimaera_peer::cluster::ClusterConfig {
+                    dir,
+                    cluster,
+                    listen: addrs.listen,
+                    advertise: addrs.advertise,
+                    seeds: addrs.seeds,
+                    data_groups: data_groups.max(1),
+                    cpus,
+                    token,
+                    tls,
+                    client_listen: addrs.client_listen,
+                };
+                chimaera_peer::cluster::run_cluster(cfg).await.map_err(|e| e.to_string()).map(|_| 0)
             }
-        });
+            Cmd::Run { detach, command } => run_program(&dir, detach, &command).await,
+            Cmd::Status { json } => status(&dir, json).await,
+            Cmd::Logs { run, follow } => logs(&dir, &run, follow).await,
+            Cmd::Inspect { run, json } => inspect(&dir, &run, json).await,
+            Cmd::Explain { run, task, decisions, json } => explain(&dir, &run, task, decisions, json).await,
+            Cmd::Profiles { name, json } => Ok(profiles(&dir, name.as_deref(), json)),
+            Cmd::Stop => stop(&dir).await,
+            Cmd::Cluster { action: ClusterCmd::Token } => {
+                println!("{}", launch::new_token().map_err(|e| e.to_string())?);
+                Ok(0)
+            }
+            Cmd::Cluster { action: ClusterCmd::Init { out } } => {
+                let token = launch::new_token().map_err(|e| e.to_string())?;
+                chimaera_peer::tls::init(&out, &token).map_err(|e| format!("{}: {e}", out.display()))?;
+                eprintln!(
+                    "cluster CA and token in {}; issue each peer a certificate with `chimaera cluster cert`",
+                    out.display()
+                );
+                Ok(0)
+            }
+            Cmd::Cluster { action: ClusterCmd::Cert { ca, name, out } } => {
+                chimaera_peer::tls::issue(&ca, &name, &out).map_err(|e| format!("{}: {e}", out.display()))?;
+                Ok(0)
+            }
+            Cmd::Doctor => Ok(doctor(&dir)),
+            Cmd::K8s { action: K8sCmd::Render(spec) } => {
+                print!("{}", launch::k8s::render(&spec)?);
+                Ok(0)
+            }
+            Cmd::SlurmLaunch { port, command } => launch::slurm::launch(dir_flag, port, &command).await,
+            Cmd::Up { name } => launch::ssh::up(&name),
+            Cmd::Down { name } => launch::ssh::down(&name),
+        }
+    });
     match result {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
@@ -215,13 +343,6 @@ fn cluster_token(file: Option<&std::path::Path>, insecure: bool) -> Result<Optio
     }
 }
 
-fn new_token() -> std::io::Result<String> {
-    use std::io::Read;
-    let mut b = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
-    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
-}
-
 type Client = pb::peer_client::PeerClient<tonic::transport::Channel>;
 
 async fn connect(dir: &std::path::Path) -> Result<Client, String> {
@@ -247,6 +368,22 @@ async fn run_program(dir: &std::path::Path, detach: bool, command: &[String]) ->
     Ok(status.code().map_or(1, |c| c.clamp(0, 255) as u8))
 }
 
+async fn logs(dir: &std::path::Path, run: &str, follow: bool) -> Result<u8, String> {
+    use std::io::Write as _;
+    let run = parse_run(run)?;
+    let mut c = connect(dir).await?;
+    let mut offset = 0;
+    loop {
+        let req = pb::LogsRequest { run: run.to_vec(), offset, wait_ms: if follow { 10_000 } else { 0 } };
+        let r = c.logs(req).await.map_err(|e| e.message().to_string())?.into_inner();
+        std::io::stdout().write_all(&r.text).map_err(|e| e.to_string())?;
+        offset = r.next;
+        if r.text.is_empty() && !follow {
+            return Ok(0);
+        }
+    }
+}
+
 async fn status(dir: &std::path::Path, json: bool) -> Result<u8, String> {
     let mut c = connect(dir).await?;
     let s = c.status(pb::StatusRequest {}).await.map_err(|e| e.message().to_string())?.into_inner();
@@ -269,6 +406,11 @@ async fn status(dir: &std::path::Path, json: bool) -> Result<u8, String> {
                 "dispatch_p50_us": s.dispatch_p50_us,
                 "dispatch_p99_us": s.dispatch_p99_us,
                 "dispatch_samples": s.dispatch_samples,
+                "memory_pool": s.memory_pool,
+                "memory_used": s.memory_used,
+                "memory_available": s.memory_available,
+                "automatic": s.automatic,
+                "links": s.links,
             })
         );
     } else {
@@ -285,6 +427,18 @@ async fn status(dir: &std::path::Path, json: bool) -> Result<u8, String> {
             s.sessions,
             s.object_bytes
         );
+        println!(
+            "  memory: {} of {} MiB pool in use, {} MiB available on the host",
+            s.memory_used >> 20,
+            s.memory_pool >> 20,
+            s.memory_available >> 20
+        );
+        for a in &s.automatic {
+            println!("  automatic: {a}");
+        }
+        for l in &s.links {
+            println!("  link: {l}");
+        }
         for r in s.pending_reasons {
             println!("  waiting: {r}");
         }
@@ -404,6 +558,59 @@ async fn stop(dir: &std::path::Path) -> Result<u8, String> {
     c.shutdown(pb::ShutdownRequest {}).await.map_err(|e| e.message().to_string())?;
     eprintln!("stopping the local peer");
     Ok(0)
+}
+
+/// The peer's saved profiles (written every 30 s while they change, and at
+/// shutdown), one function per line.
+fn profiles(dir: &std::path::Path, filter: Option<&str>, json: bool) -> u8 {
+    let path = dir.join("profiles.pb");
+    let Some(age) = std::fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()) else {
+        eprintln!("no profiles saved in {} yet (a peer saves them after its first calls)", dir.display());
+        return 1;
+    };
+    let all = chimaera_peer::profiles::Profiles::load_file(&path).all();
+    let rows: Vec<_> = all.iter().filter(|(_, name, ..)| filter.is_none_or(|f| name.contains(f))).collect();
+    let mib = |b: u64| b.div_ceil(1 << 20);
+    if json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|(k, name, s, cpus)| {
+                let mem = s.memory_for(s.max_arg_bytes);
+                serde_json::json!({
+                    "name": name,
+                    "digest": chimaera_peer::stores::hex(&k.digest),
+                    "method": k.method,
+                    "calls": s.n,
+                    "wall_p50_s": s.wall_p50_s,
+                    "cores_mean": s.cores_mean,
+                    "cpus": if *cpus > 0.0 { Some(*cpus) } else { None },
+                    "memory_bytes": mem.as_ref().map(|m| m.bytes),
+                    "memory_evidence": mem.map(|m| m.evidence),
+                    "peak_p95_bytes": s.peak_p95,
+                    "killed_for_memory_at": s.oom_bounds.iter().map(|b| b.1).max(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::Array(out));
+        return 0;
+    }
+    println!("{} function profile(s), saved {} s ago in {}", rows.len(), age.as_secs(), path.display());
+    for (k, name, s, cpus) in rows {
+        let name = if name.is_empty() {
+            format!("function {}", &chimaera_peer::stores::hex(&k.digest)[..12])
+        } else {
+            name.clone()
+        };
+        let cpu = if *cpus > 0.0 { format!("cpus {cpus} (learned)") } else { "cpus 1 (default)".into() };
+        let mem = s
+            .memory_for(s.max_arg_bytes)
+            .map_or("memory not known yet".into(), |m| format!("memory {} MiB ({})", mib(m.bytes), m.evidence));
+        println!(
+            "  {name}: {} calls, {:.3} s p50, {:.2} cores on average; next call gets {cpu}, {mem}",
+            s.n, s.wall_p50_s, s.cores_mean
+        );
+    }
+    0
 }
 
 fn doctor(dir: &std::path::Path) -> u8 {

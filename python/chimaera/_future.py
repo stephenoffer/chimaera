@@ -7,25 +7,28 @@ import os
 import sys
 import time
 import warnings
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from typing import Any, Generic, NamedTuple, TypeVar
 
-from . import _context, _serde
-from ._errors import from_outcome
-from ._native import blake3_digest
+from . import _context, _serde, _values
+from ._errors import StreamInterrupted, from_outcome
 
 T = TypeVar("T")
 
 # CH101 detection: a call site whose futures are awaited one at a time.
 _serial = {"site": None, "count": 0, "warned": set()}
 _SERIAL_WARN_AT = 200
+# A wait this long on a call that has not started prints why (once).
+STALL_NOTICE_S = float(os.environ.get("CHIMAERA_STALL_NOTICE_S", "60"))
 
 
 class Future(Generic[T]):
     """The eventual result of a call. Await it, or call ``result()``."""
 
     __slots__ = (
-        "_rt", "key", "_outcome", "_value", "_has_value", "_exc", "_callbacks", "_site", "_escaped", "_arg_bytes", "__weakref__",
+        "_rt", "key", "_outcome", "_value", "_has_value", "_exc", "_callbacks", "_site", "_escaped", "_arg_bytes", "_put",
+        "_returns", "_owned", "__weakref__",
     )
 
     def __init__(self, rt: Any, key: bytes, site: str | None = None) -> None:
@@ -39,6 +42,12 @@ class Future(Generic[T]):
         self._site = site
         self._escaped = False
         self._arg_bytes = 0
+        # For a value stored with ch.put: (run, object_id, inline or None, size).
+        self._put: tuple[bytes, bytes, bytes | None, int] | None = None
+        self._returns: int | None = None  # the call's `returns=` option, for split()
+        # Files of a ch.put value this handle owns: deleted with it unless it
+        # escaped (was pickled or passed by reference to a call).
+        self._owned: list[str] | None = None
 
     def __repr__(self) -> str:
         state = "done" if self.done() else "pending"
@@ -48,6 +57,13 @@ class Future(Generic[T]):
     def id(self) -> str:
         """Stable id of the call (run id + task id, hex)."""
         return self.key.hex()
+
+    def metrics(self) -> list[dict[str, Any]]:
+        """What the call has reported so far with ``ch.context().report(...)``,
+        oldest first (its latest attempt's reports only)."""
+        from ._metrics import reports
+
+        return reports(self.key)
 
     def done(self) -> bool:
         return self._outcome is not None or self._exc is not None
@@ -88,17 +104,36 @@ class Future(Generic[T]):
         if blocked:
             _executor_hook(ctx, True, [self.key])
         try:
-            deadline = None if timeout is None else time.monotonic() + timeout
-            with rt.cond:
-                while not self.done():
-                    left = None if deadline is None else deadline - time.monotonic()
-                    if left is not None and left <= 0:
-                        return False
-                    rt.cond.wait(left if left is not None else 1.0)
-            return True
+            start = time.monotonic()
+            deadline = None if timeout is None else start + timeout
+            noticed = False
+            while True:
+                with rt.cond:
+                    while not self.done():
+                        now = time.monotonic()
+                        if deadline is not None and now >= deadline:
+                            return False
+                        if not noticed and now - start >= STALL_NOTICE_S:
+                            break
+                        rt.cond.wait(min(1.0, deadline - now) if deadline is not None else 1.0)
+                    else:
+                        return True
+                noticed = True
+                self._stall_notice(time.monotonic() - start)
         finally:
             if blocked:
                 _executor_hook(ctx, False, [])
+
+    def _stall_notice(self, waited: float) -> None:
+        """Say once why a wait is long when the call has not started: Ray
+        writes this only to a raylet log the caller never sees."""
+        try:
+            info = self.explain()
+        except Exception:  # noqa: BLE001 -- a notice must never break the wait
+            return
+        reason = info.get("pending_reason") or ""
+        if reason and reason != "running":
+            sys.stderr.write(f"chimaera: waited {waited:.0f} s on call {self.key[16:].hex()[:12]}: {reason}\n")
 
     def result(self, timeout: float | None = None) -> T:
         """Wait for the value. A wait timeout raises TimeoutError and leaves the call running."""
@@ -125,6 +160,8 @@ class Future(Generic[T]):
         if self._outcome[0] == "ok":
             self._value = self._rt.read_value(self._outcome)
             self._has_value = True
+            if self._put is None:
+                _values.fetched.note_fetched(self._value, self._outcome[4])
             return self._value
         exc = from_outcome(self._outcome, self.key[16:].hex())
         raise exc
@@ -140,6 +177,18 @@ class Future(Generic[T]):
 
     def _cancelled(self) -> bool:
         return self._outcome is not None and self._outcome[0] == "err" and self._outcome[1] in ("cancelled", "deadline")
+
+    def split(self, n: int | None = None) -> tuple[Future[Any], ...]:
+        """One future per value of a call that returns several (``returns=n``).
+
+        Each part is its own dependency: pass ``a`` to one call and ``b`` to
+        another. The call must return a sequence of exactly ``n`` values; a
+        part used on anything else raises ``ValueError``.
+        """
+        n = n if n is not None else self._returns
+        if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            raise TypeError("split() needs the number of values: set returns=n on the call, or pass split(n)")
+        return tuple(_Part(self, i, n) for i in range(n))
 
     def explain(self) -> dict[str, Any]:
         """What happened to this call: state, waiting reason, attempts and measurements."""
@@ -160,6 +209,9 @@ class Future(Generic[T]):
         return self._value_or_raise()
 
     def __reduce__(self) -> tuple[Any, ...]:
+        if self._put is not None:
+            self._escaped = True  # copies may outlive this handle: keep its files for the run
+            return (_resolved_future, self._put)
         # An embedded future is a handle: it pins its result for the run's
         # lifetime and can be awaited wherever it is unpickled.
         self._escaped = True
@@ -169,10 +221,112 @@ class Future(Generic[T]):
         rt = self._rt
         if self._escaped or rt is None or sys.is_finalizing():
             return
+        if self._put is not None:
+            # A ch.put value nothing else refers to: free its files now rather
+            # than at the end of the run. Values already read stay mapped.
+            for path in self._owned or ():
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            return
         try:
             rt.release_later(self.key)
         except Exception:  # noqa: S110 -- best effort during garbage collection
             return
+
+
+class _Part(Future[Any]):
+    """Value ``index`` of a call that returns ``count`` values (``Future.split``).
+
+    It waits on, cancels and explains its parent call. Passed as an argument it
+    is a dependency on the parent, and the callee receives just this value.
+    """
+
+    __slots__ = ("_parent", "_index", "_count")
+
+    def __init__(self, parent: Future[Any], index: int, count: int) -> None:
+        super().__init__(parent._rt, parent.key, parent._site)
+        self._parent, self._index, self._count = parent, index, count
+        self._escaped = True  # the parent holds the pin
+
+    def __repr__(self) -> str:
+        return f"<Future {self.key[16:].hex()[:12]} part {self._index}/{self._count} {'done' if self.done() else 'pending'}>"
+
+    @property
+    def id(self) -> str:
+        return f"{self._parent.id}#{self._index}"
+
+    def done(self) -> bool:
+        return self._parent.done()
+
+    def _wait(self, timeout: float | None) -> bool:
+        return self._parent._wait(timeout)
+
+    def _value_or_raise(self) -> Any:
+        return pick(self._parent._value_or_raise(), self._index, self._count)
+
+    def add_done_callback(self, fn: Callable[[Future[Any]], object]) -> None:
+        self._parent.add_done_callback(lambda _: fn(self))
+
+    def cancel(self, *, force: bool = False) -> bool:
+        """Cancels the whole call the part belongs to."""
+        return self._parent.cancel(force=force)
+
+    def explain(self) -> dict[str, Any]:
+        return self._parent.explain()
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_Part, (self._parent, self._index, self._count))
+
+
+class PartDep:
+    """Call-frame placeholder: value ``index`` of dependency ``dep``, a call returning ``count`` values."""
+
+    __slots__ = ("dep", "index", "count")
+
+    def __init__(self, dep: int, index: int, count: int) -> None:
+        self.dep, self.index, self.count = dep, index, count
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (PartDep, (self.dep, self.index, self.count))
+
+
+def pick(value: Any, index: int, count: int) -> Any:
+    """Value ``index`` of a call declared to return ``count`` values (or item
+    ``index`` of a map chunk, whose failed items carry their own error)."""
+    if not isinstance(value, (tuple, list)) or len(value) != count:
+        got = f"a {type(value).__name__} of {len(value)}" if isinstance(value, (tuple, list)) else type(value).__name__
+        raise ValueError(f"the call was split into {count} values (returns={count}) but returned {got}")
+    v = value[index]
+    if isinstance(v, ItemFailed):
+        raise from_outcome(v.err)
+    return v
+
+
+class ItemFailed:
+    """An item of a map chunk that raised; the other items of the chunk keep
+    their values. ``err`` is an error outcome tuple, as the peer reports one."""
+
+    __slots__ = ("err",)
+
+    def __init__(self, err: tuple[Any, ...]) -> None:
+        self.err = err
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (ItemFailed, (self.err,))
+
+
+class _Chunk(list):  # type: ignore[type-arg]
+    """The results of a map chunk, and the seconds its items took on the worker."""
+
+    elapsed: float = 0.0
+
+
+# Worker time a map chunk aims for: long enough to amortize a call, short
+# enough to keep items flowing and a lost chunk cheap to redo.
+CHUNK_TARGET_S = 0.1
+MAX_CHUNK = 4096
 
 
 def _future_from_key(key: bytes) -> Future[Any]:
@@ -187,6 +341,21 @@ def _future_from_key(key: bytes) -> Future[Any]:
 
 # Set by the executor: tells the peer a task is blocked waiting on futures.
 _executor_hook: Callable[[Any, bool, list[bytes]], None] | None = None
+
+
+class waiting:
+    """Mark a wait inside a call (a lock, a barrier, a watch) as blocked, as a
+    future's ``result()`` does: the peer may lend the call's CPU meanwhile, and
+    the executor starts the next call of its batch."""
+
+    def __enter__(self) -> None:
+        self.ctx = _context.current_task()
+        if self.ctx is not None and _executor_hook is not None:
+            _executor_hook(self.ctx, True, [])
+
+    def __exit__(self, *exc: object) -> None:
+        if self.ctx is not None and _executor_hook is not None:
+            _executor_hook(self.ctx, False, [])
 
 
 def _note_serial_wait(f: Future[Any]) -> None:
@@ -206,6 +375,79 @@ def _note_serial_wait(f: Future[Any]) -> None:
             "before the next call was submitted. Submit them all first, or use fn.map(items).",
             stacklevel=3,
         )
+
+
+class Stream(Generic[T]):
+    """The items of a generator call, in order, as the generator yields them.
+
+    Iterate it (``for x in fn.remote(...)``, or ``async for``). The generator
+    runs at most a window of items ahead of you (``max_in_flight``, default
+    64). If its worker dies, the generator runs again and the items you
+    already have are skipped, so a generator should yield the same items each
+    time (the default ``deterministic=True``). An error raised in the
+    generator is raised here after the items before it. ``close()`` stops it.
+    """
+
+    def __init__(self, fut: Future[int], window: int) -> None:
+        self._fut = fut
+        self.key = fut.key
+        self._rt = fut._rt
+        self._items: dict[int, tuple[Any, ...]] = {}
+        self._next = 0
+        self._window = window
+        self._credited = 0
+        self._rt._streams[self.key] = self
+
+    def __repr__(self) -> str:
+        return f"<Stream {self.key[16:].hex()[:12]} at item {self._next}>"
+
+    def _add(self, index: int, outcome: tuple[Any, ...]) -> None:
+        """An item arrived (dispatcher thread; a replayed attempt repeats indices)."""
+        if index >= self._next:
+            self._items.setdefault(index, outcome)
+
+    def __iter__(self) -> Stream[T]:
+        return self
+
+    def __next__(self) -> T:
+        rt = self._rt
+        rt.client.flush()
+        with rt.cond:
+            while self._next not in self._items:
+                if self._fut.done():
+                    count = self._fut._value_or_raise()  # the generator's error, if it raised
+                    if self._next >= count:
+                        raise StopIteration
+                    raise StreamInterrupted(f"the stream ended after {self._next} of {count} items")
+                rt.cond.wait(1.0)
+            outcome = self._items.pop(self._next)
+        self._next += 1
+        if self._next - self._credited >= max(1, self._window // 2):
+            self._credited = self._next
+            rt.client.stream_credit(self.key, self._next)
+        return rt.read_value(outcome)
+
+    def __aiter__(self) -> Stream[T]:
+        return self
+
+    async def __anext__(self) -> T:
+        # StopIteration cannot cross a thread boundary into a coroutine.
+        end = object()
+        item = await asyncio.to_thread(lambda: next(self, end))
+        if item is end:
+            raise StopAsyncIteration
+        return item
+
+    def close(self) -> None:
+        """Stop the generator; items not taken yet are dropped."""
+        self._fut.cancel()
+
+    def __enter__(self) -> Stream[T]:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if not self._fut.done():
+            self.close()
 
 
 class ObjectRef:
@@ -231,23 +473,33 @@ def _load_object(run: bytes, object_id: bytes, inline: bytes | None) -> Any:
     return read_object(Runtime.get().object_dir, run, object_id)
 
 
-def put(value: Any) -> ObjectRef:
-    """Store `value` once; pass the returned reference to many calls without
-    re-sending it. Identical values share one copy."""
+def _resolved_future(run: bytes, object_id: bytes, inline: bytes | None, size: int) -> Future[Any]:
+    """A finished future for a stored value (what ch.put returns)."""
+    from ._runtime import Runtime
+
+    rt = Runtime.get()
+    f: Future[Any] = Future(rt, run + object_id)
+    f._escaped = True  # nothing to release: the value lives as long as its run
+    f._put = (run, object_id, inline, size)
+    f._outcome = ("ok", inline, run, object_id, size, 0)
+    return f
+
+
+def put(value: Any) -> Future[Any]:
+    """Store `value` once and return a finished future for it. Pass the
+    future to any number of calls: each reads the stored value instead of
+    receiving a copy. Identical values share one copy."""
     from ._runtime import Runtime
 
     rt = Runtime.get()
     ctx = _context.current_task()
     run = ctx.run if ctx is not None else rt.run
-    parts, size, _oob = _serde.dumps_parts(value)
-    data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts)
-    object_id = blake3_digest(data)[:16]
-    if size <= rt.inline_limit:
-        return ObjectRef(run, object_id, data, size)
-    path = _serde.object_path(rt.object_dir, run, object_id)
-    if not os.path.exists(path):
-        _serde.write_file(path, [data])
-    return ObjectRef(run, object_id, None, size)
+    assert run is not None
+    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, rt.inline_limit)
+    f = _resolved_future(run, object_id, inline, size)
+    if owned:
+        f._escaped, f._owned = False, owned
+    return f
 
 
 def gather(*futures: Future[Any], timeout: float | None = None) -> list[Any]:
@@ -345,6 +597,15 @@ class Outcome(NamedTuple):
     error: BaseException | None
 
 
+class _Slot:
+    """Calls in flight for a Results: one item, or a chunk of ``k`` items."""
+
+    __slots__ = ("first", "fut", "k", "chunk", "size")
+
+    def __init__(self, first: int, fut: Future[Any], k: int, chunk: bool, size: int) -> None:
+        self.first, self.fut, self.k, self.chunk, self.size = first, fut, k, chunk, size
+
+
 class Results(Generic[T]):
     """A single-pass stream of results from ``fn.map``.
 
@@ -363,117 +624,215 @@ class Results(Generic[T]):
         ordered: bool,
         window: int,
         window_bytes: int = 256 << 20,
+        chunk: Callable[[int, list[Any]], Future[Any]] | None = None,
+        parallel: int = 1,
+        grow_window: bool = False,
     ) -> None:
+        # `chunk(first_index, items)` submits several items as one call whose
+        # value is a _Chunk. Chunks start at one item and grow only by the
+        # worker time items are measured to take (A1), so slow items are never
+        # grouped. A window the caller chose is a hard cap; a default one
+        # widens so every worker can hold two chunks.
         self._submit = submit
+        self._chunk = chunk
+        self._parallel = max(1, parallel)
+        self._grow_window = grow_window
+        self._item_s: float | None = None
         self._source = source
         self._ordered = ordered
         self._window = max(1, window)
         self._window_bytes = max(1, window_bytes)
+        self._slots: dict[int, _Slot] = {}  # by first index, in submission order
+        self._items = 0  # items in flight
         self._bytes = 0
-        self._sizes: dict[int, int] = {}
-        self._pending: dict[int, Future[T]] = {}
+        self._out_total = 0
+        self._out_n = 0
         self._next = 0
-        self._yield = 0
+        # Items of slots already finished, waiting to be handed out:
+        # (index, value, error, slot, position in the slot).
+        self._buf: deque[tuple[int, Any, BaseException | None, _Slot, int]] = deque()
         self._exhausted = False
         self._closed = False
         self._waker = _AsyncWaker()
         self._fill()
 
+    # ---- submission ----------------------------------------------------------
+
+    def _chunk_size(self) -> int:
+        if self._chunk is None or self._item_s is None:
+            return 1
+        return max(1, min(MAX_CHUNK, int(CHUNK_TARGET_S / max(self._item_s, 1e-7))))
+
     def _fill(self) -> None:
-        # In flight is bounded by items and by argument bytes (A3), so tiny
-        # items can fill a deep window while large ones stay few. Refill in
+        # In flight is bounded by items and by argument bytes (A3). Refill in
         # bulk once half the window has drained, so the peer receives large
-        # groups it can batch instead of a trickle of single items.
-        if self._pending and len(self._pending) > self._window // 2 and self._bytes < self._window_bytes // 2:
+        # groups instead of a trickle of single items.
+        window = self._window
+        k = min(self._chunk_size(), window)
+        if self._grow_window:
+            window = max(window, 2 * self._parallel * k)
+        if self._slots and self._items > window // 2 and self._bytes < self._window_bytes // 2:
             return
-        while not self._exhausted and len(self._pending) < self._window and self._bytes < self._window_bytes:
-            try:
-                item = next(self._source)
-            except StopIteration:
-                self._exhausted = True
+        out_avg = self._out_total // self._out_n if self._out_n else 0
+        while not self._exhausted and self._items < window and self._bytes < self._window_bytes:
+            want = max(1, min(k, window - self._items))
+            items: list[Any] = []
+            while len(items) < want:
+                try:
+                    items.append(next(self._source))
+                except StopIteration:
+                    self._exhausted = True
+                    break
+            if not items:
                 break
-            f = self._submit(self._next, item)
-            size = getattr(f, "_arg_bytes", 0)
-            self._sizes[self._next] = size
-            self._bytes += size
-            self._pending[self._next] = f
-            self._next += 1
+            if self._chunk is not None and isinstance(items[0], Future):
+                self._chunk = None  # chained stages pass futures: one call each
+            if self._chunk is None:
+                for item in items:
+                    f = self._submit(self._next, item)
+                    self._add(_Slot(self._next, f, 1, False, getattr(f, "_arg_bytes", 0) + out_avg))
+            else:
+                f = self._chunk(self._next, items)
+                self._add(_Slot(self._next, f, len(items), True, getattr(f, "_arg_bytes", 0) + out_avg * len(items)))
 
-    def _forget(self, i: int) -> None:
-        self._bytes -= self._sizes.pop(i, 0)
+    def _add(self, slot: _Slot) -> None:
+        self._slots[slot.first] = slot
+        self._items += slot.k
+        self._bytes += slot.size
+        self._next += slot.k
 
-    def __iter__(self) -> Iterator[T]:
-        return self
+    def _remove(self, slot: _Slot) -> None:
+        del self._slots[slot.first]
+        self._items -= slot.k
+        self._bytes -= slot.size
 
-    def _take(self) -> tuple[int, Future[T]]:
-        if self._closed:
-            raise StopIteration
-        if not self._pending:
-            raise StopIteration
-        if self._ordered:
-            while self._yield not in self._pending:
-                self._yield += 1
-            i = self._yield
-            self._yield += 1
-            f = self._pending.pop(i)
-            self._forget(i)
-            self._fill()
-            f._wait(None)
-            return i, f
-        first = next(iter(self._pending.values()))
+    # ---- consumption ---------------------------------------------------------
+
+    def _pop_ordered(self) -> _Slot:
+        slot = self._slots[next(iter(self._slots))]
+        self._remove(slot)
+        self._fill()
+        return slot
+
+    def _pop_done(self) -> _Slot:
+        """The finished slot with the lowest index (completion order)."""
+        first = next(iter(self._slots.values())).fut
         rt = first._rt
         rt.client.flush()
         with rt.cond:
             while True:
-                done = [i for i, f in self._pending.items() if f.done()]
+                done = [s for s in self._slots.values() if s.fut.done()]
                 if done:
-                    i = min(done)
+                    slot = min(done, key=lambda s: s.first)
                     break
                 rt.cond.wait(1.0)
-        f = self._pending.pop(i)
-        self._forget(i)
+        self._remove(slot)
         self._fill()
-        return i, f
+        return slot
+
+    def _expand(self, slot: _Slot) -> None:
+        """Move a finished slot's items into the buffer."""
+        f = slot.fut
+        outcome = f._outcome
+        if outcome is not None and outcome[0] == "ok":
+            self._out_total += outcome[4]
+            self._out_n += slot.k
+        try:
+            value = f._value_or_raise()
+        except Exception as e:  # the call failed as a whole: every item has its error
+            for j in range(slot.k):
+                self._buf.append((slot.first + j, None, e, slot, j))
+            return
+        if not slot.chunk:
+            self._buf.append((slot.first, value, None, slot, 0))
+            return
+        if isinstance(value, _Chunk) and value:
+            per = value.elapsed / len(value)
+            self._item_s = per if self._item_s is None else 0.7 * self._item_s + 0.3 * per
+        for j, v in enumerate(value):
+            if isinstance(v, ItemFailed):
+                self._buf.append((slot.first + j, None, from_outcome(v.err), slot, j))
+            else:
+                self._buf.append((slot.first + j, v, None, slot, j))
+
+    def _next_item(self) -> tuple[int, Any, BaseException | None, _Slot, int]:
+        if self._buf:
+            return self._buf.popleft()
+        if self._closed or not self._slots:
+            raise StopIteration
+        if self._ordered:
+            slot = self._pop_ordered()
+            slot.fut._wait(None)
+        else:
+            slot = self._pop_done()
+        self._expand(slot)
+        return self._buf.popleft()
+
+    def __iter__(self) -> Iterator[T]:
+        return self
 
     def __next__(self) -> T:
-        _, f = self._take()
-        return f._value_or_raise()
+        _, value, err, _, _ = self._next_item()
+        if err is not None:
+            raise err
+        return value
 
     def outcomes(self) -> Iterator[Outcome]:
         """(index, value, error) for every item; never raises an item's error."""
         while True:
             try:
-                i, f = self._take()
+                i, value, err, _, _ = self._next_item()
             except StopIteration:
                 return
-            try:
-                yield Outcome(i, f._value_or_raise(), None)
-            except Exception as e:
-                yield Outcome(i, None, e)
+            yield Outcome(i, value, err)
+
+    @staticmethod
+    def _item_future(slot: _Slot, j: int) -> Future[Any]:
+        return _Part(slot.fut, j, slot.k) if slot.chunk else slot.fut
 
     def futures(self) -> Iterator[Future[T]]:
-        """Futures in order, without fetching values (for chaining stages)."""
-        while True:
-            try:
-                yield self._take_unwaited()
-            except StopIteration:
-                return
+        """Futures in order, without fetching values (for chaining stages).
 
-    def _take_unwaited(self) -> Future[T]:
-        if self._closed or not self._pending:
-            raise StopIteration
-        while self._yield not in self._pending:
-            self._yield += 1
-        f = self._pending.pop(self._yield)
-        self._forget(self._yield)
-        self._yield += 1
-        self._fill()
-        return f
+        Items submitted from here on are one call each, so cancelling an
+        item's future cancels only that item."""
+        self._chunk = None
+        while True:
+            if self._buf:
+                _, _, _, slot, j = self._buf.popleft()
+                yield self._item_future(slot, j)
+                continue
+            if self._closed or not self._slots:
+                return
+            slot = self._pop_ordered()
+            for j in range(slot.k):
+                yield self._item_future(slot, j)
 
     def map(self, fn: Any, *, ordered: bool = True) -> Results[Any]:
         """Feed this stream into another remote callable. Each item's result is
         passed by handle, so values move between executors, not through here."""
         return fn.map(self.futures(), ordered=ordered)
+
+    def reduce_by_key(self, combine: Any = None, *, partitions: int | None = None) -> Any:
+        """Group the (key, value) pairs each result yields by key, across all
+        results, folding each key's values with `combine` (associative; without
+        it, values are collected into lists). The pairs are repartitioned
+        between workers, never through here. Returns a ``Partitioned``."""
+        from ._data import reduce_by_key
+
+        return reduce_by_key(self, combine, partitions=partitions)
+
+    def write(self, sink: Any) -> Future[Any]:
+        """Write each result as one partition of `sink` (an ``ext.Sink``), from
+        the worker that holds it; the future gives the sink's commit."""
+        from ._data import write
+
+        return write(list(self.futures()), sink)
+
+    def write_parquet(self, directory: str) -> Future[Any]:
+        """Write each result as a Parquet part file in `directory` (needs pyarrow)."""
+        from .ext import FileSink
+
+        return self.write(FileSink(directory, format="parquet"))
 
     def close(self) -> None:
         if self._closed:
@@ -482,10 +841,11 @@ class Results(Generic[T]):
         close = getattr(self._source, "close", None)
         if callable(close):
             close()
-        for f in self._pending.values():
-            if not f.done():
-                f._rt.client.cancel(f.key, False)
-        self._pending.clear()
+        for slot in self._slots.values():
+            if not slot.fut.done():
+                slot.fut._rt.client.cancel(slot.fut.key, False)
+        self._slots.clear()
+        self._buf.clear()
 
     def __enter__(self) -> Results[T]:
         return self
@@ -497,18 +857,27 @@ class Results(Generic[T]):
         return self
 
     async def __anext__(self) -> T:
-        if self._closed or not self._pending:
-            raise StopAsyncIteration
-        if self._ordered:
-            return await self._take_unwaited()
-        next(iter(self._pending.values()))._rt.client.flush()
-        while True:
-            done = [i for i, f in self._pending.items() if f.done()]
-            if done:
-                i = min(done)
-                f = self._pending.pop(i)
-                self._forget(i)
+        if not self._buf:
+            if self._closed or not self._slots:
+                raise StopAsyncIteration
+            if self._ordered:
+                slot = self._pop_ordered()
+                try:
+                    await slot.fut
+                except Exception:
+                    pass  # _expand reports the call's error at each item
+            else:
+                next(iter(self._slots.values())).fut._rt.client.flush()
+                while not any(s.fut.done() for s in self._slots.values()):
+                    self._waker.watch(s.fut for s in self._slots.values())
+                    await self._waker.wait(None)
+                slot = min((s for s in self._slots.values() if s.fut.done()), key=lambda s: s.first)
+                self._remove(slot)
                 self._fill()
-                return f._value_or_raise()
-            self._waker.watch(self._pending.values())
-            await self._waker.wait(None)
+            self._expand(slot)
+        _, value, err, _, _ = self._buf.popleft()
+        if err is not None:
+            raise err
+        return value
+
+

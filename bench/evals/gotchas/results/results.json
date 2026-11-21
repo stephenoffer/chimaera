@@ -1,0 +1,289 @@
+{
+  "meta": {
+    "host": "Linux aarch64",
+    "cores": 4,
+    "container": true,
+    "memory_limit": "3221225472",
+    "reps": 1
+  },
+  "results": [
+    {
+      "trap": "mem_heavy",
+      "runtime": "ray",
+      "wall_s": 10.823,
+      "peak_extra_mib": 3024,
+      "oom_kills": 43,
+      "ok": "3/12",
+      "errors": [
+        {
+          "WorkerCrashedError": 9
+        }
+      ],
+      "reps": [
+        {
+          "trap": "mem_heavy",
+          "runtime": "ray",
+          "calls": 12,
+          "ok": 3,
+          "wrong": 0,
+          "errors": {
+            "WorkerCrashedError": 9
+          },
+          "submit_s": 0.036,
+          "wall_s": 10.823,
+          "process_s": 16.71,
+          "peak_extra_mib": 3024,
+          "oom_kills": 43
+        }
+      ]
+    },
+    {
+      "trap": "mem_heavy",
+      "runtime": "chimaera",
+      "wall_s": 12.887,
+      "peak_extra_mib": 1102,
+      "oom_kills": 0,
+      "ok": "12/12",
+      "errors": [],
+      "reps": [
+        {
+          "trap": "mem_heavy",
+          "runtime": "chimaera",
+          "calls": 12,
+          "ok": 12,
+          "wrong": 0,
+          "errors": {},
+          "submit_s": 0.072,
+          "wall_s": 12.887,
+          "process_s": 12.94,
+          "peak_extra_mib": 1102,
+          "oom_kills": 0
+        }
+      ]
+    },
+    {
+      "trap": "leak",
+      "runtime": "ray",
+      "wall_s": 1.124,
+      "peak_extra_mib": 3013,
+      "oom_kills": 3,
+      "ok": "230/230",
+      "errors": [],
+      "reps": [
+        {
+          "trap": "leak",
+          "runtime": "ray",
+          "calls": 230,
+          "ok": 230,
+          "wrong": 0,
+          "errors": {},
+          "submit_s": 0.042,
+          "wall_s": 1.124,
+          "process_s": 5.52,
+          "peak_extra_mib": 3013,
+          "oom_kills": 3
+        }
+      ]
+    },
+    {
+      "trap": "leak",
+      "runtime": "chimaera",
+      "wall_s": 0.332,
+      "peak_extra_mib": 1594,
+      "oom_kills": 0,
+      "ok": "230/230",
+      "errors": [],
+      "reps": [
+        {
+          "trap": "leak",
+          "runtime": "chimaera",
+          "calls": 230,
+          "ok": 230,
+          "wrong": 0,
+          "errors": {},
+          "submit_s": 0.059,
+          "wall_s": 0.332,
+          "process_s": 0.35,
+          "peak_extra_mib": 1594,
+          "oom_kills": 0
+        }
+      ]
+    },
+    {
+      "trap": "size_scaling",
+      "runtime": "ray",
+      "wall_s": null,
+      "peak_extra_mib": 3035,
+      "oom_kills": 0,
+      "ok": "None/None",
+      "errors": [
+        "thon3.11/site-packages/ray/util/tracing/tracing_helper.py\", line 329, in _invocation_remote_span\n    return method(self, args, kwargs, *_args, **_kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/target/venvs/ray/lib/python3.11/site-packages/ray/remote_function.py\", line 574, in _remote\n    return invocation(args, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/target/venvs/ray/lib/python3.11/site-packages/ray/remote_function.py\", line 537, in invocation\n    object_refs = worker.core_worker.submit_task(\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3982, in ray._raylet.CoreWorker.submit_task\n  File \"python/ray/_raylet.pyx\", line 3989, in ray._raylet.CoreWorker.submit_task\n  File \"python/ray/_raylet.pyx\", line 729, in ray._raylet.prepare_args_and_increment_put_refs\n  File \"python/ray/_raylet.pyx\", line 720, in ray._raylet.prepare_args_and_increment_put_refs\n  File \"python/ray/_raylet.pyx\", line 844, in ray._raylet.prepare_args_internal\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n"
+      ],
+      "reps": [
+        {
+          "error": "thon3.11/site-packages/ray/util/tracing/tracing_helper.py\", line 329, in _invocation_remote_span\n    return method(self, args, kwargs, *_args, **_kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/target/venvs/ray/lib/python3.11/site-packages/ray/remote_function.py\", line 574, in _remote\n    return invocation(args, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/target/venvs/ray/lib/python3.11/site-packages/ray/remote_function.py\", line 537, in invocation\n    object_refs = worker.core_worker.submit_task(\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3982, in ray._raylet.CoreWorker.submit_task\n  File \"python/ray/_raylet.pyx\", line 3989, in ray._raylet.CoreWorker.submit_task\n  File \"python/ray/_raylet.pyx\", line 729, in ray._raylet.prepare_args_and_increment_put_refs\n  File \"python/ray/_raylet.pyx\", line 720, in ray._raylet.prepare_args_and_increment_put_refs\n  File \"python/ray/_raylet.pyx\", line 844, in ray._raylet.prepare_args_internal\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
+          "exit": 1,
+          "process_s": 8.57,
+          "peak_extra_mib": 3035,
+          "oom_kills": 0
+        }
+      ]
+    },
+    {
+      "trap": "size_scaling",
+      "runtime": "chimaera",
+      "wall_s": 8.779,
+      "peak_extra_mib": 2018,
+      "oom_kills": 0,
+      "ok": "120/120",
+      "errors": [],
+      "reps": [
+        {
+          "trap": "size_scaling",
+          "runtime": "chimaera",
+          "calls": 120,
+          "ok": 120,
+          "wrong": 0,
+          "errors": {},
+          "submit_s": 0.779,
+          "wall_s": 8.779,
+          "process_s": 8.81,
+          "peak_extra_mib": 2018,
+          "oom_kills": 0
+        }
+      ]
+    },
+    {
+      "trap": "runaway",
+      "runtime": "ray",
+      "wall_s": null,
+      "peak_extra_mib": 2881,
+      "oom_kills": 0,
+      "ok": "None/None",
+      "errors": [
+        "timed out after 180 s"
+      ],
+      "reps": [
+        {
+          "error": "timed out after 180 s",
+          "exit": -1,
+          "process_s": 178.34,
+          "peak_extra_mib": 2881,
+          "oom_kills": 0
+        }
+      ]
+    },
+    {
+      "trap": "runaway",
+      "runtime": "chimaera",
+      "wall_s": 4.59,
+      "peak_extra_mib": 2605,
+      "oom_kills": 0,
+      "ok": "0/1",
+      "errors": [
+        {
+          "Infeasible": 1
+        }
+      ],
+      "reps": [
+        {
+          "trap": "runaway",
+          "runtime": "chimaera",
+          "calls": 1,
+          "ok": 0,
+          "wrong": 0,
+          "errors": {
+            "Infeasible": 1
+          },
+          "submit_s": 0.072,
+          "wall_s": 4.59,
+          "process_s": 4.73,
+          "peak_extra_mib": 2605,
+          "oom_kills": 0
+        }
+      ]
+    },
+    {
+      "trap": "mem_heavy_again",
+      "runtime": "ray",
+      "wall_s": 13.087,
+      "peak_extra_mib": 2999,
+      "oom_kills": 44,
+      "ok": "3/12",
+      "errors": [
+        {
+          "WorkerCrashedError": 9
+        }
+      ],
+      "reps": [
+        {
+          "trap": "mem_heavy_again",
+          "runtime": "ray",
+          "calls": 12,
+          "ok": 3,
+          "wrong": 0,
+          "errors": {
+            "WorkerCrashedError": 9
+          },
+          "submit_s": 0.054,
+          "wall_s": 13.087,
+          "process_s": 18.22,
+          "peak_extra_mib": 2999,
+          "oom_kills": 44,
+          "first_run": {
+            "trap": "mem_heavy",
+            "runtime": "ray",
+            "calls": 12,
+            "ok": 2,
+            "wrong": 0,
+            "errors": {
+              "WorkerCrashedError": 10
+            },
+            "submit_s": 0.069,
+            "wall_s": 21.191,
+            "process_s": 25.34,
+            "peak_extra_mib": 2879,
+            "oom_kills": 46
+          }
+        }
+      ]
+    },
+    {
+      "trap": "mem_heavy_again",
+      "runtime": "chimaera",
+      "wall_s": 12.741,
+      "peak_extra_mib": 1098,
+      "oom_kills": 0,
+      "ok": "12/12",
+      "errors": [],
+      "reps": [
+        {
+          "trap": "mem_heavy_again",
+          "runtime": "chimaera",
+          "calls": 12,
+          "ok": 12,
+          "wrong": 0,
+          "errors": {},
+          "submit_s": 0.005,
+          "wall_s": 12.741,
+          "process_s": 12.83,
+          "peak_extra_mib": 1098,
+          "oom_kills": 0,
+          "first_run": {
+            "trap": "mem_heavy",
+            "runtime": "chimaera",
+            "calls": 12,
+            "ok": 12,
+            "wrong": 0,
+            "errors": {},
+            "submit_s": 0.073,
+            "wall_s": 12.965,
+            "process_s": 13.2,
+            "peak_extra_mib": 1098,
+            "oom_kills": 0
+          }
+        }
+      ]
+    }
+  ]
+}

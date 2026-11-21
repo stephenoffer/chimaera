@@ -285,3 +285,23 @@ def test_sigterm_lets_running_work_finish_then_stops_the_peer():
     finally:
         if peer.poll() is None:
             peer.kill()
+
+
+def test_stop_ends_the_peer_while_a_client_is_still_connected():
+    home = tempfile.mkdtemp(prefix="chs", dir="/tmp")
+    peer = _start_peer(home)
+    client = subprocess.Popen(
+        [__import__("sys").executable, "-c", "import time, chimaera as ch\nch.remote(lambda: 1).remote().result(timeout=30)\nprint('connected', flush=True)\ntime.sleep(120)"],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=dict(os.environ, CHIMAERA_HOME=home, CHIMAERA_BIN=BIN),
+    )
+    try:
+        assert client.stdout.readline().strip() == "connected"
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=30)
+        # The idle client's session stream must not keep the stopped peer alive.
+        assert peer.wait(timeout=20) == 0, "the peer exits although a client is connected"
+    finally:
+        client.kill()
+        if peer.poll() is None:
+            peer.kill()

@@ -1,0 +1,10 @@
+=================== It4innovations/hyperqueue v0.27.0 
+=================== flux-framework/flux-core v0.91.0 
+=================== ai-dynamo/dynamo v1.6.2 
+=================== ai-dynamo/nixl v1.5.0 
+=================== skypilot-org/skypilot v0.14.0 
+=================== ray-project/ray ray-2.60.0 
+=================== meta-pytorch/torchft v0.3.0 
+=================== meta-pytorch/monarch v0.8.0 
+=================== Eventual-Inc/Daft v0.8.0-rc.1 
+=================== pytorch/torchtitan v0.4.0 

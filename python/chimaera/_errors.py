@@ -66,6 +66,26 @@ class DataLost(InfrastructureFailure):
     """A value this call needs no longer exists and cannot be recomputed."""
 
 
+class NotFound(ChimaeraError, LookupError):
+    """Nothing exists under that name (an actor key, a queue)."""
+
+
+class Closed(ChimaeraError):
+    """The queue or topic was closed."""
+
+
+class VersionConflict(ChimaeraError):
+    """A store write's ``if_version`` did not match; ``version`` is the key's current one (0: absent)."""
+
+    def __init__(self, message: str, version: int = 0) -> None:
+        super().__init__(message)
+        self.version = version
+
+
+class LeaseLost(ChimaeraError):
+    """A lock's lease expired or passed to another holder; writes fenced by it are refused."""
+
+
 class OptionsError(ChimaeraError, ValueError):
     """Options conflict or are invalid; the message names each field and its source."""
 

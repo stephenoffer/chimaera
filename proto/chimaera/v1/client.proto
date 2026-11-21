@@ -24,6 +24,89 @@ service Peer {
   rpc Shutdown(ShutdownRequest) returns (ShutdownReply);
   // Bring an object produced on another peer into this peer's store.
   rpc Localize(LocalizeRequest) returns (LocalizeReply);
+  // Large values from clients that do not share the peer's filesystem: which
+  // of these blobs the run lacks, upload one (checked against its digest),
+  // and read an object back (by range).
+  rpc HasBlobs(HasBlobsRequest) returns (HasBlobsReply);
+  rpc PutBlob(stream PutBlobChunk) returns (PutBlobReply);
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectChunk);
+  rpc Store(StoreRequest) returns (StoreReply);
+  // Events this peer saw (member changes, actor transitions, final task
+  // failures, controller decisions, drains), as a long poll. Best effort,
+  // bounded and per peer: the durable record is the shard's.
+  rpc Events(EventsRequest) returns (EventsReply);
+  // A run's output from the calls this peer ran, from a byte offset; waits
+  // up to wait_ms for more when there is none yet (`chimaera logs`).
+  rpc Logs(LogsRequest) returns (LogsReply);
+}
+
+message ClusterEvent {
+  uint64 seq = 1;          // per peer, from 1; restarts with the peer
+  uint64 at_unix_ms = 2;
+  string kind = 3;         // member | actor | task_failed | decision | drain
+  bytes node = 4;          // the peer the event is about (member, drain)
+  bytes run = 5;
+  TaskKey task = 6;
+  bytes actor = 7;
+  string message = 8;
+  string detail_json = 9;
+}
+
+message EventsRequest {
+  repeated string kinds = 1;   // empty: all kinds
+  uint64 since = 2;            // events with seq >= since
+  uint32 wait_ms = 3;          // wait this long for one if there is none yet
+}
+
+message LogsRequest {
+  bytes run = 1;
+  uint64 offset = 2;
+  uint32 wait_ms = 3;          // at most 30 000
+}
+
+message LogsReply {
+  bytes text = 1;              // whole lines when they fit
+  uint64 next = 2;             // pass as `offset` next time
+  uint64 size = 3;             // the run's output on this peer so far
+}
+
+message EventsReply {
+  repeated ClusterEvent events = 1;
+  uint64 next = 2;             // pass as `since` next time
+  bytes peer = 3;              // the answering peer
+  uint64 incarnation = 4;      // a new incarnation means seq restarted
+}
+
+message HasBlobsRequest {
+  bytes run = 1;
+  repeated bytes blob_ids = 2;
+}
+
+message HasBlobsReply {
+  repeated bytes missing = 1;
+}
+
+// The first chunk names the blob; every chunk carries at most 1 MiB of data.
+message PutBlobChunk {
+  bytes run = 1;
+  bytes blob_id = 2;   // blake3 of the whole blob, first 16 bytes
+  uint64 size = 3;
+  bytes data = 4;
+}
+
+message PutBlobReply {}
+
+message GetObjectRequest {
+  bytes run = 1;
+  bytes object_id = 2;
+  uint64 offset = 3;
+  uint64 len = 4;      // 0 = to the end
+}
+
+message GetObjectChunk {
+  bytes data = 1;
+  uint64 total = 2;    // set on the first chunk: bytes in the requested range
+  bytes checksum = 3;  // blake3 of `data`, first 16 bytes
 }
 
 message ClientHello {
@@ -103,7 +186,13 @@ message ClientMsg {
     bytes close_actor = 10;
     // A stream consumer has taken items below `up_to`.
     StreamCredit stream_credit = 11;
+    EndRun end_run = 12;         // finish or cancel a run by id (Run.finish / Run.cancel)
   }
+}
+
+message EndRun {
+  bytes run = 1;
+  bool cancel = 2;   // true: cancel its unfinished calls; false: finish it (leftovers are cancelled too)
 }
 
 message StreamCredit {
@@ -179,6 +268,8 @@ message AttemptRecord {
   string end_reason = 14;               // ok | user_error | oom | killed | cancelled | peer_lost | ...
   string detail = 15;
   string placement_reason = 16;
+  // CPU and memory this attempt reserved, and where each came from.
+  string reservation = 17;
 }
 
 message Decision {
@@ -222,6 +313,29 @@ message StatusReply {
   uint64 dispatch_samples = 13;
   // Shard commands this peer proposed that have not been answered yet.
   uint64 proposals_in_flight = 14;
+  // Memory pool: executor charges plus objects in tmpfs, in bytes.
+  uint64 memory_pool = 15;
+  uint64 memory_used = 16;
+  uint64 memory_available = 17;
+  // Settings the peer chose for itself, each with how it was derived.
+  repeated string automatic = 18;
+  // Learned transfer rates to other peers ("node: MB/s, rtt ms").
+  repeated string links = 19;
+  // Every peer this one knows (only itself when it runs alone): ch.cluster().
+  repeated ClusterNode nodes = 20;
+}
+
+message ClusterNode {
+  bytes peer = 1;
+  string addr = 2;
+  double cpus = 3;
+  uint64 memory_bytes = 4;
+  repeated string gpus = 5;
+  bool alive = 6;
+  double cpu_used = 7;     // from its last load report
+  uint64 queued = 8;
+  bool this_peer = 9;      // the peer that answered
+  map<string, string> labels = 10;
 }
 
 message ShutdownRequest {}
@@ -244,4 +358,12 @@ message ListTasksReply {
   repeated OutcomeEvent tasks = 1;   // outcome unset while the task is not done
   repeated TaskRecord.State states = 2;
   bytes next_after = 3;              // empty when there are no more
+}
+
+// ch.Store: one write, or one read. A CHANGES read with wait_ms waits up to
+// that long for a change after after_revision (a watch's long poll).
+message StoreRequest {
+  StoreWrite write = 1;
+  StoreRead read = 2;
+  uint32 wait_ms = 3;
 }

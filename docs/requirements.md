@@ -49,13 +49,13 @@ inform P4, P5 and the correctness gate on canaries (C2).
 
 | Id | Requirement | Proven in |
 |---|---|---|
-| A1 | Granularity: dispatch overhead > 10% or p50 < 50 ms → coalesce k = ⌈200 ms / item⌉ into ranges; never for `latency="interactive"` work. | M1 |
-| A2 | Arguments > 1 MB content-hashed and stored once; closures > 1 MB hoisted with a warning naming the variable. | M1 |
-| A3 | In-flight window by bytes per node; halve on spill or pressure; grow while the consumer is blocked > 5% and bytes fit. | M1 (guard), M3 |
-| A4 | CPU reservation = quantum(avg × 1.5) over {0.25, 0.5, 1, 2, 4}; shrink only if avg < 30%, p95 low, CV < 0.3; I/O reads 0.25. | M3 |
-| A5 | Thread pools set at executor spawn so threads × concurrency ≈ granted cores; executors keyed by thread class. | M1 |
-| A6 | Memory reservation = p95 peak × {1.2, 1.5, 2.0} by CV and OOM history; trend projection raises it early; enforced as a cgroup limit; OOM-killed attempts are censored lower bounds. | M3 |
-| A7 | Byte budgets per peer (objects, spill, in-flight) and disk budgets per peer (spill, shuffle, checkpoints, logs, caches). | M1, M3 |
+| A1 | Granularity: dispatch overhead > 10% or p50 < 50 ms → coalesce k = ⌈200 ms / item⌉ into ranges; never for `latency="interactive"` work. | M1: `profiles.rs` `fast_calls_are_batched_by_doubling`; plain calls batch too (`take_batch`) |
+| A2 | Arguments > 1 MB content-hashed and stored once; closures > 1 MB hoisted with a warning naming the variable. | M1: `test_values.py` (one stored copy for 50 calls; CH107); closures: CH108 |
+| A3 | In-flight window by bytes per node; halve on spill or pressure; grow while the consumer is blocked > 5% and bytes fit. | M1: map window counts argument and result bytes; driver backpressure `test_defaults.py` (CH110); M3: per-node window |
+| A4 | CPU reservation = quantum(avg × 1.5) over {0.25, 0.5, 1, 2, 4}; shrink only if avg < 30%, p95 low, CV < 0.3; I/O reads 0.25. | M1: `test_learning.py` (a waiting call reaches 0.25 CPU through the canary); `profile.rs` vetoes |
+| A5 | Thread pools set at executor spawn so threads × concurrency ≈ granted cores; executors keyed by thread class. | M1: `test_memory.py::test_executors_cap_thread_pools_and_write_no_core_dumps`; CPU grows on overuse (`profiles.rs`) |
+| A6 | Memory reservation = p95 peak × {1.2, 1.5, 2.0} by CV and OOM history; trend projection raises it early; enforced as a cgroup limit; OOM-killed attempts are censored lower bounds. | M1: `test_memory.py`, `test_learning.py` (learned after 3 calls, scales with input, survives restart); censored OOM bounds in `profile.rs` |
+| A7 | Byte budgets per peer (objects, spill, in-flight) and disk budgets per peer (spill, shuffle, checkpoints, logs, caches). | M1: `budget.rs` (one memory pool, objects in tmpfs count), spill to disk (`stores.rs`); disk budgets M3 |
 | A8 | Blocks/batches sized by bytes: 0.1–5 s per task, 1–128 MiB per block, ceiling from the attempt's memory budget, split before Arrow's 2 GiB offset limit. | M3 |
 | A9 | Stage balancer: GPU idle > 20% with an upstream queue → move cores to the binding CPU stage; the canary checks the sign. | M4 |
 | A10 | `replicas="auto"`: GPU stages start at all free GPUs; ×-up when util > 0.8, −1 down after cooldown; prefer concurrency per actor; ≤ ~1000 actors per pool. | M4 |
@@ -69,10 +69,10 @@ inform P4, P5 and the correctness gate on canaries (C2).
 
 | Id | Requirement | Proven in |
 |---|---|---|
-| R1 | Memory pressure, in order: throttle via PSI/`memory.high`; kill the attempt furthest over its reservation; retry OOMs on a separate budget at ×1.5 on a peer with room; split replayable input; an indivisible input fails with its size and smallest feasible shape. | M0 (state machine budget), M1, M3 |
+| R1 | Memory pressure, in order: throttle via PSI/`memory.high`; kill the attempt furthest over its reservation; retry OOMs on a separate budget at ×1.5 on a peer with room; split replayable input; an indivisible input fails with its size and smallest feasible shape. | M1: admission by memory and the OOM retry floor (`test_memory.py`); pressure kill implemented, exercised only by the `runaway` trap in the Linux container (unverified on macOS) |
 | R2 | Kill the whole cgroup process tree on worker death; verify GPU memory is freed before reuse. | M1 |
 | R3 | Classify failures: transient vs repeated identical fingerprint (stop on the second); deterministic re-execution; idempotent sink commits. | M0 (state machine), M3 (sinks) |
-| R4 | Rotate workers on an RSS/VRAM leak slope; jemalloc where available. | M3 |
+| R4 | Rotate workers on an RSS/VRAM leak slope; jemalloc where available. | M1: `test_memory.py::test_a_leaking_function_gets_a_fresh_worker`; Mann–Kendall in `profile.rs` |
 | R5 | Speculation for replayable, deterministic work only; first publication wins. | M0 (state machine), M2 |
 | R6 | Static stability: granted work keeps running through leader loss; overloaded is not dead. | M2 |
 | R7 | Preemption notices trigger checkpoint and drain; node replacement with backoff, bounded attempts and an alert. | M5 |
@@ -86,9 +86,9 @@ inform P4, P5 and the correctness gate on canaries (C2).
 | Id | Requirement | Proven in |
 |---|---|---|
 | O1 | Hang explainer: after T s without progress, stack-sample and classify (divergent rank, nested wait, unschedulable, backpressure, kernel OOM). | M1, M4 |
-| O2 | Every kill reports mechanism, offender, and reservation vs peak. | M1 |
+| O2 | Every kill reports mechanism, offender, and reservation vs peak. | M1: limit and pressure kills carry mechanism, offender, peak vs reservation (`kill_note`) |
 | O3 | Per-stage busy fraction, consumer-blocked time, bytes in flight per peer, spill, CPU-s/byte, event-loop lag. | M1, M3 |
-| O4 | Unschedulable work explained immediately with a feasibility diff (requested vs largest shape, blocking holders with owner and age). | M1 |
+| O4 | Unschedulable work explained immediately with a feasibility diff (requested vs largest shape, blocking holders with owner and age). | M1: memory waits in `pending_reason`/`status`; stalled-wait notice `test_defaults.py` |
 | O5 | Typed runtime events, not log regexes; bounded label cardinality; measured diagnostics overhead. | M1 |
 | O6 | Error messages cover the errors users hit most (OOM names attempt, peak vs declared, growth, retry plan; NCCL timeout names the missing rank; …). | M1–M4 |
 

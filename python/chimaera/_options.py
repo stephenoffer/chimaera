@@ -15,6 +15,8 @@ from __future__ import annotations
 import contextvars
 import datetime as _dt
 import difflib
+import functools
+import inspect
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping
@@ -31,6 +33,32 @@ class Placement:
 
     require: Mapping[str, str] = field(default_factory=dict)
     prefer: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class State:
+    """Durable actor state: ``@ch.remote(state=ch.State())`` on a class.
+
+    After every method call that returns, the instance's attributes (or what
+    ``__getstate__`` returns) are committed with the call's command id before
+    the reply goes out. A restarted instance resumes from the last committed
+    state instead of running ``__init__`` again. A call that raises commits
+    nothing. Repeating a call with ``.options(command_id=...)`` returns the
+    first reply; the same id with other arguments raises ``CommandConflict``.
+    State is stored inline, at most 1 MiB pickled.
+    """
+
+
+def _state(name: str, v: Any) -> State:
+    if not isinstance(v, State):
+        raise ValueError(f"{name}: expected ch.State(), got {v!r}")
+    return v
+
+
+def _command_id(name: str, v: Any) -> str:
+    if not isinstance(v, str) or not v:
+        raise ValueError(f"{name}: expected a non-empty string, got {v!r}")
+    return v
 
 
 @dataclass(frozen=True)
@@ -79,6 +107,18 @@ def _bool(name: str, v: Any) -> bool:
     return v
 
 
+def _int(name: str, v: Any) -> int:
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise ValueError(f"{name}: expected an integer, got {v!r}")
+    return v
+
+
+def _groups(name: str, v: Any) -> dict[str, int]:
+    if not isinstance(v, Mapping) or not v:
+        raise ValueError(f"{name}: expected a mapping of group name to concurrency, e.g. {{'io': 8}}")
+    return {str(k): _pos_int(f"{name}[{k!r}]", n) for k, n in v.items()}
+
+
 def _str(name: str, v: Any) -> str:
     if not isinstance(v, str):
         raise ValueError(f"{name}: expected a string, got {v!r}")
@@ -112,6 +152,14 @@ def _resources(name: str, v: Any) -> dict[str, float]:
     return {str(k): _nonneg_float(f"{name}[{k!r}]", x) for k, x in v.items()}
 
 
+def _within(name: str, v: Any) -> Any:
+    from ._reserve import Bundle
+
+    if not isinstance(v, Bundle):
+        raise ValueError(f"{name}: expected a bundle of a reservation, res[i] from ch.reserve(...), got {v!r}")
+    return v
+
+
 def _placement(name: str, v: Any) -> Placement:
     if not isinstance(v, Placement):
         raise ValueError(f"{name}: expected ch.Placement(require=..., prefer=...), got {v!r}")
@@ -126,6 +174,10 @@ def _exceptions(name: str, v: Any) -> tuple[type[BaseException], ...]:
     return items
 
 
+def _batch_on_method(name: str, v: Any) -> Any:
+    raise ValueError(f"{name}= batches one actor method's calls: put it on the method, @ch.method(batch=ch.Batch(...))")
+
+
 # name -> (validator, where it may be set). Where: "any", "actor", "pool", "decorator".
 FIELDS: dict[str, tuple[Any, str]] = {
     "cpus": (_or_auto(_pos_float), "any"),
@@ -135,6 +187,7 @@ FIELDS: dict[str, tuple[Any, str]] = {
     "device": (_str, "any"),
     "resources": (_resources, "any"),
     "placement": (_placement, "any"),
+    "within": (_within, "any"),
     "accounting": (_choice(("auto", "process", "isolated")), "any"),
     "effects": (_choice(EFFECTS), "any"),
     "max_attempts": (_pos_int, "any"),
@@ -144,19 +197,24 @@ FIELDS: dict[str, tuple[Any, str]] = {
     "prefetch": (_or_auto(_pos_int), "any"),
     "range_size": (_or_auto(_pos_int), "any"),
     "max_in_flight": (_pos_int, "any"),
+    "returns": (_pos_int, "any"),
+    "priority": (_int, "any"),
     "max_in_flight_bytes": (lambda n, v: _units.parse_bytes(v, n), "any"),
     "latency": (_latency, "any"),
     "adaptive": (_choice(("on", "observe", "frozen")), "any"),
     "splittable": (_bool, "any"),
     "deterministic": (_bool, "any"),
     "replicas": (_or_auto(_pos_int), "pool"),
+    "ranks": (_pos_int, "any"),
     "key": (_str, "actor"),
     "lifetime": (_choice(("run", "detached")), "actor"),
     "restart": (_choice(("never", "fresh", "checkpoint")), "actor"),
     "max_restarts": (_pos_int, "actor"),
     "workflow": (_choice(("durable",)), "decorator"),
-    "state": (lambda n, v: v, "decorator"),
-    "batch": (lambda n, v: v, "decorator"),
+    "state": (_state, "decorator"),
+    "command_id": (_command_id, "call"),
+    "batch": (_batch_on_method, "decorator"),
+    "groups": (_groups, "decorator"),
 }
 
 DEFAULTS: dict[str, Any] = {
@@ -193,6 +251,8 @@ def validate(options: Mapping[str, Any], *, kind: str, target: str, source: str)
         check, where = FIELDS[name]
         if where == "decorator" and kind != "decorator":
             raise TypeError(f"option {name!r} can only be set on the decorator ({source})")
+        if where == "call" and (kind != "view" or target != "function"):
+            raise TypeError(f"option {name!r} names one call; set it with .options(...) on that call ({source})")
         if where == "actor" and target not in ("actor", "pool", "scope"):
             raise TypeError(f"option {name!r} applies to actors, not to {target}s ({source})")
         if where == "pool" and target not in ("pool", "actor", "scope"):
@@ -242,6 +302,39 @@ class Effective:
     def describe(self) -> str:
         return ", ".join(f"{k}={v!r} ({self.sources[k]})" for k, v in sorted(self.values.items()))
 
+    @functools.cached_property
+    def native(self) -> dict[str, Any]:
+        """`policy_dict(self)`, computed once: every call submitted with these
+        options sends the same policy. Callers copy it before adding to it."""
+        return policy_dict(self)
+
+
+def resolve_cached(holder: Any, view: tuple[Layer, ...], decorator: Layer) -> Effective:
+    """`resolve(view, decorator)`, reused while the active ``with ch.options``
+    scopes are unchanged. The result is kept on `holder._resolved`; a scope
+    entered or left makes a new tuple, which misses the cache."""
+    scopes = _scopes.get()
+    cached = holder._resolved
+    if cached is not None and cached[0] is scopes:
+        return cached[1]
+    eff = resolve(view, decorator)
+    holder._resolved = (scopes, eff)
+    return eff
+
+
+@functools.lru_cache(maxsize=4096)
+def _signature(fn: Any) -> inspect.Signature:
+    return inspect.signature(fn)
+
+
+def signature_of(fn: Any) -> inspect.Signature:
+    """`inspect.signature(fn)`, computed once per callable: every `.remote()`
+    checks its arguments against it."""
+    try:
+        return _signature(fn)
+    except TypeError:  # unhashable callable, or one inspect cannot read
+        return inspect.signature(fn)
+
 
 def resolve(view: tuple[Layer, ...], decorator: Layer) -> Effective:
     """Merge layers by precedence; `view` is ordered most specific first."""
@@ -286,9 +379,21 @@ def policy_dict(eff: Effective) -> dict[str, Any]:
             return v.initial or 0
         return v or 0
 
+    def bound(name: str, which: str) -> Any:
+        """A ch.auto(min=, max=) bound on a learned value; 0 = none."""
+        v = eff.get(name)
+        x = getattr(v, which, None) if isinstance(v, Auto) else None
+        if x is None:
+            return 0
+        return _units.parse_bytes(x, f"{name} {which}") if name == "memory" else _pos_float(f"{name} {which}", x)
+
     placement: Placement | None = eff.get("placement")
     latency = eff.get("latency")
     return {
+        "cpus_min": float(bound("cpus", "min")),
+        "cpus_max": float(bound("cpus", "max")),
+        "memory_min": int(bound("memory", "min")),
+        "memory_max": int(bound("memory", "max")),
         "cpus": float(num("cpus")),
         "memory": int(num("memory")),
         "memory_limit": int(eff.get("memory_limit") or 0),
@@ -304,6 +409,8 @@ def policy_dict(eff: Effective) -> dict[str, Any]:
         "require": dict(placement.require) if placement else {},
         "prefer": list(placement.prefer) if placement else [],
         "source": eff.sources.get("cpus", ""),
+        "priority": int(eff.get("priority") or 0),
+        "max_in_flight": int(eff.get("max_in_flight") or 0),
     }
 
 

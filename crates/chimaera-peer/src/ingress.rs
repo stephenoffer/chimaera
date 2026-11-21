@@ -59,6 +59,31 @@ impl Ingress {
 
     /// Why a policy can never run on any live peer, or `None` if it can.
     fn infeasible(&self, p: &pb::Policy) -> Option<String> {
+        if !p.require.is_empty() {
+            let labelled: Vec<std::collections::HashMap<String, String>> = match &self.router.mesh {
+                Some(mesh) => mesh.members().into_iter().filter(|m| !m.dead).map(|m| m.member.labels).collect(),
+                None => vec![crate::labels::own(&self.info.peer).into_iter().collect()],
+            };
+            if !labelled.iter().any(|l| crate::labels::satisfies(l, &p.require)) {
+                let mut want: Vec<String> = p.require.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                want.sort();
+                let offered: Vec<String> = labelled
+                    .iter()
+                    .map(|l| {
+                        let mut kv: Vec<String> =
+                            p.require.keys().map(|k| format!("{k}={}", l.get(k).map_or("-", |v| v))).collect();
+                        kv.sort();
+                        kv.join(",")
+                    })
+                    .collect();
+                return Some(format!(
+                    "infeasible: no live peer has labels {} (the {} live peer(s) offer: {})",
+                    want.join(","),
+                    labelled.len(),
+                    offered.join("; ")
+                ));
+            }
+        }
         let (cpus, memory, gpus, peers) = self.largest();
         if p.cpus > cpus + 1e-9 {
             return Some(format!(
@@ -79,10 +104,10 @@ impl Ingress {
                     .to_string(),
             );
         }
-        let wants_gpu = p.gpus > 0.0 || p.device.starts_with("cuda");
+        let wants_gpu = p.gpus > 0.0 || !p.device.is_empty();
         if wants_gpu && (gpus as f64) < p.gpus.max(1.0) {
             return Some(format!(
-                "infeasible: requested {} GPU(s) (device={:?}) but the largest peer has {} ({} candidate peer(s))",
+                "infeasible: requested {} accelerator(s) (device={:?}) but the largest peer has {} ({} candidate peer(s))",
                 p.gpus.max(1.0),
                 p.device,
                 gpus,
@@ -94,7 +119,9 @@ impl Ingress {
 
     async fn submit(&self, s: pb::SubmitTasks) -> pb::TaskAcks {
         let mut acks = Vec::with_capacity(s.tasks.len());
-        let mut by_vshard: BTreeMap<u16, Vec<pb::TaskSpec>> = BTreeMap::new();
+        // Keyed by (vshard, stream): generator calls run on this peer, where
+        // their consumer reads the items.
+        let mut by_vshard: BTreeMap<(u16, bool), Vec<pb::TaskSpec>> = BTreeMap::new();
         let mut order = Vec::new();
         for spec in s.tasks {
             let Some(tk) = spec.key.as_ref().and_then(Tk::parse) else {
@@ -116,13 +143,14 @@ impl Ingress {
                 continue;
             }
             order.push(tk);
-            by_vshard.entry(tk.v()).or_default().push(spec);
+            by_vshard.entry((tk.v(), spec.stream)).or_default().push(spec);
         }
         let mut results: BTreeMap<Tk, pb::TaskAck> = BTreeMap::new();
-        for (v, tasks) in by_vshard {
+        for ((v, stream), tasks) in by_vshard {
             // A local peer grants to itself in the same commit; in a cluster
-            // the group's leader places the work.
-            let grant_to = (!self.router.is_cluster()).then(|| self.router.identity.pb());
+            // the group's leader places the work, except generator calls.
+            let grant_to = (!self.router.is_cluster() || stream).then(|| self.router.identity.pb());
+            let batch: Vec<Tk> = tasks.iter().filter_map(|t| t.key.as_ref().and_then(Tk::parse)).collect();
             let body = pb::shard_cmd::Body::SubmitTasks(pb::SubmitTasks { tasks, grant_to });
             match self.router.propose(v, body).await {
                 Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(t)) }) => {
@@ -137,7 +165,7 @@ impl Ingress {
                         Ok(r) => format!("submission rejected: {r:?}"),
                         Err(e) => format!("submission not accepted: {e}"),
                     };
-                    for tk in order.iter().filter(|t| t.v() == v) {
+                    for tk in &batch {
                         results.insert(
                             *tk,
                             pb::TaskAck {
@@ -215,6 +243,7 @@ impl pb::peer_server::Peer for Service {
                 sys_path: r.sys_path.clone(),
                 env: r.env.clone(),
             }),
+            home: Some(self.0.router.identity.pb()),
             ..Default::default()
         };
         let reply = self
@@ -235,6 +264,9 @@ impl pb::peer_server::Peer for Service {
     async fn put_code(&self, req: Request<pb::PutCodeRequest>) -> Result<Response<pb::PutCodeReply>, Status> {
         let r = req.into_inner();
         self.0.code.put(&r.digest, &r.code).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        if let Some(mesh) = &self.0.router.mesh {
+            mesh.spread_code(r.digest, r.code);
+        }
         Ok(Response::new(pb::PutCodeReply { stored: true }))
     }
 
@@ -283,6 +315,11 @@ impl pb::peer_server::Peer for Service {
                             });
                         }
                     }
+                    Some(pb::client_msg::Msg::StreamCredit(c)) => {
+                        if let Some(task) = c.task.as_ref().and_then(Tk::parse) {
+                            let _ = this.core.send(CoreMsg::StreamCredit { task, up_to: c.up_to }).await;
+                        }
+                    }
                     Some(pb::client_msg::Msg::Cancel(c)) => {
                         if let Some(task) = c.task.as_ref().and_then(Tk::parse) {
                             let _ = this.core.send(CoreMsg::Cancel { task, force: c.force }).await;
@@ -305,6 +342,11 @@ impl pb::peer_server::Peer for Service {
                     }
                     Some(pb::client_msg::Msg::FinishRun(true)) => {
                         let _ = this.core.send(CoreMsg::FinishSessionRun { session: id }).await;
+                    }
+                    Some(pb::client_msg::Msg::EndRun(e)) => {
+                        if let Ok(run) = Id::from_slice(&e.run) {
+                            let _ = this.core.send(CoreMsg::EndRun { run, cancel: e.cancel }).await;
+                        }
                     }
                     _ => {}
                 }
@@ -403,10 +445,150 @@ impl pb::peer_server::Peer for Service {
         let Some(mesh) = &self.0.router.mesh else {
             return Err(Status::not_found("object not in this peer's store"));
         };
-        mesh.localize(&self.0.objects, &r.run, &r.object_id, &[])
+        mesh.localize(&self.0.objects, &r.run, &r.object_id, 0, &[])
             .await
             .map_err(|e| Status::not_found(format!("object not found on any live peer: {e}")))?;
         Ok(Response::new(pb::LocalizeReply {}))
+    }
+
+    async fn has_blobs(&self, req: Request<pb::HasBlobsRequest>) -> Result<Response<pb::HasBlobsReply>, Status> {
+        let r = req.into_inner();
+        let missing = r.blob_ids.into_iter().filter(|b| !self.0.objects.path(&r.run, b).exists()).collect();
+        Ok(Response::new(pb::HasBlobsReply { missing }))
+    }
+
+    async fn put_blob(&self, req: Request<Streaming<pb::PutBlobChunk>>) -> Result<Response<pb::PutBlobReply>, Status> {
+        let mut chunks = req.into_inner();
+        let first = chunks.next().await.ok_or_else(|| Status::invalid_argument("empty upload"))??;
+        let (run, blob_id, size) = (first.run, first.blob_id, first.size);
+        if blob_id.len() != 16 || run.is_empty() {
+            return Err(Status::invalid_argument("the first chunk names the run and the 16-byte blob id"));
+        }
+        if size > self.0.info.memory_bytes.max(1 << 30) {
+            return Err(Status::resource_exhausted(format!("blob of {size} bytes is larger than this peer's memory")));
+        }
+        let mut data = first.data;
+        data.reserve(size.saturating_sub(data.len() as u64) as usize);
+        while let Some(c) = chunks.next().await {
+            data.extend_from_slice(&c?.data);
+            if data.len() as u64 > size {
+                return Err(Status::invalid_argument(format!("upload is longer than the declared {size} bytes")));
+            }
+        }
+        if data.len() as u64 != size {
+            return Err(Status::invalid_argument(format!("upload ended at {} of {size} bytes", data.len())));
+        }
+        let objects = self.0.objects.clone();
+        tokio::task::spawn_blocking(move || objects.put_blob(&run, &blob_id, &data))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        Ok(Response::new(pb::PutBlobReply {}))
+    }
+
+    type GetObjectStream = Pin<Box<dyn Stream<Item = Result<pb::GetObjectChunk, Status>> + Send>>;
+
+    async fn get_object(&self, req: Request<pb::GetObjectRequest>) -> Result<Response<Self::GetObjectStream>, Status> {
+        let r = req.into_inner();
+        let path = self.0.objects.path(&r.run, &r.object_id);
+        let chunks = crate::stores::read_chunks(&path, r.offset, r.len, 1 << 20).await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Status::not_found(format!("object not in this peer's store: {e}")),
+            _ => Status::invalid_argument(e.to_string()),
+        })?;
+        let stream = tokio_stream::wrappers::ReceiverStream::new(chunks).map(|c| {
+            c.map(|c| pb::GetObjectChunk { data: c.data, total: c.total, checksum: c.checksum })
+                .map_err(|e| Status::internal(e.to_string()))
+        });
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    /// ch.Store: a write or a linearizable read, applied through the
+    /// namespace's group. A CHANGES read with `wait_ms` waits for a change
+    /// (a watch's long poll): it watches this peer's replica of the namespace
+    /// cheaply and re-reads through the log once the revision moves.
+    async fn events(&self, req: Request<pb::EventsRequest>) -> Result<Response<pb::EventsReply>, Status> {
+        let r = req.into_inner();
+        let wait = r.wait_ms > 0;
+        let (reply, rx) = oneshot::channel();
+        self.0
+            .core
+            .send(CoreMsg::Events { kinds: r.kinds, since: r.since, wait, reply })
+            .await
+            .map_err(|_| Status::unavailable("peer is stopping"))?;
+        let events = if wait {
+            let limit = std::time::Duration::from_millis(u64::from(r.wait_ms.min(60_000)));
+            tokio::time::timeout(limit, rx).await.ok().and_then(|x| x.ok()).unwrap_or_default()
+        } else {
+            rx.await.unwrap_or_default()
+        };
+        let next = events.last().map_or(r.since, |e| e.seq + 1);
+        Ok(Response::new(pb::EventsReply {
+            events,
+            next,
+            peer: self.0.info.peer.clone(),
+            incarnation: self.0.info.incarnation,
+        }))
+    }
+
+    /// A run's output from the calls this peer ran (crate::runlogs), from
+    /// `offset`, at most 1 MiB; waits up to `wait_ms` for more.
+    async fn logs(&self, req: Request<pb::LogsRequest>) -> Result<Response<pb::LogsReply>, Status> {
+        let r = req.into_inner();
+        let path = crate::runlogs::path(&self.0.code, &r.run);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(u64::from(r.wait_ms.min(30_000)));
+        loop {
+            let p = path.clone();
+            let (text, next, size) = tokio::task::spawn_blocking(move || crate::runlogs::read(&p, r.offset, 1 << 20))
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(|e| Status::internal(format!("reading run output: {e}")))?;
+            if !text.is_empty() || tokio::time::Instant::now() >= deadline {
+                return Ok(Response::new(pb::LogsReply { text, next, size }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn store(&self, req: Request<pb::StoreRequest>) -> Result<Response<pb::StoreReply>, Status> {
+        use chimaera_core::shard::store;
+        let r = req.into_inner();
+        let (tenant, namespace) = match (&r.write, &r.read) {
+            (Some(w), _) => (w.tenant.clone(), w.namespace.clone()),
+            (None, Some(rd)) => (rd.tenant.clone(), rd.namespace.clone()),
+            (None, None) => return Err(Status::invalid_argument("a store request needs a write or a read")),
+        };
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("a store namespace must not be empty"));
+        }
+        let v = store::vshard_of(&tenant, &namespace);
+        let propose = |body| async move {
+            match self.0.router.propose(v, body).await {
+                Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Store(reply)) }) => Ok(reply),
+                Ok(other) => Err(Status::unavailable(format!("store command rejected: {other:?}"))),
+                Err(e) => Err(Status::unavailable(format!("store command not accepted: {e}"))),
+            }
+        };
+        if let Some(w) = r.write {
+            return propose(pb::shard_cmd::Body::StoreWrite(w)).await.map(Response::new);
+        }
+        let read = r.read.expect("checked above");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(r.wait_ms as u64);
+        let watching = read.kind() == pb::store_read::Kind::Changes && r.wait_ms > 0;
+        loop {
+            let reply = propose(pb::shard_cmd::Body::StoreRead(read.clone())).await?;
+            if !watching || !reply.changes.is_empty() || reply.compacted || tokio::time::Instant::now() >= deadline {
+                return Ok(Response::new(reply));
+            }
+            // Wait for the namespace's revision to pass what we just read.
+            let probe = pb::StoreRead { kind: pb::store_read::Kind::Changes as i32, limit: 1, ..read.clone() };
+            while tokio::time::Instant::now() < deadline {
+                let hosted = self.0.router.read(v, |kv| store::read(kv, v, &probe, 0).revision);
+                tokio::time::sleep(std::time::Duration::from_millis(if hosted.is_some() { 20 } else { 200 })).await;
+                if hosted.is_none_or(|rev| rev > reply.revision) {
+                    break;
+                }
+            }
+        }
     }
 
     async fn shutdown(&self, _req: Request<pb::ShutdownRequest>) -> Result<Response<pb::ShutdownReply>, Status> {

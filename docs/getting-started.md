@@ -58,6 +58,24 @@ for you. Leaving the `with` block cancels whatever is still running.
 To wait on a handful of futures, use `ch.gather(*futures)` (values in order) or
 `ch.as_completed(futures)` (futures as they finish).
 
+A generator function streams its items back as it yields them:
+
+```python
+@ch.remote
+def lines(path):
+    with open(path) as f:
+        yield from f
+
+for line in lines.remote("big.log"):
+    ...
+```
+
+The generator stays at most 64 items ahead of your loop
+(`.options(max_in_flight=8)` changes that). `async for` works too, and
+`.close()` stops it early. If its worker dies, the generator runs again and
+you get the remaining items once each, so it should yield the same items
+every time it runs.
+
 ## 4. State in an actor
 
 ```python
@@ -83,6 +101,31 @@ t.close()
 `async def` methods are ordered too. If you want calls to overlap,
 say so: `@ch.remote(concurrency=4)`.
 
+An actor's state normally lives only in its process. Give the class
+`state=ch.State()` and every call that returns commits the instance's
+attributes before its reply goes out:
+
+```python
+@ch.remote(state=ch.State())
+class Account:
+    def __init__(self):
+        self.balance = 0
+
+    def deposit(self, amount):
+        self.balance += amount
+        return self.balance
+
+a = Account.options(key="account/42").remote()
+a.deposit.options(command_id="order-17").remote(5).result()   # 5
+a.deposit.options(command_id="order-17").remote(5).result()   # 5 again: not deposited twice
+```
+
+If its process or its peer dies, the actor comes back with the last
+committed state, without running `__init__` again. A call that raises
+commits nothing. Reusing a `command_id` with different arguments raises
+`ch.CommandConflict`. The state is stored inline, so keep it under 1 MiB
+pickled, and a durable actor runs one call at a time.
+
 ## 5. Ask for resources
 
 ```python
@@ -96,6 +139,16 @@ larger one), then fails with `ch.OutOfMemory` and the peak it reached.
 
 Sizes need a unit: `"512 MiB"`, `"2 GB"`. Library thread pools (OpenMP, BLAS)
 are sized to the CPUs you asked for.
+
+You usually do not need either. Without them, the peer measures each
+function's calls: after three, later calls reserve the memory they were seen
+to use (more for larger inputs when memory tracks input size), and calls wait
+for memory rather than run out of it. A function whose calls mostly wait gets
+a smaller CPU share once a trial shows that is faster per core.
+`future.explain()["attempts"][-1]["reservation"]` says what a call reserved
+and why, and `chimaera explain RUN --decisions` lists every change. Set
+`cpus`/`memory` to fix a value, `ch.auto(min=..., max=...)` to bound it, or
+`adaptive="frozen"` to turn learning off.
 
 ## 6. When something goes wrong
 
@@ -126,6 +179,26 @@ for task_id, value, error in run.outcomes():
 Start a run with `ch.init(detach=True)` (or `chimaera run --detach -- python app.py`)
 to keep its work going after your script exits.
 
+A long sequence of steps can survive its own worker dying. Mark it a durable
+workflow:
+
+```python
+@ch.remote(workflow="durable")
+async def nightly(day):
+    raw = await extract.remote(day)
+    clean = await transform.remote(raw)
+    started = ch.workflow.now()
+    return await load.remote(clean, started)
+```
+
+If its worker dies, the workflow runs again from the top, and each call it
+already made is answered from the run's record instead of running twice. So
+it must make the same calls, in the same order, every time: anything that
+varies (the time, random numbers, an API response) goes through
+`ch.workflow.now()`, `ch.workflow.random()` or `ch.workflow.record(fn, ...)`.
+A replay that asks for something different at a step raises
+`ch.WorkflowDivergence`.
+
 ## 8. Environment variables
 
 Workers do not see your shell's environment. A run carries only locale
@@ -146,4 +219,5 @@ chimaera status
 chimaera inspect RUN
 chimaera explain RUN --task TASK
 chimaera explain RUN --decisions
+chimaera profiles            # per function: calls, time, cores, and what the next call reserves
 ```

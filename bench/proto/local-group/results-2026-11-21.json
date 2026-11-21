@@ -1,0 +1,290 @@
+{
+ "round_trips": [
+  {
+   "bin": "chimaera-base",
+   "task": [
+    498.7,
+    3528.2
+   ],
+   "actor": [
+    530.7,
+    1499.9
+   ],
+   "load": 13.80224609375
+  },
+  {
+   "bin": "chimaera-local",
+   "task": [
+    294.8,
+    931.9
+   ],
+   "actor": [
+    331.2,
+    987.8
+   ],
+   "load": 14.05810546875
+  },
+  {
+   "bin": "chimaera-base",
+   "task": [
+    482.8,
+    1546.9
+   ],
+   "actor": [
+    513.8,
+    807.1
+   ],
+   "load": 13.89306640625
+  },
+  {
+   "bin": "chimaera-local",
+   "task": [
+    300.6,
+    482.0
+   ],
+   "actor": [
+    336.6,
+    1659.8
+   ],
+   "load": 13.5009765625
+  },
+  {
+   "bin": "chimaera-base",
+   "task": [
+    490.2,
+    1287.1
+   ],
+   "actor": [
+    516.5,
+    1380.6
+   ],
+   "load": 12.97998046875
+  },
+  {
+   "bin": "chimaera-local",
+   "task": [
+    298.3,
+    458.9
+   ],
+   "actor": [
+    329.5,
+    1427.5
+   ],
+   "load": 12.97998046875
+  }
+ ],
+ "microbench": {
+  "base-0": [
+   {
+    "name": "single client tasks sync",
+    "value": 1582.7287596276908,
+    "sd": 149.42209447108073,
+    "unit": "ops/s"
+   },
+   {
+    "name": "single client tasks async",
+    "value": 16252.846492759552,
+    "sd": 1802.3210883988704,
+    "unit": "ops/s"
+   },
+   {
+    "name": "multi client tasks async",
+    "value": 10280.499391016196,
+    "sd": 2199.4656441101292,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls sync",
+    "value": 1303.6318315075678,
+    "sd": 169.27841940942173,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls async",
+    "value": 9979.869920035932,
+    "sd": 3159.83951688175,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls concurrent",
+    "value": 9612.641740068448,
+    "sd": 1361.399114304987,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls async",
+    "value": 11675.856170243675,
+    "sd": 1764.6767082808035,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls with arg async",
+    "value": 10361.409090734996,
+    "sd": 1784.5123673726223,
+    "unit": "ops/s"
+   }
+  ],
+  "base-1": [
+   {
+    "name": "single client tasks sync",
+    "value": 924.8647410685683,
+    "sd": 324.65684320620045,
+    "unit": "ops/s"
+   },
+   {
+    "name": "single client tasks async",
+    "value": 11681.721966531684,
+    "sd": 993.9723843883464,
+    "unit": "ops/s"
+   },
+   {
+    "name": "multi client tasks async",
+    "value": 10688.3306836808,
+    "sd": 1505.007111409602,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls sync",
+    "value": 1264.3296170945007,
+    "sd": 347.8759319999185,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls async",
+    "value": 8171.411248081438,
+    "sd": 2663.5628275091663,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls concurrent",
+    "value": 5833.349733845294,
+    "sd": 1442.8969974150784,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls async",
+    "value": 12241.078510076226,
+    "sd": 2731.280199516658,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls with arg async",
+    "value": 7612.660705813856,
+    "sd": 1069.725032733794,
+    "unit": "ops/s"
+   }
+  ],
+  "local-0": [
+   {
+    "name": "single client tasks sync",
+    "value": 2154.788016766623,
+    "sd": 525.1982064454699,
+    "unit": "ops/s"
+   },
+   {
+    "name": "single client tasks async",
+    "value": 18309.167996403616,
+    "sd": 1487.0639875014153,
+    "unit": "ops/s"
+   },
+   {
+    "name": "multi client tasks async",
+    "value": 9789.313605571233,
+    "sd": 2025.5095934312053,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls sync",
+    "value": 716.4650235792818,
+    "sd": 163.20826703540135,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls async",
+    "value": 6869.837006169001,
+    "sd": 290.02254202325946,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls concurrent",
+    "value": 5071.623944020543,
+    "sd": 144.48806585854157,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls async",
+    "value": 7008.903923703386,
+    "sd": 575.0248228279112,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls with arg async",
+    "value": 5290.7340362591785,
+    "sd": 2581.5898466196704,
+    "unit": "ops/s"
+   }
+  ],
+  "local-1": [
+   {
+    "name": "single client tasks sync",
+    "value": 1529.6480700380573,
+    "sd": 244.78578994737026,
+    "unit": "ops/s"
+   },
+   {
+    "name": "single client tasks async",
+    "value": 11581.985489690192,
+    "sd": 2655.711320900086,
+    "unit": "ops/s"
+   },
+   {
+    "name": "multi client tasks async",
+    "value": 7103.9825224088945,
+    "sd": 1035.4065496500987,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls sync",
+    "value": 1923.5838814412248,
+    "sd": 185.8416252556425,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls async",
+    "value": 12153.050025145849,
+    "sd": 2044.60392437483,
+    "unit": "ops/s"
+   },
+   {
+    "name": "1:1 actor calls concurrent",
+    "value": 5349.739281733661,
+    "sd": 1682.3331262204213,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls async",
+    "value": 11112.198571132161,
+    "sd": 1156.7725987983974,
+    "unit": "ops/s"
+   },
+   {
+    "name": "n:n actor calls with arg async",
+    "value": 10151.23191164222,
+    "sd": 779.4872930718551,
+    "unit": "ops/s"
+   }
+  ]
+ },
+ "commit_path": {
+  "raft log": {
+   "p50_us": 346,
+   "p99_us": 3106,
+   "concurrent_per_s": 95028
+  },
+  "no log": {
+   "p50_us": 132,
+   "p99_us": 479,
+   "concurrent_per_s": 98972
+  }
+ }
+}

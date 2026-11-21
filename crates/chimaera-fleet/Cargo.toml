@@ -1,0 +1,17 @@
+[package]
+name = "chimaera-fleet"
+description = "Fleet emulator: drives the real SWIM, shard and cell-summary code for whole cells"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "chimaera-fleet"
+path = "src/main.rs"
+
+[dependencies]
+chimaera-core.workspace = true
+clap = { version = "4.6", features = ["derive"] }
+serde_json = "1"

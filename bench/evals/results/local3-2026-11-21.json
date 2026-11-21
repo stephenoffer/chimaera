@@ -1,0 +1,515 @@
+{
+  "meta": {
+    "machine": "macOS-14.5-arm64-arm-64bit-Mach-O 12 cpus",
+    "nodes": 3,
+    "cpus_per_node": 4,
+    "rounds": 3,
+    "load_avg_after": [
+      15.9140625,
+      17.0205078125,
+      15.47314453125
+    ]
+  },
+  "summary": {
+    "tasks": {
+      "ray": {
+        "tasks_per_s": 8739,
+        "cpus": 12,
+        "runs": 3
+      },
+      "chimaera": {
+        "tasks_per_s": 4959,
+        "cpus": 12,
+        "runs": 3
+      }
+    },
+    "cpu_scaling": {
+      "ray": {
+        "seconds": 1.001,
+        "efficiency": 0.599,
+        "cpus": 12,
+        "runs": 3
+      },
+      "chimaera": {
+        "seconds": 0.817,
+        "efficiency": 0.734,
+        "cpus": 12,
+        "runs": 3
+      }
+    },
+    "map_small": {
+      "ray": {
+        "naive_items_per_s": 7644,
+        "hand_batched_items_per_s": 8267682,
+        "runs": 3
+      },
+      "chimaera": {
+        "naive_items_per_s": 246776,
+        "runs": 3
+      }
+    },
+    "broadcast": {
+      "ray": {
+        "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_privat"
+      },
+      "chimaera": {
+        "seconds": 0.409,
+        "nodes_reached": 1,
+        "readers": 24,
+        "runs": 3
+      }
+    },
+    "actors": {
+      "ray": {
+        "calls_per_s": 15894,
+        "actors": 8,
+        "hosts": 1,
+        "runs": 3
+      },
+      "chimaera": {
+        "calls_per_s": 7475,
+        "actors": 8,
+        "hosts": 1,
+        "runs": 3
+      }
+    },
+    "nested": {
+      "ray": {
+        "seconds": 2.494,
+        "parents": 48,
+        "runs": 3
+      },
+      "chimaera": {
+        "seconds": 0.89,
+        "parents": 48,
+        "runs": 3
+      }
+    },
+    "shuffle": {
+      "ray": {
+        "seconds": 1.514,
+        "pairs": 960000,
+        "runs": 3
+      },
+      "chimaera": {
+        "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/b"
+      }
+    }
+  },
+  "records": [
+    {
+      "runtime": "ray",
+      "workload": "tasks",
+      "result": {
+        "tasks_per_s": 9508,
+        "cpus": 12
+      },
+      "wall_s": 8.2,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "tasks",
+      "result": {
+        "tasks_per_s": 4959,
+        "cpus": 12
+      },
+      "wall_s": 12.2,
+      "round": 0
+    },
+    {
+      "runtime": "ray",
+      "workload": "cpu_scaling",
+      "result": {
+        "seconds": 1.001,
+        "efficiency": 0.599,
+        "cpus": 12
+      },
+      "wall_s": 3.7,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "cpu_scaling",
+      "result": {
+        "seconds": 0.758,
+        "efficiency": 0.791,
+        "cpus": 12
+      },
+      "wall_s": 0.9,
+      "round": 0
+    },
+    {
+      "runtime": "ray",
+      "workload": "map_small",
+      "result": {
+        "naive_items_per_s": 7644,
+        "hand_batched_items_per_s": 8267682
+      },
+      "wall_s": 9.4,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "map_small",
+      "result": {
+        "naive_items_per_s": 246776
+      },
+      "wall_s": 5.0,
+      "round": 0
+    },
+    {
+      "runtime": "ray",
+      "workload": "broadcast",
+      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
+      "wall_s": 1.7,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "broadcast",
+      "result": {
+        "seconds": 0.573,
+        "nodes_reached": 1,
+        "readers": 24
+      },
+      "wall_s": 1.3,
+      "round": 0
+    },
+    {
+      "runtime": "ray",
+      "workload": "actors",
+      "result": {
+        "calls_per_s": 8635,
+        "actors": 8,
+        "hosts": 1
+      },
+      "wall_s": 5.1,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "actors",
+      "result": {
+        "calls_per_s": 2615,
+        "actors": 8,
+        "hosts": 1
+      },
+      "wall_s": 2.4,
+      "round": 0
+    },
+    {
+      "runtime": "ray",
+      "workload": "nested",
+      "result": {
+        "seconds": 3.597,
+        "parents": 48
+      },
+      "wall_s": 5.5,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "nested",
+      "result": {
+        "seconds": 1.055,
+        "parents": 48
+      },
+      "wall_s": 1.3,
+      "round": 0
+    },
+    {
+      "runtime": "ray",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 2.468,
+        "pairs": 960000
+      },
+      "wall_s": 4.3,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "shuffle",
+      "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
+      "wall_s": 0.5,
+      "round": 0
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "tasks",
+      "result": {
+        "tasks_per_s": 3596,
+        "cpus": 12
+      },
+      "wall_s": 17.0,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "tasks",
+      "result": {
+        "tasks_per_s": 8271,
+        "cpus": 12
+      },
+      "wall_s": 9.1,
+      "round": 1
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "cpu_scaling",
+      "result": {
+        "seconds": 0.817,
+        "efficiency": 0.734,
+        "cpus": 12
+      },
+      "wall_s": 1.0,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "cpu_scaling",
+      "result": {
+        "seconds": 1.662,
+        "efficiency": 0.361,
+        "cpus": 12
+      },
+      "wall_s": 4.6,
+      "round": 1
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "map_small",
+      "result": {
+        "naive_items_per_s": 156777
+      },
+      "wall_s": 7.8,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "map_small",
+      "result": {
+        "naive_items_per_s": 7467,
+        "hand_batched_items_per_s": 7003590
+      },
+      "wall_s": 9.5,
+      "round": 1
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "broadcast",
+      "result": {
+        "seconds": 0.409,
+        "nodes_reached": 1,
+        "readers": 24
+      },
+      "wall_s": 0.7,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "broadcast",
+      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
+      "wall_s": 1.5,
+      "round": 1
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "actors",
+      "result": {
+        "calls_per_s": 7475,
+        "actors": 8,
+        "hosts": 1
+      },
+      "wall_s": 1.0,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "actors",
+      "result": {
+        "calls_per_s": 15894,
+        "actors": 8,
+        "hosts": 1
+      },
+      "wall_s": 3.0,
+      "round": 1
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "nested",
+      "result": {
+        "seconds": 0.89,
+        "parents": 48
+      },
+      "wall_s": 1.0,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "nested",
+      "result": {
+        "seconds": 2.426,
+        "parents": 48
+      },
+      "wall_s": 3.8,
+      "round": 1
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "shuffle",
+      "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
+      "wall_s": 0.1,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 1.37,
+        "pairs": 960000
+      },
+      "wall_s": 2.8,
+      "round": 1
+    },
+    {
+      "runtime": "ray",
+      "workload": "tasks",
+      "result": {
+        "tasks_per_s": 8739,
+        "cpus": 12
+      },
+      "wall_s": 8.2,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "tasks",
+      "result": {
+        "tasks_per_s": 6385,
+        "cpus": 12
+      },
+      "wall_s": 9.5,
+      "round": 2
+    },
+    {
+      "runtime": "ray",
+      "workload": "cpu_scaling",
+      "result": {
+        "seconds": 0.948,
+        "efficiency": 0.633,
+        "cpus": 12
+      },
+      "wall_s": 3.4,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "cpu_scaling",
+      "result": {
+        "seconds": 0.821,
+        "efficiency": 0.731,
+        "cpus": 12
+      },
+      "wall_s": 1.0,
+      "round": 2
+    },
+    {
+      "runtime": "ray",
+      "workload": "map_small",
+      "result": {
+        "naive_items_per_s": 8034,
+        "hand_batched_items_per_s": 10042562
+      },
+      "wall_s": 9.0,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "map_small",
+      "result": {
+        "naive_items_per_s": 294015
+      },
+      "wall_s": 4.2,
+      "round": 2
+    },
+    {
+      "runtime": "ray",
+      "workload": "broadcast",
+      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
+      "wall_s": 1.6,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "broadcast",
+      "result": {
+        "seconds": 0.336,
+        "nodes_reached": 1,
+        "readers": 24
+      },
+      "wall_s": 1.0,
+      "round": 2
+    },
+    {
+      "runtime": "ray",
+      "workload": "actors",
+      "result": {
+        "calls_per_s": 17279,
+        "actors": 8,
+        "hosts": 1
+      },
+      "wall_s": 2.5,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "actors",
+      "result": {
+        "calls_per_s": 9222,
+        "actors": 8,
+        "hosts": 1
+      },
+      "wall_s": 0.8,
+      "round": 2
+    },
+    {
+      "runtime": "ray",
+      "workload": "nested",
+      "result": {
+        "seconds": 2.494,
+        "parents": 48
+      },
+      "wall_s": 3.9,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "nested",
+      "result": {
+        "seconds": 0.062,
+        "parents": 48
+      },
+      "wall_s": 0.2,
+      "round": 2
+    },
+    {
+      "runtime": "ray",
+      "workload": "shuffle",
+      "result": {
+        "seconds": 1.514,
+        "pairs": 960000
+      },
+      "wall_s": 2.8,
+      "round": 2
+    },
+    {
+      "runtime": "chimaera",
+      "workload": "shuffle",
+      "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
+      "wall_s": 0.2,
+      "round": 2
+    }
+  ]
+}

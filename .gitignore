@@ -8,3 +8,4 @@ __pycache__/
 /python/chimaera/_bin/
 /dist/
 .chimaera/
+/results/
