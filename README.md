@@ -45,7 +45,7 @@ and their results travel worker to worker without passing through your script.
 On a laptop, the first `.remote()` starts a local peer for you. On a cluster,
 the same file runs unchanged.
 
-## Why Chimaera
+## What you get
 
 ### No head node
 
@@ -98,7 +98,7 @@ A laptop, a few SSH hosts, Kubernetes or Slurm, from one binary:
 `chimaera up` over SSH, `chimaera k8s render --image IMG | kubectl apply -f -`, or
 `chimaera slurm-launch` inside an allocation. Then
 `chimaera submit --cluster NAME -- python app.py` ships this directory and
-runs the program on the cluster, detached, and prints its run id. See
+starts the program on the cluster in the background. You get its run id back. See
 [clusters](docs/guides/clusters.md) and [deploy.md](docs/deploy.md).
 
 ## Install
@@ -124,7 +124,7 @@ Chimaera is early software. This is what works today:
 | Area | State |
 |---|---|
 | Functions, futures as dependencies, `map`, actors, pools | Working, on one machine and across peers |
-| Retries, `ch.OutcomeUnknown` for external effects, memory limits, cancellation, deadlines | Working |
+| Retries, `ch.OutcomeUnknown` for external effects, memory limits, canceling calls, deadlines | Working |
 | Learned CPU and memory reservations, memory-aware admission, large values stored once | Working; across peers, placement weighs input locality and memory |
 | Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |
 | Reattaching to a run after the driver or the peer restarts (`ch.runs.attach`) | Working |

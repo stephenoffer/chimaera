@@ -29,7 +29,8 @@ command runs the binary installed with the package. A failing command prints
 
 `status`, `runs`, `actors`, `cancel`, `logs`, `inspect` and `explain` take
 `--cluster <CLUSTER>`: a profile name from ~/.config/chimaera/clusters.toml,
-or tcp://host:port. The first of these that applies wins:
+or tcp://host:port. Their tables below leave that flag out. To pick the peer,
+the first of these that applies wins:
 
 1. `--cluster`.
 2. `--dir` or `CHIMAERA_HOME`: whichever peer uses that directory.
@@ -62,16 +63,16 @@ chimaera run [OPTIONS] <COMMAND>...
 | `--detach` | Keep the program's run going after the program exits |
 | `--cluster <CLUSTER>` | A cluster profile or tcp://host:port, passed to the program as $CHIMAERA_CLUSTER |
 
-`chimaera run` exits with the program's exit status. The program gets
-`CHIMAERA_DETACH` (`1` with `--detach`, else `0`), plus `CHIMAERA_CLUSTER`
-or, without `--cluster`, `CHIMAERA_HOME` set to the data directory.
+`chimaera run` exits with your program's exit status. It sets
+`CHIMAERA_DETACH` for it (`1` with `--detach`, else `0`), plus `CHIMAERA_CLUSTER`
+or, without `--cluster`, `CHIMAERA_HOME` pointing at the peer's directory.
 
 A program that calls `ch.init()` itself ignores `--detach`, since `detach`
 defaults to `False`. Use `ch.init(detach=True)` there.
 
 ### `chimaera submit`
 
-Run a program on the cluster. It runs on a peer as the one call of a
+Run a program remotely. One peer runs it as the only call of a
 detached run, with this directory shipped as its project. `submit` prints
 the run's id and returns (`chimaera logs RUN`, `chimaera cancel RUN`).
 
@@ -84,9 +85,9 @@ chimaera submit [OPTIONS] <COMMAND>...
 | `<COMMAND>...` | The program and its arguments, after `--` |
 | `--cluster <CLUSTER>` | A cluster profile or tcp://host:port (default: as for a driver) |
 
-The program runs at most once. A leading `python` or `python3` in the
-command becomes the peer's own interpreter. If the cluster has not taken the
-program within 60 seconds, `submit` fails. The run stays active after the
+It runs at most once. A leading `python` or `python3` in the
+command becomes the peer's own interpreter. If no peer has taken it
+within 60 seconds, `submit` fails. The run stays active after your
 program exits, until `chimaera cancel RUN` ends it.
 
 `submit` itself runs `$CHIMAERA_PYTHON -m chimaera._submit` (default
@@ -105,7 +106,6 @@ chimaera status [OPTIONS]
 | Flag | Description |
 |---|---|
 | `--json` | Print the status as JSON |
-| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 On a clustered peer, the output adds every peer (unreachable ones marked) and
 each Raft group this peer holds, with its leader and voters.
@@ -123,7 +123,6 @@ chimaera runs [OPTIONS]
 |---|---|
 | `--limit <LIMIT>` | Show at most this many (0: all) [default: 20] |
 | `--json` | Print the runs as JSON |
-| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera actors`
 
@@ -137,7 +136,6 @@ chimaera actors [OPTIONS]
 |---|---|
 | `--prefix <PREFIX>` | Only names starting with this [default: ""] |
 | `--json` | Print the actors as JSON |
-| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera inspect`
 
@@ -151,7 +149,6 @@ chimaera inspect [OPTIONS] <RUN>
 |---|---|
 | `<RUN>` | The run id, 32 hex digits |
 | `--json` | Print the run's state, whether it is detached, and its counts as JSON |
-| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera explain`
 
@@ -168,7 +165,6 @@ chimaera explain [OPTIONS] <RUN>
 | `--task <TASK>` | Task id (hex) to explain: the second half of a future's `id` |
 | `--decisions` | Show tuning decisions |
 | `--json` | Print the attempts, decisions, waiting reason and task state as JSON |
-| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera logs`
 
@@ -182,7 +178,6 @@ chimaera logs [OPTIONS] <RUN>
 |---|---|
 | `<RUN>` | The run id, 32 hex digits |
 | `-f, --follow` | Keep waiting for more output (Ctrl-C to stop) |
-| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 Each line reads `<task> <stream>| <text>`, where `<task>` is the first 12 hex
 digits of the call's task id.
@@ -201,7 +196,7 @@ chimaera profiles [OPTIONS]
 | `--fn <NAME>` | Only functions whose name contains this |
 | `--json` | Print the profiles as JSON |
 
-It reads `profiles.pb` in the data directory, which its peer rewrites
+It reads `profiles.pb` from the peer's directory. The peer rewrites that file
 every 30 seconds while profiles change, and when it stops.
 
 ### `chimaera objects`
@@ -245,7 +240,6 @@ chimaera cancel [OPTIONS] [RUNS]...
 | `[RUNS]...` | Runs to cancel, ids as `chimaera runs` prints them |
 | `--match <PATTERN>` | Instead of ids: the active runs whose command contains this text |
 | `--yes` | With `--match`, cancel them. Without it, `--match` only lists what would be cancelled |
-| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera stop`
 
@@ -399,7 +393,7 @@ chimaera k8s render [OPTIONS] --image <IMAGE>
 | `--provisioner <MAX>` | Also run the provisioner in the cluster, growing the pool from --replicas up to MAX peers under load (a Deployment whose Role may only read this StatefulSet and change its scale). Needs --namespace |
 
 With fewer than 3 founders it warns on stderr: losing one peer can then
-stop the cluster's groups until it returns.
+halt the cluster's groups until it returns.
 
 ### `chimaera slurm-launch`
 
