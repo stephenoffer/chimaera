@@ -1,4 +1,4 @@
-"""ch.cluster().events(): the peer's event log as a stream of typed events."""
+"""ch.runs.cluster().events(): the peer's event log as a stream of typed events."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class Short:
 
 
 def test_a_stream_from_now_sees_what_happens_next_in_order():
-    stream = ch.cluster().events(["task_failed", "actor"])
+    stream = ch.runs.cluster().events(["task_failed", "actor"])
     f = doomed.remote()
     with pytest.raises(ValueError):
         f.result(timeout=60)
@@ -46,6 +46,6 @@ def test_history_without_follow_stops_at_the_newest():
     f = doomed.remote()
     with pytest.raises(ValueError):
         f.result(timeout=60)
-    history = list(ch.cluster().events(["task_failed"], since=0, follow=False))
+    history = list(ch.runs.cluster().events(["task_failed"], since=0, follow=False))
     assert f.id in [e.task for e in history]
     assert all(e.kind == "task_failed" for e in history)

@@ -1,0 +1,627 @@
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "1K", "op": "put", "median_s": 0.000166970999998739, "min_s": 0.00012342200000148296, "n": 200, "payload": 1024}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "64K", "op": "put", "median_s": 0.00018152749998989748, "min_s": 0.00012784000000465312, "n": 200, "payload": 65536}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "1M", "op": "put", "median_s": 0.00034754699998984506, "min_s": 0.0002269640000349682, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "16M", "op": "put", "median_s": 0.001273248500012869, "min_s": 0.0005784680000715525, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "256M", "op": "put", "median_s": 0.014935133499989206, "min_s": 0.0052263489999404555, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "1G", "op": "put", "median_s": 0.13075380399999403, "min_s": 0.05634399999996731, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "1K", "op": "put", "median_s": 0.0002678685000319092, "min_s": 0.00019685500001287437, "n": 200, "payload": 1024}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "64K", "op": "put", "median_s": 0.0002662890000237894, "min_s": 0.00020214299991039297, "n": 200, "payload": 65536}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "1M", "op": "put", "median_s": 0.00039223549998723684, "min_s": 0.00030675599998630787, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "16M", "op": "put", "median_s": 0.0006092854999906194, "min_s": 0.0005744139999706022, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "256M", "op": "put", "median_s": 0.00527478499998324, "min_s": 0.005101974000012888, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "1G", "op": "put", "median_s": 0.019224941499999204, "min_s": 0.019159725999998045, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "1K", "op": "put", "median_s": 0.00034828999997671417, "min_s": 0.00028735900002629933, "n": 200, "payload": 1024}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "64K", "op": "put", "median_s": 0.0003677914999684617, "min_s": 0.0003287060000047859, "n": 200, "payload": 65536}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "1M", "op": "put", "median_s": 0.0006036975000824896, "min_s": 0.0004945580000139671, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "16M", "op": "put", "median_s": 0.026149127500048053, "min_s": 0.025972769999953016, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "256M", "op": "put", "median_s": 0.28798643200002516, "min_s": 0.2870469200000798, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "1G", "op": "put", "median_s": 1.1628230290000374, "min_s": 1.1611132069999712, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "1K", "op": "put", "median_s": 0.0004164740000760503, "min_s": 0.00037849299997105845, "n": 200, "payload": 1170}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "64K", "op": "put", "median_s": 0.00043963600001006853, "min_s": 0.0003898170000411483, "n": 200, "payload": 76145}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "1M", "op": "put", "median_s": 0.0006472964998920361, "min_s": 0.000544404000038412, "n": 200, "payload": 1218492}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "16M", "op": "put", "median_s": 0.002713171499976852, "min_s": 0.0025908659999913652, "n": 40, "payload": 19496064}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "256M", "op": "put", "median_s": 0.03567734950001977, "min_s": 0.0354714850000164, "n": 8, "payload": 311932170}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "1G", "op": "put", "median_s": 0.14005956300002254, "min_s": 0.13937211699999352, "n": 4, "payload": 1247728313}
+{"runtime": "ray", "scenario": "put", "kind": "pandas", "size": "1K", "op": "put", "median_s": 0.00040230150000297726, "min_s": 0.00031659599994782184, "n": 200, "payload": 1140}
+{"runtime": "ray", "scenario": "put", "kind": "pandas", "size": "64K", "op": "put", "median_s": 0.0005618079998157555, "min_s": 0.0004795380000359728, "n": 200, "payload": 65652}
+{"runtime": "ray", "scenario": "put", "kind": "pandas", "size": "1M", "op": "put", "median_s": 0.0030828605000579046, "min_s": 0.003010716999824581, "n": 200, "payload": 1048692}
+{"runtime": "ray", "scenario": "put", "kind": "pandas", "size": "16M", "op": "put", "median_s": 0.10839239150016056, "min_s": 0.10780921099990337, "n": 40, "payload": 16777332}
+{"runtime": "ray", "scenario": "put", "kind": "pandas", "size": "256M", "op": "put", "median_s": 3.1508535979999124, "min_s": 3.0871638139999504, "n": 3, "payload": 268435572}
+{"runtime": "ray", "scenario": "put", "kind": "pydict", "size": "1K", "op": "put", "median_s": 0.00016075949997684802, "min_s": 0.00012047900008838042, "n": 200, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pydict", "size": "64K", "op": "put", "median_s": 0.00025363900010688667, "min_s": 0.00017735000005814072, "n": 200, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pydict", "size": "1M", "op": "put", "median_s": 0.0009381664999636996, "min_s": 0.0008804980000149953, "n": 200, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pydict", "size": "16M", "op": "put", "median_s": 0.011016751500051214, "min_s": 0.01086281100015185, "n": 40, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pydict", "size": "256M", "op": "put", "median_s": 0.2641969404999145, "min_s": 0.26361825599997246, "n": 8, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pylist", "size": "1K", "op": "put", "median_s": 0.00016880550003861572, "min_s": 0.00012047899986100674, "n": 200, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pylist", "size": "64K", "op": "put", "median_s": 0.0002700730000242402, "min_s": 0.00020140600008744514, "n": 200, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pylist", "size": "1M", "op": "put", "median_s": 0.0011618060000273545, "min_s": 0.0011127850000320905, "n": 200, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pylist", "size": "16M", "op": "put", "median_s": 0.01495927100006611, "min_s": 0.014741163000053348, "n": 40, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "pylist", "size": "256M", "op": "put", "median_s": 0.28500563850002436, "min_s": 0.28477624300012394, "n": 8, "payload": 0}
+{"runtime": "ray", "scenario": "put", "kind": "str", "size": "1K", "op": "put", "median_s": 0.0001911935000862286, "min_s": 0.00012387800006763428, "n": 200, "payload": 1024}
+{"runtime": "ray", "scenario": "put", "kind": "str", "size": "64K", "op": "put", "median_s": 0.00019466000003376394, "min_s": 0.00012926099998367135, "n": 200, "payload": 65536}
+{"runtime": "ray", "scenario": "put", "kind": "str", "size": "1M", "op": "put", "median_s": 0.0005016884999804461, "min_s": 0.0004304699998556316, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "str", "size": "16M", "op": "put", "median_s": 0.011259850999863374, "min_s": 0.011174511000035636, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "str", "size": "256M", "op": "put", "median_s": 0.29183815700002924, "min_s": 0.2889901490000284, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "1K", "op": "put", "median_s": 0.00031401000012465374, "min_s": 0.00024422000001322886, "n": 200, "payload": 1024}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "64K", "op": "put", "median_s": 0.00035242550006842066, "min_s": 0.00025569899980837363, "n": 200, "payload": 65536}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "1M", "op": "put", "median_s": 0.00042238399998950626, "min_s": 0.00032316100009666116, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "16M", "op": "put", "median_s": 0.0019001750000597895, "min_s": 0.0018302640000911197, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "256M", "op": "put", "median_s": 0.006469660999982807, "min_s": 0.0063518229999317555, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "1G", "op": "put", "median_s": 0.020954481499984468, "min_s": 0.02057893599999261, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "done": "put", "wall_s": 71.1}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1K", "op": "get", "median_s": 7.026700006917963e-05, "min_s": 5.9546000102272956e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1K", "op": "put+get", "median_s": 0.0002658810001321399, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1K", "op": "touch", "median_s": 1.5299499978027598e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "64K", "op": "get", "median_s": 7.671150001442584e-05, "min_s": 6.27260001238028e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "64K", "op": "put+get", "median_s": 0.00028786699999727716, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "64K", "op": "touch", "median_s": 1.5179000001808163e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1M", "op": "get", "median_s": 0.00017944600006103428, "min_s": 0.00014287699991655245, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1M", "op": "put+get", "median_s": 0.0005006179999327287, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1M", "op": "touch", "median_s": 1.8195000052401156e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "16M", "op": "get", "median_s": 0.0020987374999776875, "min_s": 0.002016440000033981, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "16M", "op": "put+get", "median_s": 0.0034117909999622498, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "16M", "op": "touch", "median_s": 6.0848999964946415e-05, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "256M", "op": "get", "median_s": 0.135767911500011, "min_s": 0.1299857520000387, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "256M", "op": "put+get", "median_s": 0.14649474850000388, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "256M", "op": "touch", "median_s": 0.0007912784999462019, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1G", "op": "get", "median_s": 0.5374661299999843, "min_s": 0.5236180340000374, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1G", "op": "put+get", "median_s": 0.5779981454999188, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1G", "op": "touch", "median_s": 0.0030665465000083714, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1K", "op": "get", "median_s": 9.292000004279544e-05, "min_s": 8.132099992508302e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1K", "op": "put+get", "median_s": 0.0003600930001539382, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1K", "op": "touch", "median_s": 1.5567499985991162e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "64K", "op": "get", "median_s": 8.95620000846975e-05, "min_s": 8.06020000254648e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "64K", "op": "put+get", "median_s": 0.00036308500000359345, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "64K", "op": "touch", "median_s": 1.54310000652913e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1M", "op": "get", "median_s": 9.192649986289325e-05, "min_s": 7.997300008355523e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1M", "op": "put+get", "median_s": 0.0004723429998421125, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1M", "op": "touch", "median_s": 1.8881000073633913e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "16M", "op": "get", "median_s": 0.0001036735000070621, "min_s": 8.752999997341249e-05, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "16M", "op": "put+get", "median_s": 0.0007588209999767059, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "16M", "op": "touch", "median_s": 8.409750000737404e-05, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "256M", "op": "get", "median_s": 0.0001435344998981236, "min_s": 0.00013197699990996625, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "256M", "op": "put+get", "median_s": 0.005823822499905873, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "256M", "op": "touch", "median_s": 0.000808813000162445, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1G", "op": "get", "median_s": 0.00017569450005794351, "min_s": 0.00015491699991798669, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1G", "op": "put+get", "median_s": 0.03912719950005794, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1G", "op": "touch", "median_s": 0.01683541749991946, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1K", "op": "get", "median_s": 0.00021835399991232407, "min_s": 0.00019820600005004962, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1K", "op": "put+get", "median_s": 0.0005741185000260884, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1K", "op": "touch", "median_s": 2.6595999997880426e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "64K", "op": "get", "median_s": 0.00023236100003032334, "min_s": 0.00020776900009877863, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "64K", "op": "put+get", "median_s": 0.0006011674998944727, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "64K", "op": "touch", "median_s": 2.7725999984795635e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1M", "op": "get", "median_s": 0.00040639450014623435, "min_s": 0.00036526500002764806, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1M", "op": "put+get", "median_s": 0.001065006000089852, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1M", "op": "touch", "median_s": 3.035350005120563e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "16M", "op": "get", "median_s": 0.0031534309999869947, "min_s": 0.0029380500000115717, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "16M", "op": "put+get", "median_s": 0.030740840500129707, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "16M", "op": "touch", "median_s": 0.00010124300013103493, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "256M", "op": "get", "median_s": 0.26383932049998293, "min_s": 0.26191518499990707, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "256M", "op": "put+get", "median_s": 0.5584448270001303, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "256M", "op": "touch", "median_s": 0.000781857999982094, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1G", "op": "get", "median_s": 1.0648271784999679, "min_s": 1.0637599379999756, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1G", "op": "put+get", "median_s": 2.2491041524999673, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1G", "op": "touch", "median_s": 0.003050994000091123, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1K", "op": "get", "median_s": 0.00014959950010506873, "min_s": 0.00013712899999518413, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1K", "op": "put+get", "median_s": 0.0005717550000099436, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1K", "op": "touch", "median_s": 4.003050003120734e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "64K", "op": "get", "median_s": 0.00015814850007700443, "min_s": 0.00014004400009071105, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "64K", "op": "put+get", "median_s": 0.0006046644999742057, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "64K", "op": "touch", "median_s": 4.163450000760349e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1M", "op": "get", "median_s": 0.00015668799994728033, "min_s": 0.0001437250000435597, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1M", "op": "put+get", "median_s": 0.0008027625000295302, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1M", "op": "touch", "median_s": 4.552649988909252e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "16M", "op": "get", "median_s": 0.0001812174999713534, "min_s": 0.00016782400007286924, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "16M", "op": "put+get", "median_s": 0.0030652615000690275, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "16M", "op": "touch", "median_s": 0.00011367449997123913, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "256M", "op": "get", "median_s": 0.0003200649999826055, "min_s": 0.0003029870001682866, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "256M", "op": "put+get", "median_s": 0.03682915000001685, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "256M", "op": "touch", "median_s": 0.0010361470000361805, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1G", "op": "get", "median_s": 0.00047594549994300905, "min_s": 0.0004435329999523674, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1G", "op": "put+get", "median_s": 0.1366510699998571, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1G", "op": "touch", "median_s": 0.004027285000006486, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "1K", "op": "get", "median_s": 0.0002036725001062223, "min_s": 0.00017790300012165972, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "1K", "op": "put+get", "median_s": 0.000584378499866034, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "1K", "op": "touch", "median_s": 0.00010999749997608887, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "64K", "op": "get", "median_s": 0.0002887990000317586, "min_s": 0.00026127399996767053, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "64K", "op": "put+get", "median_s": 0.0008167414998752065, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "64K", "op": "touch", "median_s": 0.00011122249998152256, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "1M", "op": "get", "median_s": 0.0016652369999974326, "min_s": 0.0015878829999564914, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "1M", "op": "put+get", "median_s": 0.004740599499996279, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "1M", "op": "touch", "median_s": 0.0001419909998503499, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "16M", "op": "get", "median_s": 0.03555483399998138, "min_s": 0.029277419999971244, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "16M", "op": "put+get", "median_s": 0.14255312250008956, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "16M", "op": "touch", "median_s": 0.00030065949999880104, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "256M", "op": "get", "median_s": 0.8037637279999217, "min_s": 0.8028684260000318, "n": 3}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "256M", "op": "put+get", "median_s": 4.05344835599999, "n": 3}
+{"runtime": "ray", "scenario": "get", "kind": "pandas", "size": "256M", "op": "touch", "median_s": 0.0008108419999643957, "n": 3}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "1K", "op": "get", "median_s": 8.517549997577589e-05, "min_s": 7.449000008818984e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "1K", "op": "put+get", "median_s": 0.000289754499931405, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "1K", "op": "touch", "median_s": 1.2360500022623455e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "64K", "op": "get", "median_s": 0.0002736544998924728, "min_s": 0.0002503170001091348, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "64K", "op": "put+get", "median_s": 0.0005359130001352241, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "64K", "op": "touch", "median_s": 0.0005681449999883625, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "1M", "op": "get", "median_s": 0.0026986445001284665, "min_s": 0.0024589439999544993, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "1M", "op": "put+get", "median_s": 0.003648566500146444, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "1M", "op": "touch", "median_s": 0.008902460999934192, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "16M", "op": "get", "median_s": 0.06405089400004726, "min_s": 0.06258548599998903, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "16M", "op": "put+get", "median_s": 0.07593459050008278, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "16M", "op": "touch", "median_s": 0.1425326489999179, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "256M", "op": "get", "median_s": 1.9551266969999688, "min_s": 1.9501703670000552, "n": 3}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "256M", "op": "put+get", "median_s": 2.225613009999961, "n": 3}
+{"runtime": "ray", "scenario": "get", "kind": "pydict", "size": "256M", "op": "touch", "median_s": 2.2828850250000414, "n": 3}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "1K", "op": "get", "median_s": 7.797500006745395e-05, "min_s": 6.791900000280293e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "1K", "op": "put+get", "median_s": 0.00027724300002773816, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "1K", "op": "touch", "median_s": 1.2159998732386157e-06, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "64K", "op": "get", "median_s": 0.00010443300004681078, "min_s": 9.533999991617748e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "64K", "op": "put+get", "median_s": 0.0003704889999198713, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "64K", "op": "touch", "median_s": 1.2984999102627626e-06, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "1M", "op": "get", "median_s": 0.0005290545000207203, "min_s": 0.0004979249999905733, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "1M", "op": "put+get", "median_s": 0.0016722564998872258, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "1M", "op": "touch", "median_s": 1.5339999208663357e-06, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "16M", "op": "get", "median_s": 0.007475308499920175, "min_s": 0.0072312489999148966, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "16M", "op": "put+get", "median_s": 0.022711057499918752, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "16M", "op": "touch", "median_s": 2.8089999659641762e-06, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "256M", "op": "get", "median_s": 0.24970433999999386, "min_s": 0.24777424100011558, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "256M", "op": "put+get", "median_s": 0.5403228060000629, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "pylist", "size": "256M", "op": "touch", "median_s": 3.6449999925025622e-06, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "1K", "op": "get", "median_s": 7.927249998829211e-05, "min_s": 6.980300008763152e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "1K", "op": "put+get", "median_s": 0.0002779915000701294, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "1K", "op": "touch", "median_s": 1.001499867925304e-06, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "64K", "op": "get", "median_s": 8.952299992870394e-05, "min_s": 7.694400005675561e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "64K", "op": "put+get", "median_s": 0.0003051894999543947, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "64K", "op": "touch", "median_s": 1.0200001270277426e-06, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "1M", "op": "get", "median_s": 0.00026450899997598754, "min_s": 0.00024368599997615092, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "1M", "op": "put+get", "median_s": 0.000755214499918111, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "1M", "op": "touch", "median_s": 1.239500079464051e-06, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "16M", "op": "get", "median_s": 0.0030449275000137277, "min_s": 0.002949089999901844, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "16M", "op": "put+get", "median_s": 0.014464220000036221, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "16M", "op": "touch", "median_s": 1.8265000107930973e-06, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "256M", "op": "get", "median_s": 0.1563229795000325, "min_s": 0.15605574300002445, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "256M", "op": "put+get", "median_s": 0.4506092125000123, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "str", "size": "256M", "op": "touch", "median_s": 2.9905000928920344e-06, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1K", "op": "get", "median_s": 0.00011405450004531303, "min_s": 9.769600001163781e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1K", "op": "put+get", "median_s": 0.0004184365001265178, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1K", "op": "touch", "median_s": 4.6123999936753535e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "64K", "op": "get", "median_s": 0.0001073180001185392, "min_s": 9.408500000063214e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "64K", "op": "put+get", "median_s": 0.0004083195000248452, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "64K", "op": "touch", "median_s": 4.4630499928643985e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1M", "op": "get", "median_s": 0.00010758799999166513, "min_s": 9.688199997981428e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1M", "op": "put+get", "median_s": 0.0005271764998724393, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1M", "op": "touch", "median_s": 4.8685000024306646e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "16M", "op": "get", "median_s": 0.00011636699991868227, "min_s": 0.00010410000004412723, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "16M", "op": "put+get", "median_s": 0.002009125999848038, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "16M", "op": "touch", "median_s": 0.00010154600010991999, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "256M", "op": "get", "median_s": 0.00016858300000421877, "min_s": 0.0001587169999766047, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "256M", "op": "put+get", "median_s": 0.006683308499873419, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "256M", "op": "touch", "median_s": 0.0008428919999232676, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1G", "op": "get", "median_s": 0.00018844149997221393, "min_s": 0.0001806800000849762, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1G", "op": "put+get", "median_s": 0.021467548500027078, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1G", "op": "touch", "median_s": 0.003076486499935527, "n": 4}
+{"runtime": "ray", "done": "get", "wall_s": 125.3}
+{"runtime": "ray", "scenario": "return", "kind": "none", "size": "0", "op": "call", "median_s": 0.00037391050000223913}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "1K", "op": "return", "median_s": 0.0003405004999876837, "min_s": 0.00029771100003017636, "overhead_s": 0.0, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "64K", "op": "return", "median_s": 0.00040788950002479396, "min_s": 0.00034148800000366464, "overhead_s": 3.397900002255483e-05, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "1M", "op": "return", "median_s": 0.0009982750000290253, "min_s": 0.0008426080000845104, "overhead_s": 0.0006243645000267861, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "16M", "op": "return", "median_s": 0.0038735985000357687, "min_s": 0.0025325189999421127, "overhead_s": 0.0034996880000335295, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "256M", "op": "return", "median_s": 0.1597544049999442, "min_s": 0.14522708399999829, "overhead_s": 0.15938049449994196, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "1G", "op": "return", "median_s": 0.6094419170000265, "min_s": 0.5833027109999875, "overhead_s": 0.6090680065000242, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "1K", "op": "return", "median_s": 0.000446824000050583, "min_s": 0.00039315599997280515, "overhead_s": 7.291350004834385e-05, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "64K", "op": "return", "median_s": 0.0004883044999814956, "min_s": 0.00044322700000520854, "overhead_s": 0.00011439399997925648, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "1M", "op": "return", "median_s": 0.0009077985000658373, "min_s": 0.0008213959999920917, "overhead_s": 0.0005338880000635982, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "16M", "op": "return", "median_s": 0.0012320314998532922, "min_s": 0.0011214940000172646, "overhead_s": 0.0008581209998510531, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "256M", "op": "return", "median_s": 0.006371986999965884, "min_s": 0.006228534999991098, "overhead_s": 0.005998076499963645, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "1G", "op": "return", "median_s": 0.04034555650002858, "min_s": 0.020292461999815714, "overhead_s": 0.03997164600002634, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "1K", "op": "return", "median_s": 0.0007321714998624884, "min_s": 0.0006401170001026912, "overhead_s": 0.0003582609998602493, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "64K", "op": "return", "median_s": 0.000757481000050575, "min_s": 0.0006720769999901677, "overhead_s": 0.0003835705000483358, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "1M", "op": "return", "median_s": 0.001484236500004954, "min_s": 0.0014025930001935194, "overhead_s": 0.0011103260000027149, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "16M", "op": "return", "median_s": 0.02416501049992803, "min_s": 0.01653943899987098, "overhead_s": 0.02379109999992579, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "256M", "op": "return", "median_s": 0.5912120085000652, "min_s": 0.5886917699999685, "overhead_s": 0.5908380980000629, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "1G", "op": "return", "median_s": 2.3507376694999493, "min_s": 2.347913528000163, "overhead_s": 2.350363758999947, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "1K", "op": "return", "median_s": 0.0007342070001641332, "min_s": 0.000666200000068784, "overhead_s": 0.0003602965001618941, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "64K", "op": "return", "median_s": 0.0007921184999304387, "min_s": 0.0007378370000878931, "overhead_s": 0.00041820799992819957, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "1M", "op": "return", "median_s": 0.0012238205000585367, "min_s": 0.0011438730000463693, "overhead_s": 0.0008499100000562976, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "16M", "op": "return", "median_s": 0.0035112819999767453, "min_s": 0.003313310000066849, "overhead_s": 0.003137371499974506, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "256M", "op": "return", "median_s": 0.035615623499893445, "min_s": 0.03533934799997951, "overhead_s": 0.035241712999891206, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "1G", "op": "return", "median_s": 0.1430786474999195, "min_s": 0.1413905409999643, "overhead_s": 0.14270473699991726, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "pandas", "size": "1K", "op": "return", "median_s": 0.0007079114999442027, "min_s": 0.000647348000029524, "overhead_s": 0.00033400099994196353, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pandas", "size": "64K", "op": "return", "median_s": 0.0010129990000677935, "min_s": 0.0009698139999727573, "overhead_s": 0.0006390885000655544, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pandas", "size": "1M", "op": "return", "median_s": 0.0053732685000795755, "min_s": 0.0052239389999613195, "overhead_s": 0.004999358000077336, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pandas", "size": "16M", "op": "return", "median_s": 0.1488139374999946, "min_s": 0.14228820799985442, "overhead_s": 0.14844002699999237, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "pandas", "size": "256M", "op": "return", "median_s": 3.996605914000156, "min_s": 3.9920173210000485, "overhead_s": 3.996232003500154, "n": 3}
+{"runtime": "ray", "scenario": "return", "kind": "pydict", "size": "1K", "op": "return", "median_s": 0.00037483400001292466, "min_s": 0.0003184320000855223, "overhead_s": 9.235000106855296e-07, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pydict", "size": "64K", "op": "return", "median_s": 0.0006747775000803813, "min_s": 0.0005987619999814342, "overhead_s": 0.00030086700007814215, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pydict", "size": "1M", "op": "return", "median_s": 0.004716465000115022, "min_s": 0.004361883000001399, "overhead_s": 0.004342554500112783, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pydict", "size": "16M", "op": "return", "median_s": 0.09244829400006438, "min_s": 0.09105652400012332, "overhead_s": 0.09207438350006214, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "pydict", "size": "256M", "op": "return", "median_s": 2.5630316135000157, "min_s": 2.554862177000132, "overhead_s": 2.5626577030000135, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "pylist", "size": "1K", "op": "return", "median_s": 0.0003617975000906881, "min_s": 0.00031608099993718497, "overhead_s": 0.0, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pylist", "size": "64K", "op": "return", "median_s": 0.0004871014999707768, "min_s": 0.0004369509999833099, "overhead_s": 0.00011319099996853765, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pylist", "size": "1M", "op": "return", "median_s": 0.002289492500040069, "min_s": 0.0022132560000045487, "overhead_s": 0.0019155820000378299, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "pylist", "size": "16M", "op": "return", "median_s": 0.026227307499993913, "min_s": 0.02577411399988705, "overhead_s": 0.025853396999991674, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "pylist", "size": "256M", "op": "return", "median_s": 0.6169257890001063, "min_s": 0.6139108549998582, "overhead_s": 0.6165518785001041, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "str", "size": "1K", "op": "return", "median_s": 0.0003904569999804153, "min_s": 0.0003127400000266789, "overhead_s": 1.6546499978176143e-05, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "str", "size": "64K", "op": "return", "median_s": 0.0004197049998992952, "min_s": 0.00036973800001760537, "overhead_s": 4.5794499897056085e-05, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "str", "size": "1M", "op": "return", "median_s": 0.0011564589999579766, "min_s": 0.0011067870000260882, "overhead_s": 0.0007825484999557375, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "str", "size": "16M", "op": "return", "median_s": 0.015344090499979757, "min_s": 0.015075926000008621, "overhead_s": 0.014970179999977518, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "str", "size": "256M", "op": "return", "median_s": 0.4671145304999982, "min_s": 0.46446390999994946, "overhead_s": 0.46674061999999594, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "1K", "op": "return", "median_s": 0.0004937355000720345, "min_s": 0.0004586939999171591, "overhead_s": 0.00011982500006979535, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "64K", "op": "return", "median_s": 0.0005409139999983381, "min_s": 0.0004860630001530808, "overhead_s": 0.00016700349999609898, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "1M", "op": "return", "median_s": 0.0009781019999763885, "min_s": 0.000893547000032413, "overhead_s": 0.0006041914999741493, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "16M", "op": "return", "median_s": 0.0024607970001397916, "min_s": 0.002360257999953319, "overhead_s": 0.0020868865001375525, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "256M", "op": "return", "median_s": 0.007335563999959049, "min_s": 0.007147484999904918, "overhead_s": 0.00696165349995681, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "1G", "op": "return", "median_s": 0.02242451200004325, "min_s": 0.022267222999971636, "overhead_s": 0.02205060150004101, "n": 4}
+{"runtime": "ray", "done": "return", "wall_s": 107.9}
+{"runtime": "ray", "scenario": "pipeline", "kind": "none", "size": "0", "op": "call", "median_s": 0.0007513985000286993}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "1K", "op": "pipeline", "median_s": 0.0007635984999296852, "min_s": 0.0007015549999778159, "overhead_s": 1.2199999900985858e-05, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "64K", "op": "pipeline", "median_s": 0.0009805089999872507, "min_s": 0.0008453619998363138, "overhead_s": 0.00022911049995855137, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "1M", "op": "pipeline", "median_s": 0.0017225644999143697, "min_s": 0.0013449900000068737, "overhead_s": 0.0009711659998856703, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "16M", "op": "pipeline", "median_s": 0.004486098500024127, "min_s": 0.0031184689999008697, "overhead_s": 0.003734699999995428, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "256M", "op": "pipeline", "median_s": 0.16377353749999202, "min_s": 0.14507377800009635, "overhead_s": 0.16302213899996332, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "1G", "op": "pipeline", "median_s": 0.5845082920000095, "min_s": 0.5760369699999046, "overhead_s": 0.5837568934999808, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "1K", "op": "pipeline", "median_s": 0.0008608704999915062, "min_s": 0.0007936690001315583, "overhead_s": 0.00010947199996280688, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "64K", "op": "pipeline", "median_s": 0.0009979084999258703, "min_s": 0.0009156650000932132, "overhead_s": 0.00024650999989717093, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "1M", "op": "pipeline", "median_s": 0.0014405570000235457, "min_s": 0.001308093999796256, "overhead_s": 0.0006891584999948464, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "16M", "op": "pipeline", "median_s": 0.0018736435000619167, "min_s": 0.0016943560001436708, "overhead_s": 0.0011222450000332174, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "256M", "op": "pipeline", "median_s": 0.008079200999986824, "min_s": 0.007915043000139121, "overhead_s": 0.007327802499958125, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "1G", "op": "pipeline", "median_s": 0.051962786500098446, "min_s": 0.025678608999896824, "overhead_s": 0.051211388000069746, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "1K", "op": "pipeline", "median_s": 0.00121153299994603, "min_s": 0.001104021999935867, "overhead_s": 0.0004601344999173307, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "64K", "op": "pipeline", "median_s": 0.0013419700001122692, "min_s": 0.0012338629999248951, "overhead_s": 0.0005905715000835698, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "1M", "op": "pipeline", "median_s": 0.00246465850000277, "min_s": 0.002105475000007573, "overhead_s": 0.0017132599999740705, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "16M", "op": "pipeline", "median_s": 0.025058214500063514, "min_s": 0.01789088299983632, "overhead_s": 0.024306816000034814, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "256M", "op": "pipeline", "median_s": 0.5804908254999646, "min_s": 0.5763680909999493, "overhead_s": 0.5797394269999359, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "1G", "op": "pipeline", "median_s": 2.344964801999936, "min_s": 2.329499797000153, "overhead_s": 2.344213403499907, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "1K", "op": "pipeline", "median_s": 0.0011951395000551202, "min_s": 0.001102241999888065, "overhead_s": 0.0004437410000264208, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "64K", "op": "pipeline", "median_s": 0.0013322835000053601, "min_s": 0.0012246889998550614, "overhead_s": 0.0005808849999766608, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "1M", "op": "pipeline", "median_s": 0.001885604499989313, "min_s": 0.0017721499998515355, "overhead_s": 0.0011342059999606136, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "16M", "op": "pipeline", "median_s": 0.004128894000132277, "min_s": 0.004014708000113387, "overhead_s": 0.003377495500103578, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "256M", "op": "pipeline", "median_s": 0.038342299999953866, "min_s": 0.03779553399999713, "overhead_s": 0.03759090149992517, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "1G", "op": "pipeline", "median_s": 0.1464524479999909, "min_s": 0.14400337200004287, "overhead_s": 0.1457010494999622, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pandas", "size": "1K", "op": "pipeline", "median_s": 0.001263741000002483, "min_s": 0.0011882820001574146, "overhead_s": 0.0005123424999737836, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pandas", "size": "64K", "op": "pipeline", "median_s": 0.0016899620000003779, "min_s": 0.0015613959999427607, "overhead_s": 0.0009385634999716785, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pandas", "size": "1M", "op": "pipeline", "median_s": 0.006227066500059664, "min_s": 0.006009116000086578, "overhead_s": 0.005475668000030964, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pandas", "size": "16M", "op": "pipeline", "median_s": 0.15375227749996156, "min_s": 0.14541142799998852, "overhead_s": 0.15300087899993287, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pandas", "size": "256M", "op": "pipeline", "median_s": 4.362793108999995, "min_s": 4.031407208000019, "overhead_s": 4.362041710499966, "n": 3}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pydict", "size": "1K", "op": "pipeline", "median_s": 0.000897814000040853, "min_s": 0.0007575160000214964, "overhead_s": 0.00014641550001215364, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pydict", "size": "64K", "op": "pipeline", "median_s": 0.0018633760001875999, "min_s": 0.0016944460001013795, "overhead_s": 0.0011119775001589005, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pydict", "size": "1M", "op": "pipeline", "median_s": 0.014965007499995409, "min_s": 0.014318864999950165, "overhead_s": 0.01421360899996671, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pydict", "size": "16M", "op": "pipeline", "median_s": 0.2518093730000146, "min_s": 0.2438121319999027, "overhead_s": 0.2510579744999859, "n": 32}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pydict", "size": "256M", "op": "pipeline", "median_s": 4.982313236999971, "min_s": 4.962056523000001, "overhead_s": 4.9815618384999425, "n": 3}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pylist", "size": "1K", "op": "pipeline", "median_s": 0.0008123085000306673, "min_s": 0.00074024500008818, "overhead_s": 6.0910000001968e-05, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pylist", "size": "64K", "op": "pipeline", "median_s": 0.000942774999998619, "min_s": 0.0008857629998146876, "overhead_s": 0.00019137649996991968, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pylist", "size": "1M", "op": "pipeline", "median_s": 0.002822555999841825, "min_s": 0.0026977679999617976, "overhead_s": 0.0020711574998131255, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pylist", "size": "16M", "op": "pipeline", "median_s": 0.02743910050003251, "min_s": 0.026726710000048115, "overhead_s": 0.02668770200000381, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "pylist", "size": "256M", "op": "pipeline", "median_s": 0.6262127640000017, "min_s": 0.6249642770001174, "overhead_s": 0.625461365499973, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "str", "size": "1K", "op": "pipeline", "median_s": 0.0008548450000489538, "min_s": 0.0007358599998497084, "overhead_s": 0.00010344650002025446, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "str", "size": "64K", "op": "pipeline", "median_s": 0.0009869524999430723, "min_s": 0.0008975600001122075, "overhead_s": 0.00023555399991437298, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "str", "size": "1M", "op": "pipeline", "median_s": 0.0017441749999989042, "min_s": 0.001656314999991082, "overhead_s": 0.000992776499970205, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "str", "size": "16M", "op": "pipeline", "median_s": 0.016556135500081837, "min_s": 0.01632451199998286, "overhead_s": 0.015804737000053137, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "str", "size": "256M", "op": "pipeline", "median_s": 0.4764975000000504, "min_s": 0.4693647920000785, "overhead_s": 0.4757461015000217, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "1K", "op": "pipeline", "median_s": 0.0010054045000060796, "min_s": 0.0009418829999958689, "overhead_s": 0.00025400599997738027, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "64K", "op": "pipeline", "median_s": 0.0011832769998818549, "min_s": 0.0010292540000591544, "overhead_s": 0.0004318784998531555, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "1M", "op": "pipeline", "median_s": 0.0015448345001232155, "min_s": 0.0014427149999391986, "overhead_s": 0.0007934360000945162, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "16M", "op": "pipeline", "median_s": 0.003297614000075555, "min_s": 0.0031434140000783373, "overhead_s": 0.0025462155000468556, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "256M", "op": "pipeline", "median_s": 0.008903067999995073, "min_s": 0.008835876999910397, "overhead_s": 0.008151669499966374, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "1G", "op": "pipeline", "median_s": 0.026723390500023925, "min_s": 0.02653147700016234, "overhead_s": 0.025971991999995225, "n": 4}
+{"runtime": "ray", "done": "pipeline", "wall_s": 128.2}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1K", "op": "put", "per_object_s": 0.00014873151829999644, "n": 10000}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1K", "op": "get", "per_object_s": 1.5481118499997138e-05, "n": 10000, "call_s": 0.36300237999989804}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "64K", "op": "put", "per_object_s": 0.0001747124646999964, "n": 10000}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "64K", "op": "get", "per_object_s": 4.58574464000094e-05, "n": 10000, "call_s": 0.6554822440000407}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1M", "op": "put", "per_object_s": 0.000501584977050773, "n": 2048}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1M", "op": "get", "per_object_s": 0.00051504756396481, "n": 2048, "call_s": 1.195780046999971}
+{"runtime": "ray", "done": "many", "wall_s": 7.6}
+{"runtime": "chimaera", "done": "put", "wall_s": 63.7}
+{"runtime": "chimaera", "scenario": "return", "kind": "none", "size": "0", "op": "call", "median_s": 0.0012219789996379404}
+{"runtime": "chimaera", "scenario": "return", "kind": "bytes", "size": "1K", "op": "return", "median_s": 0.001262286500150367, "min_s": 0.001147863000369398, "overhead_s": 4.0307500512426486e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "bytes", "size": "64K", "op": "return", "median_s": 0.001367427999866777, "min_s": 0.0012833669998144615, "overhead_s": 0.00014544900022883667, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "bytes", "size": "1M", "op": "return", "median_s": 0.0018381365002824168, "min_s": 0.0017527859999972861, "overhead_s": 0.0006161575006444764, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "bytes", "size": "16M", "op": "return", "median_s": 0.006589592499949504, "min_s": 0.00598310199984553, "overhead_s": 0.005367613500311563, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "bytes", "size": "256M", "op": "return", "median_s": 0.20153247700000065, "min_s": 0.19932003600024473, "overhead_s": 0.2003104980003627, "n": 8}
+{"runtime": "chimaera", "scenario": "return", "kind": "bytes", "size": "1G", "op": "return", "median_s": 0.7833448279998265, "min_s": 0.7757795509996868, "overhead_s": 0.7821228490001886, "n": 4}
+{"runtime": "chimaera", "scenario": "return", "kind": "numpy", "size": "1K", "op": "return", "median_s": 0.0012969484996574465, "min_s": 0.001202919000206748, "overhead_s": 7.496950001950609e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "numpy", "size": "64K", "op": "return", "median_s": 0.0013878400004614377, "min_s": 0.001295231999392854, "overhead_s": 0.0001658610008234973, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "numpy", "size": "1M", "op": "return", "median_s": 0.0013661994998983573, "min_s": 0.001258745000086492, "overhead_s": 0.00014422050026041688, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "numpy", "size": "16M", "op": "return", "median_s": 0.0013915399995312328, "min_s": 0.0013360250004552654, "overhead_s": 0.00016956099989329232, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "numpy", "size": "256M", "op": "return", "median_s": 0.0014993609997873136, "min_s": 0.001439308000044548, "overhead_s": 0.0002773820001493732, "n": 8}
+{"runtime": "chimaera", "scenario": "return", "kind": "numpy", "size": "1G", "op": "return", "median_s": 0.0016052700002546771, "min_s": 0.0014838309998594923, "overhead_s": 0.0003832910006167367, "n": 4}
+{"runtime": "chimaera", "scenario": "return", "kind": "torch", "size": "1K", "op": "return", "median_s": 0.0013589689997388632, "min_s": 0.0012434450000000652, "overhead_s": 0.00013699000010092277, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "torch", "size": "64K", "op": "return", "median_s": 0.0014589090001209115, "min_s": 0.0013545520005209255, "overhead_s": 0.00023693000048297108, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "torch", "size": "1M", "op": "return", "median_s": 0.0017750880001585756, "min_s": 0.0016224279997913982, "overhead_s": 0.0005531090005206352, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "torch", "size": "16M", "op": "return", "median_s": 0.004406306500186474, "min_s": 0.0037746059997516568, "overhead_s": 0.003184327500548534, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "torch", "size": "256M", "op": "return", "median_s": 0.042175038500317896, "min_s": 0.0386790109996582, "overhead_s": 0.040953059500679956, "n": 8}
+{"runtime": "chimaera", "scenario": "return", "kind": "torch", "size": "1G", "op": "return", "median_s": 0.16165654349970282, "min_s": 0.1451301160004732, "overhead_s": 0.16043456450006488, "n": 4}
+{"runtime": "chimaera", "scenario": "return", "kind": "arrow", "size": "1K", "op": "return", "median_s": 0.0013939135001237446, "min_s": 0.0013185499992687255, "overhead_s": 0.00017193450048580416, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "arrow", "size": "64K", "op": "return", "median_s": 0.00153388199987603, "min_s": 0.0014422750000449014, "overhead_s": 0.0003119030002380896, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "arrow", "size": "1M", "op": "return", "median_s": 0.0019034820006709197, "min_s": 0.0017577660000824835, "overhead_s": 0.0006815030010329792, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "arrow", "size": "16M", "op": "return", "median_s": 0.003242839999984426, "min_s": 0.003027066000868217, "overhead_s": 0.0020208610003464855, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "arrow", "size": "256M", "op": "return", "median_s": 0.014247009500195418, "min_s": 0.01271035199988546, "overhead_s": 0.013025030500557477, "n": 8}
+{"runtime": "chimaera", "scenario": "return", "kind": "arrow", "size": "1G", "op": "return", "median_s": 0.07646800650036312, "min_s": 0.06799738500012609, "overhead_s": 0.07524602750072518, "n": 4}
+{"runtime": "chimaera", "scenario": "return", "kind": "pandas", "size": "1K", "op": "return", "median_s": 0.001514551499440131, "min_s": 0.0013762349999524304, "overhead_s": 0.0002925724998021906, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pandas", "size": "64K", "op": "return", "median_s": 0.001904286999888427, "min_s": 0.0017754890004653134, "overhead_s": 0.0006823080002504867, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pandas", "size": "1M", "op": "return", "median_s": 0.006002988000091136, "min_s": 0.005833840000377677, "overhead_s": 0.004781009000453196, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pandas", "size": "16M", "op": "return", "median_s": 0.1617188250002073, "min_s": 0.15555606199995964, "overhead_s": 0.16049684600056935, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "pandas", "size": "256M", "op": "return", "median_s": 4.092050938999819, "min_s": 4.081488078999428, "overhead_s": 4.090828960000181, "n": 3}
+{"runtime": "chimaera", "scenario": "return", "kind": "pydict", "size": "1K", "op": "return", "median_s": 0.001236528500157874, "min_s": 0.0011666669997794088, "overhead_s": 1.4549500519933645e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pydict", "size": "64K", "op": "return", "median_s": 0.0014830429995527084, "min_s": 0.0013843569995515281, "overhead_s": 0.0002610639999147679, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pydict", "size": "1M", "op": "return", "median_s": 0.003627978499935125, "min_s": 0.003508138000142935, "overhead_s": 0.0024059995002971846, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pydict", "size": "16M", "op": "return", "median_s": 0.05200065849976454, "min_s": 0.051365172999794595, "overhead_s": 0.0507786795001266, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "pydict", "size": "256M", "op": "return", "median_s": 1.4894553835001716, "min_s": 1.4842390759995396, "overhead_s": 1.4882334045005337, "n": 6}
+{"runtime": "chimaera", "scenario": "return", "kind": "pylist", "size": "1K", "op": "return", "median_s": 0.0012798770003428217, "min_s": 0.001177121999717201, "overhead_s": 5.789800070488127e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pylist", "size": "64K", "op": "return", "median_s": 0.001449207499717886, "min_s": 0.0012690579997070017, "overhead_s": 0.00022722850007994566, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pylist", "size": "1M", "op": "return", "median_s": 0.00255529000014576, "min_s": 0.002460540000356559, "overhead_s": 0.0013333110005078197, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "pylist", "size": "16M", "op": "return", "median_s": 0.020214544999817008, "min_s": 0.019785886999670765, "overhead_s": 0.018992566000179067, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "pylist", "size": "256M", "op": "return", "median_s": 0.450970083500124, "min_s": 0.44652793499972177, "overhead_s": 0.4497481045004861, "n": 8}
+{"runtime": "chimaera", "scenario": "return", "kind": "str", "size": "1K", "op": "return", "median_s": 0.0012833830005547497, "min_s": 0.0011842909998449613, "overhead_s": 6.140400091680931e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "str", "size": "64K", "op": "return", "median_s": 0.0013774095000371744, "min_s": 0.0012961880001967074, "overhead_s": 0.000155430500399234, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "str", "size": "1M", "op": "return", "median_s": 0.002075202000014542, "min_s": 0.001980007000383921, "overhead_s": 0.0008532230003766017, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "str", "size": "16M", "op": "return", "median_s": 0.010968044000492227, "min_s": 0.010487178000403219, "overhead_s": 0.009746065000854287, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "str", "size": "256M", "op": "return", "median_s": 0.4951114444997984, "min_s": 0.4893960530007462, "overhead_s": 0.49388946550016044, "n": 8}
+{"runtime": "chimaera", "scenario": "return", "kind": "nested", "size": "1K", "op": "return", "median_s": 0.001336703000106354, "min_s": 0.0012648450001506717, "overhead_s": 0.00011472400046841358, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "nested", "size": "64K", "op": "return", "median_s": 0.0014271140003074834, "min_s": 0.0013524099995265715, "overhead_s": 0.00020513500066954293, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "nested", "size": "1M", "op": "return", "median_s": 0.0017495024999334419, "min_s": 0.001642674000322586, "overhead_s": 0.0005275235002955014, "n": 200}
+{"runtime": "chimaera", "scenario": "return", "kind": "nested", "size": "16M", "op": "return", "median_s": 0.0015444519999618933, "min_s": 0.0014719499995408114, "overhead_s": 0.0003224730003239529, "n": 40}
+{"runtime": "chimaera", "scenario": "return", "kind": "nested", "size": "256M", "op": "return", "median_s": 0.001540428000225802, "min_s": 0.0015289270004359423, "overhead_s": 0.0003184490005878615, "n": 8}
+{"runtime": "chimaera", "scenario": "return", "kind": "nested", "size": "1G", "op": "return", "median_s": 0.001736161999815522, "min_s": 0.001677588000347896, "overhead_s": 0.0005141830001775816, "n": 4}
+{"runtime": "chimaera", "done": "return", "wall_s": 92.0}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "none", "size": "0", "op": "call", "median_s": 0.002320016499652411}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "bytes", "size": "1K", "op": "pipeline", "median_s": 0.00242848200014123, "min_s": 0.0019818179998765117, "overhead_s": 0.00010846550048881909, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "bytes", "size": "64K", "op": "pipeline", "median_s": 0.0025385999997524777, "min_s": 0.0019969020004282356, "overhead_s": 0.00021858350010006689, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "bytes", "size": "1M", "op": "pipeline", "median_s": 0.0030638549997092923, "min_s": 0.0024239280000983854, "overhead_s": 0.0007438385000568815, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "bytes", "size": "16M", "op": "pipeline", "median_s": 0.009208634499827895, "min_s": 0.008206973000596918, "overhead_s": 0.006888618000175484, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "bytes", "size": "256M", "op": "pipeline", "median_s": 0.22005251599966869, "min_s": 0.21781350199944427, "overhead_s": 0.21773249950001627, "n": 8}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "bytes", "size": "1G", "op": "pipeline", "median_s": 0.859099232999597, "min_s": 0.8442113199998857, "overhead_s": 0.8567792164999446, "n": 4}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "numpy", "size": "1K", "op": "pipeline", "median_s": 0.0024990150000121503, "min_s": 0.0020902469996144646, "overhead_s": 0.0001789985003597394, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "numpy", "size": "64K", "op": "pipeline", "median_s": 0.0026347544999225647, "min_s": 0.0020447160004550824, "overhead_s": 0.00031473800027015386, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "numpy", "size": "1M", "op": "pipeline", "median_s": 0.002569274499819585, "min_s": 0.002139580999937607, "overhead_s": 0.00024925800016717403, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "numpy", "size": "16M", "op": "pipeline", "median_s": 0.0033337419999952544, "min_s": 0.0029092229997331742, "overhead_s": 0.0010137255003428436, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "numpy", "size": "256M", "op": "pipeline", "median_s": 0.014077709499360935, "min_s": 0.013880876999792235, "overhead_s": 0.011757692999708524, "n": 8}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "numpy", "size": "1G", "op": "pipeline", "median_s": 0.05063281150023613, "min_s": 0.04986457100039843, "overhead_s": 0.04831279500058372, "n": 4}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "torch", "size": "1K", "op": "pipeline", "median_s": 0.002471772500030056, "min_s": 0.002236244999949122, "overhead_s": 0.00015175600037764525, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "torch", "size": "64K", "op": "pipeline", "median_s": 0.0026372620000074676, "min_s": 0.002538978999837127, "overhead_s": 0.0003172455003550567, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "torch", "size": "1M", "op": "pipeline", "median_s": 0.0030252090000431053, "min_s": 0.0024776659993221983, "overhead_s": 0.0007051925003906945, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "torch", "size": "16M", "op": "pipeline", "median_s": 0.007591524999952526, "min_s": 0.0069333300007201615, "overhead_s": 0.005271508500300115, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "torch", "size": "256M", "op": "pipeline", "median_s": 0.07422292649971496, "min_s": 0.07262673300010647, "overhead_s": 0.07190291000006255, "n": 8}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "torch", "size": "1G", "op": "pipeline", "median_s": 0.2861534794997169, "min_s": 0.28395619000002625, "overhead_s": 0.2838334630000645, "n": 4}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "arrow", "size": "1K", "op": "pipeline", "median_s": 0.0026221185003123537, "min_s": 0.002336079999622598, "overhead_s": 0.00030210200065994286, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "arrow", "size": "64K", "op": "pipeline", "median_s": 0.0026788400004988944, "min_s": 0.0021449490004670224, "overhead_s": 0.0003588235008464835, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "arrow", "size": "1M", "op": "pipeline", "median_s": 0.0032162565003091004, "min_s": 0.002646100000674778, "overhead_s": 0.0008962400006566895, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "arrow", "size": "16M", "op": "pipeline", "median_s": 0.005835326500346127, "min_s": 0.005565926000599575, "overhead_s": 0.0035153100006937166, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "arrow", "size": "256M", "op": "pipeline", "median_s": 0.03636219450027056, "min_s": 0.03257441799996741, "overhead_s": 0.03404217800061815, "n": 8}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "arrow", "size": "1G", "op": "pipeline", "median_s": 0.18593600899976082, "min_s": 0.18541080500017415, "overhead_s": 0.1836159925001084, "n": 4}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pandas", "size": "1K", "op": "pipeline", "median_s": 0.0027378134996070003, "min_s": 0.002266905000396946, "overhead_s": 0.0004177969999545894, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pandas", "size": "64K", "op": "pipeline", "median_s": 0.0031646130000808625, "min_s": 0.0025166719997287146, "overhead_s": 0.0008445965004284517, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pandas", "size": "1M", "op": "pipeline", "median_s": 0.007713655499628658, "min_s": 0.007513614000345115, "overhead_s": 0.005393638999976247, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pandas", "size": "16M", "op": "pipeline", "median_s": 0.16730669899970962, "min_s": 0.16211366599964094, "overhead_s": 0.1649866825000572, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pandas", "size": "256M", "op": "pipeline", "median_s": 4.22374628200032, "min_s": 4.2205006300000605, "overhead_s": 4.221426265500668, "n": 3}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pydict", "size": "1K", "op": "pipeline", "median_s": 0.002422405500055902, "min_s": 0.0019111960000373074, "overhead_s": 0.00010238900040349108, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pydict", "size": "64K", "op": "pipeline", "median_s": 0.003260618000240356, "min_s": 0.002771759999632195, "overhead_s": 0.0009406015005879453, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pydict", "size": "1M", "op": "pipeline", "median_s": 0.014065813999422971, "min_s": 0.013364603999434621, "overhead_s": 0.01174579749977056, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pydict", "size": "16M", "op": "pipeline", "median_s": 0.19923043200014945, "min_s": 0.19746897200002422, "overhead_s": 0.19691041550049704, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pydict", "size": "256M", "op": "pipeline", "median_s": 3.832832277000307, "min_s": 3.8184386909997556, "overhead_s": 3.8305122605006545, "n": 3}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pylist", "size": "1K", "op": "pipeline", "median_s": 0.002387636500316148, "min_s": 0.002224022000518744, "overhead_s": 6.76200006637373e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pylist", "size": "64K", "op": "pipeline", "median_s": 0.0025401164998584136, "min_s": 0.001991889000237279, "overhead_s": 0.00022010000020600273, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pylist", "size": "1M", "op": "pipeline", "median_s": 0.003816374000052747, "min_s": 0.0031958169993231422, "overhead_s": 0.001496357500400336, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pylist", "size": "16M", "op": "pipeline", "median_s": 0.024825529500049015, "min_s": 0.024468540999805555, "overhead_s": 0.022505513000396604, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "pylist", "size": "256M", "op": "pipeline", "median_s": 0.5278681694994702, "min_s": 0.520336980999673, "overhead_s": 0.5255481529998178, "n": 8}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "str", "size": "1K", "op": "pipeline", "median_s": 0.0024320769998666947, "min_s": 0.001985533999686595, "overhead_s": 0.00011206050021428382, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "str", "size": "64K", "op": "pipeline", "median_s": 0.0025224429996342224, "min_s": 0.002308433000507648, "overhead_s": 0.0002024264999818115, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "str", "size": "1M", "op": "pipeline", "median_s": 0.0033279720005339186, "min_s": 0.002698988999327412, "overhead_s": 0.0010079555008815078, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "str", "size": "16M", "op": "pipeline", "median_s": 0.013591623500360583, "min_s": 0.012943693000124767, "overhead_s": 0.011271607000708173, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "str", "size": "256M", "op": "pipeline", "median_s": 0.523415132500304, "min_s": 0.5173409159997391, "overhead_s": 0.5210951160006516, "n": 8}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "nested", "size": "1K", "op": "pipeline", "median_s": 0.0024760460000834428, "min_s": 0.002043614000285743, "overhead_s": 0.00015602950043103192, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "nested", "size": "64K", "op": "pipeline", "median_s": 0.002653682999607554, "min_s": 0.002128449999872828, "overhead_s": 0.0003336664999551431, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "nested", "size": "1M", "op": "pipeline", "median_s": 0.0030828945000394015, "min_s": 0.0024931740008469205, "overhead_s": 0.0007628780003869906, "n": 200}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "nested", "size": "16M", "op": "pipeline", "median_s": 0.0037065025003357732, "min_s": 0.0035154040006091236, "overhead_s": 0.0013864860006833624, "n": 40}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "nested", "size": "256M", "op": "pipeline", "median_s": 0.015497605999826192, "min_s": 0.015323252999223769, "overhead_s": 0.01317758950017378, "n": 8}
+{"runtime": "chimaera", "scenario": "pipeline", "kind": "nested", "size": "1G", "op": "pipeline", "median_s": 0.05264426299982006, "min_s": 0.05103909199988266, "overhead_s": 0.050324246500167646, "n": 4}
+{"runtime": "chimaera", "done": "pipeline", "wall_s": 118.2}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "1K", "op": "put", "median_s": 6.392499926732853e-06, "min_s": 6.10999995842576e-06, "n": 200, "payload": 1024}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "64K", "op": "put", "median_s": 2.5015000574057922e-05, "min_s": 2.3176000468083657e-05, "n": 200, "payload": 65536}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "1M", "op": "put", "median_s": 0.0003427445008128416, "min_s": 0.000326659999700496, "n": 200, "payload": 1048576}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "16M", "op": "put", "median_s": 0.004249488500136067, "min_s": 0.003635982000560034, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "256M", "op": "put", "median_s": 0.05958232800003316, "min_s": 0.054741489999287296, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "1G", "op": "put", "median_s": 0.22727789249984198, "min_s": 0.21914938899863046, "n": 4, "payload": 1073741824}
+{"runtime": "chimaera", "scenario": "put", "kind": "numpy", "size": "1K", "op": "put", "median_s": 2.0029500774398912e-05, "min_s": 1.870099913503509e-05, "n": 200, "payload": 1024}
+{"runtime": "chimaera", "scenario": "put", "kind": "numpy", "size": "64K", "op": "put", "median_s": 2.4964499971247278e-05, "min_s": 2.3554001018055715e-05, "n": 200, "payload": 65536}
+{"runtime": "chimaera", "scenario": "put", "kind": "numpy", "size": "1M", "op": "put", "median_s": 3.779949929594295e-05, "min_s": 3.600000127335079e-05, "n": 200, "payload": 1048576}
+{"runtime": "chimaera", "scenario": "put", "kind": "numpy", "size": "16M", "op": "put", "median_s": 3.886049944412662e-05, "min_s": 3.751399890461471e-05, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "numpy", "size": "256M", "op": "put", "median_s": 3.9373000618070364e-05, "min_s": 3.7879999581491575e-05, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "numpy", "size": "1G", "op": "put", "median_s": 3.8995999602775555e-05, "min_s": 3.7088999306433834e-05, "n": 4, "payload": 1073741824}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "1K", "op": "put", "median_s": 3.114649916824419e-05, "min_s": 2.963800034194719e-05, "n": 200, "payload": 1024}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "64K", "op": "put", "median_s": 4.436050039657857e-05, "min_s": 3.524000021570828e-05, "n": 200, "payload": 65536}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "1M", "op": "put", "median_s": 0.00039916000059747603, "min_s": 0.0003480600007605972, "n": 200, "payload": 1048576}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "16M", "op": "put", "median_s": 0.004375164500743267, "min_s": 0.003494556000077864, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "256M", "op": "put", "median_s": 0.06134153250059171, "min_s": 0.05810475399994175, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "1G", "op": "put", "median_s": 0.24806236199947307, "min_s": 0.24267770999904315, "n": 4, "payload": 1073741824}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "1K", "op": "put", "median_s": 6.0975000451435335e-05, "min_s": 5.790599971078336e-05, "n": 200, "payload": 1170}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "64K", "op": "put", "median_s": 6.959799975447822e-05, "min_s": 6.713100083288737e-05, "n": 200, "payload": 76145}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "1M", "op": "put", "median_s": 0.0005547675000343588, "min_s": 0.00048737600081949495, "n": 200, "payload": 1218492}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "16M", "op": "put", "median_s": 0.0021511525001187692, "min_s": 0.0019469729995762464, "n": 40, "payload": 19496064}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "256M", "op": "put", "median_s": 0.03287367000029917, "min_s": 0.030860168999424786, "n": 8, "payload": 311932170}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "1G", "op": "put", "median_s": 0.11643991199980519, "min_s": 0.1118704059990705, "n": 4, "payload": 1247728313}
+{"runtime": "chimaera", "scenario": "put", "kind": "pandas", "size": "1K", "op": "put", "median_s": 5.9745500948338304e-05, "min_s": 5.643999975291081e-05, "n": 200, "payload": 1140}
+{"runtime": "chimaera", "scenario": "put", "kind": "pandas", "size": "64K", "op": "put", "median_s": 0.00018300450028618798, "min_s": 0.00017227199896296952, "n": 200, "payload": 65652}
+{"runtime": "chimaera", "scenario": "put", "kind": "pandas", "size": "1M", "op": "put", "median_s": 0.0031853914997554966, "min_s": 0.0030963299996074056, "n": 200, "payload": 1048692}
+{"runtime": "chimaera", "scenario": "put", "kind": "pandas", "size": "16M", "op": "put", "median_s": 0.12222633199962729, "min_s": 0.12140503599948715, "n": 40, "payload": 16777332}
+{"runtime": "chimaera", "scenario": "put", "kind": "pandas", "size": "256M", "op": "put", "median_s": 3.245355061999362, "min_s": 3.2380933059994277, "n": 3, "payload": 268435572}
+{"runtime": "chimaera", "scenario": "put", "kind": "pydict", "size": "1K", "op": "put", "median_s": 7.734000064374413e-06, "min_s": 7.464999725925736e-06, "n": 200, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pydict", "size": "64K", "op": "put", "median_s": 5.329200030246284e-05, "min_s": 5.1760000133072026e-05, "n": 200, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pydict", "size": "1M", "op": "put", "median_s": 0.0009417330002179369, "min_s": 0.0009037079998961417, "n": 200, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pydict", "size": "16M", "op": "put", "median_s": 0.013838496999596828, "min_s": 0.013615274998301174, "n": 40, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pydict", "size": "256M", "op": "put", "median_s": 0.27144202449926524, "min_s": 0.26897740200001863, "n": 8, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pylist", "size": "1K", "op": "put", "median_s": 7.04200010659406e-06, "min_s": 6.827000106568448e-06, "n": 200, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pylist", "size": "64K", "op": "put", "median_s": 4.576350056595402e-05, "min_s": 4.5028999011265114e-05, "n": 200, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pylist", "size": "1M", "op": "put", "median_s": 0.0006078540000089561, "min_s": 0.0005877820003661327, "n": 200, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pylist", "size": "16M", "op": "put", "median_s": 0.010362390499722096, "min_s": 0.01019770899983996, "n": 40, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "pylist", "size": "256M", "op": "put", "median_s": 0.20100990850005473, "min_s": 0.1993162239996309, "n": 8, "payload": 0}
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "1K", "op": "put", "median_s": 6.416499672923237e-06, "min_s": 6.173999281600118e-06, "n": 200, "payload": 1024}
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "64K", "op": "put", "median_s": 1.5190501471806783e-05, "min_s": 1.4859999282634817e-05, "n": 200, "payload": 65536}
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "1M", "op": "put", "median_s": 0.0006088245008868398, "min_s": 0.0005146629991941154, "n": 200, "payload": 1048576}
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "16M", "op": "put", "median_s": 0.006796996500270325, "min_s": 0.006294288999924902, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "256M", "op": "put", "median_s": 0.3489623280011074, "min_s": 0.34666945100070734, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "nested", "size": "1K", "op": "put", "median_s": 3.8880500142113306e-05, "min_s": 3.7306999729480594e-05, "n": 200, "payload": 1024}
+{"runtime": "chimaera", "scenario": "put", "kind": "nested", "size": "64K", "op": "put", "median_s": 4.671650003729155e-05, "min_s": 4.502099909586832e-05, "n": 200, "payload": 65536}
+{"runtime": "chimaera", "scenario": "put", "kind": "nested", "size": "1M", "op": "put", "median_s": 0.0006446959987442824, "min_s": 0.0005705319999833591, "n": 200, "payload": 1048576}
+{"runtime": "chimaera", "scenario": "put", "kind": "nested", "size": "16M", "op": "put", "median_s": 0.00013733349987887777, "min_s": 0.0001318440008617472, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "nested", "size": "256M", "op": "put", "median_s": 0.00013164199935999932, "min_s": 0.00012670500109379645, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "nested", "size": "1G", "op": "put", "median_s": 0.00013649050015374087, "min_s": 0.00013161400056560524, "n": 4, "payload": 1073741824}
+{"runtime": "chimaera", "done": "put", "wall_s": 65.4}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1K", "op": "get", "median_s": 6.183999175846111e-06, "min_s": 5.231000614003278e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1K", "op": "put+get", "median_s": 2.10565012821462e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1K", "op": "touch", "median_s": 1.1439999070717022e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "64K", "op": "get", "median_s": 1.3269999726617243e-05, "min_s": 1.183900167234242e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "64K", "op": "put+get", "median_s": 6.222399952093838e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "64K", "op": "touch", "median_s": 1.3185999705456197e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1M", "op": "get", "median_s": 0.00020345200027804822, "min_s": 0.00016961199980869424, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1M", "op": "put+get", "median_s": 0.0007582135003758594, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1M", "op": "touch", "median_s": 1.9006000002264045e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "get", "median_s": 0.002254616500067641, "min_s": 0.0021944330001133494, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "put+get", "median_s": 0.005425538999588753, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "touch", "median_s": 6.189150008140132e-05, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "get", "median_s": 0.14747832299963193, "min_s": 0.14670448800097802, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "put+get", "median_s": 0.1874647240010745, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "touch", "median_s": 0.0007601124998473097, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1G", "op": "get", "median_s": 0.5745905474996107, "min_s": 0.5695677629992133, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1G", "op": "put+get", "median_s": 0.7268115399992894, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1G", "op": "touch", "median_s": 0.0030256315003498457, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1K", "op": "get", "median_s": 1.5157500456552953e-05, "min_s": 1.2651000361074694e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1K", "op": "put+get", "median_s": 5.4251499932433944e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1K", "op": "touch", "median_s": 1.3120500625518616e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "64K", "op": "get", "median_s": 1.819950011849869e-05, "min_s": 1.5675999748054892e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "64K", "op": "put+get", "median_s": 7.375449877145002e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "64K", "op": "touch", "median_s": 1.4390499927685596e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1M", "op": "get", "median_s": 3.910899977199733e-05, "min_s": 3.639699934865348e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1M", "op": "put+get", "median_s": 0.00010898200071096653, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1M", "op": "touch", "median_s": 4.779650043928996e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "16M", "op": "get", "median_s": 4.244450065016281e-05, "min_s": 4.062300104124006e-05, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "16M", "op": "put+get", "median_s": 0.00011500250093376962, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "16M", "op": "touch", "median_s": 0.0005658209993271157, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "256M", "op": "get", "median_s": 5.0138499318563845e-05, "min_s": 4.683699989982415e-05, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "256M", "op": "put+get", "median_s": 0.00012784399950760417, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "256M", "op": "touch", "median_s": 0.008615397999164998, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1G", "op": "get", "median_s": 6.042850054654991e-05, "min_s": 5.463600064103957e-05, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1G", "op": "put+get", "median_s": 0.00016328150013578124, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "numpy", "size": "1G", "op": "touch", "median_s": 0.03510508899944398, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1K", "op": "get", "median_s": 2.099149969581049e-05, "min_s": 1.862399949459359e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1K", "op": "put+get", "median_s": 7.643500066478737e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1K", "op": "touch", "median_s": 1.793649971659761e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "64K", "op": "get", "median_s": 2.6653000531950966e-05, "min_s": 2.456499896652531e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "64K", "op": "put+get", "median_s": 0.00010242300049867481, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "64K", "op": "touch", "median_s": 2.117849999194732e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1M", "op": "get", "median_s": 6.053400011296617e-05, "min_s": 5.316500028129667e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1M", "op": "put+get", "median_s": 0.0006317585002761916, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1M", "op": "touch", "median_s": 5.965749915048946e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "16M", "op": "get", "median_s": 6.174649934109766e-05, "min_s": 5.967499964754097e-05, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "16M", "op": "put+get", "median_s": 0.0030848034994050977, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "16M", "op": "touch", "median_s": 0.0005466455004352611, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "256M", "op": "get", "median_s": 0.00011495899980218383, "min_s": 0.00011038499906135257, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "256M", "op": "put+get", "median_s": 0.038492650000080175, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "256M", "op": "touch", "median_s": 0.008640612499220879, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1G", "op": "get", "median_s": 0.0001316560001214384, "min_s": 0.00012534300003608223, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1G", "op": "put+get", "median_s": 0.14600069799962512, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1G", "op": "touch", "median_s": 0.034254097499797354, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1K", "op": "get", "median_s": 4.7502499910478946e-05, "min_s": 3.830899913737085e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1K", "op": "put+get", "median_s": 0.00013826800022798125, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1K", "op": "touch", "median_s": 3.621199994086055e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "64K", "op": "get", "median_s": 5.1800499932141975e-05, "min_s": 4.642200110538397e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "64K", "op": "put+get", "median_s": 0.00016539250009373063, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "64K", "op": "touch", "median_s": 3.649600057542557e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1M", "op": "get", "median_s": 8.911850000004051e-05, "min_s": 8.147399967128877e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1M", "op": "put+get", "median_s": 0.0006919644993104157, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1M", "op": "touch", "median_s": 7.195899979706155e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "16M", "op": "get", "median_s": 0.00011856800028908765, "min_s": 0.00010922000001301058, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "16M", "op": "put+get", "median_s": 0.002699508498153591, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "16M", "op": "touch", "median_s": 0.000651811000352609, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "256M", "op": "get", "median_s": 0.00021464500059664715, "min_s": 0.00020687299911514856, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "256M", "op": "put+get", "median_s": 0.020644551999794203, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "256M", "op": "touch", "median_s": 0.00999416100057715, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1G", "op": "get", "median_s": 0.00040834349965734873, "min_s": 0.00039384199953929055, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1G", "op": "put+get", "median_s": 0.07220856349977112, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1G", "op": "touch", "median_s": 0.04023847549979109, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "1K", "op": "get", "median_s": 0.00011346249993948732, "min_s": 9.702600073069334e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "1K", "op": "put+get", "median_s": 0.00021052850115665933, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "1K", "op": "touch", "median_s": 0.00010451549951540073, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "64K", "op": "get", "median_s": 0.00020969500019418774, "min_s": 0.00018873299995902926, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "64K", "op": "put+get", "median_s": 0.00045637000130227534, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "64K", "op": "touch", "median_s": 0.00010892499994952232, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "1M", "op": "get", "median_s": 0.0016452529998787213, "min_s": 0.0015916110005491646, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "1M", "op": "put+get", "median_s": 0.004834969001421996, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "1M", "op": "touch", "median_s": 0.0001527639997220831, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "16M", "op": "get", "median_s": 0.03799782250007411, "min_s": 0.03152395699908084, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "16M", "op": "put+get", "median_s": 0.15970729799846595, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "16M", "op": "touch", "median_s": 0.0006533149999086163, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "256M", "op": "get", "median_s": 0.813199001000612, "min_s": 0.8120758719996957, "n": 3}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "256M", "op": "put+get", "median_s": 4.025300570998297, "n": 3}
+{"runtime": "chimaera", "scenario": "get", "kind": "pandas", "size": "256M", "op": "touch", "median_s": 0.0062044120004429715, "n": 3}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "1K", "op": "get", "median_s": 8.339000487467274e-06, "min_s": 7.197999366326258e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "1K", "op": "put+get", "median_s": 2.5626000024203677e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "1K", "op": "touch", "median_s": 1.1629999789875e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "64K", "op": "get", "median_s": 8.258399975602515e-05, "min_s": 7.562199971289374e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "64K", "op": "put+get", "median_s": 0.0001583714993103058, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "64K", "op": "touch", "median_s": 0.0005610859998341766, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "1M", "op": "get", "median_s": 0.001406200500241539, "min_s": 0.0013677059996552998, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "1M", "op": "put+get", "median_s": 0.002472635499543685, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "1M", "op": "touch", "median_s": 0.008815328500531905, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "16M", "op": "get", "median_s": 0.03684374799922807, "min_s": 0.03616918199986685, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "16M", "op": "put+get", "median_s": 0.05203687949870073, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "16M", "op": "touch", "median_s": 0.14144380649941013, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "256M", "op": "get", "median_s": 1.242430764999881, "min_s": 1.2323867699997209, "n": 3}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "256M", "op": "put+get", "median_s": 1.500705733000359, "n": 3}
+{"runtime": "chimaera", "scenario": "get", "kind": "pydict", "size": "256M", "op": "touch", "median_s": 2.2549995290009974, "n": 3}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "1K", "op": "get", "median_s": 7.271998583746608e-06, "min_s": 6.218000635271892e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "1K", "op": "put+get", "median_s": 3.0081999284448102e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "1K", "op": "touch", "median_s": 1.018000148178544e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "64K", "op": "get", "median_s": 3.231000027881237e-05, "min_s": 3.0606999644078314e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "64K", "op": "put+get", "median_s": 9.880950074148132e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "64K", "op": "touch", "median_s": 1.1584997992031276e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "1M", "op": "get", "median_s": 0.00037044549935671967, "min_s": 0.0003601200005505234, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "1M", "op": "put+get", "median_s": 0.00100292150000314, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "1M", "op": "touch", "median_s": 1.8450000425218605e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "16M", "op": "get", "median_s": 0.006852110500403796, "min_s": 0.0066885440010082675, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "16M", "op": "put+get", "median_s": 0.01866442700065818, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "16M", "op": "touch", "median_s": 3.926000317733269e-06, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "256M", "op": "get", "median_s": 0.23927936000018235, "min_s": 0.23811010500139673, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "256M", "op": "put+get", "median_s": 0.4331086325000797, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "pylist", "size": "256M", "op": "touch", "median_s": 6.09600010648137e-06, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1K", "op": "get", "median_s": 6.309500349743757e-06, "min_s": 5.53499921807088e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1K", "op": "put+get", "median_s": 2.370000038354192e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1K", "op": "touch", "median_s": 7.259995982167311e-07, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "64K", "op": "get", "median_s": 1.4010998711455613e-05, "min_s": 1.281000004382804e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "64K", "op": "put+get", "median_s": 5.121399954077788e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "64K", "op": "touch", "median_s": 8.534989319741726e-07, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1M", "op": "get", "median_s": 0.0002752500004135072, "min_s": 0.0002505269985704217, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1M", "op": "put+get", "median_s": 0.0009263259980798466, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1M", "op": "touch", "median_s": 1.5730001905467361e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "16M", "op": "get", "median_s": 0.003655872499621182, "min_s": 0.003580540000257315, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "16M", "op": "put+get", "median_s": 0.009344321500066144, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "16M", "op": "touch", "median_s": 2.2490003175335005e-06, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "256M", "op": "get", "median_s": 0.1670144084991989, "min_s": 0.16623473400068178, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "256M", "op": "put+get", "median_s": 0.47847579950030195, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "256M", "op": "touch", "median_s": 5.373999556468334e-06, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1K", "op": "get", "median_s": 2.7563500225369353e-05, "min_s": 2.3148999389377423e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1K", "op": "put+get", "median_s": 9.206200138578424e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1K", "op": "touch", "median_s": 3.9636000110476743e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "64K", "op": "get", "median_s": 3.096149976045126e-05, "min_s": 2.8496999220806174e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "64K", "op": "put+get", "median_s": 0.0001144599991675932, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "64K", "op": "touch", "median_s": 4.06694998673629e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1M", "op": "get", "median_s": 6.370499977492727e-05, "min_s": 5.864500053576194e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1M", "op": "put+get", "median_s": 0.0006312770010481472, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1M", "op": "touch", "median_s": 8.304600032715825e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "16M", "op": "get", "median_s": 0.0001257564999832539, "min_s": 0.00011923100100830197, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "16M", "op": "put+get", "median_s": 0.00029657999948540237, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "16M", "op": "touch", "median_s": 0.0005650644989145803, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "256M", "op": "get", "median_s": 0.00013116899935994297, "min_s": 0.000127945999338408, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "256M", "op": "put+get", "median_s": 0.00031439449958270416, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "256M", "op": "touch", "median_s": 0.008695961500961857, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1G", "op": "get", "median_s": 0.00016234150007221615, "min_s": 0.00015433100088557694, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1G", "op": "put+get", "median_s": 0.0004234180005369126, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "nested", "size": "1G", "op": "touch", "median_s": 0.0351989640003012, "n": 4}
+{"runtime": "chimaera", "done": "get", "wall_s": 106.9}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1K", "op": "put", "per_object_s": 7.975235699996119e-06, "n": 10000}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1K", "op": "get", "per_object_s": 5.8130900000833205e-06, "n": 10000, "call_s": 0.14079091100029473}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "64K", "op": "put", "per_object_s": 5.319008870010293e-05, "n": 10000}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "64K", "op": "get", "per_object_s": 3.8551947300038594e-05, "n": 10000, "call_s": 2.0309428439995827}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1M", "op": "put", "per_object_s": 0.0005406690698244176, "n": 2048}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1M", "op": "get", "per_object_s": 0.0005915842661137205, "n": 2048, "call_s": 1.3290640650011483}
+{"runtime": "chimaera", "done": "many", "wall_s": 5.5}

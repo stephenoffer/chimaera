@@ -80,9 +80,9 @@ def test_node_affinity_and_labels_become_placement():
     )
 
     hard = _options.translate({"scheduling_strategy": NodeAffinitySchedulingStrategy("ab12", soft=False)}, _options.TASK)
-    assert hard["placement"] == ch.Placement(require={"node": "ab12"})
+    assert hard["placement"] == ch.dist.Placement(require={"node": "ab12"})
     soft = _options.translate({"scheduling_strategy": NodeAffinitySchedulingStrategy("ab12", soft=True)}, _options.TASK)
-    assert soft["placement"] == ch.Placement(prefer=("node=ab12",))
+    assert soft["placement"] == ch.dist.Placement(prefer=("node=ab12",))
     both = _options.translate(
         {
             "label_selector": {"zone": "a"},
@@ -90,7 +90,7 @@ def test_node_affinity_and_labels_become_placement():
         },
         _options.TASK,
     )
-    assert both["placement"] == ch.Placement(require={"zone": "a", "rack": "r7"}, prefer=("disk=ssd",))
+    assert both["placement"] == ch.dist.Placement(require={"zone": "a", "rack": "r7"}, prefer=("disk=ssd",))
     with pytest.raises(ray.Unsupported, match="exact label values"):
         _options.translate({"scheduling_strategy": NodeLabelSchedulingStrategy(hard={"rack": NotIn("r7")})}, _options.TASK)
 
@@ -204,7 +204,7 @@ def test_task_errors_are_dual_typed():
     assert err.__notes__ == cause.__notes__  # copied once, not duplicated
     assert isinstance(translate(ch.Cancelled("x")), ray.exceptions.TaskCancelledError)
     assert isinstance(translate(ch.ActorDied("x")), ray.exceptions.ActorDiedError)
-    assert isinstance(translate(ch.WorkerCrashed("x")), ray.exceptions.WorkerCrashedError)
+    assert isinstance(translate(ch.errors.WorkerCrashed("x")), ray.exceptions.WorkerCrashedError)
     assert translate(ch.Infeasible("no")) is None  # no Ray equivalent: Chimaera's error stands
 
 
@@ -373,7 +373,7 @@ def test_actor_pool_orders_and_reuses_actors():
 
 
 def test_runtime_context_reports_the_run():
-    assert ray.get_runtime_context().get_job_id() == ch.current_run().id
+    assert ray.get_runtime_context().get_job_id() == ch.runs.current_run().id
     assert ray.get_runtime_context().get_task_id() is None
 
 

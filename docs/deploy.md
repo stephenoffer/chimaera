@@ -52,13 +52,42 @@ on each voter. Where it takes longer (network volumes such as EBS, about
 its group's machines hold it in memory, because syncing would cap per-call
 throughput (on 4 cloud machines: 2,681 no-op calls/s synced, 17,547/s
 replicated). A peer whose logs were not synced and whose machine rebooted
-without a clean shutdown discards its raft identity when it comes back and
-joins as a new member, so it can never vote with a log it may have lost. What
-stays at risk is a majority of one group's machines failing at the same
-moment, which can lose that group's latest commits. `chimaera status` lists
-the choice and why. `CHIMAERA_RAFT_SYNC` overrides it: `fsync`, `full` (also
+without a clean shutdown first asks the other voters of its groups whether
+they still lead them (for up to 10 seconds). If they do, it discards its raft
+identity and joins as a new member, so it can never vote with a log it may
+have lost. If some group has no leader (most of its machines went down
+together), it keeps its state instead, so the group comes back when enough
+of its voters return, possibly without its last moments of commits. A peer
+whose groups have no majority yet still starts and serves the groups that
+do; the others are retried in the background. `chimaera status` lists the
+choice and why. `CHIMAERA_RAFT_SYNC` overrides it: `fsync`, `full` (also
 flushes the drive cache; very slow on macOS) or `none`. Local peers never
-sync (one machine survives the peer process dying, not the machine).
+sync, except that the record of an `effects="external"` call starting is
+synced before the call runs, so a power loss cannot make it run twice.
+
+Recovering a group whose other voters are gone for good (their disks lost):
+stop the surviving peer, then run
+`chimaera --dir DIR cluster recover --group G --force-new-quorum` for each
+such group. That peer becomes the group's only voter, keeping every commit it
+holds; commits it never received are lost. Start it again: the cluster adds
+live peers back as voters. Use it only when the other voters will not return,
+and on the surviving replica that holds the most of the group's log.
+
+Upgrading: `chimaera --version` prints the release and its peer level, for
+example `chimaera 0.1.0 (peer level 1)`. Every replica of a group must apply
+its log with the same code, so peers at different levels refuse each other's
+calls (the refused peer logs "every peer of a cluster must run the same
+release"). A release that keeps the level can replace peers one at a time:
+restart a peer, wait for `chimaera status` to list it, then the next. Under
+Kubernetes, `kubectl apply` the new image, then `kubectl delete pod NAME-N`
+one pod at a time, since the StatefulSet only replaces pods you delete. A
+release that raises the level needs every peer stopped before any starts
+again on the new release (`kubectl scale --replicas=0`, then back). Raft
+state and peer identities stay on disk across a clean stop, so detached runs
+and named actors' records survive; calls running at the stop are interrupted
+as in any whole-cluster restart. Drivers are checked separately: a peer
+refuses a driver whose wire version is newer than its own, so upgrade peers
+before drivers.
 
 Under `auto`, two flags keep the meaning they had before providers existed:
 `--listen` means a hand-configured (`static`) peer, and `--idle-timeout`
@@ -107,6 +136,7 @@ sets these, each for a reason:
 | Setting | Why |
 |---|---|
 | `podManagementPolicy: Parallel` | `OrderedReady` deadlocks formation: pod 0 can't be ready until the other founders exist |
+| `updateStrategy: OnDelete` | a release that raises the peer level must replace every pod together; see Upgrading |
 | `publishNotReadyAddresses: true` | founders must resolve each other before they are ready |
 | a readiness probe on the client port | the port opens only once the cluster has formed |
 | a volume claim per pod, mounted at `/data` | Raft logs and the peer's identity survive pod restarts |
@@ -217,14 +247,26 @@ to cap each tenant's CPUs on that peer:
 - **No quota:** tenants without a quota are not limited.
 - **Bad setting:** a malformed setting stops the peer.
 
-Quotas are per peer today; a tenant's share across a whole cluster comes later.
+`CHIMAERA_TENANT_SHARES="team-a=64"` caps a tenant's CPUs across the whole
+cluster in the same way. Set it on every peer:
+- **How it counts:** each peer reports its tenants' CPUs in its load replies, and admits a call only if the tenant's CPUs here, plus what the other peers last reported, leave room.
+- **Overshoot:** peers admitting in the same instant may overshoot a share briefly, until their next reports (a fraction of a second), never for long.
+- **Combining:** a peer quota and a cluster share combine; a call must fit both.
+
+A test runs 12 one-second calls under `ml=2` on two 4-CPU peers. They take
+about 6 s (2 at a time), against about 2 s for a tenant without a share.
 
 ### Metrics
 
 Set `CHIMAERA_METRICS_LISTEN=0.0.0.0:9700` and each peer serves Prometheus
-gauges at `GET /metrics`: calls queued and running, CPUs in use, busy
+metrics at `GET /metrics`. Gauges: calls queued and running, CPUs in use, busy
 executors, object and memory bytes, connected drivers, shard proposals in
-flight, dispatch latency (p50 and p99) and live/dead peers. The endpoint
+flight, dispatch latency (p50 and p99), live/dead peers, groups with no
+leader, and per group this peer holds whether it leads it and, on the leader,
+how many log entries its slowest voter lacks. Counters since the peer
+started: proposals and proposals no leader accepted, peers declared dead,
+worker deaths, OOM kills, cancelled calls' workers killed, and failed object
+replicas. The endpoint
 serves counts only, never run names or values, and takes no token, so bind it
 where only your scraper can reach it. `chimaera k8s render` turns it on and
 adds the `prometheus.io/scrape` annotations.
@@ -233,7 +275,7 @@ adds the `prometheus.io/scrape` annotations.
 
 `python -m chimaera.provisioner --k8s-statefulset chimaera --min 1 --max 8`
 grows and shrinks the StatefulSet. It is an ordinary remote driver
-(`CHIMAERA_ADDRESS`, `CHIMAERA_TOKEN`) that reads `ch.cluster().nodes()` and
+(`CHIMAERA_ADDRESS`, `CHIMAERA_TOKEN`) that reads `ch.runs.cluster().nodes()` and
 keeps no state, so it can restart at any time, and losing it stops scaling,
 never work. It runs outside the peers, so user code never sits next to the
 credentials that scale the cluster.
@@ -267,6 +309,23 @@ and the spares' names are kept in the cluster's store, so a restarted
 provisioner knows them. Run it with `CHIMAERA_CLUSTER_TOKEN` set. The calls
 it makes are checked against stand-in `sky` and `ssh` commands; it has not
 run against a real SkyPilot install.
+
+### Several clusters (federation)
+
+Clusters (cells) can lend each other capacity. Start a cell's peers with the
+other cells' client endpoints and a token those cells accept:
+
+```
+CHIMAERA_FLEET="b=10.0.1.5:7710" CHIMAERA_FLEET_TOKEN_FILE=/etc/chimaera/fleet chimaera peer start ...
+```
+
+When every peer of a cell is full, a queued call that carries everything it
+needs may run in another cell with room:
+- **Eligible:** plain function calls with inline arguments, no dependencies and no effects.
+- **Ownership:** it stays a call of its home cell, which publishes its result.
+- **Failure:** losing the other cell costs only a retry of what it held.
+
+Details, limits and the test are in [federation.md](federation.md).
 
 ## Selecting and reaching a cluster (P3)
 
@@ -362,7 +421,7 @@ devices of that kind. UUIDs are used for CUDA so device ordinals never matter.
 The TPU rules follow Ray 2.60's accelerator managers. Intel differs from Ray,
 which leaves Level Zero's device order and hierarchy at their defaults: here
 both are pinned, so a mask names the card the peer chose.
-`ch.device()` returns the framework device string (`"cuda:0"`, `"xla:0"`,
+`ch.dist.device()` returns the framework device string (`"cuda:0"`, `"xla:0"`,
 `"hpu"`, `"xpu:0"`, `"mps"` or `"cpu"`) without importing a framework.
 
 ### How peers discover them
@@ -381,8 +440,29 @@ Neuron instance family (`trn2`).
 
 Only CUDA's `CUDA_VISIBLE_DEVICES=""` behavior is documented by its vendor
 and relied on as fact. Every other vendor detail here is unverified on
-hardware until `chimaera doctor --capture` records real trees on GPU nodes and
-replaces the hand-written fixtures in `tests/fixtures/topology/`.
+hardware, and the fixtures in `tests/fixtures/topology/` are hand-written.
+
+`deploy/anyscale/gpu-check.job.yaml` is the first hardware check: one node
+with 4 NVIDIA A10Gs, running `bench/evals/gpu_check.py`. That script checks:
+- the peer finds every GPU `nvidia-smi` lists;
+- a `gpus=1` call sees exactly one GPU, as torch counts them, named by its UUID;
+- concurrent calls get different GPUs, and a CPU call sees none;
+- a 2-rank gang all-reduces over NCCL.
+
+It also copies the node's driver files to `OUT/fixture`, a real tree to
+replace the hand-written CUDA ones.
+
+It ran on 2026-11-21 (job `prodjob_hallzt4lkuhdbrgazpxhrrepv9`):
+- **Passed (7 of 8):**
+  - each `gpus=1` call saw exactly one GPU by UUID (torch counted 1, `ch.dist.device()` was `cuda:0`);
+  - four concurrent calls got four different GPUs;
+  - a CPU call saw none;
+  - a 2-rank gang all-reduced over NCCL;
+  - the driver files were captured.
+- **Failed (1):** a lone peer listed no GPUs in `ch.runs.cluster().nodes()`, though it granted all four. That was a bug in how a peer without a mesh reports itself. It is fixed and covered by `test_devices.py`, but the fix hasn't been rerun on that node.
+
+So CUDA discovery, grants and NCCL gangs are verified on NVIDIA A10Gs. ROCm,
+TPU, Neuron, Gaudi and Intel are not.
 
 ## Your environment on remote peers (P3)
 

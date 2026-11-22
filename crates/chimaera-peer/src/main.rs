@@ -8,7 +8,7 @@ use chimaera_core::pb;
 use chimaera_core::provider::ProviderKind;
 use chimaera_peer::launch;
 use chimaera_peer::runtime::{self, PeerConfig};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,11 +31,15 @@ enum Cmd {
         #[command(subcommand)]
         action: PeerCmd,
     },
-    /// Run a program against the local peer (`chimaera run -- python app.py`).
+    /// Run a program against the local peer, or with --cluster against a
+    /// cluster (`chimaera run --cluster lab -- python app.py`).
     Run {
         /// Keep the program's run going after the program exits.
         #[arg(long)]
         detach: bool,
+        /// A cluster profile or tcp://host:port, passed to the program as $CHIMAERA_CLUSTER.
+        #[arg(long)]
+        cluster: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
@@ -43,6 +47,33 @@ enum Cmd {
     Status {
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        at: At,
+    },
+    /// The cluster's runs, newest first: state, age and the command that started each.
+    Runs {
+        /// Show at most this many (0: all).
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        at: At,
+    },
+    /// Cancel a run: its unfinished calls are cancelled and its actors stopped.
+    Cancel {
+        run: String,
+        #[command(flatten)]
+        at: At,
+    },
+    /// What this peer's object store holds: in memory, on disk (spilled or
+    /// replicas), per run, the largest objects, NumPy arenas and the reserve.
+    Objects {
+        #[arg(long)]
+        json: bool,
+        /// Every live peer's store, not only this one's.
+        #[arg(long)]
+        cluster: bool,
     },
     /// What a run's calls printed on this peer, kept after the driver has gone.
     Logs {
@@ -50,12 +81,16 @@ enum Cmd {
         /// Keep waiting for more output (Ctrl-C to stop).
         #[arg(long, short)]
         follow: bool,
+        #[command(flatten)]
+        at: At,
     },
     /// Summary of a run: tasks by state.
     Inspect {
         run: String,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        at: At,
     },
     /// What happened to one task of a run (attempts, measurements, waiting reason),
     /// or the tuning decisions the peer made.
@@ -69,6 +104,8 @@ enum Cmd {
         decisions: bool,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        at: At,
     },
     /// What the peer has learned about each function: calls, time, cores,
     /// memory, and the reservation the next call gets.
@@ -106,6 +143,17 @@ enum Cmd {
     Up { name: String },
     /// Stop the peers of an SSH cluster profile.
     Down { name: String },
+}
+
+/// Which peer a command asks.
+#[derive(clap::Args)]
+struct At {
+    /// A cluster profile in ~/.config/chimaera/clusters.toml, or tcp://host:port.
+    /// Default, as for a driver: $CHIMAERA_CLUSTER, $CHIMAERA_ADDRESS, then the
+    /// profile file's default; the local peer when --dir or $CHIMAERA_HOME is
+    /// set, or when none of those is.
+    #[arg(long)]
+    cluster: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -175,6 +223,17 @@ enum PeerCmd {
 enum ClusterCmd {
     /// Print a new random cluster token.
     Token,
+    /// Print a driver credential for TENANT: drivers presenting it (as
+    /// $CHIMAERA_TOKEN, or a profile's token file) reach only that tenant's
+    /// runs, actors, store and logs, and cannot stop peers. Changing the
+    /// cluster token revokes every credential.
+    Credential {
+        #[arg(long)]
+        tenant: String,
+        /// The cluster token's file (default: $CHIMAERA_CLUSTER_TOKEN).
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
     /// Create a cluster CA and token in OUT (ca.pem, ca.key, token).
     Init {
         #[arg(long)]
@@ -191,19 +250,38 @@ enum ClusterCmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Rebuild group GROUP around this stopped peer when its other voters are
+    /// gone for good: this peer becomes the group's only voter, keeping the
+    /// commits it holds (ones it never received are lost), and the cluster
+    /// adds voters back once it runs. Use the surviving replica that holds the
+    /// most of the group's log.
+    Recover {
+        #[arg(long)]
+        group: u32,
+        /// Required: confirms that the group's other voters will not return.
+        #[arg(long)]
+        force_new_quorum: bool,
+    },
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // The peer level decides how a release is rolled out (docs/deploy.md, "Upgrading").
+    let version: &'static str =
+        format!("{} (peer level {})", env!("CARGO_PKG_VERSION"), chimaera_proto::PEER_LEVEL).leak();
+    let cli = Cli::from_arg_matches(&Cli::command().version(version).get_matches()).unwrap_or_else(|e| e.exit());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("CHIMAERA_LOG")
                 .unwrap_or_else(|_| "chimaera=info,chimaera_peer=info,warn".into()),
         )
         .with_writer(std::io::stderr)
+        // Colours only on a terminal: peer.log is read with less and grep.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
     let dir_flag = cli.dir.clone();
     let dir = dir_flag.clone().unwrap_or_else(runtime::default_local_dir);
+    // A data directory named on the command line or in $CHIMAERA_HOME means its peer.
+    let local = dir_flag.is_some() || std::env::var_os("CHIMAERA_HOME").is_some();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let result = rt.block_on(async move {
         match cli.cmd {
@@ -278,15 +356,28 @@ fn main() -> ExitCode {
                 };
                 chimaera_peer::cluster::run_cluster(cfg).await.map_err(|e| e.to_string()).map(|_| 0)
             }
-            Cmd::Run { detach, command } => run_program(&dir, detach, &command).await,
-            Cmd::Status { json } => status(&dir, json).await,
-            Cmd::Logs { run, follow } => logs(&dir, &run, follow).await,
-            Cmd::Inspect { run, json } => inspect(&dir, &run, json).await,
-            Cmd::Explain { run, task, decisions, json } => explain(&dir, &run, task, decisions, json).await,
+            Cmd::Run { detach, cluster, command } => run_program(&dir, detach, cluster.as_deref(), &command).await,
+            Cmd::Status { json, at } => status(connect(&dir, local, &at).await?, json).await,
+            Cmd::Runs { limit, json, at } => runs(connect(&dir, local, &at).await?, limit, json).await,
+            Cmd::Cancel { run, at } => cancel(connect(&dir, local, &at).await?, &run).await,
+            Cmd::Objects { json, cluster } => objects(&dir, json, cluster).await,
+            Cmd::Logs { run, follow, at } => logs(connect(&dir, local, &at).await?, &run, follow).await,
+            Cmd::Inspect { run, json, at } => inspect(connect(&dir, local, &at).await?, &run, json).await,
+            Cmd::Explain { run, task, decisions, json, at } => {
+                explain(connect(&dir, local, &at).await?, &run, task, decisions, json).await
+            }
             Cmd::Profiles { name, json } => Ok(profiles(&dir, name.as_deref(), json)),
             Cmd::Stop => stop(&dir).await,
             Cmd::Cluster { action: ClusterCmd::Token } => {
                 println!("{}", launch::new_token().map_err(|e| e.to_string())?);
+                Ok(0)
+            }
+            Cmd::Cluster { action: ClusterCmd::Credential { tenant, token_file } } => {
+                if !chimaera_peer::auth::valid_tenant(&tenant) {
+                    return Err(format!("tenant {tenant:?} must be 1-64 letters, digits, '-' or '_'"));
+                }
+                let token = cluster_token(token_file.as_deref(), false)?.expect("required above");
+                println!("{}", chimaera_peer::auth::credential(&token, &tenant));
                 Ok(0)
             }
             Cmd::Cluster { action: ClusterCmd::Init { out } } => {
@@ -300,6 +391,21 @@ fn main() -> ExitCode {
             }
             Cmd::Cluster { action: ClusterCmd::Cert { ca, name, out } } => {
                 chimaera_peer::tls::issue(&ca, &name, &out).map_err(|e| format!("{}: {e}", out.display()))?;
+                Ok(0)
+            }
+            Cmd::Cluster { action: ClusterCmd::Recover { group, force_new_quorum } } => {
+                if !force_new_quorum {
+                    return Err(format!(
+                        "recover makes this peer the only voter of group {group}, losing any commit it never \
+                         received; run it only when the group's other voters are gone for good, and pass \
+                         --force-new-quorum"
+                    ));
+                }
+                let at = chimaera_peer::cluster::recover_group(&dir, group).map_err(|e| format!("{}: {e}", dir.display()))?;
+                println!(
+                    "group {group}: this peer is its only voter, resuming after log index {at}; start the peer, and \
+                     the cluster adds voters back from live peers"
+                );
                 Ok(0)
             }
             Cmd::Doctor => Ok(doctor(&dir)),
@@ -343,35 +449,53 @@ fn cluster_token(file: Option<&std::path::Path>, insecure: bool) -> Result<Optio
     }
 }
 
-type Client = pb::peer_client::PeerClient<tonic::transport::Channel>;
+type Client = chimaera_proto::client::PeerClient;
 
-async fn connect(dir: &std::path::Path) -> Result<Client, String> {
+async fn connect_local(dir: &std::path::Path) -> Result<Client, String> {
     let sock = chimaera_proto::uds::socket_path(dir, runtime::CLIENT_SOCKET);
-    let ch = chimaera_proto::uds::connect(&sock)
+    chimaera_proto::client::connect(&sock.to_string_lossy(), None, None)
         .await
-        .map_err(|e| format!("no local peer at {} ({e}); start one with `chimaera peer start`", sock.display()))?;
-    Ok(pb::peer_client::PeerClient::new(ch))
+        .map_err(|e| format!("no local peer at {} ({e}); start one with `chimaera peer start`", sock.display()))
+}
+
+/// The peer `at` names, else the one a driver here would use (`local`: the
+/// data directory was named, so its peer).
+async fn connect(dir: &std::path::Path, local: bool, at: &At) -> Result<Client, String> {
+    if at.cluster.is_none() && local {
+        return connect_local(dir).await;
+    }
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let path = chimaera_peer::launch::ssh::profile_path();
+    let text = std::fs::read_to_string(&path).ok();
+    let shown = path.display().to_string();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
+    match chimaera_peer::target::resolve(at.cluster.as_deref(), &env, text.as_deref().map(|t| (shown.as_str(), t)), &home)? {
+        Some(t) => chimaera_peer::target::connect(&t).await,
+        None => connect_local(dir).await,
+    }
 }
 
 fn parse_run(run: &str) -> Result<Id, String> {
     Id::parse_hex(run.trim_start_matches("r-")).ok_or_else(|| format!("{run:?} is not a run id (32 hex digits)"))
 }
 
-async fn run_program(dir: &std::path::Path, detach: bool, command: &[String]) -> Result<u8, String> {
-    let status = tokio::process::Command::new(&command[0])
-        .args(&command[1..])
-        .env("CHIMAERA_HOME", dir)
-        .env("CHIMAERA_DETACH", if detach { "1" } else { "0" })
+async fn run_program(dir: &std::path::Path, detach: bool, cluster: Option<&str>, command: &[String]) -> Result<u8, String> {
+    let mut cmd = tokio::process::Command::new(&command[0]);
+    cmd.args(&command[1..]).env("CHIMAERA_DETACH", if detach { "1" } else { "0" });
+    match cluster {
+        Some(c) => cmd.env("CHIMAERA_CLUSTER", c),
+        None => cmd.env("CHIMAERA_HOME", dir),
+    };
+    let status = cmd
         .status()
         .await
         .map_err(|e| format!("cannot run {}: {e}", command[0]))?;
     Ok(status.code().map_or(1, |c| c.clamp(0, 255) as u8))
 }
 
-async fn logs(dir: &std::path::Path, run: &str, follow: bool) -> Result<u8, String> {
+async fn logs(mut c: Client, run: &str, follow: bool) -> Result<u8, String> {
     use std::io::Write as _;
     let run = parse_run(run)?;
-    let mut c = connect(dir).await?;
     let mut offset = 0;
     loop {
         let req = pb::LogsRequest { run: run.to_vec(), offset, wait_ms: if follow { 10_000 } else { 0 } };
@@ -384,9 +508,62 @@ async fn logs(dir: &std::path::Path, run: &str, follow: bool) -> Result<u8, Stri
     }
 }
 
-async fn status(dir: &std::path::Path, json: bool) -> Result<u8, String> {
-    let mut c = connect(dir).await?;
-    let s = c.status(pb::StatusRequest {}).await.map_err(|e| e.message().to_string())?.into_inner();
+async fn objects(dir: &std::path::Path, json: bool, cluster: bool) -> Result<u8, String> {
+    let mut c = connect_local(dir).await?;
+    let req = pb::StatusRequest { objects: cluster };
+    let s = c.status(req).await.map_err(|e| e.message().to_string())?.into_inner();
+    let stores: Vec<serde_json::Value> = if cluster {
+        s.objects.iter().map(|j| serde_json::from_str(j).unwrap_or_default()).collect()
+    } else {
+        let object_dir = s.peer.map(|p| p.object_dir).unwrap_or_default();
+        vec![chimaera_peer::objplane::inventory(std::path::Path::new(&object_dir))]
+    };
+    if json {
+        let out = if cluster { serde_json::Value::Array(stores) } else { stores.into_iter().next().unwrap_or_default() };
+        println!("{out}");
+        return Ok(0);
+    }
+    for inv in &stores {
+        if cluster {
+            println!("peer {}", inv["addr"].as_str().unwrap_or("?"));
+        }
+        if let Some(e) = inv["error"].as_str() {
+            println!("  cannot read its store: {e}");
+            continue;
+        }
+        print_objects(inv);
+    }
+    Ok(0)
+}
+
+fn print_objects(inv: &serde_json::Value) {
+    let mib = |v: &serde_json::Value| v.as_u64().unwrap_or(0) as f64 / (1 << 20) as f64;
+    println!("objects in {} (huge pages: {})", inv["object_dir"].as_str().unwrap_or(""), inv["huge_pages"]);
+    println!("  in memory: {} objects, {:.1} MiB", inv["in_memory"]["objects"], mib(&inv["in_memory"]["bytes"]));
+    println!("  on disk:   {} objects, {:.1} MiB (spilled, or replicas of other peers' objects)",
+        inv["on_disk"]["objects"], mib(&inv["on_disk"]["bytes"]));
+    let arenas = inv["arenas"].as_array().cloned().unwrap_or_default();
+    let arena_bytes: f64 = arenas.iter().map(|a| mib(&a["bytes"])).sum();
+    println!("  arenas:    {:.1} MiB of arrays and large Python values in {} processes", arena_bytes, arenas.len());
+    println!("  reserve:   {:.1} MiB of pre-zeroed pages", mib(&inv["reserve_bytes"]));
+    for r in inv["runs"].as_array().into_iter().flatten() {
+        println!("  run {}: {} objects, {:.1} MiB in memory, {:.1} MiB on disk",
+            r["run"].as_str().unwrap_or(""), r["objects"], mib(&r["memory_bytes"]), mib(&r["disk_bytes"]));
+    }
+    for o in inv["largest"].as_array().into_iter().flatten() {
+        println!("  {:>10.1} MiB  {}  ({})", mib(&o["bytes"]), o["object"].as_str().unwrap_or(""), o["where"].as_str().unwrap_or(""));
+    }
+}
+
+/// Groups (the directory, 0, and the data groups) no live peer reports leading.
+fn leaderless(s: &pb::StatusReply) -> Vec<u32> {
+    let led: std::collections::BTreeSet<u32> =
+        s.nodes.iter().filter(|n| n.alive).flat_map(|n| n.leading.iter().copied()).collect();
+    (0..=s.data_groups).filter(|g| !led.contains(g)).collect()
+}
+
+async fn status(mut c: Client, json: bool) -> Result<u8, String> {
+    let s = c.status(pb::StatusRequest::default()).await.map_err(|e| e.message().to_string())?.into_inner();
     let peer = s.peer.clone().unwrap_or_default();
     if json {
         println!(
@@ -411,6 +588,26 @@ async fn status(dir: &std::path::Path, json: bool) -> Result<u8, String> {
                 "memory_available": s.memory_available,
                 "automatic": s.automatic,
                 "links": s.links,
+                "nodes": s.nodes.iter().map(|n| serde_json::json!({
+                    "addr": n.addr,
+                    "alive": n.alive,
+                    "cpus": n.cpus,
+                    "cpu_used": n.cpu_used,
+                    "queued": n.queued,
+                    "leading": n.leading,
+                    "this_peer": n.this_peer,
+                })).collect::<Vec<_>>(),
+                "data_groups": s.data_groups,
+                "groups": s.groups.iter().map(|g| serde_json::json!({
+                    "group": g.group,
+                    "leader": g.leader,
+                    "leading": g.leading,
+                    "voters": g.voters,
+                    "last_log": g.last_log,
+                    "applied": g.applied,
+                    "max_lag": g.leading.then_some(g.max_lag),
+                })).collect::<Vec<_>>(),
+                "leaderless_groups": leaderless(&s),
             })
         );
     } else {
@@ -439,16 +636,141 @@ async fn status(dir: &std::path::Path, json: bool) -> Result<u8, String> {
         for l in &s.links {
             println!("  link: {l}");
         }
-        for r in s.pending_reasons {
+        for r in &s.pending_reasons {
             println!("  waiting: {r}");
+        }
+        if s.nodes.len() > 1 {
+            println!("  peers:");
+            for n in &s.nodes {
+                let leads = if n.leading.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · leads {}", n.leading.iter().map(u32::to_string).collect::<Vec<_>>().join(", "))
+                };
+                let state = if n.alive { "" } else { " · unreachable" };
+                println!(
+                    "    {}{} · {:.1}/{:.1} CPU in use · {} queued{leads}{state}",
+                    n.addr,
+                    if n.this_peer { " (this peer)" } else { "" },
+                    n.cpu_used,
+                    n.cpus,
+                    n.queued
+                );
+            }
+        }
+        if s.data_groups > 0 {
+            println!("  groups this peer holds a replica of ({} data groups in the cluster):", s.data_groups);
+            for g in &s.groups {
+                let leader = match (g.leading, g.leader.as_str()) {
+                    (true, _) => format!("led here, voters behind by at most {} entries", g.max_lag),
+                    (false, "") => "no leader".to_string(),
+                    (false, addr) => format!("leader {addr}"),
+                };
+                let name = if g.group == 0 { "0 (directory)".to_string() } else { g.group.to_string() };
+                println!("    {name} · {leader} · {} voters · log {}, applied {}", g.voters, g.last_log, g.applied);
+            }
+            let missing = leaderless(&s);
+            if !missing.is_empty() {
+                let list: Vec<String> = missing.iter().map(u32::to_string).collect();
+                println!(
+                    "  no live peer leads group {}: work whose run lives there waits until a majority of its voters is back",
+                    list.join(", ")
+                );
+            }
         }
     }
     Ok(0)
 }
 
-async fn inspect(dir: &std::path::Path, run: &str, json: bool) -> Result<u8, String> {
+fn state_name(s: pb::run_record::State) -> &'static str {
+    match s {
+        pb::run_record::State::Active => "active",
+        pb::run_record::State::Finished => "finished",
+        pb::run_record::State::Cancelled => "cancelled",
+    }
+}
+
+/// "42s", "5m", "3h", "2d".
+fn age(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
+async fn runs(mut c: Client, limit: u32, json: bool) -> Result<u8, String> {
+    let r = c.list_runs(pb::ListRunsRequest { limit }).await.map_err(|e| e.message().to_string())?.into_inner();
+    let now = chimaera_peer::router::now_ms();
+    if json {
+        let runs: Vec<_> = r
+            .runs
+            .iter()
+            .map(|run| {
+                serde_json::json!({
+                    "run": Id::from_slice(&run.run).map(|i| i.hex()).unwrap_or_default(),
+                    "state": state_name(run.state()),
+                    "detached": run.detached,
+                    "tenant": run.tenant,
+                    "created_ms": chimaera_core::hlc::wall_ms(run.created_hlc),
+                    "finished_ms": (run.finished_hlc > 0).then(|| chimaera_core::hlc::wall_ms(run.finished_hlc)),
+                    "command": run.description,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({"runs": runs, "unavailable_groups": r.unavailable}));
+    } else {
+        println!("{:<32}  {:<9}  {:>4}  COMMAND", "RUN", "STATE", "AGE");
+        for run in &r.runs {
+            let tenant = if run.tenant == "default" { String::new() } else { format!("  [tenant {}]", run.tenant) };
+            println!(
+                "{:<32}  {:<9}  {:>4}  {}{}{}",
+                Id::from_slice(&run.run).map(|i| i.hex()).unwrap_or_default(),
+                state_name(run.state()),
+                age(now.saturating_sub(chimaera_core::hlc::wall_ms(run.created_hlc))),
+                run.description,
+                if run.detached { "  (detached)" } else { "" },
+                tenant
+            );
+        }
+    }
+    if !r.unavailable.is_empty() {
+        let groups: Vec<String> = r.unavailable.iter().map(u32::to_string).collect();
+        eprintln!("no replica of group {} answered: their runs are missing above", groups.join(", "));
+    }
+    Ok(0)
+}
+
+async fn cancel(mut c: Client, run: &str) -> Result<u8, String> {
     let run = parse_run(run)?;
-    let mut c = connect(dir).await?;
+    let state = |r: pb::ExplainReply| r.run.map(|rec| rec.state());
+    let explain = pb::ExplainRequest { run: run.to_vec(), ..Default::default() };
+    match state(c.explain(explain.clone()).await.map_err(|e| e.message().to_string())?.into_inner()) {
+        None => return Err(format!("run {} is not known to this cluster", run.hex())),
+        Some(pb::run_record::State::Active) => {}
+        Some(s) => {
+            println!("run {} already {}", run.hex(), state_name(s));
+            return Ok(0);
+        }
+    }
+    let end = pb::ClientMsg { msg: Some(pb::client_msg::Msg::EndRun(pb::EndRun { run: run.to_vec(), cancel: true })), ..Default::default() };
+    c.session(tokio_stream::iter([end])).await.map_err(|e| e.message().to_string())?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let reply = c.explain(explain.clone()).await.map_err(|e| e.message().to_string())?.into_inner();
+        if let Some(s) = state(reply).filter(|s| *s != pb::run_record::State::Active) {
+            println!("run {} {}", run.hex(), state_name(s));
+            return Ok(0);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(format!("run {} is still active 30 s after the cancel was sent", run.hex()))
+}
+
+async fn inspect(mut c: Client, run: &str, json: bool) -> Result<u8, String> {
+    let run = parse_run(run)?;
     let r = c
         .explain(pb::ExplainRequest { run: run.to_vec(), ..Default::default() })
         .await
@@ -469,19 +791,12 @@ async fn inspect(dir: &std::path::Path, run: &str, json: bool) -> Result<u8, Str
     Ok(0)
 }
 
-async fn explain(
-    dir: &std::path::Path,
-    run: &str,
-    task: Option<String>,
-    decisions: bool,
-    json: bool,
-) -> Result<u8, String> {
+async fn explain(mut c: Client, run: &str, task: Option<String>, decisions: bool, json: bool) -> Result<u8, String> {
     let run = parse_run(run)?;
     let task = task
         .map(|t| Id::parse_hex(&t).ok_or_else(|| format!("{t:?} is not a task id")))
         .transpose()?
         .map(|t| pb::TaskKey { run: run.to_vec(), task: t.to_vec() });
-    let mut c = connect(dir).await?;
     let r = c
         .explain(pb::ExplainRequest { run: run.to_vec(), task: task.clone(), decisions, pending: true })
         .await
@@ -554,7 +869,7 @@ async fn explain(
 }
 
 async fn stop(dir: &std::path::Path) -> Result<u8, String> {
-    let mut c = connect(dir).await?;
+    let mut c = connect_local(dir).await?;
     c.shutdown(pb::ShutdownRequest {}).await.map_err(|e| e.message().to_string())?;
     eprintln!("stopping the local peer");
     Ok(0)

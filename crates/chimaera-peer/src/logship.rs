@@ -30,6 +30,11 @@ impl LogShip {
         *self.homes.entry(run).or_insert_with(lookup)
     }
 
+    /// The run's home node as the work's sender knew it.
+    pub fn set_home(&mut self, run: Id, node: Option<u64>) {
+        self.homes.insert(run, node);
+    }
+
     pub fn forget_run(&mut self, run: &Id) {
         self.homes.remove(run);
     }

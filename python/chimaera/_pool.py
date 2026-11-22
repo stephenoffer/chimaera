@@ -4,8 +4,8 @@ Calls go to the replica with the fewest calls in flight; ``route(key)`` sends
 everything for one key to one replica (rendezvous hashing, so resizing moves
 few keys). ``resize`` grows or shrinks the pool and ``upgrade`` replaces every
 replica, both without dropping calls: a replica leaving the pool takes no new
-calls and closes once its calls finish. ``key=`` shares one pool between
-processes (its membership lives in a ``ch.Store``), and ``replicas=ch.auto(...)``
+calls and closes once its calls finish. ``name=`` shares one pool between
+processes (its membership lives in a ``ch.coord.Store``), and ``replicas=ch.auto(...)``
 sizes it from load.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 import itertools
 import threading
 import time
+import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
@@ -33,6 +34,10 @@ class _Replica:
     draining: bool = False
 
 
+# A pool handle's own attributes: a replica method with one of these names is unreachable through it.
+_POOL_NAMES = ("close", "decisions", "resize", "route", "upgrade")
+
+
 class Pool(Generic[C]):
     """Interchangeable replicas of an actor class."""
 
@@ -42,12 +47,19 @@ class Pool(Generic[C]):
         from ._runtime import Runtime
 
         self._cls_view, self._args, self._kwargs, self._eff = cls_view, args, kwargs, eff
+        shadowed = sorted(n for n in _POOL_NAMES if callable(getattr(cls_view._cls, n, None)))
+        if shadowed:
+            warnings.warn(
+                f"{cls_view._cls.__qualname__} defines {', '.join(shadowed)}, which a pool handle reserves for "
+                "itself: rename the method to call it through the pool",
+                stacklevel=3,
+            )
         self._lock = threading.RLock()
         self._replicas: list[_Replica] = []
         self._closed = False
         self._turn = itertools.count()
         self.decisions: list[str] = []  # what the auto-sizer did, and why
-        self._key: str | None = eff.get("key")
+        self._key: str | None = eff.get("name")
         self._store: Any = None
         self._seen_version = -1
         self._last_refresh = 0.0
@@ -80,8 +92,8 @@ class Pool(Generic[C]):
         from ._remote import _create_actor
         from ._runtime import Runtime
 
-        values = {**self._eff.values, "key": name}
-        eff = Effective(values, {**self._eff.sources, "key": "pool replica"})
+        values = {**self._eff.values, "name": name}
+        eff = Effective(values, {**self._eff.sources, "name": "pool replica"})
         return _create_actor(Runtime.get(), self._cls_view._cls, eff, self._args, self._kwargs)
 
     def _check_args(self) -> None:
@@ -158,12 +170,16 @@ class Pool(Generic[C]):
             start = next(self._turn) % len(live)
             return min(live[start:] + live[:start], key=lambda r: r.inflight)
 
-    def route(self, key: Any) -> Any:
-        """The replica for `key`: the same one while the pool's membership does
-        not change, and after a resize, the same one for most keys."""
-        k = str(key).encode()
+    def _replica_for(self, k: bytes) -> _Replica:
         with self._lock:
-            return max(self._live(), key=lambda r: blake3_digest(r.name.encode() + b"\0" + k)).actor
+            return max(self._live(), key=lambda r: blake3_digest(r.name.encode() + b"\0" + k))
+
+    def route(self, key: Any) -> Any:
+        """Calls through the replica for `key` (``pool.route(k).method.remote(...)``):
+        the same one while the pool's membership does not change, and after a
+        resize, the same one for most keys. They count as that replica's load,
+        so a resize or upgrade waits for them before closing it."""
+        return _Routed(self, str(key).encode())
 
     # ---- changes ------------------------------------------------------------------
 
@@ -204,7 +220,7 @@ class Pool(Generic[C]):
         old = [r for r in self._replicas if not r.draining]
         if cls is not None:
             # The new class's own options, keeping this pool's identity and size.
-            keep = {k: v for k, v in self._eff.values.items() if k in ("key", "replicas")}
+            keep = {k: v for k, v in self._eff.values.items() if k in ("name", "replicas")}
             new = cls.policy()
             self._cls_view = cls
             self._eff = Effective({**new.values, **keep}, {**new.sources, **{k: "pool" for k in keep}})
@@ -274,22 +290,35 @@ class Pool(Generic[C]):
 
     def __reduce__(self) -> tuple[Any, ...]:
         if self._key is None:
-            raise TypeError("only a pool created with key= can be passed to calls; give it a key")
+            raise TypeError("only a pool created with name= can be passed to calls; give it a name")
         return (_shared, (self._cls_view, self._key))
 
 
-def _shared(cls_view: Any, key: str) -> Pool[Any]:
-    return cls_view.options(key=key).pool()
+def _shared(cls_view: Any, name: str) -> Pool[Any]:
+    return cls_view.options(name=name).pool()
+
+
+class _Routed:
+    """``pool.route(key)``: methods whose calls go to that key's replica."""
+
+    def __init__(self, pool: Pool[Any], k: bytes) -> None:
+        self._pool, self._k = pool, k
+
+    def __getattr__(self, name: str) -> _PoolMethod:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return _PoolMethod(self._pool, name, lambda: self._pool._replica_for(self._k))
 
 
 class _PoolMethod:
-    def __init__(self, pool: Pool[Any], name: str) -> None:
+    def __init__(self, pool: Pool[Any], name: str, pick: Any = None) -> None:
         self._pool, self._name = pool, name
+        self._pick = pick or pool._pick  # the least busy replica, or a routed key's
 
     def remote(self, *args: Any, **kwargs: Any) -> Future[Any]:
         lock = self._pool._lock
         with lock:
-            r = self._pool._pick()
+            r = self._pick()
             r.inflight += 1
         try:
             f = getattr(r.actor, self._name).remote(*args, **kwargs)
@@ -302,7 +331,7 @@ class _PoolMethod:
             with lock:
                 r.inflight -= 1
 
-        f.add_done_callback(done)
+        f._on_done(done)
         return f
 
     def map(self, source: Iterable[Any], *, ordered: bool = True) -> Results[Any]:

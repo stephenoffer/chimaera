@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import dataclasses
 import datetime as _dt
 import functools
 import inspect
 import itertools
 import os
 import sys
+import threading
 import time
 import warnings
-from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, Any, Generic, ParamSpec, TypeVar
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Generic, ParamSpec, Protocol, TypeVar, Unpack, overload
 
 from . import _context, _serde, _values
-from ._errors import ChimaeraError, Infeasible, NotFound, OptionsError
+from ._errors import ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
 from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part
 from ._native import blake3_digest, child_id, derive_id
-from ._options import Effective, Layer, resolve, resolve_cached, signature_of, validate
+from ._options import Effective, Layer, Options, resolve, resolve_cached, signature_of, validate
 from ._batch import Batch
 from ._pool import Pool
 
@@ -37,6 +40,7 @@ from ._serde import Dep
 P = ParamSpec("P")
 R = TypeVar("R")
 C = TypeVar("C")
+T = TypeVar("T")
 
 _RESTART = {"never": 0, "fresh": 1, "checkpoint": 2}
 
@@ -98,6 +102,7 @@ def build_call(
     durable: bool = False,
     stream: bool = False,
     policy_extra: dict[str, Any] | None = None,
+    reads: list[Any] | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Encode a call. Futures passed directly as arguments become dependency
     edges (the callee receives their values; nothing flows through here). A
@@ -126,6 +131,15 @@ def build_call(
             return {k: sub_one(v) for k, v in x.items()}
         return sub_one(x)
 
+    def pin(put: Future[Any]) -> None:
+        # A value this call reads: recorded in `reads` so it is released after
+        # the call; without `reads`, or for an actor that may keep it, pinned
+        # for the run.
+        if reads is None or kind in (CALL_ACTOR_CTOR, CALL_ACTOR_METHOD):
+            put._escaped = True
+        else:
+            reads.append(put)
+
     def sub_one(x: Any) -> Any:
         if isinstance(x, Handles):
             return x.value
@@ -137,11 +151,19 @@ def build_call(
         if isinstance(x, Future):
             if x._put is not None:
                 _run, object_id, inline, size = x._put
+                for path in x._owned or ():
+                    # Files it links (Linux arena arrays) are inputs too, even
+                    # when the handle itself is inline: placed by and fetched
+                    # before the call, not on first read inside it.
+                    try:
+                        stored[bytes.fromhex(os.path.basename(path))] = os.stat(path).st_size
+                    except (OSError, ValueError):
+                        pass
                 if inline is not None:
                     if x._owned:
-                        x._escaped = True  # its arrays are blob files the call reads
+                        pin(x)  # its arrays are blob files the call reads
                     return _values.InlineRef(inline)  # decoded in the callee, never re-encoded here
-                x._escaped = True  # the call reads the stored file: keep it for the run
+                pin(x)  # the call reads the stored file
                 stored[object_id] = size
                 return _values.BlobRef(object_id, size)
             return Dep(dep(x.key))
@@ -150,11 +172,22 @@ def build_call(
     _values.fetched.check(site, args, kwargs)
     frame = (tuple(sub(a) for a in args), {k: sub(v) for k, v in kwargs.items()})
     key = key or rt.new_key()
-    packed = rt.pack(key, frame, site)
+    holds: list[_values.ClaimHold] = []
+    try:
+        packed = rt.pack(key, frame, site, holds)
+    except Exception as e:
+        raise _unsendable(target, method, args, kwargs, site, e) from e
+    for hold in holds:  # arena arrays the call reads: kept like a put's file
+        if reads is None or kind in (CALL_ACTOR_CTOR, CALL_ACTOR_METHOD):
+            hold.keep()
+        else:
+            reads.append(hold)
+    # Stored values are inputs (placement, fetch) but not in `read_bytes`: they
+    # exist before the call and are shared by every call that reads them, so
+    # pending calls hold no more memory for them (driver room, map windows).
     for object_id, size in stored.items():
         if object_id not in dict(packed["blobs"]):
             packed["blobs"].append((object_id, size))
-            packed["read_bytes"] += size
     ctx = _context.current_task()
     effects = eff.get("effects")
     retry = eff.get("retry_exceptions") or ()
@@ -197,11 +230,56 @@ def build_call(
     return spec, key
 
 
+def _unsendable(
+    target: Any, method: str, args: tuple[Any, ...], kwargs: dict[str, Any], site: str | None, err: Exception
+) -> SerializationError:
+    """The error for a call whose arguments cannot be pickled, naming the
+    argument (the pickle error alone names only a type)."""
+    fn = getattr(target, method, None) if method and not isinstance(target, bytes) else target
+    try:
+        named = signature_of(fn).bind(*((None,) if method else ()), *args, **kwargs).arguments
+    except (TypeError, ValueError):
+        named = {**{f"#{i}": a for i, a in enumerate(args)}, **kwargs}
+    culprit = None
+    for name, value in named.items():
+        try:
+            _serde.dumps(value)
+        except Exception:
+            culprit = name
+            break
+    where = _fn_name(target, method) + (f" ({site})" if site else "")
+    what = f"argument {culprit!r}" if culprit else "its arguments"
+    return SerializationError(
+        f"{where}: {what} cannot be sent to a worker: {err}. Pass what the call needs to rebuild it "
+        "(a path rather than an open file, settings rather than a client) and create it inside the call."
+    )
+
+
+def check_call(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any], *, bound: bool = False) -> None:
+    """Check a call's arguments against `fn`'s signature, naming `fn` when they
+    do not fit (`bound`: a method, whose `self` is not passed)."""
+    try:
+        sig = signature_of(fn)
+    except ValueError:  # a builtin with no readable signature: the call itself checks
+        return
+    try:
+        sig.bind(*((None,) if bound else ()), *args, **kwargs)
+    except TypeError as e:
+        raise TypeError(f"{getattr(fn, '__qualname__', fn)}(): {e}") from None
+
+
 def submit_call(rt: Runtime, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any], **kw: Any) -> Future[Any]:
     site = kw.pop("site", None)
-    spec, key = build_call(rt, target, args, kwargs, site=site, **kw)
+    future_cls = kw.pop("future_cls", Future)
+    reads: list[Any] = []
+    spec, key = build_call(rt, target, args, kwargs, site=site, reads=reads, **kw)
+    if reads:
+        rt._reads[key] = reads
     rt.wait_for_room(spec["read_bytes"], site)
-    fut: Future[Any] = Future(rt, key, site)
+    fut: Future[Any] = future_cls(rt, key, site)
+    ctx = _context.current_task()
+    if ctx is not None and ctx.workflow:
+        fut._escaped = True  # a durable workflow's replay reads this step again: never release it
     fut._arg_bytes = spec["read_bytes"]
     fut._returns = kw["eff"].get("returns")
     rt.submit([spec], [fut])
@@ -226,15 +304,15 @@ class RemoteFunction(Generic[P, R]):
         return self._fn(*args, **kwargs)
 
     def gang(self, *args: P.args, **kwargs: P.kwargs) -> Gang[R]:
-        """Run as an SPMD gang of ``.options(ranks=n)`` ranks (see ``ch.Gang``)."""
-        from ._gang import Gang
+        """Run as an SPMD gang of ``.options(ranks=n)`` ranks (see ``ch.dist.Gang``)."""
+        from ._gang import start
 
         if not self.policy().get("ranks"):
             raise TypeError("gang() needs the number of ranks: fn.options(ranks=n).gang(...)")
-        signature_of(self._fn).bind(*args, **kwargs)
-        return Gang(self, args, kwargs)
+        check_call(self._fn, args, kwargs)
+        return start(self, args, kwargs)
 
-    def options(self, **opts: Any) -> RemoteFunction[P, R]:
+    def options(self, **opts: Unpack[Options]) -> RemoteFunction[P, R]:
         """A configured view; the original function is unchanged."""
         layer = validate(opts, kind="view", target="function", source=f".options at {_site(2).rsplit('/', 1)[-1]}")
         return RemoteFunction(self._fn, self._decorator, (layer, *self._view))
@@ -247,11 +325,23 @@ class RemoteFunction(Generic[P, R]):
         """Effective options and where each value came from."""
         return resolve_cached(self, self._view, self._decorator)
 
-    def remote(self, *args: P.args, **kwargs: P.kwargs) -> Any:
+    # What `.remote()` returns, by what the function returns: an async
+    # function's awaited value, a generator's items, else the value itself.
+    @overload
+    def remote(self: RemoteFunction[P, Coroutine[Any, Any, T]], *args: P.args, **kwargs: P.kwargs) -> Future[T]: ...
+    @overload
+    def remote(self: RemoteFunction[P, Iterator[T]], *args: P.args, **kwargs: P.kwargs) -> Stream[T]: ...  # type: ignore[overload-overlap]
+    @overload
+    def remote(self: RemoteFunction[P, AsyncIterator[T]], *args: P.args, **kwargs: P.kwargs) -> Stream[T]: ...  # type: ignore[overload-overlap]
+    @overload
+    def remote(self: RemoteFunction[P, R], *args: P.args, **kwargs: P.kwargs) -> Future[R]: ...
+    def remote(self, *args: Any, **kwargs: Any) -> Any:
         """Run remotely: a Future, or for a generator function a Stream of its items."""
-        signature_of(self._fn).bind(*args, **kwargs)
+        check_call(self._fn, args, kwargs)
         rt = Runtime.get()
         eff = self.policy()
+        if eff.get("ranks") is not None:
+            raise OptionsError(f"ranks= makes a gang: run it with .gang(...), not .remote() ({eff.sources['ranks']})")
         if eff.get("within") is not None:
             from ._reserve import call_within
 
@@ -365,7 +455,7 @@ class ActorClass(Generic[C]):
     def __call__(self, *args: Any, **kwargs: Any) -> C:
         return self._cls(*args, **kwargs)
 
-    def options(self, **opts: Any) -> ActorClass[C]:
+    def options(self, **opts: Unpack[Options]) -> ActorClass[C]:
         layer = validate(opts, kind="view", target="actor", source=f".options at {_site(2).rsplit('/', 1)[-1]}")
         return ActorClass(self._cls, self._decorator, (layer, *self._view))
 
@@ -373,9 +463,12 @@ class ActorClass(Generic[C]):
         return resolve_cached(self, self._view, self._decorator)
 
     def remote(self, *args: Any, **kwargs: Any) -> Actor[C]:
-        """Create an actor. With ``key=...`` it is get-or-create by name."""
-        signature_of(self._cls).bind(*args, **kwargs)
+        """Create an actor. With ``name=...`` it is get-or-create by name."""
+        check_call(self._cls, args, kwargs)
         eff = self.policy()
+        for opt, use in (("replicas", ".pool(...)"), ("ranks", ".gang(...)")):
+            if eff.get(opt) is not None:
+                raise OptionsError(f"{opt}= makes several actors: create them with {use}, not .remote() ({eff.sources[opt]})")
         if eff.get("within") is not None:
             from ._reserve import HostedActor
 
@@ -384,22 +477,22 @@ class ActorClass(Generic[C]):
 
     def pool(self, *args: Any, **kwargs: Any) -> Pool[C]:
         """Independent replicas, each constructed with these arguments. With
-        ``key=``, a pool that exists already is joined, and arguments are optional."""
+        ``name=``, a pool that exists already is joined, and arguments are optional."""
         return Pool(self, args, kwargs, self.policy())
 
     def gang(self, *args: Any, **kwargs: Any) -> GangActor:
-        """``ranks=n`` instances built together as an SPMD gang (see ``ch.GangActor``)."""
+        """``ranks=n`` instances built together as an SPMD gang (see ``ch.dist.GangActor``)."""
         from ._gang import GangActor
 
         if not self.policy().get("ranks"):
             raise TypeError("gang() needs the number of ranks: Class.options(ranks=n).gang(...)")
-        signature_of(self._cls).bind(*args, **kwargs)
+        check_call(self._cls, args, kwargs)
         return GangActor(self, args, kwargs)
 
 
 def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Actor[Any]:
-    name = eff.get("key")
-    tenant = "default"
+    name = eff.get("name")
+    tenant = rt.tenant
     ctx = _context.current_task()
     run = ctx.run if ctx is not None else rt.run
     if run is None:
@@ -417,7 +510,7 @@ def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, 
         eff = Effective({**eff.values, "concurrency": own + lanes}, {**eff.sources, "concurrency": "concurrency groups"})
     durable = eff.get("state") is not None
     if durable and eff.get("concurrency") not in (None, 1):
-        raise OptionsError("a durable actor (state=ch.State()) runs one call at a time; drop `concurrency`")
+        raise OptionsError("a durable actor (state=ch.durable.State()) runs one call at a time; drop `concurrency`")
     ctor_key = run + child_id(run, [actor, b"ctor"])
     spec, _ = build_call(rt, cls, args, kwargs, kind=CALL_ACTOR_CTOR, eff=eff, actor=actor, key=ctor_key)
     seq = rt.client.create_actor(
@@ -428,7 +521,7 @@ def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, 
         spec["fn_digest"],
         _RESTART[eff.get("restart")],
         int(eff.get("max_restarts") or 0),
-        eff.get("lifetime") == "detached",
+        bool(eff.get("detach")),
         durable,
     )
     ev = rt.wait_actor(seq)
@@ -462,16 +555,16 @@ def _lane_limits(cls: type[Any]) -> dict[str, int]:
     return limits
 
 
-def actor(key: str) -> Actor[Any]:
-    """The live actor created with ``key=`` (``Cls.options(key=...).remote()``),
+def actor(name: str) -> Actor[Any]:
+    """The live actor created with ``name=`` (``Cls.options(name=...).remote()``),
     without needing its class. Raises ``NotFound`` if there is none."""
     rt = Runtime.get()
-    actor_id = _keyed_actor_id("default", key)
+    actor_id = _keyed_actor_id(rt.tenant, name)
     rec = rt.client.get_actor(actor_id)
     if rec is None or rec[0] == "Dead":
-        raise NotFound(f"no live actor with key {key!r}")
+        raise NotFound(f"no live actor named {name!r}")
     _state, ctor, class_digest = rec
-    eff = resolve((), Layer({}, f"ch.actor({key!r})", "decorator"))
+    eff = resolve((), Layer({}, f"ch.actor({name!r})", "decorator"))
     return Actor(rt, actor_id, ctor, _load_class(rt, class_digest), eff, class_digest)
 
 
@@ -548,7 +641,7 @@ class RemoteMethod(Generic[P, R]):
         self._view = view
         self._resolved: tuple[tuple[Layer, ...], Effective] | None = None
 
-    def options(self, **opts: Any) -> RemoteMethod[P, R]:
+    def options(self, **opts: Unpack[Options]) -> RemoteMethod[P, R]:
         """Settings for calls through this view (``deadline``, ``returns``,
         ``max_attempts``, ``priority``, a stricter ``effects``...)."""
         source = f".options at {_site(2).rsplit('/', 1)[-1]}"
@@ -564,9 +657,9 @@ class RemoteMethod(Generic[P, R]):
 
     def _check(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         if self._fn is not None:
-            signature_of(self._fn).bind(None, *args, **kwargs)
+            check_call(self._fn, args, kwargs, bound=True)
 
-    def remote(self, *args: Any, **kwargs: Any) -> Future[Any]:
+    def remote(self, *args: P.args, **kwargs: P.kwargs) -> Future[R]:
         self._check(args, kwargs)
         a = self._actor
         return submit_call(
@@ -610,18 +703,45 @@ class RemoteMethod(Generic[P, R]):
         return Results(submit, iter(source), ordered=ordered, window=window)
 
 
+class _Decorator(Protocol):
+    """What ``@ch.remote(...)`` with options returns."""
+
+    @overload
+    def __call__(self, obj: type[C], /) -> ActorClass[C]: ...
+    @overload
+    def __call__(self, obj: Callable[P, R], /) -> RemoteFunction[P, R]: ...
+
+
+@overload
+def remote(obj: type[C], /) -> ActorClass[C]: ...
+@overload
+def remote(obj: Callable[P, R], /) -> RemoteFunction[P, R]: ...
+@overload
+def remote(obj: None = None, /, **options: Unpack[Options]) -> _Decorator: ...
 def remote(obj: Any = None, /, **options: Any) -> Any:
     """Make a function or class usable remotely. ``@ch.remote`` and
-    ``@ch.remote(...)`` are equivalent; options set defaults for every call."""
+    ``@ch.remote(...)`` are equivalent; options set defaults for every call.
+
+    For mypy, add ``plugins = chimaera.mypy`` to your config: it types
+    ``Cls.remote(...)`` and actor handles' methods (see chimaera/mypy.py)."""
     if obj is None:
         return lambda o: _wrap(o, options)
     return _wrap(obj, options)
 
 
+def _decorator_layer(obj: Any, options: dict[str, Any], target: str, name: str) -> Layer:
+    """The decorator's options. Chimaera's own decorated helpers (queue hosts,
+    gang ranks...) are marked internal: a caller's `with ch.options` block
+    must not resize or retry them."""
+    layer = validate(options, kind="decorator", target=target, source=f"@ch.remote on {name}")
+    internal = str(getattr(obj, "__module__", "") or "").startswith("chimaera.")
+    return dataclasses.replace(layer, internal=True) if internal else layer
+
+
 def _wrap(obj: Any, options: dict[str, Any]) -> Any:
     name = getattr(obj, "__qualname__", repr(obj))
     if inspect.isclass(obj):
-        layer = validate(options, kind="decorator", target="actor", source=f"@ch.remote on {name}")
+        layer = _decorator_layer(obj, options, "actor", name)
         shadowed = sorted(n for n in _HANDLE_NAMES if callable(getattr(obj, n, None)))
         if shadowed:
             warnings.warn(
@@ -647,7 +767,7 @@ def _wrap(obj: Any, options: dict[str, Any]) -> Any:
             # Read by the executor; replays need retries beyond the usual three.
             obj.__chimaera_workflow__ = True
             options = {"max_attempts": 100, **options}
-        return RemoteFunction(obj, validate(options, kind="decorator", target="function", source=f"@ch.remote on {name}"))
+        return RemoteFunction(obj, _decorator_layer(obj, options, "function", name))
     raise TypeError(f"@ch.remote applies to functions and classes, not {type(obj).__name__}")
 
 
@@ -684,3 +804,94 @@ def method(*, group: str | None = None, batch: Batch | None = None, **options: A
 
 
 CALL_KINDS = (CALL_FUNCTION, CALL_ACTOR_CTOR, CALL_ACTOR_METHOD, CALL_MAP_ITEM)
+
+
+@remote(cpus=0.01, latency="interactive")
+def _gathered(*values: Any) -> list[Any]:
+    return list(values)
+
+
+def gather(*futures: Future[T]) -> Future[list[T]]:
+    """One future of all the futures' values, in order: ``await`` it, call
+    ``.result()``, or pass it to another call, which receives the list. It
+    fails with the first error. ``ch.get(futures)`` waits for the values here."""
+    from ._future import put
+
+    for f in futures:
+        if not isinstance(f, Future):
+            hint = " (unpack a list: ch.gather(*futures), or wait with ch.get(futures))" if isinstance(f, (list, tuple, set)) else ""
+            raise TypeError(f"ch.gather takes futures as separate arguments, not {type(f).__name__}{hint}")
+    return _gathered.remote(*futures) if futures else put([])
+
+
+class _ExecutorFuture(concurrent.futures.Future):  # type: ignore[type-arg]
+    def __init__(self, inner: Future[Any]) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def cancel(self) -> bool:
+        return self._inner.cancel() and super().cancel()
+
+    def _settle(self) -> None:
+        if self.cancelled():
+            return
+        try:
+            value = self._inner.result()
+        except BaseException as e:  # noqa: BLE001 -- the call's error is this future's
+            if not self.done():
+                self.set_exception(e)
+        else:
+            if not self.done():
+                self.set_result(value)
+
+
+class Executor(concurrent.futures.Executor):
+    """A ``concurrent.futures`` executor whose calls run through Chimaera, so
+    code written for ``ProcessPoolExecutor`` runs unchanged, lambdas and
+    closures included, and on a cluster. ``options`` apply to every call, as
+    on ``@ch.remote(...)``. Futures complete on a thread of their own, so a
+    slow done-callback never holds up other results."""
+
+    def __init__(self, **options: Any) -> None:
+        validate(options, kind="decorator", target="function", source="ch.Executor(...)")
+        self._options = options
+        self._pending: set[concurrent.futures.Future[Any]] = set()
+        self._settler = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="chimaera-executor")
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def submit(self, fn: Callable[..., R], /, *args: Any, **kwargs: Any) -> concurrent.futures.Future[R]:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("cannot submit to a ch.Executor after shutdown")
+        if isinstance(fn, RemoteFunction):  # already decorated: keep its options
+            rf = fn.options(**self._options) if self._options else fn
+        else:
+            # A class is called like any function here (its instance comes
+            # back), as with ProcessPoolExecutor, never made an actor.
+            rf = remote(functools.partial(fn) if inspect.isclass(fn) else fn, **self._options)
+        inner = rf.remote(*args, **kwargs)
+        if not isinstance(inner, Future) or isinstance(inner, Results):
+            inner.close()
+            raise TypeError(f"{getattr(fn, '__qualname__', fn)} is a generator function; call it with ch.remote(fn).remote(...) to stream its items")
+        out = _ExecutorFuture(inner)
+        with self._lock:
+            self._pending.add(out)
+        out.add_done_callback(self._forget)
+        inner._on_done(lambda _: self._settler.submit(out._settle))
+        return out
+
+    def _forget(self, f: concurrent.futures.Future[Any]) -> None:
+        with self._lock:
+            self._pending.discard(f)
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._closed = True
+            pending = list(self._pending)
+        if cancel_futures:
+            for f in pending:
+                f.cancel()
+        if wait:
+            concurrent.futures.wait(pending)
+        self._settler.shutdown(wait=wait)

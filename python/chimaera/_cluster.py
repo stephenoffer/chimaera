@@ -21,6 +21,7 @@ and ``ca`` in the profile name other files.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import tomllib
 from dataclasses import dataclass
@@ -58,6 +59,13 @@ def _token_from_env() -> str | None:
         return os.environ["CHIMAERA_TOKEN"]
     path = os.environ.get("CHIMAERA_TOKEN_FILE")
     return _read(path) if path else None
+
+
+def tenant_of(token: str | None) -> str | None:
+    """The tenant a driver credential (``chimaera cluster credential``) is for;
+    None for the cluster token or no token."""
+    m = re.fullmatch(r"([A-Za-z0-9_-]{1,64})\.[0-9a-f]{64}", (token or "").strip())
+    return m.group(1) if m else None
 
 
 def load_profiles() -> dict[str, Any]:
@@ -116,6 +124,11 @@ class RemoteBlobSink:
         with self._lock:
             self._sent.add(key)
 
+    def forget(self, run: bytes, blob_id: bytes) -> None:
+        """The blob was freed on the peer: upload it again if it is sent again."""
+        with self._lock:
+            self._sent.discard((run, blob_id))
+
 
 class Node(NamedTuple):
     peer: str
@@ -145,7 +158,7 @@ class Event(NamedTuple):
 
 
 class EventStream:
-    """Events in order, as ``ch.cluster().events()`` returns them. Iterating
+    """Events in order, as ``ch.runs.cluster().events()`` returns them. Iterating
     waits for new ones (``follow=True``) or stops at the newest."""
 
     _WAIT_MS = 10_000
@@ -205,7 +218,7 @@ class EventStream:
 
 
 class ClusterView:
-    """What the connected peer knows about the cluster (``ch.cluster()``)."""
+    """What the connected peer knows about the cluster (``ch.runs.cluster()``)."""
 
     def nodes(self) -> list[Node]:
         from ._runtime import Runtime

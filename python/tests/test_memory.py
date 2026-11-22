@@ -7,6 +7,7 @@ container.)"""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -109,7 +110,7 @@ def test_a_leaking_function_gets_a_fresh_worker(home):
             return os.getpid()
 
         pids = [leak.remote(i).result(timeout=60) for i in range(40)]
-        print(len(set(pids)), ch.current_run().id)
+        print(len(set(pids)), ch.runs.current_run().id)
         """,
         home=home,
         timeout=300,
@@ -251,6 +252,8 @@ def test_objects_past_the_pool_move_to_disk_and_stay_readable(home):
     values, object_dir, spilled = r.stdout.split("\n")[:3]
     if _fs_type(object_dir) != "tmpfs":
         pytest.skip(f"objects are not in tmpfs here ({object_dir}), so they never count against the pool")
+    if os.stat(object_dir).st_dev == os.stat(home).st_dev:
+        pytest.skip("objects and the peer's directory share a filesystem: spilling there would free nothing")
     assert int(spilled) > 0, "nothing moved to the spill directory"
     assert json.loads(values) == [float(i) for i in range(6)], "every value reads back, spilled or not"
 

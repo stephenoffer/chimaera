@@ -14,6 +14,9 @@ service Mesh {
   rpc Join(JoinRequest) returns (JoinReply);
   // One openraft RPC (postcard body) for a group hosted on the target.
   rpc Raft(RaftRequest) returns (RaftReply);
+  // A raft snapshot, streamed: the first chunk carries the header, the rest
+  // the file in pieces, so its size is never bound by one message's limit.
+  rpc InstallSnapshot(stream SnapshotChunk) returns (RaftReply);
   // Propose a shard command on the target's replica of its group.
   rpc Propose(ProposeRequest) returns (ProposeReply);
   // Read records of a group hosted on the target.
@@ -32,9 +35,22 @@ service Mesh {
   rpc PutCode(MeshPutCode) returns (PutCodeReply);
   // Output of calls that ran on the sender, for the run's home peer.
   rpc PushLogs(PushLogsRequest) returns (PushLogsReply);
+  // The receiver's copy of a run's output (`chimaera logs` asked at another peer).
+  rpc Logs(MeshLogsRequest) returns (LogsReply);
   // Keep a copy of an object the sender just stored (on the target's disk),
-  // so the object outlives the sender. Answered at once; the copy follows.
+  // so the object outlives the sender. Answered at once, the copy following,
+  // or with `wait` once the copy is made.
   rpc Replicate(ReplicateRequest) returns (ReplicateReply);
+  // What this peer's object store holds (`chimaera objects --cluster`).
+  rpc Inventory(InventoryRequest) returns (InventoryReply);
+}
+
+message InventoryRequest {
+  string cluster = 1;
+}
+
+message InventoryReply {
+  string json = 1;  // chimaera-peer objplane::inventory
 }
 
 message ReplicateRequest {
@@ -43,6 +59,7 @@ message ReplicateRequest {
   bytes object_id = 3;
   uint64 size = 4;
   uint64 from_node = 5;  // the sender, which holds the object
+  bool wait = 6;         // answer once the copy is made (an error if it failed), not at once
 }
 
 message ReplicateReply {}
@@ -54,6 +71,11 @@ message PushLogsRequest {
 }
 
 message PushLogsReply {}
+
+message MeshLogsRequest {
+  string cluster = 1;
+  LogsRequest logs = 2;
+}
 
 message Member {
   bytes peer = 1;
@@ -103,6 +125,14 @@ message RaftReply {
   bytes body = 1;
 }
 
+message SnapshotChunk {
+  string cluster = 1;  // first chunk only
+  uint32 group = 2;    // first chunk only
+  bytes header = 3;    // first chunk only: postcard (vote, snapshot meta)
+  uint64 size = 4;     // first chunk only: the file's length
+  bytes data = 5;
+}
+
 message ProposeRequest {
   string cluster = 1;
   uint32 group = 2;
@@ -125,6 +155,8 @@ message ReadRequest {
   // With limit > 0: one page of `run`'s tasks after `after_task`.
   bytes after_task = 6;
   uint32 limit = 7;
+  // > 0: list the runs whose records group `list_runs_group` holds (`chimaera runs`).
+  uint32 list_runs_group = 8;
 }
 
 message ReadReply {
@@ -133,6 +165,7 @@ message ReadReply {
   ActorRecord actor = 3;
   string error = 4;
   repeated TaskKey page_keys = 5;   // keys of `tasks` in page mode
+  repeated RunRecord runs = 6;      // list_runs_group's runs, without exec_env
 }
 
 // An attempt the leader granted to the target, with everything needed to run
@@ -149,6 +182,9 @@ message RemoteWork {
   // The reservation the placer chose (learned or requested); 0 = unknown.
   double cpus = 8;
   uint64 memory = 9;
+  // The run's home peer, where its output goes: the target may hold no
+  // replica of the run's group to read it from. Empty = unknown.
+  bytes home = 10;
 }
 
 message DispatchRequest {
@@ -225,6 +261,9 @@ message PingReply {
   repeated bytes recent_blobs = 15;
   repeated SwimUpdate updates = 16;
   bool relay_ok = 17;    // indirect probe: the target answered the relay
+  // CPUs this peer's running calls hold per tenant that has a cluster share
+  // (CHIMAERA_TENANT_SHARES); the others add these up when admitting.
+  map<string, double> tenant_cpu = 18;
 }
 
 message ForgetRequest {

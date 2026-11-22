@@ -1,10 +1,10 @@
-"""Queues and topics shared across processes: ``ch.Queue`` and ``ch.Topic``.
+"""Queues and topics shared across processes: ``ch.coord.Queue`` and ``ch.coord.Topic``.
 
 Each is hosted by an actor, so it lives as long as its run (or, with
-``lifetime="detached"``, until closed), is shared by ``key=``, and works from
+``detach=True``, until closed), is shared by ``name=``, and works from
 the driver and from inside calls alike. They are not replicated: if the
 hosting process dies, its contents are lost and further calls raise
-``ch.ActorDied`` (durable queues arrive with ``ch.Store``).
+``ch.ActorDied`` (durable queues arrive with ``ch.coord.Store``).
 """
 
 from __future__ import annotations
@@ -101,33 +101,33 @@ class Queue(Generic[T]):
     ``put`` and ``get`` return futures. A full queue makes ``put`` wait (in
     the queue, not in your process) until there is room; ``maxsize=0`` means
     unbounded. Iterating (``for x in q`` or ``async for x in q``) takes items
-    until the queue is closed and empty. ``key=`` shares one queue between
+    until the queue is closed and empty. ``name=`` shares one queue between
     everyone who names it; the first creator's ``maxsize`` applies.
     """
 
-    def __new__(cls, maxsize: int = 0, *, key: str | None = None, lifetime: str = "run", durable: bool = False) -> Any:
+    def __new__(cls, maxsize: int = 0, *, name: str | None = None, detach: bool = False, durable: bool = False) -> Any:
         return super().__new__(DurableQueue if durable and cls is Queue else cls)
 
-    def __init__(self, maxsize: int = 0, *, key: str | None = None, lifetime: str = "run", durable: bool = False) -> None:
+    def __init__(self, maxsize: int = 0, *, name: str | None = None, detach: bool = False, durable: bool = False) -> None:
         if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 0:
             raise ValueError(f"maxsize: expected an integer >= 0, got {maxsize!r}")
-        opts: dict[str, Any] = {"lifetime": lifetime}
-        if key is not None:
-            opts["key"] = f"queue/{key}"
+        opts: dict[str, Any] = {"detach": detach}
+        if name is not None:
+            opts["name"] = f"queue/{name}"
         self._host = _QueueHost.options(**opts).remote(maxsize)
 
     def put(self, item: T, *, timeout: float | None = None) -> Future[None]:
         """Add `item`. The future fails with ``queue.Full`` if there was no room
-        within `timeout` seconds, or with ``ch.Closed`` after ``close()``."""
+        within `timeout` seconds, or with ``ch.errors.Closed`` after ``close()``."""
         return self._host.put.remote(item, timeout)
 
     def get(self, *, timeout: float | None = None) -> Future[T]:
         """The next item. Fails with ``queue.Empty`` if none arrived within
-        `timeout` seconds, or ``ch.Closed`` once the queue is closed and empty."""
+        `timeout` seconds, or ``ch.errors.Closed`` once the queue is closed and empty."""
         return self._host.get.remote(timeout)
 
     def close(self) -> None:
-        """No more puts. Waiting and later gets drain what is left, then raise ``ch.Closed``."""
+        """No more puts. Waiting and later gets drain what is left, then raise ``ch.errors.Closed``."""
         self._host.seal.remote().result()
 
     def qsize(self) -> int:
@@ -149,7 +149,7 @@ class Queue(Generic[T]):
 
 
 class DurableQueue(Queue[T]):
-    """``ch.Queue(key=..., durable=True)``: a queue kept in a ``ch.Store``.
+    """``ch.coord.Queue(name=..., durable=True)``: a queue kept in a ``ch.coord.Store``.
 
     It survives the loss of any process and a minority of peers, and lives
     until closed. Items are delivered first-in, first-out to consumers that
@@ -162,14 +162,14 @@ class DurableQueue(Queue[T]):
 
     _POLL_MAX = 0.25
 
-    def __init__(self, maxsize: int = 0, *, key: str | None = None, lifetime: str = "run", durable: bool = True) -> None:
+    def __init__(self, maxsize: int = 0, *, name: str | None = None, detach: bool = False, durable: bool = True) -> None:
         from ._store import Store
 
         if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 0:
             raise ValueError(f"maxsize: expected an integer >= 0, got {maxsize!r}")
-        if key is None:
-            raise ValueError("a durable queue is found by name: give it key=")
-        self._store = Store(f"queue/{key}")
+        if name is None:
+            raise ValueError("a durable queue is found by its name: give it name=")
+        self._store = Store(f"queue/{name}")
         self._maxsize = maxsize
 
     def __reduce__(self) -> tuple[Any, ...]:
@@ -221,8 +221,8 @@ class DurableQueue(Queue[T]):
         return self._store.get("size", 0)
 
 
-def _durable_queue(key: str, maxsize: int) -> DurableQueue[Any]:
-    return DurableQueue(maxsize, key=key)
+def _durable_queue(name: str, maxsize: int) -> DurableQueue[Any]:
+    return DurableQueue(maxsize, name=name)
 
 
 class Claim(Generic[T]):
@@ -331,19 +331,19 @@ class Topic(Generic[T]):
     (``retain=1024``) or a size (``retain="1 GiB"``). ``publish`` returns the
     item's offset. Each subscriber reads at its own pace from where it starts;
     one that falls behind the retained log skips ahead and its ``skipped``
-    count says how many items it missed. ``key=`` shares one topic.
+    count says how many items it missed. ``name=`` shares one topic.
     """
 
-    def __init__(self, *, key: str | None = None, retain: int | str = 1024, lifetime: str = "run") -> None:
+    def __init__(self, *, name: str | None = None, retain: int | str = 1024, detach: bool = False) -> None:
         if isinstance(retain, str):
             items, size = 0, _units.parse_bytes(retain, "retain")
         elif isinstance(retain, int) and not isinstance(retain, bool) and retain > 0:
             items, size = retain, 0
         else:
             raise ValueError(f"retain: expected a positive count or a size like '1 GiB', got {retain!r}")
-        opts: dict[str, Any] = {"lifetime": lifetime}
-        if key is not None:
-            opts["key"] = f"topic/{key}"
+        opts: dict[str, Any] = {"detach": detach}
+        if name is not None:
+            opts["name"] = f"topic/{name}"
         self._host = _TopicHost.options(**opts).remote(items, size)
 
     def publish(self, item: T) -> Future[int]:

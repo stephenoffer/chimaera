@@ -67,7 +67,7 @@ def parent(n):
 
 
 def w_latency():
-    ch.gather(*(noop.remote(i) for i in range(100)))
+    ch.get((noop.remote(i) for i in range(100)))
     lat = []
     for i in range(LATENCY_CALLS):
         t = time.perf_counter()
@@ -78,7 +78,7 @@ def w_latency():
 
 def w_tasks():
     with Timer() as t:
-        out = ch.gather(*[noop.remote(i) for i in range(TASKS)])
+        out = ch.get([noop.remote(i) for i in range(TASKS)])
     assert out[-1] == TASKS - 1
     return {"tasks_per_s": round(TASKS / t.s), "seconds": round(t.s, 3)}
 
@@ -99,15 +99,15 @@ def w_dag_chains():
             for _ in range(DEPTH - 1):
                 f = add1.remote(f)
             heads.append(f)
-        out = ch.gather(*heads)
+        out = ch.get(heads)
     assert out[0] == DEPTH
     return {"seconds": round(t.s, 3), "steps_per_s": round(CHAINS * DEPTH / t.s)}
 
 
 def w_cpu_scaling():
-    ch.gather(*(noop.remote(i) for i in range(CORES * 2)))
+    ch.get((noop.remote(i) for i in range(CORES * 2)))
     with Timer() as t:
-        ch.gather(*(burn.remote(SCALING_TASK_S) for _ in range(SCALING_TASKS)))
+        ch.get((burn.remote(SCALING_TASK_S) for _ in range(SCALING_TASKS)))
     ideal = SCALING_TASKS * SCALING_TASK_S / CORES
     return {"seconds": round(t.s, 3), "efficiency": round(ideal / t.s, 3)}
 
@@ -116,7 +116,7 @@ def w_large_object():
     a = np.ones(LARGE_BYTES // 8)
     with Timer() as t:
         ref = ch.put(a)
-        out = ch.gather(*(total.remote(ref) for _ in range(LARGE_READERS)))
+        out = ch.get((total.remote(ref) for _ in range(LARGE_READERS)))
     assert all(x == len(a) for x in out)
     return {"seconds": round(t.s, 3)}
 
@@ -124,14 +124,14 @@ def w_large_object():
 def w_actor_calls():
     log = Log.remote()
     with Timer() as t:
-        ch.gather(*[log.append.remote(i) for i in range(ACTOR_CALLS)])
+        ch.get([log.append.remote(i) for i in range(ACTOR_CALLS)])
     ordered = log.get.remote().result() == list(range(ACTOR_CALLS))
     return {"calls_per_s": round(ACTOR_CALLS / t.s), "in_submission_order": ordered}
 
 
 def w_nested():
     with Timer() as t:
-        out = ch.gather(*[parent.remote(NESTED_CHILDREN) for _ in range(NESTED_PARENTS)], timeout=300)
+        out = ch.get([parent.remote(NESTED_CHILDREN) for _ in range(NESTED_PARENTS)], timeout=300)
     assert out[0] == sum(range(NESTED_CHILDREN))
     return {"seconds": round(t.s, 3)}
 

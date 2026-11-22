@@ -38,12 +38,24 @@ class DeadlineExceeded(Cancelled):
     """The call's deadline passed. Distinct from a wait timeout (TimeoutError)."""
 
 
+class BudgetExceeded(Cancelled):
+    """The call's budget, or that of the call it runs under, was used up: the
+    budgeted call and every call it made were cancelled. The message names the
+    budget and what was used."""
+
+
 class Infeasible(ChimaeraError):
     """No peer can ever satisfy the request; the message says which constraint."""
 
 
 class InfrastructureFailure(ChimaeraError):
     """Attempts were lost to worker or peer failures until the retry budget ran out."""
+
+
+class QuorumLost(InfrastructureFailure):
+    """A group of the cluster lost the majority of its peers, so it accepts no
+    writes: calls whose state lives there cannot be submitted until enough of
+    those peers come back. The message names the group."""
 
 
 class WorkerCrashed(InfrastructureFailure):
@@ -86,7 +98,7 @@ class LeaseLost(ChimaeraError):
     """A lock's lease expired or passed to another holder; writes fenced by it are refused."""
 
 
-class OptionsError(ChimaeraError, ValueError):
+class OptionsError(ChimaeraError, ValueError, TypeError):
     """Options conflict or are invalid; the message names each field and its source."""
 
 
@@ -119,6 +131,7 @@ _BY_KIND: dict[str, type[ChimaeraError]] = {
     "oom": OutOfMemory,
     "cancelled": Cancelled,
     "deadline": DeadlineExceeded,
+    "budget": BudgetExceeded,
     "outcome_unknown": OutcomeUnknown,
     "infeasible": Infeasible,
     "worker_crashed": WorkerCrashed,
@@ -147,7 +160,10 @@ def from_outcome(err: tuple[Any, ...], task: str = "") -> BaseException:
             exc.add_note(f"remote traceback ({context}):\n{tb}")
         return exc
     rebuilt = _rebuild(exc_pickle)
-    if rebuilt is None or isinstance(rebuilt, _NEVER_RERAISE):
+    runtime = _BY_KIND.get(type_name.removeprefix("chimaera:").lower()) if type_name.startswith("chimaera:") else None
+    if runtime is not None and rebuilt is None:
+        rebuilt = runtime(message)  # a prerequisite failed with a runtime error: the same type here
+    elif rebuilt is None or isinstance(rebuilt, _NEVER_RERAISE):
         rebuilt = RemoteError(type_name, message, tb)
     if kind == "causal" and upstream:
         rebuilt.add_note(f"raised by prerequisite task {bytes(upstream[16:]).hex()}; this call never ran")

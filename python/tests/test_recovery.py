@@ -158,7 +158,7 @@ def test_driver_that_disconnects_without_finishing_has_its_run_cancelled():
     )
     assert r.returncode == 0, r.stderr
     run_id, task = r.stdout.split()
-    run = ch.attach(run_id)
+    run = ch.runs.attach(run_id)
     counts = run.wait(timeout=60)
     assert counts == {"Done": 1}
     [(tid, _value, error)] = list(run.outcomes())
@@ -218,7 +218,7 @@ time.sleep(600)
         r = run_script(
             f"""
             import chimaera as ch
-            run = ch.attach("{run_id}")
+            run = ch.runs.attach("{run_id}")
             counts = run.wait(timeout=180)
             values = [v for _, v, e in run.outcomes() if e is None]
             errors = [e for _, _, e in run.outcomes() if e is not None]

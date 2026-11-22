@@ -165,9 +165,9 @@ def _scheduling_strategy(name: str, value: Any, out: Out) -> None:
 
 
 def _place(out: Out, require: Mapping[str, str] | None = None, prefer: list[str] | None = None) -> None:
-    """Merge into the call's ch.Placement (label_selector and scheduling_strategy may both add to it)."""
-    have = out.get("placement") or ch.Placement()
-    out["placement"] = ch.Placement(require={**have.require, **(require or {})}, prefer=(*have.prefer, *(prefer or ())))
+    """Merge into the call's ch.dist.Placement (label_selector and scheduling_strategy may both add to it)."""
+    have = out.get("placement") or ch.dist.Placement()
+    out["placement"] = ch.dist.Placement(require={**have.require, **(require or {})}, prefer=(*have.prefer, *(prefer or ())))
 
 
 def _exact(what: str, selector: Mapping[str, Any]) -> dict[str, str]:
@@ -179,7 +179,7 @@ def _exact(what: str, selector: Mapping[str, Any]) -> dict[str, str]:
         elif isinstance(match, str) and not match.startswith(("!", "in(")):
             exact[key] = match
         else:
-            raise unsupported(f"{what} with {key}: {match!r}", use="exact label values, ch.Placement(require={key: value})")
+            raise unsupported(f"{what} with {key}: {match!r}", use="exact label values, ch.dist.Placement(require={key: value})")
     return exact
 
 
@@ -202,7 +202,7 @@ def _max_restarts(name: str, value: Any, out: Out) -> None:
 
 def _lifetime(name: str, value: Any, out: Out) -> None:
     if value == "detached":
-        out["lifetime"] = "detached"
+        out["detach"] = True
     elif value not in (None, "non_detached"):
         raise ValueError(f"lifetime must be 'detached', 'non_detached' or None, got {value!r}")
 
@@ -233,7 +233,7 @@ _HANDLERS: dict[str, tuple[tuple[str, ...], Callable[[str, Any, Out], None]]] = 
     "resources": (BOTH, _resources),
     "accelerator_type": (BOTH, _accelerator_type),
     "label_selector": (BOTH, _label_selector),
-    "fallback_strategy": (BOTH, _not_yet("ch.Placement(prefer=...)", "P3")),
+    "fallback_strategy": (BOTH, _not_yet("ch.dist.Placement(prefer=...)", "P3")),
     "runtime_env": (BOTH, _not_yet("ray.init(runtime_env={'env_vars': ...}), or ch.Env per call", "P3")),
     "scheduling_strategy": (BOTH, _scheduling_strategy),
     "enable_task_events": (BOTH, _ignored("every call is recorded; see `chimaera explain`")),

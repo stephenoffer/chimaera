@@ -159,7 +159,7 @@ def test_an_undeclared_group_is_rejected_at_decoration():
 
 
 def test_actor_lookup_by_key_without_the_class():
-    Server.options(key="tier1/server").remote().record.remote("a").result()
+    Server.options(name="tier1/server").remote().record.remote("a").result()
     found = ch.actor("tier1/server")
     assert found.record.remote("b").result(timeout=30) == ["a", "b"]
     with pytest.raises(ch.NotFound):
@@ -202,7 +202,7 @@ def test_cancelling_a_call_cancels_the_calls_it_started():
     assert parent.cancel()
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        child = {tid: err for tid, _, err in ch.current_run().outcomes() if child_id.endswith(tid)}
+        child = {tid: err for tid, _, err in ch.runs.current_run().outcomes() if child_id.endswith(tid)}
         if child:
             break
         time.sleep(0.1)
@@ -212,10 +212,10 @@ def test_cancelling_a_call_cancels_the_calls_it_started():
 # ---- runs -------------------------------------------------------------------------------
 
 
-def test_init_returns_the_run_which_is_its_id():
+def test_init_returns_the_run_and_str_gives_its_id():
     run = ch.init()
-    assert isinstance(run, ch.Run) and isinstance(run, str) and run == ch.current_run().id
-    assert ch.attach(run).status() == ch.attach(str(run)).status()
+    assert isinstance(run, ch.runs.Run) and run == ch.runs.current_run() and str(run) == run.id
+    assert ch.runs.attach(run).status() == ch.runs.attach(str(run)).status()
     assert all(state in ("Pending", "Ready", "Running", "Done") for _, state in run.tasks())
 
 
@@ -254,7 +254,7 @@ def stamp(tag, seconds):
 
 def test_higher_priority_starts_first_among_queued_calls():
     # Each call takes over half the CPUs, so they run one at a time in queue order.
-    cores = ch.Runtime.get().info["usable_cores"]
+    cores = ch._runtime.Runtime.get().info["usable_cores"]
     whole = stamp.options(cpus=cores / 2 + 0.5)
     blocker = whole.remote("blocker", 0.8)  # runs while the rest queue behind it
     time.sleep(0.2)
@@ -282,7 +282,7 @@ def consume(q):
 
 
 def test_queue_connects_producers_and_consumers_across_calls():
-    q = ch.Queue(maxsize=8)
+    q = ch.coord.Queue(maxsize=8)
     total = consume.remote(q)
     assert produce.remote(q, 100).result(timeout=60) == 100
     q.close()
@@ -290,7 +290,7 @@ def test_queue_connects_producers_and_consumers_across_calls():
 
 
 def test_queue_bounds_timeouts_and_close():
-    q = ch.Queue(maxsize=1)
+    q = ch.coord.Queue(maxsize=1)
     q.put("a").result()
     with pytest.raises(queue.Full):
         q.put("b", timeout=0.2).result(timeout=30)
@@ -300,17 +300,17 @@ def test_queue_bounds_timeouts_and_close():
     q.put("c").result()
     q.close()
     assert list(q) == ["c"]
-    with pytest.raises(ch.Closed):
+    with pytest.raises(ch.errors.Closed):
         q.put("d").result(timeout=30)
 
 
 def test_keyed_queue_is_shared():
-    ch.Queue(key="tier1/jobs").put("job").result()
-    assert ch.Queue(key="tier1/jobs").get(timeout=10).result(timeout=30) == "job"
+    ch.coord.Queue(name="tier1/jobs").put("job").result()
+    assert ch.coord.Queue(name="tier1/jobs").get(timeout=10).result(timeout=30) == "job"
 
 
 def test_topic_delivers_to_every_subscriber_from_its_start():
-    topic = ch.Topic(retain=3)
+    topic = ch.coord.Topic(retain=3)
     early = topic.subscribe("earliest")
     offsets = [topic.publish(i).result() for i in range(5)]
     assert offsets == [0, 1, 2, 3, 4]
@@ -321,7 +321,7 @@ def test_topic_delivers_to_every_subscriber_from_its_start():
 
 
 def test_latest_starts_at_subscribe_not_at_the_first_read():
-    topic = ch.Topic()
+    topic = ch.coord.Topic()
     topic.publish("before").result()
     sub = topic.subscribe("latest")
     topic.publish("between").result()  # after subscribing, before any read
@@ -335,7 +335,7 @@ def test_latest_starts_at_subscribe_not_at_the_first_read():
 def test_topic_latest_sees_only_new_items_and_async_works():
     import asyncio
 
-    topic = ch.Topic()
+    topic = ch.coord.Topic()
     topic.publish("old").result()
     sub = topic.subscribe("latest")
 

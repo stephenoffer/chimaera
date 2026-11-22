@@ -7,7 +7,8 @@ A call's arguments are encoded by size (`_runtime.pack`):
 - up to 1 MiB it is one object file for that call, dropped when the call ends;
 - every out-of-band buffer (NumPy, Arrow, bytes-like) of 1 MiB or more, and
   every top-level argument that pickles to 1 MiB or more, becomes a blob named
-  by its blake3 digest and written once per run.
+  by its blake3 digest, written once while something holds it: the array it
+  came from, or a call still to read it (see ClaimHold).
 
 So the same 200 MB array passed to a thousand calls is hashed a thousand times
 (without the GIL, on all cores) but written and shipped once; Ray copies it
@@ -17,6 +18,7 @@ exactly as before: nothing is shared with the caller's later mutations.
 
 from __future__ import annotations
 
+import collections
 import os
 import sys
 import threading
@@ -60,6 +62,11 @@ class LocalBlobSink:
             _serde.write_file(path, [data])
         with self._lock:
             self._written.add(key)
+
+    def forget(self, run: bytes, blob_id: bytes) -> None:
+        """The blob was freed: store it again if it is sent again."""
+        with self._lock:
+            self._written.discard((run, blob_id))
 
 
 # Read-only buffers of objects that can be weakly referenced (NumPy arrays with
@@ -122,10 +129,19 @@ class InlineRef:
 class Encoded:
     """An encoded call frame and the blobs it reads."""
 
-    __slots__ = ("parts", "size", "oob", "blobs", "seconds")
+    __slots__ = ("parts", "size", "oob", "blobs", "seconds", "holds")
 
-    def __init__(self, parts: list[bytes | memoryview], size: int, oob: int, blobs: dict[bytes, int], seconds: float):
+    def __init__(
+        self,
+        parts: list[bytes | memoryview],
+        size: int,
+        oob: int,
+        blobs: dict[bytes, int],
+        seconds: float,
+        holds: list[ClaimHold] | None = None,
+    ):
         self.parts, self.size, self.oob, self.blobs, self.seconds = parts, size, oob, blobs, seconds
+        self.holds = holds or []
 
     @property
     def total_bytes(self) -> int:
@@ -133,9 +149,13 @@ class Encoded:
         return self.size + sum(self.blobs.values())
 
 
-def store(value: Any, run: bytes, sink: LocalBlobSink, inline_limit: int) -> tuple[bytes, bytes | None, int, list[str]]:
+def store(
+    value: Any, run: bytes, sink: LocalBlobSink, inline_limit: int, prefix: bytes = b""
+) -> tuple[bytes, bytes | None, int, list[str]]:
     """Store one value (``ch.put``): (object id, inline bytes or None, size,
-    files that only this value uses).
+    files that only this value uses). Local ids start with `prefix`: a put
+    made inside a call passes its run's prefix, so its files are named like
+    results and outlive the run's values (the call may return the handle).
 
     Locally nothing is hashed: arena arrays are linked in place (no copy, see
     _objects), everything else is written once by the native writer, and the
@@ -146,13 +166,13 @@ def store(value: Any, run: bytes, sink: LocalBlobSink, inline_limit: int) -> tup
         owned: list[str] = []
 
         def claim(view: memoryview) -> tuple[bytes, int] | None:
-            got = _objects.claim(view, rdir) if view.nbytes >= PROMOTE_BYTES else None
+            got = _objects.claim(view, rdir, prefix) if view.nbytes >= PROMOTE_BYTES else None
             if got is not None:
                 owned.append(os.path.join(rdir, got[0].hex()))
             return got
 
         parts, size, _ = _serde.dumps_parts(value, external=claim)
-        object_id = os.urandom(16)
+        object_id = prefix + os.urandom(16 - len(prefix))
         if size <= inline_limit:
             return object_id, b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts), size, owned
         path = _serde.object_path(sink.object_dir, run, object_id)
@@ -175,36 +195,187 @@ def store(value: Any, run: bytes, sink: LocalBlobSink, inline_limit: int) -> tup
     return object_id, None, size, []
 
 
-# (run dir, inode) -> the first blob id an arena array was claimed under.
-_first_claims: dict[tuple[str, int], bytes] = {}
+class ClaimHold:
+    """A blob a call reads: an arena array linked into its run (see
+    _objects.claim), or a buffer or argument stored by content. A loop that
+    passes a fresh array per iteration would fill memory if these lasted for
+    the run. Instead the blob is dropped, here and on the peers that fetched
+    it, once this hold is unreachable: its owner (the array) has been collected
+    and every call that read it has an outcome (the calls' `reads` hold it
+    until then); a blob stored by content is forgotten by its `sink` too, so
+    the same bytes sent later are stored again. A blob stored by content whose
+    owner could not be watched (bytes, lists: the program may send them again)
+    waits among the recently freed (_RECENT_BYTES) before it is dropped.
+    Without a `release` (inside a task, whose session owns no run) or after
+    keep(), it stays for the run."""
+
+    __slots__ = ("blob", "_fin", "_owner", "_watched", "__weakref__")
+
+    def __init__(
+        self,
+        path: str | None,
+        run: bytes,
+        blob: bytes,
+        release: Callable[[bytes, list[bytes]], None] | None,
+        sink: Any = None,
+        size: int = 0,
+    ):
+        self.blob = blob
+        self._owner: Any = None
+        self._watched = [False]  # shared with the finalizer: an owner was watched
+        fin = (
+            weakref.finalize(
+                self, _drop_claim, path, run, blob, release, os.getpid(), sink, size, self._watched
+            )
+            if release is not None
+            else None
+        )
+        self._fin = fin
+        if self._fin is None:
+            _kept.add(self)
+        else:
+            self._fin.atexit = False  # the run's end removes it
+
+    def keep(self) -> None:
+        """Keep for the run: an actor may read it again (a restart re-runs
+        the constructor with the same arguments)."""
+        if self._fin is not None and self._fin.detach() is not None:
+            _kept.add(self)
+
+    def held_by(self, owner: Any) -> None:
+        """Stay at least as long as `owner`, the object whose bytes it holds,
+        so passing the same live array again reuses this blob. An owner that
+        cannot be watched (bytes) leaves it to the calls that read it."""
+        if self._fin is None or not self._fin.alive or (self._owner is not None and self._owner() is owner):
+            return
+        try:
+            weakref.finalize(owner, _owner_gone, self).atexit = False
+            self._owner = weakref.ref(owner)
+            self._watched[0] = True
+        except TypeError:
+            pass
 
 
-def _same_claim(run_dir: str, claimed: tuple[bytes, int]) -> tuple[bytes, int]:
+def _owner_gone(hold: ClaimHold) -> None:
+    """The owner was collected: its finalizer, which kept `hold` alive until
+    now, lets go of it here, and the hold forgets the owner."""
+    hold._owner = None
+
+
+def _drop_claim(
+    path: str | None,
+    run: bytes,
+    blob: bytes,
+    release: Callable[[bytes, list[bytes]], None],
+    pid: int,
+    sink: Any,
+    size: int,
+    watched: list[bool],
+) -> None:
+    if sys.is_finalizing() or os.getpid() != pid:  # a forked child's copy: the blob is its parent's
+        return
+    with _blob_lock:  # against a call storing the same bytes again meanwhile (see _hold_blob)
+        if sink is None or watched[0]:
+            _drop_now(path, run, blob, release, sink)
+            return
+        global _recent_bytes
+        _recent[(run, blob)] = (path, release, sink, size)
+        _recent_bytes += size
+        while _recent_bytes > _RECENT_BYTES and _recent:
+            (r, b), (p, rel, snk, n) = _recent.popitem(last=False)
+            _recent_bytes -= n
+            _drop_now(p, r, b, rel, snk)
+
+
+def _drop_now(
+    path: str | None, run: bytes, blob: bytes, release: Callable[[bytes, list[bytes]], None], sink: Any
+) -> None:
+    if sink is not None:
+        sink.forget(run, blob)
+    if path is not None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    try:
+        release(run, [blob])
+    except Exception:  # noqa: S110 -- best effort during garbage collection
+        pass
+
+
+# (run dir, inode) -> the live hold of an arena array's link; holds kept for
+# the run stay reachable through _kept.
+_claims: weakref.WeakValueDictionary[tuple[str, int], ClaimHold] = weakref.WeakValueDictionary()
+_kept: set[ClaimHold] = set()
+# (run, blob id) -> the live hold of a blob stored by content.
+_blob_holds: weakref.WeakValueDictionary[tuple[bytes, bytes], ClaimHold] = weakref.WeakValueDictionary()
+_blob_lock = threading.RLock()
+# Blobs stored by content that nothing holds but the program may send again
+# (their owner could not be watched), oldest first, up to this many bytes.
+_RECENT_BYTES = 256 << 20
+_recent: collections.OrderedDict[tuple[bytes, bytes], tuple[str | None, Any, Any, int]] = collections.OrderedDict()
+_recent_bytes = 0
+
+
+def _hold_blob(
+    run: bytes, bid: bytes, data: bytes | memoryview, sink: Any, release: Callable[[bytes, list[bytes]], None] | None
+) -> ClaimHold | None:
+    """Store `data` as blob `bid` of the run (once while it is held) and the
+    hold that frees it when nothing needs it; None, kept for the run, without
+    a `release`."""
+    if release is None:
+        sink.put(run, bid, data)
+        return None
+    global _recent_bytes
+    with _blob_lock:
+        hold = _blob_holds.get((run, bid))
+        cached = _recent.pop((run, bid), None)
+        if cached is not None:  # freed recently and still stored: reused as it is
+            _recent_bytes -= cached[3]
+        sink.put(run, bid, data)
+        if hold is None:
+            path = blob_path(sink.object_dir, run, bid) if isinstance(sink, LocalBlobSink) else None
+            hold = ClaimHold(path, run, bid, release, sink, memoryview(data).nbytes)
+            _blob_holds[(run, bid)] = hold
+    return hold
+
+
+def _claim_hold(
+    run_dir: str, run: bytes, claimed: tuple[bytes, int], release: Callable[[bytes, list[bytes]], None] | None
+) -> ClaimHold:
     """An arena array passed again unchanged links the same file (a changed
-    one is not claimed at all): reuse the name it got first, so other peers
+    one is not claimed at all): reuse the hold it already has, so other peers
     see one object and fetch it once instead of once per call."""
-    blob, off = claimed
-    path = os.path.join(run_dir, blob.hex())
+    path = os.path.join(run_dir, claimed[0].hex())
     try:
         inode = os.stat(path).st_ino
     except OSError:
-        return claimed
-    first = _first_claims.get((run_dir, inode))
-    if first is not None and first != blob:
+        return ClaimHold(path, run, claimed[0], release)
+    hold = _claims.get((run_dir, inode))
+    if hold is not None and hold.blob != claimed[0]:
         try:
-            if os.stat(os.path.join(run_dir, first.hex())).st_ino == inode:
+            if os.stat(os.path.join(run_dir, hold.blob.hex())).st_ino == inode:
                 os.unlink(path)
-                return first, off
+                return hold
         except OSError:
-            pass  # the first name is gone: this one becomes the first
-    _first_claims[(run_dir, inode)] = blob
-    return claimed
+            pass  # its name is gone (spilled): this link takes over
+    hold = ClaimHold(path, run, claimed[0], release)
+    _claims[(run_dir, inode)] = hold
+    return hold
 
 
-def encode_frame(frame: tuple[tuple[Any, ...], dict[str, Any]], run: bytes, sink: LocalBlobSink) -> Encoded:
-    """Encode `(args, kwargs)`, moving large buffers and arguments into blobs."""
+def encode_frame(
+    frame: tuple[tuple[Any, ...], dict[str, Any]],
+    run: bytes,
+    sink: LocalBlobSink,
+    release: Callable[[bytes, list[bytes]], None] | None = None,
+) -> Encoded:
+    """Encode `(args, kwargs)`, moving large buffers and arguments into blobs.
+    Arena arrays are linked instead, each under a ClaimHold (in the result's
+    `holds`) that `release`s the link once nothing needs it."""
     t0 = time.perf_counter()
     blobs: dict[bytes, int] = {}
+    holds: list[ClaimHold] = []
 
     local_dir = _serde.run_dir(sink.object_dir, run) if isinstance(sink, LocalBlobSink) else None
 
@@ -214,11 +385,16 @@ def encode_frame(frame: tuple[tuple[Any, ...], dict[str, Any]], run: bytes, sink
         if local_dir is not None:
             claimed = _objects.claim(view, local_dir)  # an arena array: linked, not hashed or copied
             if claimed is not None:
-                claimed = _same_claim(local_dir, claimed)
-                blobs[claimed[0]] = view.nbytes
-                return claimed
+                hold = _claim_hold(local_dir, run, claimed, release)
+                hold.held_by(view.obj)
+                holds.append(hold)
+                blobs[hold.blob] = view.nbytes
+                return hold.blob, claimed[1]
         bid = blob_id_of(view)
-        sink.put(run, bid, view)
+        hold = _hold_blob(run, bid, view, sink, release)
+        if hold is not None:
+            hold.held_by(view.obj)
+            holds.append(hold)
         blobs[bid] = view.nbytes
         return bid
 
@@ -227,14 +403,19 @@ def encode_frame(frame: tuple[tuple[Any, ...], dict[str, Any]], run: bytes, sink
         # Large without buffers (big dicts, lists, objects): store each large
         # top-level argument once and pass a reference that loads it.
         args, kwargs = frame
-        promote = _promoter(run, sink, external, blobs)
+        promote = _promoter(run, sink, external, blobs, holds, release)
         frame = (tuple(promote(a) for a in args), {k: promote(v) for k, v in kwargs.items()})
         parts, size, oob = _serde.dumps_parts(frame, external=external)
-    return Encoded(parts, size, oob, blobs, time.perf_counter() - t0)
+    return Encoded(parts, size, oob, blobs, time.perf_counter() - t0, holds)
 
 
 def _promoter(
-    run: bytes, sink: LocalBlobSink, external: Callable[[memoryview], bytes | None], blobs: dict[bytes, int]
+    run: bytes,
+    sink: LocalBlobSink,
+    external: Callable[[memoryview], bytes | None],
+    blobs: dict[bytes, int],
+    holds: list[ClaimHold],
+    release: Callable[[bytes, list[bytes]], None] | None,
 ) -> Callable[[Any], Any]:
     def promote(x: Any) -> Any:
         if isinstance(x, (_serde.Dep, BlobRef, InlineRef)) or type(x).__name__ in ("Future", "ObjectRef"):
@@ -244,7 +425,10 @@ def _promoter(
             return x
         data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts)
         bid = blake3_buffer(data)[:16]
-        sink.put(run, bid, data)
+        hold = _hold_blob(run, bid, data, sink, release)
+        if hold is not None:
+            hold.held_by(x)
+            holds.append(hold)
         blobs[bid] = len(data)
         return BlobRef(bid, len(data))
 
@@ -319,12 +503,24 @@ fetched = FetchedTracker()
 def torch_reducers() -> dict[type, Callable[[Any], Any]]:
     """Zero-copy reduction for CPU torch tensors, only when torch is already
     imported (never imports it): through NumPy, so the bytes travel out of band
-    like any array instead of being copied into the pickle."""
+    like any array instead of being copied into the pickle.
+
+    A CUDA tensor goes through host memory too (torch's own pickling copies it
+    as well), but is rebuilt on the reader's GPU: torch's pickling names the
+    writer's device index, which fails to load where there is no GPU and may
+    name a missing or wrong device where other GPUs are visible."""
     torch = sys.modules.get("torch")
     if torch is None:
         return {}
 
     def reduce_tensor(t: Any) -> Any:
+        if t.device.type == "cuda" and not t.requires_grad and not t.is_sparse:
+            host = t.detach().cpu()
+            try:
+                payload: Any = host.contiguous().numpy()
+            except (TypeError, RuntimeError):  # dtypes NumPy lacks: torch pickles the host copy
+                payload = host
+            return (tensor_on_device, (payload, "cuda"))
         if t.device.type != "cpu" or t.requires_grad or t.is_sparse or not t.is_contiguous():
             return t.__reduce_ex__(5)
         try:
@@ -334,3 +530,30 @@ def torch_reducers() -> dict[type, Callable[[Any], Any]]:
         return (torch.from_numpy, (arr,))  # the array itself travels out of band
 
     return {torch.Tensor: reduce_tensor}
+
+
+_device_warned: set[str] = set()
+
+
+def tensor_on_device(payload: Any, kind: str) -> Any:
+    """A tensor sent from a `kind` device: on this call's granted device of
+    that kind; in the driver, on its current one if it has one; else on the
+    CPU, with a warning (CH112) instead of torch's load failure."""
+    import torch
+
+    from ._devices import device, devices
+
+    t = payload if isinstance(payload, torch.Tensor) else torch.from_numpy(payload)
+    granted = device()
+    if granted.split(":")[0] == kind:
+        return t.to(granted)
+    if not devices() and kind == "cuda" and torch.cuda.is_available():
+        return t.to(kind)
+    if kind not in _device_warned:
+        _device_warned.add(kind)
+        warnings.warn(
+            f"CH112: a tensor sent from a {kind} device arrived where there is none, so it is on the CPU. "
+            f"Ask the call for gpus=1 to receive it on a GPU, or send t.cpu() to make the copy explicit.",
+            stacklevel=2,
+        )
+    return t

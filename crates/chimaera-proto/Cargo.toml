@@ -13,7 +13,7 @@ blake3.workspace = true
 lz4_flex.workspace = true
 zstd.workspace = true
 thiserror.workspace = true
-tonic = { workspace = true, optional = true, features = ["codegen", "transport"] }
+tonic = { workspace = true, optional = true, features = ["codegen", "transport", "tls-ring"] }
 tonic-prost = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }

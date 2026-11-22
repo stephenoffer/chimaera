@@ -9,11 +9,14 @@ use crate::{Group, NodeId, TypeConfig};
 use openraft::error::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::network::v2::RaftNetworkV2;
-use openraft::raft::{AppendEntriesRequest, AppendError, AppendResult, SnapshotResponse, VoteRequest, VoteResponse};
+use openraft::raft::{
+    AppendEntriesRequest, AppendError, AppendResult, SnapshotResponse, TransferLeaderRequest, TransferLeaderResponse,
+    VoteRequest, VoteResponse,
+};
 use openraft::type_config::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, VoteOf};
 use openraft::{BasicNode, OptionalSend, RaftNetworkFactory};
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -22,7 +25,7 @@ pub enum RpcKind {
     Append,
     Vote,
     PreVote,
-    Snapshot,
+    TransferLeader,
 }
 
 impl RpcKind {
@@ -30,15 +33,19 @@ impl RpcKind {
         self as u8
     }
     pub fn from_code(c: u8) -> Option<RpcKind> {
-        [RpcKind::Append, RpcKind::Vote, RpcKind::PreVote, RpcKind::Snapshot].get(c as usize).copied()
+        [RpcKind::Append, RpcKind::Vote, RpcKind::PreVote, RpcKind::TransferLeader].get(c as usize).copied()
     }
 }
 
 pub type RpcFuture = Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>;
 
-/// Delivers one raft RPC to `target` (reachable at `addr`) for `group`.
+/// Delivers raft RPCs to `target` (reachable at `addr`) for `group`.
 pub trait Transport: Send + Sync + 'static {
     fn call(&self, target: NodeId, addr: &str, group: u32, kind: RpcKind, body: Vec<u8>) -> RpcFuture;
+    /// Send a snapshot: `header` (the vote and the snapshot's meta), then
+    /// `file` streamed in pieces, never as one message. The reply is what
+    /// [`handle_snapshot`] returns on the receiving peer.
+    fn send_snapshot(&self, target: NodeId, addr: &str, group: u32, header: Vec<u8>, file: std::fs::File) -> RpcFuture;
 }
 
 pub struct NetworkFactory {
@@ -113,13 +120,6 @@ impl From<AppendWire> for AppendResult<TypeConfig> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SnapshotRpc {
-    vote: VoteOf<TypeConfig>,
-    meta: SnapshotMetaOf<TypeConfig>,
-    data: Vec<u8>,
-}
-
 impl RaftNetworkV2<TypeConfig> for Network {
     type SnapshotData = std::fs::File;
 
@@ -148,27 +148,45 @@ impl RaftNetworkV2<TypeConfig> for Network {
         self.rpc(RpcKind::PreVote, &rpc).await
     }
 
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> Result<TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
+        self.rpc(RpcKind::TransferLeader, &req).await
+    }
+
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<TypeConfig>,
         snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
-        let mut data = Vec::new();
-        let mut f = snapshot.snapshot;
-        f.read_to_end(&mut data).map_err(|e| StreamingError::Unreachable(Unreachable::new(&e)))?;
-        let req = SnapshotRpc { vote, meta: snapshot.meta, data };
-        self.rpc(RpcKind::Snapshot, &req).await.map_err(|e| match e {
-            RPCError::Unreachable(u) => StreamingError::Unreachable(u),
-            other => StreamingError::Unreachable(Unreachable::new(&io_err(other))),
-        })
+        let failed = |e: io::Error| StreamingError::Unreachable(Unreachable::new(&e));
+        let header = enc(&(vote, snapshot.meta)).map_err(failed)?;
+        let send = self.transport.send_snapshot(self.target, &self.addr, self.group, header, snapshot.snapshot);
+        let bytes = tokio::select! {
+            r = send => r.map_err(failed)?,
+            closed = cancel => return Err(StreamingError::Closed(closed)),
+        };
+        let resp: Result<SnapshotResponse<TypeConfig>, String> = dec(&bytes).map_err(failed)?;
+        resp.map_err(|e| failed(io_err(e)))
     }
+}
+
+/// Install a snapshot that arrived as `header` plus the file at `path`. The
+/// reply is a postcard `Result<SnapshotResponse, String>`.
+pub async fn handle_snapshot(group: &Group, header: &[u8], path: &std::path::Path) -> io::Result<Vec<u8>> {
+    let (vote, meta): (VoteOf<TypeConfig>, SnapshotMetaOf<TypeConfig>) = dec(header)?;
+    let snapshot = openraft::storage::Snapshot { meta, snapshot: std::fs::File::open(path)? };
+    let r = group.raft.install_full_snapshot(vote, snapshot).await;
+    enc(&r.map_err(|e| e.to_string()))
 }
 
 /// Serve one raft RPC addressed to `group` on this peer. The reply is always a
 /// postcard `Result<Response, String>`, so remote failures stay visible.
-pub async fn handle_rpc(group: &Group, kind: RpcKind, body: &[u8], scratch: &std::path::Path) -> io::Result<Vec<u8>> {
+pub async fn handle_rpc(group: &Group, kind: RpcKind, body: &[u8]) -> io::Result<Vec<u8>> {
     fn wrap<T: serde::Serialize, E: std::fmt::Display>(r: Result<T, E>) -> io::Result<Vec<u8>> {
         enc(&r.map_err(|e| e.to_string()))
     }
@@ -176,16 +194,7 @@ pub async fn handle_rpc(group: &Group, kind: RpcKind, body: &[u8], scratch: &std
         RpcKind::Append => wrap(group.raft.append_entries(dec(body)?).await.map(AppendWire::from)),
         RpcKind::Vote => wrap(group.raft.vote(dec(body)?).await),
         RpcKind::PreVote => wrap(group.raft.pre_vote(dec(body)?).await),
-        RpcKind::Snapshot => {
-            let req: SnapshotRpc = dec(body)?;
-            let path = scratch.join(format!("incoming-{}-{}.snap", group.id, std::process::id()));
-            std::fs::File::create(&path)?.write_all(&req.data)?;
-            let file = std::fs::File::open(&path)?;
-            let snap = openraft::storage::Snapshot { meta: req.meta, snapshot: file };
-            let r = group.raft.install_full_snapshot(req.vote, snap).await;
-            let _ = std::fs::remove_file(&path);
-            wrap(r)
-        }
+        RpcKind::TransferLeader => wrap(group.raft.handle_transfer_leader(dec(body)?).await),
     }
 }
 
@@ -194,6 +203,17 @@ pub struct NoTransport;
 
 impl Transport for NoTransport {
     fn call(&self, target: NodeId, _addr: &str, group: u32, _kind: RpcKind, _body: Vec<u8>) -> RpcFuture {
+        Box::pin(async move { Err(io_err(format!("no transport to node {target} for group {group}"))) })
+    }
+
+    fn send_snapshot(
+        &self,
+        target: NodeId,
+        _addr: &str,
+        group: u32,
+        _header: Vec<u8>,
+        _file: std::fs::File,
+    ) -> RpcFuture {
         Box::pin(async move { Err(io_err(format!("no transport to node {target} for group {group}"))) })
     }
 }

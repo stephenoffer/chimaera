@@ -8,64 +8,41 @@
 
     word_count("blue sky")                    # 2, an ordinary local call
     word_count.remote("blue sky").result()    # 2, scheduled by the runtime
+
+The top level is what most programs need. The rest is in submodules:
+``chimaera.coord`` (queues, topics, a replicated store), ``chimaera.dist``
+(gangs, reservations, placement, devices), ``chimaera.data`` (partitions),
+``chimaera.runs`` (runs and the cluster), ``chimaera.durable`` (durable state
+and workflows), ``chimaera.errors`` (every error), ``chimaera.typing``
+(types for annotations) and ``chimaera.ext`` (sources, sinks, serializers).
 """
 
+from ._batch import Batch
 from ._context import context
-from ._devices import device, devices
-from ._gang import Gang, GangActor, GangFailed, Group, GroupHandle, group
-from ._reserve import Reservation, reserve
 from ._errors import (
     ActorDied,
     Cancelled,
     ChimaeraError,
-    Closed,
-    CommandConflict,
-    DataLost,
     DeadlineExceeded,
     Infeasible,
     InfrastructureFailure,
-    LeaseLost,
     NotFound,
     OptionsError,
     OutcomeUnknown,
     OutOfMemory,
-    Overloaded,
-    PreflightError,
-    RemoteError,
     SerializationError,
-    StreamInterrupted,
-    VersionConflict,
-    WorkerCrashed,
-    WorkflowDivergence,
 )
-from ._future import Future, ObjectRef, Outcome, Results, Stream, as_completed, gather, handles, put
-from ._batch import Batch
-from ._options import Placement, State, auto, options
-from ._remote import Actor, ActorClass, Pool, RemoteFunction, actor, method, remote
-from ._run import Run, attach, current_run
-from ._runtime import Runtime
-from . import workflow  # noqa: E402 -- ch.workflow.now/random/sleep/record
-from ._coord import Queue, Subscription, Topic  # noqa: E402 -- builds on _remote
-from ._store import Store
-from ._cluster import cluster
-from . import ext  # noqa: E402 -- sources, sinks, serializers
-from ._data import Partition, Partitioned, partitions
-
-
-def submit(fn, /, *args, **kwargs) -> Future:
-    """Run an undecorated callable remotely (same contract as ``remote(fn).remote``)."""
-    return remote(fn).remote(*args, **kwargs)
-
-
-def map(fn, /, *sources, ordered: bool = True) -> Results:  # noqa: A001 -- mirrors builtins.map
-    """Apply an undecorated callable to every item remotely."""
-    f = fn if isinstance(fn, RemoteFunction) else remote(fn)
-    return f.map(*sources, ordered=ordered)
+from ._future import Future, Results, as_completed, get, handles, put, wait
+from ._options import auto, defaults
+from ._remote import Executor, actor, gather, method, remote
+from ._run import Run as _Run, current_run as _current_run
+from ._runtime import Runtime as _Runtime
+from . import coord, data, dist, durable, errors, ext, runs, typing  # noqa: E402 -- build on the above
 
 
 def init(
     cluster: str | None = None, *, detach: bool = False, env: dict[str, str] | None = None, tenant: str | None = None
-) -> Run:
+) -> _Run:
     """Connect now (normally the first submission does) and return the run.
     A ``Run`` is its id string, so it can be printed, stored and passed to
     ``ch.attach`` from another process.
@@ -85,83 +62,68 @@ def init(
     work is charged to: peers with ``CHIMAERA_TENANT_QUOTAS`` hold a tenant's
     calls back while its running calls use its quota of CPUs.
     """
-    with Runtime._lock:
-        if Runtime._instance is None:
-            Runtime._instance = Runtime(detached=detach, env=env, cluster=cluster, tenant=tenant)
+    with _Runtime._lock:
+        if _Runtime._instance is None:
+            _Runtime._instance = _Runtime(detached=detach, env=env, cluster=cluster, tenant=tenant)
         elif env is not None or cluster is not None or tenant is not None:
-            raise RuntimeError("ch.init(cluster=..., env=..., tenant=...) must come before the first submission")
-    return current_run()
+            raise RuntimeError(
+                "ch.init(cluster=..., env=..., tenant=...) must come before the first call; "
+                "call ch.shutdown() first to connect again with other settings"
+            )
+    return _current_run()
+
+
+def shutdown(*, cancel: bool = False) -> None:
+    """End this script's run now, as exit would: wait for the calls and maps
+    it has not waited on (``cancel=True``: cancel them), finish the run and
+    disconnect. The next call, or ``ch.init(...)``, connects again, to any
+    cluster: a notebook or a test suite can switch clusters this way."""
+    with _Runtime._lock:
+        rt, _Runtime._instance = _Runtime._instance, None
+    if rt is None:
+        return
+    if rt.in_executor:
+        _Runtime._instance = rt
+        raise RuntimeError("ch.shutdown() ends a script's run; a call cannot end the run it belongs to")
+    rt.shutdown(cancel)
 
 
 __all__ = [
-    "Actor",
-    "ActorClass",
     "ActorDied",
     "Batch",
     "Cancelled",
     "ChimaeraError",
-    "Closed",
-    "CommandConflict",
-    "DataLost",
     "DeadlineExceeded",
+    "Executor",
     "Future",
-    "Gang",
-    "GangActor",
-    "GangFailed",
-    "Group",
-    "GroupHandle",
     "Infeasible",
     "InfrastructureFailure",
-    "LeaseLost",
     "NotFound",
-    "ObjectRef",
     "OptionsError",
-    "Outcome",
-    "OutcomeUnknown",
     "OutOfMemory",
-    "Overloaded",
-    "Partition",
-    "Partitioned",
-    "Placement",
-    "Reservation",
-    "Pool",
-    "PreflightError",
-    "Queue",
-    "RemoteError",
-    "RemoteFunction",
+    "OutcomeUnknown",
     "Results",
-    "Run",
     "SerializationError",
-    "State",
-    "Store",
-    "Stream",
-    "StreamInterrupted",
-    "Subscription",
-    "Topic",
-    "VersionConflict",
-    "WorkerCrashed",
-    "WorkflowDivergence",
     "actor",
     "as_completed",
-    "handles",
-    "attach",
     "auto",
-    "cluster",
     "context",
-    "current_run",
-    "device",
-    "devices",
+    "coord",
+    "data",
+    "dist",
+    "durable",
+    "errors",
     "ext",
     "gather",
-    "group",
+    "get",
+    "handles",
     "init",
-    "map",
     "method",
-    "options",
-    "partitions",
+    "defaults",
     "put",
     "remote",
-    "reserve",
-    "submit",
-    "workflow",
+    "runs",
+    "shutdown",
+    "typing",
+    "wait",
 ]

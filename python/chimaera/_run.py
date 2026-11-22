@@ -1,4 +1,4 @@
-"""Reattaching to a run by id: ``ch.attach(run_id)``."""
+"""Reattaching to a run by id: ``ch.runs.attach(run_id)``."""
 
 from __future__ import annotations
 
@@ -10,30 +10,44 @@ from ._errors import from_outcome
 from ._runtime import Runtime
 
 
-class Run(str):
-    """A run: its id (a ``Run`` is that string) and what you can do with it.
+class Run:
+    """A run: the calls one script (or one detached job) made, by id.
 
-    ``ch.init()`` and ``ch.current_run()`` return the current run;
-    ``ch.attach(run_id)`` reopens any run, from any process.
+    ``ch.init()`` and ``ch.runs.current_run()`` return the current run;
+    ``ch.runs.attach(run_id)`` reopens any run, from any process. ``str(run)`` is
+    its id. ``with ch.init() as run:`` ends it (``ch.shutdown()``) when the
+    block ends.
     """
 
-    _rt: Runtime
-    _run: bytes
-
-    def __new__(cls, rt: Runtime, run: bytes) -> Run:
-        self = super().__new__(cls, run.hex())
+    def __init__(self, rt: Runtime, run: bytes) -> None:
         self._rt, self._run = rt, run
-        return self
 
     @property
     def id(self) -> str:
-        return str(self)
+        return self._run.hex()
+
+    def __str__(self) -> str:
+        return self.id
 
     def __repr__(self) -> str:
-        return f"<Run {str(self)[:12]}>"
+        return f"<Run {self.id[:12]}>"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Run) and other._run == self._run
+
+    def __hash__(self) -> int:
+        return hash(self._run)
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (attach, (str(self),))
+        return (attach, (self.id,))
+
+    def __enter__(self) -> Run:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        from . import shutdown
+
+        shutdown(cancel=exc[0] is not None)
 
     def tasks(self, state: str | None = None) -> list[tuple[str, str]]:
         """(task_id, state) for every call in the run, optionally only one
@@ -108,13 +122,20 @@ class Run(str):
                 yield key[16:].hex(), None, from_outcome(outcome, key[16:].hex())
 
 
-def attach(run_id: str) -> Run:
+def attach(run_id: str | Run) -> Run:
     """Reattach to a run by id, from any process, after the driver or peer restarted."""
     rt = Runtime.get()
-    return Run(rt, bytes.fromhex(run_id))
+    return Run(rt, bytes.fromhex(str(run_id)))
 
 
 def current_run() -> Run:
+    """The run this code belongs to: the script's, or inside a call, the run
+    of the script that made the call."""
+    from ._context import current_task
+
     rt = Runtime.get()
-    assert rt.run is not None
-    return Run(rt, rt.run)
+    ctx = current_task()
+    run = ctx.run if ctx is not None else rt.run
+    if run is None:
+        raise RuntimeError("no run: this process is neither a script that made calls nor a call")
+    return Run(rt, run)

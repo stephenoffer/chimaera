@@ -91,7 +91,7 @@ class Pool:
             raise unsupported("Pool(maxtasksperchild=...)", why="workers are long-lived actors")
         if ray_address is not None:
             raise unsupported("Pool(ray_address=...)", use="ray.init(address) before creating the pool")
-        n = processes or int(ch.cluster().resources()["cpus"]) or os.cpu_count() or 1
+        n = processes or int(ch.runs.cluster().resources()["cpus"]) or os.cpu_count() or 1
         if n < 1:
             raise ValueError("Number of processes must be at least 1")
         opts = {"replicas": n}

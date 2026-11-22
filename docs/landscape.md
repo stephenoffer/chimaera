@@ -142,7 +142,7 @@ queued/s (vendor claims). Temporal history is capped at 51,200 events or 50 MB p
 fixed at cluster creation.
 
 **Take:** durable workflows (built), durable sleep, signals through a durable queue, patch markers
-(`ch.workflow.patched`), call keys as idempotency keys, delayed calls (`start_after=`), HA schedules, and flow
+(`ch.durable.patched`), call keys as idempotency keys, delayed calls (`start_after=`), HA schedules, and flow
 control by key (`ch.Limit`). **Avoid:** fixed shard counts (Chimaera's vshards move between groups), a database on
 the call path, and history without compaction.
 

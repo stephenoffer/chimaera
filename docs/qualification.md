@@ -34,7 +34,7 @@ the colima VM (Linux 6.8 aarch64, 4 vCPU, 6 GiB, cgroup v2 delegated with
 | Killed executor is retried as attempt 2 | pass (local) | `test_executor_killed_mid_call_is_retried_on_a_new_attempt` |
 | User exception runs exactly once | pass (local) | counter file has one line |
 | External effect lost after start is `OutcomeUnknown`, never replayed | pass (local) | ledger has one line |
-| Peer killed during a 10,000-call run; restart; attach sees every result once | pass (local) | SIGKILL at ~30% done; after restart and `ch.attach`: 10,000 results, 10,000 distinct |
+| Peer killed during a 10,000-call run; restart; attach sees every result once | pass (local) | SIGKILL at ~30% done; after restart and `ch.runs.attach`: 10,000 results, 10,000 distinct |
 | Busy loop measures 0.95–1.05 cores; a sleep under 0.02 | pass (local, macOS and Linux) | `test_accounting` (process scope, rusage) |
 | Isolated attempt reports its own peak; exceeding the limit is an OOM kill | pass (local, Linux) | `memory_peak_bytes` ≥ 64 MiB with scope `attempt`, method `cgroup`; a 300 MiB allocation under `memory_limit="100 MiB"` raises `OutOfMemory` with the peak |
 | `cpus=64` is infeasible with the shape | pass (local) | rejected at submit with requested vs offered |
@@ -199,6 +199,74 @@ also caught a starting peer being declared dead while its core was not yet
 answering pings, and a dead identity kept alive by a new one answering at its
 address).
 
+## Ray comparison (cluster, 1 and 16 nodes)
+
+c7i.4xlarge machines (16 vCPU each), Ray from the image against one Chimaera
+peer per machine started through Ray (`bench/evals/multi_node.py`). Each
+workload ran for at least 60 s after an uncounted warm-up; the median of the
+repetitions is shown. Peers chose raft sync themselves (replicas only on this
+volume: fsync p50 3.9 ms). Jobs `prodjob_18yra1pp6t3udi8ufteexn5vsv` (1 node)
+and `prodjob_sk36myi9natg8ailnndgnxmzap` (16 nodes), tree diff `4805bb8acb567ec2`
+on `b6c71a5`.
+
+| Workload | 1 node: Ray | 1 node: Chimaera | 16 nodes: Ray | 16 nodes: Chimaera |
+|---|---:|---:|---:|---:|
+| Independent no-op tasks | 6,285/s | 4,787/s | 5,644/s | 13,785/s |
+| CPU scaling efficiency | 0.703 | 0.695 | 0.716 | 0.729 |
+| Map of tiny items, naive | 6,427/s | 2,020,917/s | 5,432/s | 1,026,548/s |
+| 512 MiB value to 2 x CPUs readers | 0.010 s | 0.010 s | 0.097 s | 0.079 s |
+| 32 MiB array passed straight to 2 x CPUs calls | 0.054 s | 0.010 s | 0.921 s | 0.078 s |
+| 10 calls on a 256 MiB value just made | 0.223 s | 0.239 s | 0.229 s | 0.237 s |
+| Actor calls | 7,893/s | 13,246/s | 8,184/s | 14,183/s |
+| Nested tasks (4 x CPUs parents, 8 children each) | 0.179 s | 0.063 s | 0.464 s | 0.799 s |
+| Shuffle, 3.2M pairs | 0.226 s | 0.496 s | 0.137 s | 0.634 s |
+| A node killed under one-second tasks | 7.95 s | 5.56 s | 21.25 s | 6.76 s |
+
+Where Ray is ahead: tasks on one machine (1.3x), shuffle on both (2.2x and
+4.6x), nested at 16 nodes (1.7x); follow-input is within 7%. At 16 nodes
+Chimaera put all 128 actors on one host (Ray: 16), which these trivial
+methods did not mind but CPU-heavy ones would.
+
+Fixed since the earlier 16-node run (`prodjob_y95uyvfdg61kqayqwerrjyyqq4`,
+where broadcast took 6.39 s and the large argument 0.389 s): values a driver
+uploaded now carry their holder, so placement keeps quick readers there; tuple
+results are stored value by value so a split value decodes alone; a cluster
+of one grants at submission; local-first grants for calls made inside tasks.
+An earlier 1-node run hung on the large-argument workload (an arena leak in
+/dev/shm), now fixed. Before those, a 16-node attempt filled /dev/shm before
+spilling began and retired the driver's peer after a 2 s stall; both fixed
+(spill on free space, 6 s suspicion floor).
+
+## Ray comparison (cluster, 64 nodes)
+
+64 x c7i.4xlarge (1,024 vCPU), job `prodjob_knugq6wg8kwlahg9kby44ssf6c`, same
+method with at least 45 s of repetitions per workload, tree diff
+`40e2fe4826e0cf5b` on `b6c71a5`.
+
+| Workload | Ray | Chimaera | Better |
+|---|---:|---:|---|
+| Independent no-op tasks | 5,341/s | 9,579/s | Chimaera, 1.8x |
+| CPU scaling efficiency (1,024 CPUs) | 0.674 | 0.633 | Ray, 6% |
+| Map of tiny items, naive | 5,197/s | 1,016,057/s | Chimaera |
+| 512 MiB value to 2,048 readers | 0.391 s (p90 19.6 s) | 0.365 s | Chimaera |
+| 32 MiB array passed straight to 2,048 calls | 3.50 s | 0.391 s | Chimaera, 9x |
+| 10 calls on a 256 MiB value just made | 0.228 s | 0.249 s | Ray, 9% |
+| Actor calls, 512 actors | 9,005/s | failed: timed out creating an actor | Ray |
+| Nested tasks, 4,096 parents | 1.29 s | 5.23 s | Ray, 4x |
+| Shuffle, 3.2M pairs | 0.135 s | 1.149 s | Ray, 8.5x |
+| A node killed under 4,096 one-second tasks | 18.5 s | 20.5 s | Ray, 10% |
+
+Found since: actor placement let a group leader win every tie on idle peers,
+and all of a run's actors share one group, so a burst landed on one host (at
+16 nodes all 128 did); placements now count against their host for 10 s.
+The actor-admission retry rescanned every waiting actor against the whole
+membership every 100 ms, starving the core loop when hundreds waited (fixed
+by the layered-api session). A call's missing inputs are now fetched
+concurrently (a shuffle gather reads 64). Per-run throughput falls from
+13.8k/s at 16 nodes to 9.6k/s at 64: every call of a run goes through one
+raft group's leader, which the design's partitioning of runs across groups
+(not built yet) would remove.
+
 ## Smart defaults: learned reservations, memory, large values
 
 Plan `mellow-finding-scone.md`. All results are **local** (macOS 14, 12 cores,
@@ -211,7 +279,7 @@ was shared with other builds and test runs during these measurements.
 | Arrays arrive writable; a write stays in its call | pass (local) | `test_values.py`: copy-on-write mapping; the next call and the caller see the original |
 | Old and new value encodings agree | pass (local) | without blobs the new encoder writes byte-identical objects for ten kinds of value; old and new readers read each other's output |
 | Per-call argument files are released when the call ends | pass (local) | `test_values.py` |
-| A finished run's stored arguments go when it ends; its results stay | pass (local) | `test_values.py`: after the script exits, its 16 MiB argument is deleted within 15 s and its 2 MiB result is still read through `ch.attach`. Fails on the previous peer, which kept both for the 24 h retention |
+| A finished run's stored arguments go when it ends; its results stay | pass (local) | `test_values.py`: after the script exits, its 16 MiB argument is deleted within 15 s and its 2 MiB result is still read through `ch.runs.attach`. Fails on the previous peer, which kept both for the 24 h retention |
 | `ch.put` returns a finished future read by reference | pass (local) | `test_values.py` |
 | Memory is learned after three calls and survives a peer restart | pass (local) | `test_learning.py` |
 | A memory kill raises later reservations, then fades as calls succeed | pass (unit) | `profile.rs`: killed at 900 MiB among 100 MiB calls: 900 MiB reserved (not 1.5× it, capped by 4× usual use), 500 after 8 successes, 400 after 16, back to 120 after 56. Before, the bound held at 1.5× until 64 more calls pushed it out, then vanished at once |
@@ -221,7 +289,16 @@ was shared with other builds and test runs during these measurements.
 | Memory the allocator kept after frees goes back before the leak check | pass (Linux container) | `test_memory.py::test_memory_a_call_freed_goes_back_to_the_system`: 400k 1 KiB blocks with every 50th kept leave the worker at 423 MiB without `malloc_trim`, under 200 MiB with it; fails with the trim disabled |
 | NumPy arrays in the Linux arena count toward memory | pass (Linux container) | Arrays allocated as tmpfs files (`.arena/<pid>`) are not private memory: each worker is charged its arena files, the plane's pre-zeroed reserve counts as object memory, and the leak check counts shared memory held past the arena's 256 MiB reuse cache. `test_memory.py` actor charge (300 MiB actor was charged 81 MiB before) and leak tests; `test_values.py` stored-once now counts files by inode, since the arena links one file under a name per use |
 | A call queued at an actor whose method waits says how to overlap them | pass (local) | `test_learning.py`: after 12 calls of a 100 ms sleep, a call behind 25 others suggests `@ch.method(concurrency=N) on fetch`. Every call of a batch now counts toward its function's profile (at most 64 per batch), not only the last |
-| New calls wait when the objects' disk is nearly full | pass (unit; Linux container) | `budget.rs` test; on a 700 MiB tmpfs object directory with 399 MiB free, a new call waited with "the filesystem holding objects (...) has 399 MiB free; new calls wait for room" while the running one finished |
+| New calls wait when the objects' disk is nearly full | pass (unit; Linux container) | `budget.rs` tests: below min(512 MiB, a tenth of the filesystem) free, new calls wait with a reason naming it; on a 700 MiB tmpfs object directory with 59 MiB free a new call waited while the running one finished |
+| A `ch.put` value is freed when nothing needs it | pass (local, cluster) | Passed to calls, it used to stay pinned for the whole run on every peer that fetched it. Now it is released once its future is dropped and the calls that read it have finished (the runtime holds it until each reader's outcome): `test_values.py` (fails with the old pinning), and `test_locality.py` checks a fetching peer's copy is deleted too. A put that escaped as a handle (nested deeper, or sent to an actor) stays for the run |
+| A fresh array per iteration does not pile up | pass (Linux container) | On Linux an array passed to calls is linked into the run, not hashed. Each new array was a new link kept until the run ended, so the 16-node eval's 60 s loop of fresh 32 MiB arrays filled /dev/shm and hung. A link is now dropped once its array is collected and the calls that read it have finished, here and on peers that fetched it, as a `ch.put` value is. Links passed to actors, or made inside a task, still last for the run. `test_values.py::test_a_fresh_array_per_iteration_does_not_pile_up`: 12 iterations of 4 MiB keep at most 2 stored; it fails when links last for the run. The eval's `naive_big_arg` for 60 s on one container peer with a 2 GiB /dev/shm: with links kept for the run, /dev/shm filled within 15 s and the run failed for lack of space; now 3153 reps (p50 4 ms) with /dev/shm between 88 and 129 MiB, against 1142 reps (p50 44 ms) with the arena off |
+| A forked child neither shares its parent's connection nor deletes its values | pass (local; Linux container) | A child of `os.fork`, a fork-mode multiprocessing pool or a DataLoader worker shared the parent's session stream (on macOS its call even returned, but either process could take the other's events). Dropping its copy of a `ch.put` value unlinked the parent's stored files. Now any submit, wait or fetch in the child raises CH113, and finalizers in a child leave the parent's files alone. `test_values.py`: both tests fail without the after-fork hook |
+| A CUDA tensor is rebuilt where its reader is | pass (stand-in torch module) | It travels as a host array and lands on the reader's granted GPU, or in a driver on its current one; a reader with no GPU gets it on the CPU with CH112. Torch's own pickling names the writer's device index, which fails in a CPU call. `test_values.py::test_a_cuda_tensor_is_rebuilt_where_its_reader_is` fails with the old fallback. Not yet run on a GPU; three checks are in `bench/evals/gpu_check.py` for the next GPU job |
+| A version mismatch with a remote cluster is named | pass (local; the Python mismatch is simulated) | Workers learn the program's Python version from its run. When a function will not load on a worker running another version (remote clusters run their own Python), the error names both versions and the fix (CH115). A remote cluster on another Chimaera version warns once at `ch.init` (CH116). `test_defaults.py`, `test_cluster.py` |
+| A gather that outgrows the machine warns | pass (local; Linux container) | `ch.gather` warns once (CH117) when the results it has read pass a quarter of physical memory, counting arrays' bytes because a Linux arena result's stored size is only its frame. It points at `ch.as_completed` and `fn.map`. `test_values.py` |
+| A long-lived driver's argument blobs do not accumulate | pass (local; Linux container) | Blobs stored by content (arrays on macOS or without the arena, bytes, large Python objects) lasted until the run ended. In a soak, the run grew 4 MiB per wave of fresh 4 MiB arrays. Now a blob is held while its array lives or a pending call reads it, then deleted here and released on the peers that fetched it. A blob whose owner cannot be watched (bytes, lists) waits among the recently freed, up to 256 MiB, so sending the same object again still stores it once. A peer now reports a released input only after the fetch fails, because the same bytes sent again get the same id. Tests: `test_values.py::test_fresh_values_per_iteration_do_not_pile_up` (12 stored arrays when blobs last for the run) and `test_locality.py::test_bytes_sent_again_after_their_release_reach_a_peer_that_had_them` (fails with the old up-front check). Soak: 296 waves, run directory flat at 0 MiB |
+| A busy peer's memory stays bounded | pass (local soak, release peer) | `heap -showSizes` on a peer after 700k calls showed exactly 200,000 blocks of 3 KB plus their parts, about 700 MB: the attempt log kept for `explain()`, capped only by count (ATTEMPT_LOG_CAP). It is now also capped at 8 MiB encoded, about 25,000 recent attempts. Physical footprint after 750k tiny calls: 833 MB before, 213 MB after. Together with the runtime owner's change keeping only a released call's outcome, a 1.3M-call mixed soak keeps peer memory flat rather than about 1.2 KB per call. The modules that use `explain()` pass (accounting, api, learning, memory, defaults, locality, compat, gang) |
+| In-memory objects spill before their filesystem fills | pass (Linux container) | Objects also move to disk when their tmpfs has under a fifth free, not only past 80% of the pool (/dev/shm defaults to half of RAM, smaller than the pool). 3 peers, objects on a 700 MiB tmpfs, 25 rounds of a 64 MiB `ch.put` read by 24 calls: failed within 4–17 rounds before, 25 of 25 in three runs after (arena on and off) |
 | A full disk is named in the error | pass (local, unit) | `test_values.py::test_a_full_disk_is_named_in_the_error`; objects are now written natively (`chimaera-py/src/objects.rs`), which owns removing a partial file on failure |
 | A memory or CPU limit on a parent cgroup is honored | pass (unit) | `topology.rs::chain_tests`: the pool, CPU capacity and available memory take the tightest limit from the process's cgroup up to the root (systemd slices and some runtimes leave the process's own cgroup unlimited) |
 | A local peer running an older binary is reported | pass (local) | `test_defaults.py::test_a_program_warns_when_the_local_peer_runs_another_binary`: the peer records its binary (path, size, mtime) at start; a program that would start a different one warns CH111 |
@@ -233,6 +310,8 @@ was shared with other builds and test runs during these measurements.
 | Driver backpressure, stalled-wait notice, task logs at the driver's level | pass (local) | `test_defaults.py` |
 | A shared large input reaches each peer once | pass (local, 3-peer localhost cluster) | `test_locality.py`; fails with the single-flight lock removed |
 | A call runs where its large input is | pass (local, cluster) | `test_locality.py`: at least 4 of 5 calls on the holder of a 64 MiB input; 10 of 10 repeats. Earlier failures were the test's own `result()` copying the input to the driver's peer, which then held it too |
+| Quick readers of a `ch.put` value stay on its peer | pass (local, 4-peer localhost) | Put values and argument blobs carried no holder, so every group leader except the one on the driver's peer saw all peers, the holder included, missing them and placed by load alone. With 4 peers × 4 CPUs, a fresh 128 MiB put and 32 one-millisecond readers, the readers split 8/8/8/8 in every rep (0.46–0.83 s). Now, when calls are submitted, the driver's peer names itself as the holder of the inputs it stored: all 32 readers run on the holder from the second rep, in about 0.2 s. The first rep still spreads partly, because an unmeasured function's duration is assumed to be 1 s. On Linux, a put of an arena array is a small inline handle that links the array's file. That file is now listed among the call's inputs too, so it is placed by and fetched before the call, not on first read inside it. `test_locality.py::test_quick_readers_of_a_put_value_stay_where_it_is` learns the duration on one value, then reads a fresh one only the driver's peer holds. It asks for at least 20 of 24 readers on the holder and passed 3 of 3 on macOS and in the Linux container; without the stamp, 4 of 24. An earlier version read the value it had learned on. Its first calls, run before the duration was known, had copied that value to other peers, so spreading by load was then correct and the count varied. Found by the 16-node broadcast eval (6.39 s against Ray's 0.087 s); not yet rerun there |
+| Calls reading one `ch.put` value do not wait for driver room | pass (local) | A stored value was counted in every pending call's argument bytes, so 12 calls on one 16 MiB put under a 48 MiB limit waited and warned CH110. It now counts only as an input. `test_defaults.py::test_calls_reading_one_stored_value_do_not_wait_for_room` fails with the old count |
 | What one peer learned is used by another | pass (local, cluster) | `test_locality.py`: a peer that never ran the function reserves learned memory |
 | Spill to disk keeps objects readable | pass (unit; Linux container end to end) | `stores.rs`; `test_memory.py::test_objects_past_the_pool_move_to_disk_and_stay_readable` in the dev container with objects in tmpfs: six 100 MiB values under a 600 MiB pool, some move to the spill directory and all six read back. Skipped on macOS, where objects are on disk |
 | Host-pressure kill of the call furthest over its reservation | pass (Linux container, 3 GiB, 4 vCPU) | `deploy/dev/gotchas.sh`, `runaway` trap: a call whose memory grows without bound is stopped by the peer in 4.6 s with no kernel OOM kill; its retry would need 1.5× the peak it reached, more than the pool, so the caller gets an error at once, naming the peak and the pool (`ch.OutOfMemory` since `test_memory.py::test_a_call_killed_for_memory_whose_retry_cannot_fit_is_out_of_memory`; the container run returned `ch.Infeasible`). Ray 2.60 retried it until the trap's 180 s limit |

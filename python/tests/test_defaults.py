@@ -4,7 +4,38 @@ and log records from tasks reach the driver at its level."""
 
 from __future__ import annotations
 
+import sys
+
 from conftest import run_script
+
+from chimaera._executor import python_mismatch
+
+PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def test_a_function_that_will_not_load_on_another_python_says_so(monkeypatch):
+    # Workers learn the program's Python version from its run...
+    r = run_script(
+        """
+        import os
+        import chimaera as ch
+
+        @ch.remote
+        def driver_python():
+            return os.environ.get("CHIMAERA_DRIVER_PYTHON")
+
+        print(driver_python.remote().result(timeout=60))
+        """
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split()[-1] == PYTHON, r.stdout
+    # ...and a function that fails to load names a version difference (a
+    # remote cluster's workers run the cluster's Python), and nothing else.
+    monkeypatch.setenv("CHIMAERA_DRIVER_PYTHON", "3.99")
+    err = python_mismatch(TypeError("code() argument 13 must be bytes, not int"))
+    assert err is not None and "CH115" in str(err) and "Python 3.99" in str(err) and f"Python {PYTHON}" in str(err)
+    monkeypatch.setenv("CHIMAERA_DRIVER_PYTHON", PYTHON)
+    assert python_mismatch(TypeError("x")) is None
 
 
 def test_a_driver_submitting_faster_than_calls_finish_waits_for_room():
@@ -34,6 +65,36 @@ def test_a_driver_submitting_faster_than_calls_finish_waits_for_room():
     # At most three 16 MiB calls are outstanding, so submitting twelve takes
     # several of their 0.3 s turns.
     assert float(r.stdout.split()[-1]) >= 0.6, r.stdout
+
+
+def test_calls_reading_one_stored_value_do_not_wait_for_room():
+    # A ch.put value is stored once, before its calls: passing it to many
+    # calls adds no pending memory, so it must not count once per call.
+    r = run_script(
+        """
+        import time, warnings
+        import numpy as np
+        import chimaera as ch
+
+        @ch.remote
+        def slow(a):
+            time.sleep(0.3)
+            return float(a[0])
+
+        warnings.simplefilter("always")
+        v = ch.put(np.ones(2 << 20))  # 16 MiB
+        started = time.monotonic()
+        futures = [slow.remote(v) for _ in range(12)]
+        submitted = time.monotonic() - started
+        assert [f.result(timeout=120) for f in futures] == [1.0] * 12
+        print(round(submitted, 2))
+        """,
+        env={"CHIMAERA_MAX_PENDING_BYTES": str(48 << 20)},
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "CH110" not in r.stderr, r.stderr
+    assert float(r.stdout.split()[-1]) < 0.3, r.stdout
 
 
 def test_a_wait_on_a_call_that_cannot_start_says_why():

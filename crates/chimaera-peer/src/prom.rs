@@ -99,6 +99,42 @@ pub fn render(s: &pb::StatusReply) -> String {
     gauge("proposals_in_flight", "Shard commands proposed and not yet answered.", s.proposals_in_flight as f64);
     gauge("dispatch_p50_microseconds", "Median grant-to-handoff latency of recent calls.", s.dispatch_p50_us);
     gauge("dispatch_p99_microseconds", "99th percentile grant-to-handoff latency of recent calls.", s.dispatch_p99_us);
+    if s.data_groups > 0 {
+        let led: std::collections::BTreeSet<u32> =
+            s.nodes.iter().filter(|n| n.alive).flat_map(|n| n.leading.iter().copied()).collect();
+        gauge(
+            "groups_without_leader",
+            "Groups (the directory and the data groups) no live peer reports leading: their work waits.",
+            (0..=s.data_groups).filter(|g| !led.contains(g)).count() as f64,
+        );
+    }
+    for c in crate::counters::ALL {
+        let _ = writeln!(
+            out,
+            "# HELP chimaera_{0} {1}\n# TYPE chimaera_{0} counter\nchimaera_{0} {2}",
+            c.name,
+            c.help,
+            c.get()
+        );
+    }
+    if s.data_groups > 0 {
+        let _ = writeln!(
+            out,
+            "# HELP chimaera_group_leading Whether this peer leads the group (one series per group it holds).\n\
+             # TYPE chimaera_group_leading gauge"
+        );
+        for g in &s.groups {
+            let _ = writeln!(out, "chimaera_group_leading{{group=\"{}\"}} {}", g.group, u8::from(g.leading));
+        }
+        let _ = writeln!(
+            out,
+            "# HELP chimaera_group_max_lag_entries On a group's leader: log entries its furthest-behind voter lacks.\n\
+             # TYPE chimaera_group_max_lag_entries gauge"
+        );
+        for g in s.groups.iter().filter(|g| g.leading) {
+            let _ = writeln!(out, "chimaera_group_max_lag_entries{{group=\"{}\"}} {}", g.group, g.max_lag);
+        }
+    }
     let alive = s.nodes.iter().filter(|n| n.alive).count();
     let _ = writeln!(
         out,
@@ -120,9 +156,14 @@ mod tests {
             running: 3,
             cpu_in_use: 2.5,
             nodes: vec![
+                pb::ClusterNode { alive: true, leading: vec![1], ..Default::default() },
+                pb::ClusterNode { alive: false, leading: vec![2], ..Default::default() },
                 pb::ClusterNode { alive: true, ..Default::default() },
-                pb::ClusterNode { alive: false, ..Default::default() },
-                pb::ClusterNode { alive: true, ..Default::default() },
+            ],
+            data_groups: 3,
+            groups: vec![
+                pb::GroupStatus { group: 1, leading: true, max_lag: 4, ..Default::default() },
+                pb::GroupStatus { group: 2, ..Default::default() },
             ],
             ..Default::default()
         };
@@ -137,9 +178,15 @@ mod tests {
         assert!(samples.contains(&"chimaera_cpu_in_use 2.5"));
         assert!(samples.contains(&"chimaera_cluster_nodes{state=\"alive\"} 2"));
         assert!(samples.contains(&"chimaera_cluster_nodes{state=\"dead\"} 1"));
+        assert!(samples.contains(&"chimaera_groups_without_leader 3"), "group 2's leader is dead; nobody leads 0 or 3");
+        assert!(samples.contains(&"chimaera_group_leading{group=\"1\"} 1"));
+        assert!(samples.contains(&"chimaera_group_leading{group=\"2\"} 0"));
+        assert!(samples.contains(&"chimaera_group_max_lag_entries{group=\"1\"} 4"));
+        assert!(!text.contains("chimaera_group_max_lag_entries{group=\"2\"}"), "only a leader knows the lag");
+        assert!(text.contains("# TYPE chimaera_proposals_total counter"));
         // Every sample has HELP and TYPE lines before it.
         for name in samples.iter().map(|l| l.split(['{', ' ']).next().unwrap()) {
-            assert!(text.contains(&format!("# TYPE {name} gauge")), "{name}");
+            assert!(text.contains(&format!("# HELP {name} ")) && text.contains(&format!("# TYPE {name} ")), "{name}");
         }
     }
 }

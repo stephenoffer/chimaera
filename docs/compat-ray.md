@@ -82,10 +82,10 @@ Chimaera API work on them too.
 | `num_returns=n` | `returns=n`; `.remote()` returns a list of `n` refs, one per value, as in Ray |
 | `num_returns="streaming"` / `"dynamic"`, generator tasks | `Unsupported` until streaming generators (M1) |
 | `scheduling_strategy="SPREAD"` | CHR002: not enforced until P3 |
-| `NodeAffinitySchedulingStrategy(node_id, soft=False)` | `ch.Placement(require={"node": node_id})`. A node id is a peer id, as `ray.nodes()` reports it. If no live peer has it, `ray.get` raises `ch.Infeasible` naming the labels on offer; Ray would leave the task pending |
-| `NodeAffinitySchedulingStrategy(node_id, soft=True)` | `ch.Placement(prefer=["node=<node_id>"])` |
+| `NodeAffinitySchedulingStrategy(node_id, soft=False)` | `ch.dist.Placement(require={"node": node_id})`. A node id is a peer id, as `ray.nodes()` reports it. If no live peer has it, `ray.get` raises `ch.Infeasible` naming the labels on offer; Ray would leave the task pending |
+| `NodeAffinitySchedulingStrategy(node_id, soft=True)` | `ch.dist.Placement(prefer=["node=<node_id>"])` |
 | `label_selector={"k": "v"}`, `NodeLabelSchedulingStrategy(hard={"k": In("v")}, soft=...)` | `require` for exact values (hard), `prefer` for soft ones. Negations, sets and `Exists`/`DoesNotExist` (`"!v"`, `"in(a,b)"`, `NotIn`, `In` with several values) are `Unsupported`: Chimaera labels match exactly |
-| `PlacementGroupSchedulingStrategy(pg, i)` | `within=` bundle `i` of the group's `ch.reserve`; `-1` takes the bundles in turn. `placement_group_capture_child_tasks` is accepted with CHR002 (child tasks are not placed in the group) |
+| `PlacementGroupSchedulingStrategy(pg, i)` | `within=` bundle `i` of the group's `ch.dist.reserve`; `-1` takes the bundles in turn. `placement_group_capture_child_tasks` is accepted with CHR002 (child tasks are not placed in the group) |
 | `runtime_env` | `Unsupported` per call until `ch.Env` (P3) |
 | `name`, `max_calls`, `enable_task_events`, `_metadata`, `_labels` | CHR001 |
 | anything else | `ValueError: Invalid option keyword ...`, as in Ray |
@@ -94,13 +94,13 @@ Chimaera API work on them too.
 
 | Ray | On Chimaera |
 |---|---|
-| `Cls.remote(...)`, `handle.method.remote(...)` | An `ActorHandle` over a `chimaera.Actor`. Calls through one handle run in submission order |
+| `Cls.remote(...)`, `handle.method.remote(...)` | An `ActorHandle` over a `chimaera.typing.Actor`. Calls through one handle run in submission order |
 | `max_concurrency=n` | `concurrency=n` |
 | An async actor with no `max_concurrency` | `concurrency=1000`, Ray's default, so an awaiting call doesn't block others. Native Chimaera async actors default to 1 |
 | `name=`, `namespace=` | `key="<namespace>/<name>"`. Without a namespace, the name is scoped to this run, as Ray scopes it to the job |
 | `get_if_exists=True` | Get or create |
 | `get_if_exists=False` (Ray's default) | CHR003: still get-or-create, so an existing actor is returned instead of an error |
-| `lifetime="detached"` | `lifetime="detached"` |
+| `detach=True` | `detach=True` |
 | `max_restarts=n` / `-1` | `restart="fresh"`, `max_restarts=n` (a very large number for `-1`) |
 | `max_task_retries=n` | `max_attempts=n+1` on the actor's calls. Unset means 1, Ray's default |
 | `ray.kill(actor)` | `actor.close()`. A call made after `kill` returns raises `ActorDiedError`; in Ray the kill is asynchronous and such a call can still succeed |
@@ -110,7 +110,7 @@ Chimaera API work on them too.
 | `handle.method.options(num_returns=, max_task_retries=, retry_exceptions=)` | Method `.options()`; other per-call options are `Unsupported` |
 | `max_pending_calls` | CHR002: not enforced; the runtime bounds submission itself |
 | `allow_out_of_order_execution=True` | `Unsupported`: calls through one handle always run in order |
-| `ray.get_actor(name, namespace=)` | `ch.actor(key)`. A missing actor raises `ValueError`, as in Ray |
+| `ray.get_actor(name, namespace=)` | `ch.actor(name)`. A missing actor raises `ValueError`, as in Ray |
 | `ray.actor.exit_actor()` | `Unsupported`: an actor is ended by its owner with `ray.kill(handle)` |
 
 ### Utilities
@@ -118,15 +118,15 @@ Chimaera API work on them too.
 | Ray | On Chimaera |
 |---|---|
 | `ray.util.ActorPool` | Supported: `map`, `map_unordered`, `submit`, `get_next`, `get_next_unordered`, `has_next`, `has_free`, `pop_idle`, `push` |
-| `ray.util.queue.Queue` | Ray's blocking API (`put`, `get`, `*_nowait`, `*_nowait_batch`, `qsize`, `empty`, `full`, `shutdown`) over `ch.Queue`. `actor_options=` is `Unsupported` |
-| `ray.util.placement_group(...)` | `ch.reserve`: `PACK`/`SPREAD`/`STRICT_PACK`/`STRICT_SPREAD`, bundles of `CPU`/`GPU`/`memory`/custom resources; `pg.ready()` (a ref for `ray.get`), `pg.wait(t)`, `remove_placement_group`, `get_placement_group(name)` (names are known in the process that made them). Detached lifetime, `bundle_label_selector`, `get_current_placement_group` and `placement_group_table` are `Unsupported` |
+| `ray.util.queue.Queue` | Ray's blocking API (`put`, `get`, `*_nowait`, `*_nowait_batch`, `qsize`, `empty`, `full`, `shutdown`) over `ch.coord.Queue`. `actor_options=` is `Unsupported` |
+| `ray.util.placement_group(...)` | `ch.dist.reserve`: `PACK`/`SPREAD`/`STRICT_PACK`/`STRICT_SPREAD`, bundles of `CPU`/`GPU`/`memory`/custom resources; `pg.ready()` (a ref for `ray.get`), `pg.wait(t)`, `remove_placement_group`, `get_placement_group(name)` (names are known in the process that made them). Detached lifetime, `bundle_label_selector`, `get_current_placement_group` and `placement_group_table` are `Unsupported` |
 | `ray.util.scheduling_strategies` | The strategy classes import; see Task options for which are honored |
 | `ray.util.multiprocessing.Pool` | The standard library's API over a pool of actors (one per process): `initializer`, `map`/`map_async`, `starmap`, `imap`/`imap_unordered`, `apply`/`apply_async` with callbacks, `close`/`terminate`/`join`. `maxtasksperchild` and `ray_address` are `Unsupported` |
-| `ray.util.collective` | `ch.group`. `create_collective_group` (driver) and `init_collective_group` (in the actors); `allreduce`, `reduce`, `broadcast`, `allgather` and `barrier` work in place on torch tensors (through `torch.distributed`, one torch-backed group per actor process) or small NumPy arrays (through the store); `send`, `recv`, `reducescatter` and the `*_multigpu` calls raise `Unsupported` |
-| `ray.util.state`, `ray.util.metrics` | `Unsupported`, naming `ch.cluster()` and `context().report()` |
-| `ray.get_runtime_context()` | `get_job_id()` (the run id), `get_task_id()`, `get_actor_id()`, `get_node_id()` (the peer id), `get_accelerator_ids()` (`{"GPU": [...], "TPU": [...], ...}` from `ch.devices()`), `namespace`. Others are `Unsupported`, naming `ch.context()` |
-| `ray.get_gpu_ids()` | The call's GPUs (CUDA, ROCm, Intel, Apple) from `ch.devices()`, numbered as the call sees them, so `cuda:N` works directly |
-| `ray.nodes()` | One record per peer from `ch.cluster()`: `NodeID`, `Alive`, `NodeManagerAddress`, `NodeManagerHostname`, `NodeManagerPort`, `Resources` (`CPU`, `memory`, `GPU`, `node:<ip>`), `Labels` (the peer's labels plus `ray.io/node_id`) |
+| `ray.util.collective` | `ch.dist.group`. `create_collective_group` (driver) and `init_collective_group` (in the actors); `allreduce`, `reduce`, `broadcast`, `allgather` and `barrier` work in place on torch tensors (through `torch.distributed`, one torch-backed group per actor process) or small NumPy arrays (through the store); `send`, `recv`, `reducescatter` and the `*_multigpu` calls raise `Unsupported` |
+| `ray.util.state`, `ray.util.metrics` | `Unsupported`, naming `ch.runs.cluster()` and `context().report()` |
+| `ray.get_runtime_context()` | `get_job_id()` (the run id), `get_task_id()`, `get_actor_id()`, `get_node_id()` (the peer id), `get_accelerator_ids()` (`{"GPU": [...], "TPU": [...], ...}` from `ch.dist.devices()`), `namespace`. Others are `Unsupported`, naming `ch.context()` |
+| `ray.get_gpu_ids()` | The call's GPUs (CUDA, ROCm, Intel, Apple) from `ch.dist.devices()`, numbered as the call sees them, so `cuda:N` works directly |
+| `ray.nodes()` | One record per peer from `ch.runs.cluster()`: `NodeID`, `Alive`, `NodeManagerAddress`, `NodeManagerHostname`, `NodeManagerPort`, `Resources` (`CPU`, `memory`, `GPU`, `node:<ip>`), `Labels` (the peer's labels plus `ray.io/node_id`) |
 | `ray.cluster_resources()`, `ray.available_resources()` | Sums over live peers. Available CPU is capacity minus each peer's reported use; memory and GPUs are reported as capacity, since nothing reserves them ahead of a call yet |
 | `ray.timeline()` | `Unsupported`: use `chimaera explain RUN` |
 
@@ -143,9 +143,9 @@ traceback is attached as a note.
 | `ch.Cancelled`, `ch.DeadlineExceeded` | `TaskCancelledError` |
 | `ch.ActorDied` | `ActorDiedError` (a `RayActorError`) |
 | `ch.OutOfMemory` | `OutOfMemoryError` |
-| `ch.DataLost` | `ObjectLostError` |
-| `ch.InfrastructureFailure`, `ch.WorkerCrashed` | `WorkerCrashedError` |
-| `ch.Overloaded` | `PendingCallsLimitExceeded` |
+| `ch.errors.DataLost` | `ObjectLostError` |
+| `ch.InfrastructureFailure`, `ch.errors.WorkerCrashed` | `WorkerCrashedError` |
+| `ch.errors.Overloaded` | `PendingCallsLimitExceeded` |
 | a `ray.get` timeout | `GetTimeoutError`, which is also a `TimeoutError` |
 | `ch.Infeasible`, `ch.OutcomeUnknown` | Kept as they are. Ray has no equivalent: it waits forever for an infeasible request |
 

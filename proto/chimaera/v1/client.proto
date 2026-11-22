@@ -20,6 +20,8 @@ service Peer {
   rpc Explain(ExplainRequest) returns (ExplainReply);
   // Page through a run's tasks and outcomes (reattach, inspection).
   rpc ListTasks(ListTasksRequest) returns (ListTasksReply);
+  // Every run the cluster holds, newest first (`chimaera runs`).
+  rpc ListRuns(ListRunsRequest) returns (ListRunsReply);
   rpc Status(StatusRequest) returns (StatusReply);
   rpc Shutdown(ShutdownRequest) returns (ShutdownReply);
   // Bring an object produced on another peer into this peer's store.
@@ -29,6 +31,9 @@ service Peer {
   // and read an object back (by range).
   rpc HasBlobs(HasBlobsRequest) returns (HasBlobsReply);
   rpc PutBlob(stream PutBlobChunk) returns (PutBlobReply);
+  // A value under the id it already has (a ch.put value from another cell):
+  // checked against its checksum instead of its id.
+  rpc PutObject(stream PutObjectChunk) returns (PutObjectReply);
   rpc GetObject(GetObjectRequest) returns (stream GetObjectChunk);
   rpc Store(StoreRequest) returns (StoreReply);
   // Events this peer saw (member changes, actor transitions, final task
@@ -95,6 +100,16 @@ message PutBlobChunk {
 }
 
 message PutBlobReply {}
+
+message PutObjectChunk {
+  bytes run = 1;        // the first chunk names the run, the 16-byte id, size and checksum
+  bytes object_id = 2;
+  uint64 size = 3;
+  bytes checksum = 4;   // blake3 of the whole value, first 16 bytes
+  bytes data = 5;
+}
+
+message PutObjectReply {}
 
 message GetObjectRequest {
   bytes run = 1;
@@ -187,7 +202,15 @@ message ClientMsg {
     // A stream consumer has taken items below `up_to`.
     StreamCredit stream_credit = 11;
     EndRun end_run = 12;         // finish or cancel a run by id (Run.finish / Run.cancel)
+    ReleaseObjects release_objects = 13;
   }
+}
+
+// ch.put values nothing refers to any more and whose readers have finished:
+// their copies go from every peer.
+message ReleaseObjects {
+  bytes run = 1;
+  repeated bytes object_ids = 2;
 }
 
 message EndRun {
@@ -293,7 +316,10 @@ message ExplainReply {
   map<string, uint64> counts = 6;    // run summary: tasks by state
 }
 
-message StatusRequest {}
+message StatusRequest {
+  // Also gather what every live peer's object store holds (StatusReply.objects).
+  bool objects = 1;
+}
 
 message StatusReply {
   PeerInfo peer = 1;
@@ -323,6 +349,23 @@ message StatusReply {
   repeated string links = 19;
   // Every peer this one knows (only itself when it runs alone): ch.cluster().
   repeated ClusterNode nodes = 20;
+  // With StatusRequest.objects: each live peer's object store, as JSON
+  // (chimaera-peer objplane::inventory plus its "addr").
+  repeated string objects = 21;
+  // The groups this peer holds a replica of, as this replica sees them.
+  repeated GroupStatus groups = 22;
+  // How many data groups the cluster has (0 on a local peer).
+  uint32 data_groups = 23;
+}
+
+message GroupStatus {
+  uint32 group = 1;
+  string leader = 2;      // the leader's address; empty: none known
+  uint32 voters = 3;
+  uint64 last_log = 4;
+  uint64 applied = 5;
+  bool leading = 6;       // this peer leads it
+  uint64 max_lag = 7;     // when leading: entries the furthest-behind voter lacks
 }
 
 message ClusterNode {
@@ -336,6 +379,7 @@ message ClusterNode {
   uint64 queued = 8;
   bool this_peer = 9;      // the peer that answered
   map<string, string> labels = 10;
+  repeated uint32 leading = 11;  // raft groups it leads (others: from their last load report)
 }
 
 message ShutdownRequest {}
@@ -347,6 +391,15 @@ message LocalizeRequest {
 }
 
 message LocalizeReply {}
+
+message ListRunsRequest {
+  uint32 limit = 1;   // 0 = all
+}
+
+message ListRunsReply {
+  repeated RunRecord runs = 1;     // newest first, without exec_env
+  repeated uint32 unavailable = 2; // groups no replica answered for: the list misses their runs
+}
 
 message ListTasksRequest {
   bytes run = 1;

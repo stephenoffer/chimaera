@@ -77,7 +77,7 @@ def test_calls_that_mostly_wait_move_to_a_quarter_core(home):
         last = wait.remote(0)
         last.result(timeout=60)
         print(last.explain()["attempts"][-1]["reservation"])
-        print(ch.current_run().id)
+        print(ch.runs.current_run().id)
         """,
         home=home,
         timeout=300,
@@ -205,7 +205,7 @@ import chimaera as ch
 def add(a, b):
     return a + b
 
-print(sum(ch.gather(*(add.remote(i, 1) for i in range(50)), timeout=120)))
+print(sum(ch.get((add.remote(i, 1) for i in range(50)), timeout=120)))
 """
     for _ in range(2):
         r = run_script(script, home=home)
@@ -226,11 +226,11 @@ def test_calls_queued_at_an_actor_whose_method_waits_suggest_concurrency(home):
                 return i
 
         f = Fetcher.remote()
-        ch.gather(*[f.fetch.remote(i) for i in range(12)])  # enough calls to learn they mostly wait
+        ch.get([f.fetch.remote(i) for i in range(12)])  # enough calls to learn they mostly wait
         queued = [f.fetch.remote(i) for i in range(30)]
         time.sleep(0.5)
         print(queued[-1].explain()["pending_reason"])
-        ch.gather(*queued, timeout=60)
+        ch.get(queued, timeout=60)
         """,
         home=home,
         timeout=120,

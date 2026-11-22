@@ -4,6 +4,7 @@
 use super::*;
 use chimaera_core::ids::Id;
 use chimaera_core::shard::{Event, Tk, read};
+use openraft::async_runtime::WatchReceiver;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -140,10 +141,29 @@ struct LocalNet {
 impl Transport for LocalNet {
     fn call(&self, target: NodeId, _addr: &str, _group: u32, kind: RpcKind, body: Vec<u8>) -> RpcFuture {
         let g = self.nodes.lock().unwrap().get(&target).cloned();
+        Box::pin(async move {
+            let g = g.ok_or_else(|| std::io::Error::other(format!("node {target} is down")))?;
+            handle_rpc(&g, kind, &body).await
+        })
+    }
+
+    fn send_snapshot(
+        &self,
+        target: NodeId,
+        _addr: &str,
+        _group: u32,
+        header: Vec<u8>,
+        mut file: std::fs::File,
+    ) -> RpcFuture {
+        let g = self.nodes.lock().unwrap().get(&target).cloned();
         let scratch = self.scratch.lock().unwrap().clone().unwrap();
         Box::pin(async move {
             let g = g.ok_or_else(|| std::io::Error::other(format!("node {target} is down")))?;
-            handle_rpc(&g, kind, &body, &scratch).await
+            let path = scratch.join(format!("incoming-{target}-{}.snap", std::process::id()));
+            std::io::copy(&mut file, &mut std::fs::File::create(&path)?)?;
+            let r = handle_snapshot(&g, &header, &path).await;
+            let _ = std::fs::remove_file(&path);
+            r
         })
     }
 }
@@ -347,4 +367,266 @@ async fn measure_concurrent_commit_throughput() {
             g.shutdown().await;
         }
     }
+}
+
+fn snapshot_files(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir.join("snapshots"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+async fn wait_snapshot_past(g: &Group, index: u64) {
+    for _ in 0..200 {
+        if g.raft.metrics().borrow_watched().snapshot.is_some_and(|s| s.index >= index) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no snapshot at or after index {index}");
+}
+
+/// A new snapshot replaces the old one on disk (they used to pile up: about
+/// 8.6 GB per test-suite run), and a restart deletes files no group points at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_snapshot_deletes_the_one_it_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (host, rx) = RaftHost::open(dir.path(), 1, Arc::new(NoTransport), DiskDurability::Os).unwrap();
+        std::mem::forget(rx);
+        let g = host.start_group(0, members(&[1]), true).await.unwrap();
+        wait_leader(&g).await;
+        setup_run(&g, 3).await;
+        for round in 0..3u64 {
+            for i in 0..20 {
+                g.propose(&submit(3, round * 100 + i)).await.unwrap();
+            }
+            let applied = g.raft.metrics().borrow_watched().last_applied.unwrap().index;
+            g.raft.trigger().snapshot().await.unwrap();
+            wait_snapshot_past(&g, applied).await;
+        }
+        assert_eq!(snapshot_files(dir.path()).len(), 1, "{:?}", snapshot_files(dir.path()));
+        g.shutdown().await;
+    }
+    // Leftovers from a crash: an unreferenced snapshot, a half-written one, an unfinished transfer.
+    for name in ["snapshots/group-0-1.snap", "snapshots/group-0-99.tmp"] {
+        std::fs::write(dir.path().join(name), b"x").unwrap();
+    }
+    std::fs::write(dir.path().join("incoming-0-123.snap"), b"x").unwrap();
+    let mut reopened = None;
+    for _ in 0..100 {
+        match RaftHost::open(dir.path(), 1, Arc::new(NoTransport), DiskDurability::Os) {
+            Ok(h) => {
+                reopened = Some(h);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let (host, _rx) = reopened.expect("database lock released");
+    assert_eq!(snapshot_files(dir.path()).len(), 1, "{:?}", snapshot_files(dir.path()));
+    assert!(!dir.path().join("incoming-0-123.snap").exists());
+    // The surviving snapshot is the current one and still loads.
+    let g = host.start_group(0, members(&[1]), true).await.unwrap();
+    wait_leader(&g).await;
+    g.linearizable().await.unwrap();
+    assert_eq!(g.read(|kv| read::ready(kv, 3, 1000).len()).unwrap(), 60);
+}
+
+/// Snapshots follow the log's size: once the log since the last snapshot
+/// outgrows the threshold, one is built without anyone asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_is_built_once_the_log_outgrows_the_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut host, rx) = RaftHost::open(dir.path(), 1, Arc::new(NoTransport), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    host.snapshot_min_log_bytes = 16 << 10;
+    let g = host.start_group(0, members(&[1]), true).await.unwrap();
+    wait_leader(&g).await;
+    setup_run(&g, 3).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(snapshot_files(dir.path()).is_empty(), "no snapshot before the log reaches the threshold");
+    for i in 0..400 {
+        g.propose(&submit(3, i)).await.unwrap();
+    }
+    let applied = g.raft.metrics().borrow_watched().last_applied.unwrap().index;
+    wait_snapshot_past(&g, applied.saturating_sub(400)).await;
+    assert_eq!(snapshot_files(dir.path()).len(), 1);
+}
+
+/// A learner that joins after the leader purged its log catches up from the
+/// snapshot, and its installed state and pointer agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_learner_installs_the_leaders_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    *net.scratch.lock().unwrap() = Some(dir.path().to_path_buf());
+    let (h1, rx) = RaftHost::open(&dir.path().join("n1"), 1, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let leader = h1.start_group(0, members(&[1]), true).await.unwrap();
+    net.nodes.lock().unwrap().insert(1, leader.clone());
+    wait_leader(&leader).await;
+    setup_run(&leader, 9).await;
+    for i in 0..30 {
+        leader.propose(&submit(9, i)).await.unwrap();
+    }
+    let applied = leader.raft.metrics().borrow_watched().last_applied.unwrap().index;
+    leader.raft.trigger().snapshot().await.unwrap();
+    wait_snapshot_past(&leader, applied).await;
+    leader.raft.trigger().purge_log(applied).await.unwrap();
+    for _ in 0..200 {
+        if leader.raft.metrics().borrow_watched().purged.is_some_and(|p| p.index >= applied) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let (h2, rx) = RaftHost::open(&dir.path().join("n2"), 2, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let learner = h2.start_group(0, BTreeMap::new(), false).await.unwrap();
+    net.nodes.lock().unwrap().insert(2, learner.clone());
+    tokio::time::timeout(Duration::from_secs(20), leader.add_learner(2, "node-2")).await.unwrap().unwrap();
+    for _ in 0..200 {
+        if learner.read(|kv| read::ready(kv, 9, 1000).len()).unwrap() == 30 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(learner.read(|kv| read::ready(kv, 9, 1000).len()).unwrap(), 30);
+    assert_eq!(snapshot_files(&dir.path().join("n2")).len(), 1);
+    drop((h1, h2));
+}
+
+/// Two of three voters are gone for good: the survivor, recovered as the only
+/// voter, serves every write it had committed, and a new node then joins and
+/// catches up from the snapshot recovery wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_recovers_around_its_one_surviving_voter() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    *net.scratch.lock().unwrap() = Some(dir.path().to_path_buf());
+    let ids = [1u64, 2, 3];
+    {
+        let mut hosts = Vec::new();
+        for id in ids {
+            let (host, rx) =
+                RaftHost::open(&dir.path().join(format!("n{id}")), id, net.clone(), DiskDurability::Os).unwrap();
+            std::mem::forget(rx);
+            let g = host.start_group(0, members(&ids), id == 1).await.unwrap();
+            net.nodes.lock().unwrap().insert(id, g);
+            hosts.push(host);
+        }
+        let leader = net.nodes.lock().unwrap().get(&1).cloned().unwrap();
+        wait_leader(&leader).await;
+        setup_run(&leader, 9).await;
+        for i in 0..50 {
+            leader.propose(&submit(9, i)).await.unwrap();
+        }
+        let groups: Vec<Group> = std::mem::take(&mut *net.nodes.lock().unwrap()).into_values().collect();
+        for g in groups {
+            g.shutdown().await;
+        }
+    }
+    let n1 = dir.path().join("n1");
+    let mut resumed = None;
+    for _ in 0..100 {
+        match force_single_voter(&n1, 0, 1) {
+            Ok(i) => {
+                resumed = Some(i);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await, // the old host still holds the files
+        }
+    }
+    assert!(resumed.expect("recovered") > 50);
+    let (h1, rx) = RaftHost::open(&n1, 1, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let g1 = h1.start_group(0, BTreeMap::new(), false).await.unwrap();
+    net.nodes.lock().unwrap().insert(1, g1.clone());
+    wait_leader(&g1).await;
+    g1.linearizable().await.unwrap();
+    assert_eq!(g1.read(|kv| read::ready(kv, 9, 1000).len()).unwrap(), 50, "every committed write survived");
+    assert_eq!(g1.view().1, vec![1]);
+    g1.propose(&submit(9, 50)).await.unwrap();
+    let (h4, rx) = RaftHost::open(&dir.path().join("n4"), 4, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let g4 = h4.start_group(0, BTreeMap::new(), false).await.unwrap();
+    net.nodes.lock().unwrap().insert(4, g4.clone());
+    tokio::time::timeout(Duration::from_secs(20), g1.add_learner(4, "node-4")).await.unwrap().unwrap();
+    g1.change_voters([1, 4].into()).await.unwrap();
+    for _ in 0..200 {
+        if g4.read(|kv| read::ready(kv, 9, 1000).len()).unwrap() == 51 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(g4.read(|kv| read::ready(kv, 9, 1000).len()).unwrap(), 51);
+    drop((h1, h4));
+}
+
+/// A leader can hand its group to another voter (leader balancing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_hands_its_group_to_another_voter() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    *net.scratch.lock().unwrap() = Some(dir.path().to_path_buf());
+    let ids = [1u64, 2, 3];
+    let mut hosts = Vec::new();
+    for id in ids {
+        let (host, rx) =
+            RaftHost::open(&dir.path().join(format!("n{id}")), id, net.clone(), DiskDurability::Os).unwrap();
+        std::mem::forget(rx);
+        let g = host.start_group(0, members(&ids), id == 1).await.unwrap();
+        net.nodes.lock().unwrap().insert(id, g);
+        hosts.push(host);
+    }
+    let group = |id: NodeId| net.nodes.lock().unwrap().get(&id).cloned().unwrap();
+    wait_leader(&group(1)).await;
+    setup_run(&group(1), 9).await;
+    group(1).transfer_leader(2).await.unwrap();
+    wait_leader(&group(2)).await;
+    assert!(!group(1).is_leader().await);
+    group(2).propose(&submit(9, 1)).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_reports_its_leader_voters_and_follower_lag() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    let ids = [1u64, 2, 3];
+    let mut hosts = Vec::new();
+    for id in ids {
+        let (host, rx) =
+            RaftHost::open(&dir.path().join(format!("n{id}")), id, net.clone(), DiskDurability::Os).unwrap();
+        std::mem::forget(rx);
+        let g = host.start_group(0, members(&ids), id == 1).await.unwrap();
+        net.nodes.lock().unwrap().insert(id, g);
+        hosts.push(host);
+    }
+    let group = |id: NodeId| net.nodes.lock().unwrap().get(&id).cloned().unwrap();
+    wait_leader(&group(1)).await;
+    setup_run(&group(1), 9).await;
+    for t in 1..=5 {
+        group(1).propose(&submit(9, t)).await.unwrap();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let leader = loop {
+        let s = group(1).stats();
+        if (s.max_lag == Some(0) && s.applied == s.last_log) || std::time::Instant::now() > deadline {
+            break s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!((leader.leader, leader.voters.len(), leader.max_lag), (Some(1), 3, Some(0)), "{leader:?}");
+    assert!(leader.last_log >= 6 && leader.applied == leader.last_log, "{leader:?}");
+    let follower = group(2).stats();
+    assert_eq!((follower.leader, follower.max_lag), (Some(1), None), "only the leader knows the lag: {follower:?}");
+    // A voter that stops answering falls behind.
+    net.nodes.lock().unwrap().remove(&3);
+    for t in 6..=10 {
+        group(1).propose(&submit(9, t)).await.unwrap();
+    }
+    assert_eq!(group(1).stats().max_lag, Some(5), "{:?}", group(1).stats());
 }

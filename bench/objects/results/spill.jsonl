@@ -1,0 +1,14 @@
+{"runtime": "ray", "scenario": "spill", "kind": "numpy", "size": "16M", "op": "put", "seconds": 5.01380953700027, "n": 1536, "gb_per_s": 5.139765199660518, "error": null}
+{"runtime": "ray", "scenario": "spill", "kind": "numpy", "size": "16M", "op": "restore", "seconds": 7.754982241000107, "n": 1536, "verified": 1536, "gb_per_s": 3.322999714913163, "error": null}
+{"runtime": "ray", "scenario": "spill", "kind": "numpy", "size": "16M", "op": "first_get", "seconds": 0.00019468400023470167}
+{"runtime": "ray", "scenario": "spill", "kind": "numpy", "size": "256M", "op": "put", "seconds": 8.10265526800049, "n": 96, "gb_per_s": 3.180414681810753, "error": null}
+{"runtime": "ray", "scenario": "spill", "kind": "numpy", "size": "256M", "op": "restore", "seconds": 3.56698174200028, "n": 96, "verified": 96, "gb_per_s": 7.224540420985978, "error": null}
+{"runtime": "ray", "scenario": "spill", "kind": "numpy", "size": "256M", "op": "first_get", "seconds": 0.04550593099975231}
+{"runtime": "ray", "done": "spill", "wall_s": 25.5}
+{"runtime": "chimaera", "scenario": "spill", "kind": "numpy", "size": "16M", "op": "put", "seconds": 7.508760260000145, "n": 1536, "gb_per_s": 3.43196518249199, "error": null}
+{"runtime": "chimaera", "scenario": "spill", "kind": "numpy", "size": "16M", "op": "restore", "seconds": 1.6590849259998777, "n": 1536, "verified": 1536, "gb_per_s": 15.532540481898092, "error": null}
+{"runtime": "chimaera", "scenario": "spill", "kind": "numpy", "size": "16M", "op": "first_get", "seconds": 0.00012526000000434578}
+{"runtime": "chimaera", "scenario": "spill", "kind": "numpy", "size": "256M", "op": "put", "seconds": 15.348571504999882, "n": 96, "gb_per_s": 1.6789708258912137, "error": null}
+{"runtime": "chimaera", "scenario": "spill", "kind": "numpy", "size": "256M", "op": "restore", "seconds": 1.3364059939999606, "n": 96, "verified": 96, "gb_per_s": 19.28291544014188, "error": null}
+{"runtime": "chimaera", "scenario": "spill", "kind": "numpy", "size": "256M", "op": "first_get", "seconds": 0.00010427000006529852}
+{"runtime": "chimaera", "done": "spill", "wall_s": 26.3}

@@ -377,5 +377,701 @@
   "live_base_debug": "268 passed, 5 skipped, 1 failed (test_cluster unsynced reboot, pre-existing)",
   "step1_debug": "267 passed, 5 skipped, 2 failed (same cluster test; test_locality spread timing, passes on rerun with both binaries)",
   "step2_debug": "269 passed, 5 skipped, 0 failed"
+ },
+ "final_same_snapshot_off_vs_on": [
+  {
+   "bin": "A-off",
+   "task": [
+    639.7,
+    7368.5
+   ],
+   "actor": [
+    653.9,
+    2579.3
+   ],
+   "load": 30.09375
+  },
+  {
+   "bin": "A-on",
+   "task": [
+    247.2,
+    2083.0
+   ],
+   "actor": [
+    295.7,
+    6318.3
+   ],
+   "load": 29.28515625
+  },
+  {
+   "bin": "A-off",
+   "task": [
+    596.7,
+    3815.0
+   ],
+   "actor": [
+    641.3,
+    3061.3
+   ],
+   "load": 25.5576171875
+  },
+  {
+   "bin": "A-on",
+   "task": [
+    250.8,
+    1286.5
+   ],
+   "actor": [
+    275.7,
+    1151.9
+   ],
+   "load": 25.5576171875
+  },
+  {
+   "bin": "A-off",
+   "task": [
+    595.3,
+    1549.8
+   ],
+   "actor": [
+    646.3,
+    3002.0
+   ],
+   "load": 23.9912109375
+  },
+  {
+   "bin": "A-on",
+   "task": [
+    295.8,
+    2080.0
+   ],
+   "actor": [
+    286.4,
+    610.0
+   ],
+   "load": 22.79052734375
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    2325.1,
+    8667.2
+   ],
+   "actor": [
+    982.3,
+    4952.8
+   ],
+   "load": 36.720703125
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    1621.5,
+    9553.4
+   ],
+   "actor": [
+    194.8,
+    3528.7
+   ],
+   "load": 36.77197265625
+  }
+ ],
+ "final_interleaved_with_ray": [
+  {
+   "bin": "A-on",
+   "task": [
+    1084.4,
+    7509.1
+   ],
+   "actor": [
+    471.6,
+    5399.0
+   ],
+   "load": 31.5146484375
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    1987.0,
+    8486.4
+   ],
+   "actor": [
+    185.2,
+    473.6
+   ],
+   "load": 37.7685546875
+  },
+  {
+   "bin": "A-on",
+   "task": [
+    272.7,
+    2123.4
+   ],
+   "actor": [
+    312.5,
+    2127.2
+   ],
+   "load": 37.38623046875
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    390.5,
+    813.2
+   ],
+   "actor": [
+    163.0,
+    280.2
+   ],
+   "load": 33.24267578125
+  },
+  {
+   "bin": "A-on",
+   "task": [
+    240.9,
+    333.9
+   ],
+   "actor": [
+    256.8,
+    359.5
+   ],
+   "load": 33.24267578125
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    443.2,
+    3330.6
+   ],
+   "actor": [
+    771.4,
+    2489.4
+   ],
+   "load": 37.00146484375
+  }
+ ],
+ "overlay_commit_path": {
+  "attached call, overlay": {
+   "p50_us": 22,
+   "p99_us": 128,
+   "concurrent_per_s": 136765
+  },
+  "raft log (same run)": {
+   "p50_us": 347,
+   "p99_us": 1117,
+   "concurrent_per_s": 95347
+  }
+ },
+ "executor_lane_cache_ab": [
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    326.2,
+    2286.0
+   ],
+   "actor": [
+    540.8,
+    2740.8
+   ],
+   "load": 22.40283203125,
+   "variant": "A"
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    281.3,
+    3417.5
+   ],
+   "actor": [
+    287.9,
+    637.4
+   ],
+   "load": 21.8896484375,
+   "variant": "B"
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    271.8,
+    2641.0
+   ],
+   "actor": [
+    326.6,
+    3500.9
+   ],
+   "load": 20.45703125,
+   "variant": "A"
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    263.4,
+    500.2
+   ],
+   "actor": [
+    296.5,
+    972.1
+   ],
+   "load": 19.45947265625,
+   "variant": "B"
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    280.0,
+    1256.1
+   ],
+   "actor": [
+    326.3,
+    1694.5
+   ],
+   "load": 18.38134765625,
+   "variant": "A"
+  },
+  {
+   "bin": "chimaera-step2-rel",
+   "task": [
+    269.9,
+    658.8
+   ],
+   "actor": [
+    298.1,
+    586.0
+   ],
+   "load": 18.38134765625,
+   "variant": "B"
+  }
+ ],
+ "python_suite_final": "298 passed, 5 skipped, 0 failed (fresh debug build of the live tree, test_docs excluded)",
+ "early_notify_same_snapshot": [
+  {
+   "bin": "E-off",
+   "task": [
+    230.1,
+    3015.5
+   ],
+   "actor": [
+    246.8,
+    935.4
+   ],
+   "load": 32.48876953125
+  },
+  {
+   "bin": "E-on",
+   "task": [
+    202.3,
+    272.1
+   ],
+   "actor": [
+    219.5,
+    314.5
+   ],
+   "load": 32.48876953125
+  },
+  {
+   "bin": "E-off",
+   "task": [
+    238.5,
+    383.2
+   ],
+   "actor": [
+    261.1,
+    3559.9
+   ],
+   "load": 30.126953125
+  },
+  {
+   "bin": "E-on",
+   "task": [
+    199.8,
+    250.3
+   ],
+   "actor": [
+    219.5,
+    1125.1
+   ],
+   "load": 27.87451171875
+  },
+  {
+   "bin": "E-off",
+   "task": [
+    236.7,
+    315.8
+   ],
+   "actor": [
+    258.9,
+    332.0
+   ],
+   "load": 27.87451171875
+  },
+  {
+   "bin": "E-on",
+   "task": [
+    199.4,
+    1325.5
+   ],
+   "actor": [
+    220.2,
+    1412.6
+   ],
+   "load": 26.44287109375
+  }
+ ],
+ "python_suite_early_notify": {
+  "live": "323 passed, 5 skipped, 4 failed; 2 of the 4 (unsynced cluster reboot, competing reservations) also fail without early notify; dead-voters and quick-readers pass alone, and from one snapshot dead-voters passes 2/2 with and 2/2 without",
+  "scratch_snapshot": "306 passed, 1 failed (elastic gang timeout under load; passes 2/2 alone)"
+ },
+ "forwarder_removal_no_gain": [
+  {
+   "bin": "F-off",
+   "task": [
+    226.4,
+    2347.6
+   ],
+   "actor": [
+    207.2,
+    759.4
+   ],
+   "load": 27.65380859375
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    180.0,
+    456.3
+   ],
+   "actor": [
+    200.2,
+    983.6
+   ],
+   "load": 27.65380859375
+  },
+  {
+   "bin": "F-off",
+   "task": [
+    202.4,
+    1735.1
+   ],
+   "actor": [
+    188.9,
+    2457.7
+   ],
+   "load": 26.31982421875
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    212.8,
+    1025.1
+   ],
+   "actor": [
+    224.1,
+    993.9
+   ],
+   "load": 25.5732421875
+  },
+  {
+   "bin": "F-off",
+   "task": [
+    217.0,
+    1277.0
+   ],
+   "actor": [
+    235.2,
+    1851.7
+   ],
+   "load": 25.5732421875
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    212.2,
+    1896.0
+   ],
+   "actor": [
+    222.7,
+    2084.0
+   ],
+   "load": 26.64794921875
+  },
+  {
+   "bin": "F-off",
+   "task": [
+    255.4,
+    2590.0
+   ],
+   "actor": [
+    225.5,
+    1105.5
+   ],
+   "load": 22.806640625
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    539.5,
+    3102.7
+   ],
+   "actor": [
+    360.7,
+    2305.6
+   ],
+   "load": 22.82177734375
+  },
+  {
+   "bin": "F-off",
+   "task": [
+    214.9,
+    1101.5
+   ],
+   "actor": [
+    236.0,
+    1677.6
+   ],
+   "load": 23.31640625
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    220.9,
+    1933.8
+   ],
+   "actor": [
+    201.1,
+    979.8
+   ],
+   "load": 23.31640625
+  },
+  {
+   "bin": "F-off",
+   "task": [
+    205.2,
+    1653.6
+   ],
+   "actor": [
+    201.7,
+    882.6
+   ],
+   "load": 23.05078125
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    192.2,
+    851.1
+   ],
+   "actor": [
+    204.5,
+    1325.7
+   ],
+   "load": 23.05078125
+  },
+  {
+   "bin": "F-off",
+   "task": [
+    181.9,
+    1350.7
+   ],
+   "actor": [
+    193.8,
+    570.7
+   ],
+   "load": 21.52490234375
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    212.6,
+    1266.5
+   ],
+   "actor": [
+    218.4,
+    1152.1
+   ],
+   "load": 20.28125
+  },
+  {
+   "bin": "F-off",
+   "task": [
+    170.2,
+    627.2
+   ],
+   "actor": [
+    200.0,
+    1052.2
+   ],
+   "load": 20.28125
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    191.1,
+    1439.8
+   ],
+   "actor": [
+    212.0,
+    1850.1
+   ],
+   "load": 20.41845703125
+  }
+ ],
+ "notify_before_accounting_paired": [
+  {
+   "bin": "F-on",
+   "task": [
+    192.3,
+    441.5
+   ],
+   "actor": [
+    210.5,
+    2093.9
+   ],
+   "load": 33.27978515625
+  },
+  {
+   "bin": "N-on",
+   "task": [
+    200.5,
+    502.5
+   ],
+   "actor": [
+    199.3,
+    583.3
+   ],
+   "load": 31.01513671875
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    746.4,
+    3021.0
+   ],
+   "actor": [
+    859.2,
+    6658.0
+   ],
+   "load": 28.8056640625
+  },
+  {
+   "bin": "N-on",
+   "task": [
+    202.4,
+    1051.9
+   ],
+   "actor": [
+    202.4,
+    4779.1
+   ],
+   "load": 28.8056640625
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    616.0,
+    4105.3
+   ],
+   "actor": [
+    807.5,
+    5734.5
+   ],
+   "load": 31.41943359375
+  },
+  {
+   "bin": "N-on",
+   "task": [
+    681.3,
+    4378.7
+   ],
+   "actor": [
+    475.5,
+    6023.0
+   ],
+   "load": 31.7060546875
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    259.8,
+    2811.2
+   ],
+   "actor": [
+    269.6,
+    3670.4
+   ],
+   "load": 31.3291015625
+  },
+  {
+   "bin": "N-on",
+   "task": [
+    459.6,
+    2261.8
+   ],
+   "actor": [
+    243.3,
+    3172.8
+   ],
+   "load": 29.861328125
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    538.3,
+    3123.6
+   ],
+   "actor": [
+    353.2,
+    4981.7
+   ],
+   "load": 28.3505859375
+  },
+  {
+   "bin": "N-on",
+   "task": [
+    386.4,
+    4448.4
+   ],
+   "actor": [
+    203.0,
+    802.3
+   ],
+   "load": 26.720703125
+  },
+  {
+   "bin": "F-on",
+   "task": [
+    189.7,
+    614.1
+   ],
+   "actor": [
+    200.9,
+    1020.2
+   ],
+   "load": 25.14111328125
+  },
+  {
+   "bin": "N-on",
+   "task": [
+    185.0,
+    310.3
+   ],
+   "actor": [
+    190.5,
+    311.4
+   ],
+   "load": 24.32861328125
+  }
+ ],
+ "actor_call_trace_p50_us": {
+  "driver .remote()": 34,
+  ".remote() -> ingress": 14,
+  "ingress submit through group -> on_granted": 35,
+  "on_granted -> Execute sent": 5,
+  "Execute -> executor reader": 21,
+  "reader -> main thread": 15,
+  "method": 16,
+  "done -> core": 5,
+  "core bookkeeping before notify (now moved after)": 12,
+  "notify -> driver result()": 33,
+  "total": 202
  }
 }

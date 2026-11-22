@@ -1,0 +1,306 @@
+--- a/crates/chimaera-raft/src/local.rs
++++ b/crates/chimaera-raft/src/local.rs
+@@ -36,10 +36,17 @@
+ use std::collections::{BTreeMap, HashMap};
+ use std::io;
+ use std::ops::Bound;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::{Arc, RwLock, mpsc};
+ use std::time::Instant;
+ use tokio::sync::oneshot;
+ 
++#[cfg(test)]
++thread_local! {
++    /// The applier thread's `Applier::event_delay_us` (tests only).
++    static DELAY: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
++}
++
+ /// Commands applied in one batch at most.
+ const MAX_BATCH: usize = 1024;
+ /// Runs whose detached flag is remembered; the cache is cleared beyond this.
+@@ -55,6 +62,8 @@
+ struct Overlay {
+     map: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+     since: Option<Instant>,
++    /// Runs' detached flags, as `needs_durability` looked them up.
++    detached: HashMap<Vec<u8>, bool>,
+ }
+ 
+ pub(crate) struct Applier {
+@@ -62,6 +71,17 @@
+     group: u32,
+     db: Arc<Database>,
+     overlay: Arc<RwLock<Overlay>>,
++    /// Proposals sent to the applier thread whose events are not yet sent.
++    queued: Arc<AtomicUsize>,
++    events: tokio::sync::mpsc::Sender<GroupEvents>,
++    shard: ShardState,
++    /// Commands applied inline (tests only).
++    #[cfg(test)]
++    inline_count: AtomicUsize,
++    /// A pause between a batch's replies and its events (tests only), to
++    /// widen the window an inline apply must not overtake.
++    #[cfg(test)]
++    event_delay_us: Arc<std::sync::atomic::AtomicU64>,
+ }
+ 
+ impl Applier {
+@@ -73,19 +93,84 @@
+     ) -> io::Result<Applier> {
+         let (tx, rx) = mpsc::channel::<Proposal>();
+         let overlay = Arc::new(RwLock::new(Overlay::default()));
+-        let (d, o) = (db.clone(), overlay.clone());
+-        std::thread::Builder::new()
+-            .name(format!("apply-{group}"))
+-            .spawn(move || run(group, &d, &path, &o, &events, &rx))?;
+-        Ok(Applier { tx, group, db, overlay })
++        let queued = Arc::new(AtomicUsize::new(0));
++        let (d, o, q, e) = (db.clone(), overlay.clone(), queued.clone(), events.clone());
++        #[cfg(test)]
++        let delay = Arc::new(std::sync::atomic::AtomicU64::new(0));
++        #[cfg(test)]
++        let delay2 = delay.clone();
++        std::thread::Builder::new().name(format!("apply-{group}")).spawn(move || {
++            #[cfg(test)]
++            DELAY.with(|cell| *cell.borrow_mut() = Some(delay2));
++            run(group, &d, &path, &o, &q, &e, &rx)
++        })?;
++        Ok(Applier {
++            tx,
++            group,
++            db,
++            overlay,
++            queued,
++            events,
++            shard: ShardState::new(),
++            #[cfg(test)]
++            inline_count: AtomicUsize::new(0),
++            #[cfg(test)]
++            event_delay_us: delay,
++        })
+     }
+ 
+     pub(crate) async fn propose(&self, cmd: pb::ShardCmd) -> Result<pb::ShardReply, String> {
++        match self.inline(&cmd) {
++            Some(Ok((reply, evs))) => {
++                if !evs.is_empty() {
++                    let ev = GroupEvents { group: self.group, events: evs };
++                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) = self.events.try_send(ev) {
++                        let _ = self.events.send(ev).await;
++                    }
++                }
++                return Ok(reply);
++            }
++            Some(Err(e)) => return Err(e.to_string()),
++            None => {}
++        }
++        self.queued.fetch_add(1, Ordering::SeqCst);
+         let (tx, rx) = oneshot::channel();
+-        self.tx.send((cmd, tx)).map_err(|_| "local applier stopped".to_string())?;
++        if self.tx.send((cmd, tx)).is_err() {
++            self.queued.fetch_sub(1, Ordering::SeqCst);
++            return Err("local applier stopped".to_string());
++        }
+         rx.await.map_err(|_| "local applier stopped".to_string())?
+     }
+ 
++    /// Apply `cmd` in the calling task when it only touches the overlay and
++    /// the applier thread has nothing in hand (so nothing proposed earlier is
++    /// still unapplied or has events unsent); None: queue it instead.
++    fn inline(&self, cmd: &pb::ShardCmd) -> Option<io::Result<(pb::ShardReply, Vec<chimaera_core::shard::Event>)>> {
++        let mut guard = self.overlay.write().expect("overlay lock");
++        if self.queued.load(Ordering::SeqCst) != 0 {
++            return None;
++        }
++        let Overlay { map, since, detached } = &mut *guard;
++        if map.len() >= MAX_OVERLAY || since.is_some_and(|t| t.elapsed() >= CHECKPOINT_EVERY) {
++            return None;
++        }
++        let base = match self.db.begin_read().map_err(io_err).and_then(|t| t.open_table(SM).map_err(io_err)) {
++            Ok(b) => b,
++            Err(e) => return Some(Err(e)),
++        };
++        if detached.len() > MAX_CACHED_RUNS {
++            detached.clear();
++        }
++        if needs_durability(&View { base: &base, group: self.group, overlay: map }, cmd, detached) {
++            return None;
++        }
++        since.get_or_insert_with(Instant::now);
++        #[cfg(test)]
++        self.inline_count.fetch_add(1, Ordering::Relaxed);
++        let applied = self.shard.apply(&mut OverlayKv { base: &base, group: self.group, overlay: map }, cmd);
++        Some(Ok((applied.reply, applied.events)))
++    }
++
+     /// Run `f` over the group's state: the overlay over the database.
+     pub(crate) fn read<T>(&self, f: impl FnOnce(&dyn KvRead) -> T) -> io::Result<T> {
+         let overlay = self.overlay.read().expect("overlay lock");
+@@ -99,11 +184,11 @@
+     db: &Database,
+     path: &std::path::Path,
+     overlay: &RwLock<Overlay>,
++    queued: &AtomicUsize,
+     events: &tokio::sync::mpsc::Sender<GroupEvents>,
+     rx: &mpsc::Receiver<Proposal>,
+ ) {
+     let shard = ShardState::new();
+-    let mut detached = HashMap::new();
+     loop {
+         let first = match rx.recv_timeout(CHECKPOINT_EVERY) {
+             Ok(p) => p,
+@@ -126,17 +211,22 @@
+                 Err(_) => break,
+             }
+         }
+-        if detached.len() > MAX_CACHED_RUNS {
+-            detached.clear();
+-        }
++        let n = batch.len();
+         let starts_external = batch.iter().any(|(c, _)| matches!(c.body, Some(pb::shard_cmd::Body::StartExternal(_))));
+-        let applied = apply(db, group, &shard, overlay, &batch, &mut detached)
++        let applied = apply(db, group, &shard, overlay, &batch)
+             .and_then(|a| if starts_external { sync(path).map(|()| a) } else { Ok(a) });
+         match applied {
+             Ok((replies, evs)) => {
+                 for ((_, tx), reply) in batch.into_iter().zip(replies) {
+                     let _ = tx.send(Ok(reply));
+                 }
++                #[cfg(test)]
++                DELAY.with(|cell| {
++                    let us = cell.borrow().as_ref().map_or(0, |d| d.load(Ordering::Relaxed));
++                    if us > 0 {
++                        std::thread::sleep(std::time::Duration::from_micros(us));
++                    }
++                });
+                 if !evs.is_empty() {
+                     // A dropped receiver means the peer is shutting down; state is applied.
+                     let _ = events.blocking_send(GroupEvents { group, events: evs });
+@@ -149,6 +239,9 @@
+                 }
+             }
+         }
++        // Only now may later proposals apply inline: these are applied and
++        // their events are ahead of anything an inline apply sends.
++        queued.fetch_sub(n, Ordering::SeqCst);
+     }
+ }
+ 
+@@ -172,13 +265,16 @@
+     shard: &ShardState,
+     overlay: &RwLock<Overlay>,
+     batch: &[Proposal],
+-    detached: &mut HashMap<Vec<u8>, bool>,
+ ) -> io::Result<Applied> {
+     let mut o = overlay.write().expect("overlay lock");
+     let full = o.map.len() >= MAX_OVERLAY || o.since.is_some_and(|t| t.elapsed() >= CHECKPOINT_EVERY);
+     let base = db.begin_read().map_err(io_err)?.open_table(SM).map_err(io_err)?;
++    if o.detached.len() > MAX_CACHED_RUNS {
++        o.detached.clear();
++    }
+     let durable = full || {
+-        let view = View { base: &base, group, overlay: &o.map };
++        let Overlay { map, detached, .. } = &mut *o;
++        let view = View { base: &base, group, overlay: map };
+         batch.iter().any(|(cmd, _)| needs_durability(&view, cmd, detached))
+     };
+     if durable {
+@@ -226,7 +322,8 @@
+         }
+     }
+     txn.commit().map_err(io_err)?;
+-    *o = Overlay::default();
++    o.map.clear();
++    o.since = None;
+     Ok(out)
+ }
+ 
+@@ -364,6 +461,7 @@
+     use chimaera_core::shard::{Event, Tk, read};
+     use openraft::BasicNode;
+     use std::sync::Arc;
++    use std::sync::atomic::Ordering;
+     use std::time::Duration;
+ 
+     fn cmd(body: pb::shard_cmd::Body) -> pb::ShardCmd {
+@@ -581,8 +679,80 @@
+             );
+             g.shutdown().await;
+         }
++    }
++
++    fn submit_to(run: Id, i: u64) -> pb::ShardCmd {
++        let tk = Tk { run, task: run.child(&[&i.to_le_bytes()]) };
++        let spec = pb::TaskSpec { key: Some(tk.pb()), ..Default::default() };
++        cmd(pb::shard_cmd::Body::SubmitTasks(pb::SubmitTasks { tasks: vec![spec], grant_to: None }))
++    }
++
++    async fn create_run(g: &crate::Group, run: Id, detached: bool) {
++        let rec = pb::RunRecord { run: run.to_vec(), tenant: "t".into(), detached, ..Default::default() };
++        g.propose(&cmd(pb::shard_cmd::Body::RunCreate(pb::RunCreate { run: Some(rec) }))).await.unwrap();
+     }
+ 
++    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++    async fn an_attached_runs_calls_apply_in_the_calling_task() {
++        let dir = tempfile::tempdir().unwrap();
++        let (_host, mut events, g) = open(dir.path(), false).await;
++        g.propose(&cmd(pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards: vec![3], epoch: 1 })))
++            .await
++            .unwrap();
++        let run = Id::derive(0, 3, &[b"run"]);
++        create_run(&g, run, false).await;
++        let applier = g.local.as_ref().unwrap();
++        let before = applier.inline_count.load(Ordering::Relaxed);
++        for i in 0..20 {
++            g.propose(&submit_to(run, i)).await.unwrap();
++        }
++        assert_eq!(applier.inline_count.load(Ordering::Relaxed) - before, 20, "each submit applied inline");
++        assert_eq!(ready(&g), 20);
++        let mut seen = 0;
++        while seen < 20 {
++            let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
++            seen += ev.events.iter().filter(|e| matches!(e, Event::Ready(_))).count();
++        }
++    }
++
++    /// A queued (durable) command's events reach the core before those of an
++    /// inline command proposed after its reply.
++    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++    async fn events_keep_proposal_order_across_queued_and_inline_commands() {
++        let dir = tempfile::tempdir().unwrap();
++        let (_host, mut events, g) = open(dir.path(), false).await;
++        g.propose(&cmd(pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards: vec![3], epoch: 1 })))
++            .await
++            .unwrap();
++        let (durable, attached) = (Id::derive(0, 3, &[b"durable"]), Id::derive(0, 3, &[b"attached"]));
++        create_run(&g, durable, true).await;
++        create_run(&g, attached, false).await;
++        // Hold each queued batch's events back after its reply: an inline
++        // apply that did not wait for them would now overtake them.
++        g.local.as_ref().unwrap().event_delay_us.store(2_000, Ordering::Relaxed);
++        let n = 50u64;
++        for i in 0..n {
++            g.propose(&submit_to(durable, i)).await.unwrap();
++            g.propose(&submit_to(attached, i)).await.unwrap();
++        }
++        let mut order = Vec::new();
++        while order.len() < 2 * n as usize {
++            let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
++            for e in ev.events {
++                if let Event::Ready(tk) = e {
++                    order.push(tk.run == durable);
++                }
++            }
++        }
++        // Each pair: the durable run's task first, then the attached run's.
++        let pairs: Vec<bool> = order.chunks(2).map(|p| p == [true, false]).collect();
++        assert!(
++            pairs.iter().all(|ok| *ok),
++            "events out of order at pairs {:?}",
++            pairs.iter().enumerate().filter(|(_, ok)| !**ok).map(|(i, _)| i).collect::<Vec<_>>()
++        );
++    }
++
+     const CRASH_DIR: &str = "CHIMAERA_TEST_CRASH_DIR";
+     const CRASH_MODE: &str = "CHIMAERA_TEST_CRASH_MODE";
+     const CRASH_EXIT: i32 = 86;

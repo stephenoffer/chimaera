@@ -1,16 +1,17 @@
 """The same-host object plane, Python side.
 
-On Linux, with the object directory in memory (tmpfs), NumPy arrays of at
+On Linux, with the object directory in memory (tmpfs), NumPy arrays and
+Python's own large blocks (``bytes``, ``bytearray``, ``str``, lists) of at
 least ``ARENA_MIN`` bytes are allocated as files in that directory (see
 ``objects.rs``). Storing one, by ``ch.put`` or as a call's return value, then
 hard-links its file under the stored object's name instead of copying the
-bytes: the cost no longer grows with the array's size. The owner keeps a
+bytes: the cost no longer grows with the value's size. The owner keeps a
 copy-on-write view, so its later writes never change what was stored, and
 readers in other processes map the same pages. Arrays come back writable,
 also copy-on-write.
 
-Everything else (other buffer types, or arrays allocated before the arena was
-installed) is copied into the object file by the native writer, which uses
+Everything else (other buffer types, such as torch's or Arrow's own
+allocations, or values allocated before the arena was installed) is copied into the object file by the native writer, which uses
 several threads for large files. ``CHIMAERA_ARENA=0`` turns the arena off.
 """
 
@@ -21,9 +22,9 @@ import importlib.abc
 import os
 import sys
 import threading
-from typing import Any
+from typing import Any, Callable
 
-from . import _native
+from . import _native, _serde
 
 # Arrays at least this large live in the arena (the same threshold at which
 # buffers leave the pickle and become blobs; see _values.PROMOTE_BYTES).
@@ -84,22 +85,33 @@ def enable(object_dir: str) -> None:
         return
     with _lock:
         _state["dir"] = os.path.join(object_dir, ".arena", str(os.getpid()))
-    if "numpy" in sys.modules:
-        _install()
-    else:
+    _install()
+    if "numpy" not in sys.modules:
         sys.meta_path.insert(0, _NumpyHook())
 
 
 def _install() -> None:
+    """Create the arena once, wrapping Python's raw allocator (large `bytes`,
+    `str` and lists), and patch NumPy's allocator if NumPy is loaded; called
+    again once `import numpy` finishes."""
+    import tracemalloc
+
     with _lock:
-        if _state["installed"] or not _state["dir"]:
+        if not _state["dir"]:
             return
+        first = not _state["installed"]
         _state["installed"] = True
     try:
-        ok = _native.arena_install(_state["dir"], ARENA_MIN)
+        # tracemalloc.stop() restores the allocator it saved at start, which
+        # would leave blocks from our wrapper to a free() that does not know
+        # them: while it traces, only NumPy's allocator is routed here.
+        ok = _native.arena_install(_state["dir"], ARENA_MIN, raw=not tracemalloc.is_tracing())
     except Exception:  # noqa: BLE001 -- the arena is an optimization; values still copy
         ok = False
-    if ok:
+    if not ok:
+        with _lock:
+            _state["installed"] = False
+    elif first:
         atexit.register(_native.arena_shutdown)
 
 
@@ -139,6 +151,26 @@ def claim(view: memoryview, run_dir: str, prefix: bytes = b"") -> tuple[bytes, i
     blob = prefix + os.urandom(16 - len(prefix))
     off = _native.arena_claim(view, os.path.join(run_dir, blob.hex()))
     return None if off is None else (blob, off)
+
+
+def prefetch(outcome: tuple[Any, ...], object_dir: str, localize: Callable[[bytes, bytes], None]) -> None:
+    """Make a finished call's stored value local without decoding it: its
+    object file, then every blob its header links (``ch.wait(fetch_local=True)``)."""
+    if outcome[0] != "ok":
+        return
+    _, inline, run, obj, _size, _oob = outcome
+    head = inline
+    if head is None:
+        path = _serde.object_path(object_dir, run, obj)
+        if not os.path.exists(path):
+            localize(run, obj)
+        with open(path, "rb") as f:
+            first = f.read(_serde.header_size(0))
+            n = int.from_bytes(first[8:12], "little")  # n_buffers, after magic and flags
+            head = first + f.read(_serde.header_size(n) - len(first))
+    for blob in _serde.external_blobs(head):
+        if not os.path.exists(os.path.join(_serde.run_dir(object_dir, run), blob.hex())):
+            localize(run, blob)
 
 
 def stats() -> dict[str, int]:

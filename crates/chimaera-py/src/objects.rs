@@ -88,8 +88,9 @@ struct Config {
     root: Option<PathBuf>,
     /// Pre-zeroed files, `<class>-<n>`, refilled by the peer.
     reserve: Option<PathBuf>,
-    /// Disk directory for objects written while memory is over `limit`.
-    spill: Option<PathBuf>,
+    /// Disk directories for objects written while memory is over `limit`,
+    /// each in turn.
+    spill: Vec<PathBuf>,
     /// Bytes the object filesystem may hold before new objects go to disk.
     limit: u64,
 }
@@ -97,20 +98,34 @@ struct Config {
 static CONFIG: std::sync::RwLock<Option<Config>> = std::sync::RwLock::new(None);
 
 /// Configure the object plane of this process: the object directory, its
-/// reserve of pre-zeroed pages, the disk directory objects go to when memory
-/// is over `limit` bytes (0: no limit).
+/// reserve of pre-zeroed pages, the disk directories (colon-separated) that
+/// objects go to when memory is over `limit` bytes (0: no limit).
 #[pyfunction]
 #[pyo3(signature = (root, reserve=None, spill=None, limit=0))]
 pub fn objects_config(root: PathBuf, reserve: Option<PathBuf>, spill: Option<PathBuf>, limit: u64) {
-    *CONFIG.write().expect("lock") = Some(Config { root: Some(root), reserve, spill, limit });
+    let spill = spill.map(|s| std::env::split_paths(&s).filter(|p| !p.as_os_str().is_empty()).collect());
+    *CONFIG.write().expect("lock") =
+        Some(Config { root: Some(root), reserve, spill: spill.unwrap_or_default(), limit });
 }
 
 /// Smallest and largest reserve classes: files of 2^class bytes.
-pub const RESERVE_MIN_CLASS: u32 = 21;
+pub const RESERVE_MIN_CLASS: u32 = 18;
 pub const RESERVE_MAX_CLASS: u32 = 30;
 
+/// Bytes in a reserve file of class `k`: 2^k plus 1/64 of it, so a payload
+/// of a power of two plus its header (or an array of exactly 2^k bytes) fits
+/// its own class instead of taking a file twice its size. The peer's
+/// objplane.rs uses the same formula.
+pub fn class_bytes(k: u32) -> usize {
+    (1usize << k) + (1usize << k >> 6).max(4096)
+}
+
 fn class_of(len: usize) -> u32 {
-    (usize::BITS - len.saturating_sub(1).leading_zeros()).max(RESERVE_MIN_CLASS)
+    let mut k = RESERVE_MIN_CLASS;
+    while class_bytes(k) < len && k < usize::BITS - 1 {
+        k += 1;
+    }
+    k
 }
 
 /// Move a pre-zeroed file of at least `len` bytes (at most twice that) from
@@ -137,7 +152,11 @@ fn take_reserve(dir: &Path, len: usize, to: &Path) -> bool {
             }
         }
     }
-    let _ = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(format!("want-{k}")));
+    // One marker per miss (the peer fills a class that misses repeatedly).
+    static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("want-{k}-{}-{n}", std::process::id());
+    let _ = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(name));
     false
 }
 
@@ -151,15 +170,55 @@ fn fs_used(p: &Path) -> Option<u64> {
         .then(|| (st.f_blocks as u64).saturating_sub(st.f_bfree as u64) * st.f_frsize as u64)
 }
 
+/// (sequence of the peer's last `.usage`, bytes this process wrote to memory
+/// since): writes between the peer's once-a-second measurements count too.
+static WRITTEN: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// Bytes of objects in memory: the peer's measurement (`<root>/.usage`)
+/// plus this process's writes since; the filesystem's usage when the peer
+/// publishes none.
+fn objects_used(root: &Path) -> Option<u64> {
+    let mut buf = [0u8; 16];
+    let Ok(f) = std::fs::File::open(root.join(".usage")) else { return fs_used(root) };
+    if f.read_exact_at(&mut buf, 0).is_err() {
+        return fs_used(root);
+    }
+    let seq = u64::from_le_bytes(buf[..8].try_into().expect("8 bytes"));
+    let bytes = u64::from_le_bytes(buf[8..].try_into().expect("8 bytes"));
+    let mut w = WRITTEN.lock().expect("lock");
+    if w.0 != seq {
+        *w = (seq, 0);
+    }
+    Some(bytes + w.1)
+}
+
+fn note_written(n: u64) {
+    WRITTEN.lock().expect("lock").1 += n;
+}
+
+/// Whether `len` more bytes of objects in memory would pass the hard cap:
+/// the limit plus a quarter. Between the two, new objects still go to memory
+/// while the peer's background spiller (which starts at 80% of the pool)
+/// moves the oldest to disk; past the cap they go straight to disk.
+fn over_limit(len: u64) -> bool {
+    let cfg = CONFIG.read().expect("lock");
+    cfg.as_ref().is_some_and(|c| {
+        c.limit > 0 && c.root.as_ref().and_then(|r| objects_used(r)).is_some_and(|u| u + len > c.limit + c.limit / 4)
+    })
+}
+
 /// Where an object of `total` bytes headed for `path` should be written
 /// instead, when memory is over the limit: its spill path, or None.
 fn spill_target(path: &Path, total: usize) -> Option<PathBuf> {
-    let cfg = CONFIG.read().expect("lock");
-    let cfg = cfg.as_ref()?;
-    let (root, spill) = (cfg.root.as_ref()?, cfg.spill.as_ref()?);
-    if cfg.limit == 0 || fs_used(root)? + total as u64 <= cfg.limit {
+    if !over_limit(total as u64) {
         return None;
     }
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let cfg = CONFIG.read().expect("lock");
+    let cfg = cfg.as_ref()?;
+    let root = cfg.root.as_ref()?;
+    let n = cfg.spill.len();
+    let spill = cfg.spill.get(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n.max(1))?;
     Some(spill.join(path.strip_prefix(root).ok()?))
 }
 
@@ -187,7 +246,9 @@ pub fn write_parts(path: &Path, parts: &[&[u8]]) -> io::Result<u64> {
         }
         return Ok(n);
     }
-    write_file(path, parts, total)
+    let n = write_file(path, parts, total)?;
+    note_written(n);
+    Ok(n)
 }
 
 fn write_file(path: &Path, parts: &[&[u8]], total: usize) -> io::Result<u64> {
@@ -367,9 +428,9 @@ mod portable {
 
     /// The arena needs Linux (tmpfs, MAP_FIXED remaps, pagemap).
     #[pyfunction]
-    #[pyo3(signature = (dir, min_bytes, cache_bytes=0))]
-    pub fn arena_install(dir: PathBuf, min_bytes: usize, cache_bytes: usize) -> bool {
-        let _ = (dir, min_bytes, cache_bytes);
+    #[pyo3(signature = (dir, min_bytes, cache_bytes=0, raw=false))]
+    pub fn arena_install(dir: PathBuf, min_bytes: usize, cache_bytes: usize, raw: bool) -> bool {
+        let _ = (dir, min_bytes, cache_bytes, raw);
         false
     }
 
@@ -430,6 +491,39 @@ mod arena {
     unsafe impl Send for Prev {}
     unsafe impl Sync for Prev {}
 
+    type RawFree = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
+    /// CPython's `PyMemAllocatorEx` (pymem.h, 3.5+; not in the stable ABI).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawAllocator {
+        ctx: *mut c_void,
+        malloc: Option<Malloc>,
+        calloc: Option<Calloc>,
+        realloc: Option<Realloc>,
+        free: Option<RawFree>,
+    }
+
+    struct RawPrev(RawAllocator);
+    // SAFETY: CPython's raw allocator is thread-safe by contract (it is called
+    // without the GIL) and the ctx is an opaque pointer it owns.
+    unsafe impl Send for RawPrev {}
+    unsafe impl Sync for RawPrev {}
+
+    const PYMEM_DOMAIN_RAW: libc::c_int = 0;
+
+    unsafe extern "C" {
+        fn PyMem_GetAllocator(domain: libc::c_int, allocator: *mut RawAllocator);
+        fn PyMem_SetAllocator(domain: libc::c_int, allocator: *mut RawAllocator);
+    }
+
+    /// The raw allocator Python had before ours wrapped it.
+    static RAW: OnceLock<RawPrev> = OnceLock::new();
+
+    fn raw() -> &'static RawAllocator {
+        &RAW.get().expect("raw hooks are installed only after RAW").0
+    }
+
     struct Alloc {
         len: usize,
         path: PathBuf,
@@ -444,7 +538,8 @@ mod arena {
         dir: PathBuf,
         min: usize,
         cache_max: usize,
-        prev: Prev,
+        /// NumPy's allocator, once it is patched.
+        numpy: OnceLock<Prev>,
         seq: AtomicU64,
         live: Mutex<BTreeMap<usize, Alloc>>,
         /// Freed allocations never stored anywhere, kept mapped for reuse.
@@ -500,17 +595,10 @@ mod arena {
                 return base as *mut c_void;
             }
             let path = self.dir.join(format!("{}", self.seq.fetch_add(1, Ordering::Relaxed)));
-            let (reserve, over_limit) = {
-                let cfg = CONFIG.read().expect("lock");
-                let cfg = cfg.as_ref();
-                let over = cfg.is_some_and(|c| {
-                    c.limit > 0 && c.root.as_ref().and_then(|r| fs_used(r)).is_some_and(|u| u + len as u64 > c.limit)
-                });
-                (cfg.and_then(|c| c.reserve.clone()), over)
-            };
-            if over_limit {
+            if over_limit(len as u64) {
                 return std::ptr::null_mut(); // memory is full of objects: the heap it is
             }
+            let reserve = CONFIG.read().expect("lock").as_ref().and_then(|c| c.reserve.clone());
             // Pre-zeroed pages when the reserve has them: no faults to fill.
             let warm = reserve.is_some_and(|d| take_reserve(&d, len, &path));
             let c = cstr(&path);
@@ -564,6 +652,61 @@ mod arena {
             Some((b, a))
         }
 
+        /// Resize an allocation of ours in place when no object links its
+        /// file: the file grows or shrinks and the mapping follows (mremap),
+        /// with no copy. None: not ours. Some((old length, None)): ours, but it
+        /// must move (an object links it, it is inherited, or it is now below
+        /// the arena's minimum).
+        fn resize(&self, p: usize, new: usize) -> Option<(usize, Option<usize>)> {
+            if p < self.lo.load(Ordering::Relaxed) || p >= self.hi.load(Ordering::Relaxed) {
+                return None;
+            }
+            let mut live = self.live.lock().expect("lock");
+            let a = live.get(&p)?;
+            let (old, len) = (a.len, page_up(new));
+            if a.published || a.foreign || new < self.min || !self.enabled.load(Ordering::Relaxed) {
+                return Some((old, None));
+            }
+            if len == old {
+                return Some((old, Some(p)));
+            }
+            if len > old && over_limit((len - old) as u64) {
+                return Some((old, None));
+            }
+            let c = cstr(&a.path);
+            // SAFETY: our own file and mapping. The file covers the mapping at
+            // every step (it grows first and shrinks last), so no access to
+            // the mapping falls past the file's end.
+            let q = unsafe {
+                let fd = libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Some((old, None));
+                }
+                let room =
+                    len < old || (self.fs_has_room(fd, len - old) && libc::ftruncate(fd, len as libc::off_t) == 0);
+                let q = if room {
+                    libc::mremap(p as *mut c_void, old, len, libc::MREMAP_MAYMOVE)
+                } else {
+                    libc::MAP_FAILED
+                };
+                if q != libc::MAP_FAILED && len < old {
+                    libc::ftruncate(fd, len as libc::off_t);
+                }
+                libc::close(fd);
+                q
+            };
+            if q == libc::MAP_FAILED {
+                return Some((old, None));
+            }
+            let q = q as usize;
+            let mut a = live.remove(&p).expect("held under the lock");
+            a.len = len;
+            live.insert(q, a);
+            self.lo.fetch_min(q, Ordering::Relaxed);
+            self.hi.fetch_max(q + len, Ordering::Relaxed);
+            Some((old, Some(q)))
+        }
+
         /// Ours: unmap (or cache) and return true. Not ours: false.
         fn free(&self, ptr: usize) -> bool {
             if ptr < self.lo.load(Ordering::Relaxed) || ptr >= self.hi.load(Ordering::Relaxed) {
@@ -603,7 +746,7 @@ mod arena {
             ar.fallbacks.fetch_add(1, Ordering::Relaxed);
         }
         // SAFETY: forwarding to NumPy's own allocator with its context.
-        unsafe { ar.prev.0.malloc.expect("malloc")(ctx, size) }
+        unsafe { np(ar).malloc.expect("malloc")(ctx, size) }
     }
 
     unsafe extern "C" fn h_calloc(ctx: *mut c_void, n: usize, el: usize) -> *mut c_void {
@@ -618,26 +761,41 @@ mod arena {
             ar.fallbacks.fetch_add(1, Ordering::Relaxed);
         }
         // SAFETY: as above.
-        unsafe { ar.prev.0.calloc.expect("calloc")(ctx, n, el) }
+        unsafe { np(ar).calloc.expect("calloc")(ctx, n, el) }
+    }
+
+    fn np(ar: &Arena) -> &Allocator {
+        &ar.numpy.get().expect("NumPy's hooks run only once it is patched").0
     }
 
     unsafe extern "C" fn h_realloc(ctx: *mut c_void, ptr: *mut c_void, new: usize) -> *mut c_void {
         let ar = arena();
+        // SAFETY: NumPy's own functions with its context.
+        let heap_realloc = || unsafe { np(ar).realloc.expect("realloc")(ctx, ptr, new) };
+        let heap_malloc = |n| unsafe { np(ar).malloc.expect("malloc")(ctx, n) };
+        // SAFETY: `ptr` came from this allocator (NumPy's contract).
+        unsafe { realloc_any(ptr, new, heap_realloc, heap_malloc) }
+    }
+
+    /// realloc for either hooked allocator: in place for a block of ours that
+    /// no object links, else moved (into the arena, or the previous
+    /// allocator's heap when small or the arena is full). Not ours: the
+    /// previous allocator's realloc.
+    unsafe fn realloc_any(
+        ptr: *mut c_void,
+        new: usize,
+        heap_realloc: impl FnOnce() -> *mut c_void,
+        heap_malloc: impl FnOnce(usize) -> *mut c_void,
+    ) -> *mut c_void {
+        let ar = arena();
         let p = ptr as usize;
-        let old = if p >= ar.lo.load(Ordering::Relaxed) && p < ar.hi.load(Ordering::Relaxed) {
-            ar.live.lock().expect("lock").get(&p).map(|a| a.len)
-        } else {
-            None
-        };
-        let Some(old_len) = old else {
-            // SAFETY: not ours: NumPy's allocator owns `ptr`.
-            return unsafe { ar.prev.0.realloc.expect("realloc")(ctx, ptr, new) };
-        };
-        // Ours: move into a new allocation (ours or the heap's) and copy.
+        let Some((old_len, resized)) = ar.resize(p, new) else { return heap_realloc() };
+        if let Some(q) = resized {
+            return q as *mut c_void;
+        }
         let mut q = if new >= ar.min { ar.alloc(new, false) } else { std::ptr::null_mut() };
         if q.is_null() {
-            // SAFETY: NumPy's malloc with its context.
-            q = unsafe { ar.prev.0.malloc.expect("malloc")(ctx, new.max(1)) };
+            q = heap_malloc(new.max(1));
             if q.is_null() {
                 return q;
             }
@@ -648,11 +806,88 @@ mod arena {
         q
     }
 
+    /// Python's raw allocator (under its large `bytes`, `str`, lists and
+    /// dicts): blocks of at least the arena's minimum come from the arena,
+    /// so a large `bytes` is stored by link, like a NumPy array.
+    unsafe extern "C" fn raw_malloc(ctx: *mut c_void, size: usize) -> *mut c_void {
+        let ar = arena();
+        if size >= ar.min {
+            let p = ar.alloc(size, false);
+            if !p.is_null() {
+                return p;
+            }
+            ar.fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: forwarding to the previous raw allocator with its context.
+        unsafe { raw().malloc.expect("malloc")(ctx, size) }
+    }
+
+    unsafe extern "C" fn raw_calloc(ctx: *mut c_void, n: usize, el: usize) -> *mut c_void {
+        let ar = arena();
+        if let Some(size) = n.checked_mul(el)
+            && size >= ar.min
+        {
+            let p = ar.alloc(size, true);
+            if !p.is_null() {
+                return p;
+            }
+            ar.fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: as above.
+        unsafe { raw().calloc.expect("calloc")(ctx, n, el) }
+    }
+
+    unsafe extern "C" fn raw_realloc(ctx: *mut c_void, ptr: *mut c_void, new: usize) -> *mut c_void {
+        if ptr.is_null() {
+            // SAFETY: realloc(NULL, n) is malloc(n).
+            return unsafe { raw_malloc(ctx, new) };
+        }
+        // SAFETY: the previous raw allocator's functions with its context.
+        let heap_realloc = || unsafe { raw().realloc.expect("realloc")(ctx, ptr, new) };
+        let heap_malloc = |n| unsafe { raw().malloc.expect("malloc")(ctx, n) };
+        // SAFETY: `ptr` came from the raw allocator (CPython's contract).
+        unsafe { realloc_any(ptr, new, heap_realloc, heap_malloc) }
+    }
+
+    unsafe extern "C" fn raw_free(ctx: *mut c_void, ptr: *mut c_void) {
+        if !arena().free(ptr as usize) {
+            // SAFETY: not ours: the previous raw allocator owns `ptr`.
+            unsafe { raw().free.expect("free")(ctx, ptr) }
+        }
+    }
+
+    /// Wrap Python's raw allocator (once). A hook that forwards everything
+    /// not its own is the only kind CPython allows after start-up.
+    fn hook_raw() {
+        if RAW.get().is_some() {
+            return;
+        }
+        let mut prev =
+            RawAllocator { ctx: std::ptr::null_mut(), malloc: None, calloc: None, realloc: None, free: None };
+        // SAFETY: copies the current raw allocator into `prev`.
+        unsafe { PyMem_GetAllocator(PYMEM_DOMAIN_RAW, &mut prev) };
+        if prev.malloc.is_none() || prev.calloc.is_none() || prev.realloc.is_none() || prev.free.is_none() {
+            return;
+        }
+        if RAW.set(RawPrev(prev)).is_err() {
+            return;
+        }
+        let mut ours = RawAllocator {
+            ctx: prev.ctx,
+            malloc: Some(raw_malloc),
+            calloc: Some(raw_calloc),
+            realloc: Some(raw_realloc),
+            free: Some(raw_free),
+        };
+        // SAFETY: installs a hook over `prev` (saved above); called with the GIL.
+        unsafe { PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &mut ours) };
+    }
+
     unsafe extern "C" fn h_free(ctx: *mut c_void, ptr: *mut c_void, size: usize) {
         let ar = arena();
         if !ar.free(ptr as usize) {
             // SAFETY: not ours: NumPy's allocator owns `ptr`.
-            unsafe { ar.prev.0.free.expect("free")(ctx, ptr, size) }
+            unsafe { np(ar).free.expect("free")(ctx, ptr, size) }
         }
     }
 
@@ -667,7 +902,17 @@ mod arena {
 
     extern "C" fn atfork_prepare() {
         if let Some(ar) = ARENA.get() {
-            let g = (ar.live.lock().expect("lock"), ar.cache.lock().expect("lock"));
+            let mut live = ar.live.lock().expect("lock");
+            // The child must not share pages the parent keeps writing (an
+            // array's data, a Python object's reference count): make the
+            // parent's mappings copy-on-write first, as storing one does, so
+            // fork gives the child the usual private copy.
+            for (&b, a) in live.iter_mut() {
+                if !a.published && !a.foreign && remap_private(b, a) {
+                    a.published = true;
+                }
+            }
+            let g = (live, ar.cache.lock().expect("lock"));
             FORK_GUARDS.with(|f| *f.borrow_mut() = Some(g));
         }
     }
@@ -676,15 +921,18 @@ mod arena {
         FORK_GUARDS.with(|f| drop(f.borrow_mut().take()));
     }
 
-    /// The child shares the parent's files: make its mappings private (so its
-    /// writes stay its own), never unlink them, and allocate from the heap.
+    /// The child inherits the parent's (copy-on-write) mappings: it never
+    /// unlinks their files, and allocates from the heap. A mapping the parent
+    /// could not make private is made private here.
     extern "C" fn atfork_child() {
         let Some(ar) = ARENA.get() else { return };
         ar.enabled.store(false, Ordering::Relaxed);
         let Some((mut live, mut cache)) = FORK_GUARDS.with(|f| f.borrow_mut().take()) else { return };
         for (&b, a) in live.iter_mut() {
             a.foreign = true;
-            remap_private(b, a);
+            if !a.published {
+                remap_private(b, a);
+            }
         }
         for (b, a) in cache.drain(..) {
             // SAFETY: an inherited mapping nobody in the child uses.
@@ -731,6 +979,30 @@ mod arena {
         category_mask: u64,
         category_anyof_mask: u64,
         return_mask: u64,
+    }
+
+    /// Whether [ptr, ptr+len) of a stored allocation differs from its file.
+    /// Pages wholly inside are checked in the page map; the partial pages at
+    /// either end are compared with the file (a Python object's header, which
+    /// its reference count rewrites, shares the first page with its data).
+    fn changed(base: usize, a: &Alloc, ptr: usize, len: usize) -> bool {
+        let (lo, hi) = (page_up(ptr), (ptr + len) & !4095);
+        if lo < hi && dirty(lo, hi - lo) {
+            return true;
+        }
+        let ends = if lo > hi { [(ptr, len), (0, 0)] } else { [(ptr, lo - ptr), (hi, ptr + len - hi)] };
+        let Ok(f) = std::fs::File::open(&a.path) else { return true };
+        let mut buf = [0u8; 4096];
+        for (start, n) in ends.into_iter().filter(|&(_, n)| n > 0) {
+            if f.read_exact_at(&mut buf[..n], (start - base) as u64).is_err() {
+                return true;
+            }
+            // SAFETY: [start, start+n) lies inside the live allocation.
+            if unsafe { std::slice::from_raw_parts(start as *const u8, n) } != &buf[..n] {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether the owner wrote to any page of [base, base+len) since the
@@ -786,50 +1058,26 @@ mod arena {
         false
     }
 
-    /// Route NumPy allocations of at least `min_bytes` to files in `dir` (on
-    /// the object store's filesystem). Idempotent; false when NumPy's handler
-    /// API is missing or not the expected version.
+    /// Route allocations of at least `min_bytes` to files in `dir` (on the
+    /// object store's filesystem): NumPy's, once NumPy is loaded (call again
+    /// after importing it), and with `raw` Python's raw allocator's too.
+    /// Idempotent. False only when `dir` cannot be created.
     #[pyfunction]
-    #[pyo3(signature = (dir, min_bytes, cache_bytes=256 << 20))]
-    pub fn arena_install(py: Python<'_>, dir: PathBuf, min_bytes: usize, cache_bytes: usize) -> PyResult<bool> {
-        if ARENA.get().is_some() {
-            return Ok(true);
-        }
-        let mods = ["numpy._core._multiarray_umath", "numpy.core._multiarray_umath"];
-        let Some(api) = mods.iter().find_map(|m| py.import(*m).ok().and_then(|m| m.getattr("_ARRAY_API").ok())) else {
-            return Ok(false);
-        };
-        std::fs::create_dir_all(&dir).map_err(os_err)?;
-        // SAFETY: `_ARRAY_API` is NumPy's C-API table (a capsule of void*[]);
-        // entry 305 is PyDataMem_GetHandler (NumPy >= 1.22), which returns a
-        // capsule named "mem_handler" holding the current PyDataMem_Handler.
-        unsafe {
-            let table = pyo3::ffi::PyCapsule_GetPointer(api.as_ptr(), std::ptr::null()) as *const *const c_void;
-            if table.is_null() {
-                pyo3::ffi::PyErr_Clear();
-                return Ok(false);
-            }
-            let get_handler: unsafe extern "C" fn() -> *mut pyo3::ffi::PyObject = std::mem::transmute(*table.add(305));
-            let cap = get_handler();
-            if cap.is_null() {
-                pyo3::ffi::PyErr_Clear();
-                return Ok(false);
-            }
-            let handler = pyo3::ffi::PyCapsule_GetPointer(cap, c"mem_handler".as_ptr()) as *mut Handler;
-            pyo3::ffi::Py_DecRef(cap); // the handler struct is static in NumPy
-            if handler.is_null() || (*handler).version != 1 {
-                pyo3::ffi::PyErr_Clear();
-                return Ok(false);
-            }
-            let prev = (*handler).allocator;
-            if prev.malloc.is_none() || prev.calloc.is_none() || prev.realloc.is_none() || prev.free.is_none() {
-                return Ok(false);
-            }
+    #[pyo3(signature = (dir, min_bytes, cache_bytes=256 << 20, raw=false))]
+    pub fn arena_install(
+        py: Python<'_>,
+        dir: PathBuf,
+        min_bytes: usize,
+        cache_bytes: usize,
+        raw: bool,
+    ) -> PyResult<bool> {
+        if ARENA.get().is_none() {
+            std::fs::create_dir_all(&dir).map_err(os_err)?;
             let ar = Arena {
                 dir,
                 min: min_bytes.max(4096),
                 cache_max: cache_bytes,
-                prev: Prev(prev),
+                numpy: OnceLock::new(),
                 seq: AtomicU64::new(0),
                 live: Mutex::new(BTreeMap::new()),
                 cache: Mutex::new(Vec::new()),
@@ -840,10 +1088,58 @@ mod arena {
                 claims: AtomicU64::new(0),
                 fallbacks: AtomicU64::new(0),
             };
-            if ARENA.set(ar).is_err() {
-                return Ok(true);
+            if ARENA.set(ar).is_ok() {
+                // SAFETY: registers the process-wide fork handlers, once.
+                unsafe { libc::pthread_atfork(Some(atfork_prepare), Some(atfork_parent), Some(atfork_child)) };
             }
-            libc::pthread_atfork(Some(atfork_prepare), Some(atfork_parent), Some(atfork_child));
+        }
+        if raw {
+            hook_raw();
+        }
+        hook_numpy(py);
+        Ok(true)
+    }
+
+    /// Patch NumPy's default allocator, if NumPy is loaded (never importing
+    /// it) and not patched yet.
+    fn hook_numpy(py: Python<'_>) {
+        let ar = arena();
+        if ar.numpy.get().is_some() {
+            return;
+        }
+        let Ok(modules) = py.import("sys").and_then(|s| s.getattr("modules")) else { return };
+        let mods = ["numpy._core._multiarray_umath", "numpy.core._multiarray_umath"];
+        let Some(api) = mods.iter().find_map(|m| modules.get_item(*m).ok()?.getattr("_ARRAY_API").ok()) else {
+            return;
+        };
+        // SAFETY: `_ARRAY_API` is NumPy's C-API table (a capsule of void*[]);
+        // entry 305 is PyDataMem_GetHandler (NumPy >= 1.22), which returns a
+        // capsule named "mem_handler" holding the current PyDataMem_Handler.
+        unsafe {
+            let table = pyo3::ffi::PyCapsule_GetPointer(api.as_ptr(), std::ptr::null()) as *const *const c_void;
+            if table.is_null() {
+                pyo3::ffi::PyErr_Clear();
+                return;
+            }
+            let get_handler: unsafe extern "C" fn() -> *mut pyo3::ffi::PyObject = std::mem::transmute(*table.add(305));
+            let cap = get_handler();
+            if cap.is_null() {
+                pyo3::ffi::PyErr_Clear();
+                return;
+            }
+            let handler = pyo3::ffi::PyCapsule_GetPointer(cap, c"mem_handler".as_ptr()) as *mut Handler;
+            pyo3::ffi::Py_DecRef(cap); // the handler struct is static in NumPy
+            if handler.is_null() || (*handler).version != 1 {
+                pyo3::ffi::PyErr_Clear();
+                return;
+            }
+            let prev = (*handler).allocator;
+            if prev.malloc.is_none() || prev.calloc.is_none() || prev.realloc.is_none() || prev.free.is_none() {
+                return;
+            }
+            if ar.numpy.set(Prev(prev)).is_err() {
+                return;
+            }
             // The handler struct is NumPy's default policy, shared by every
             // context and thread: patching it in place routes them all here.
             (*handler).allocator.malloc = Some(h_malloc);
@@ -851,7 +1147,6 @@ mod arena {
             (*handler).allocator.realloc = Some(h_realloc);
             (*handler).allocator.free = Some(h_free);
         }
-        Ok(true)
     }
 
     /// Store the arena allocation holding `buffer` as the file `dest`
@@ -872,7 +1167,7 @@ mod arena {
             if ptr + len > base + a.len || a.foreign {
                 return Ok(None);
             }
-            if a.published && dirty(base, a.len) {
+            if a.published && changed(base, a, ptr, len) {
                 return Ok(None);
             }
             match std::fs::hard_link(&a.path, &dest) {
@@ -890,6 +1185,7 @@ mod arena {
                     return Ok(None);
                 }
                 a.published = true;
+                note_written(a.len as u64); // an object now, until the peer's next measurement
             }
             ar.claims.fetch_add(1, Ordering::Relaxed);
             Ok(Some((ptr - base) as u64))

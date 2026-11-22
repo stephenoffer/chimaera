@@ -1,0 +1,171 @@
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "1M", "op": "put", "median_s": 0.00037637600007656147, "min_s": 0.00030974099990999093, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "16M", "op": "put", "median_s": 0.0018056364997391938, "min_s": 0.0006244320002224413, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "256M", "op": "put", "median_s": 0.011004013500041765, "min_s": 0.0052863990003970684, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "numpy", "size": "1G", "op": "put", "median_s": 0.04117746200017791, "min_s": 0.02002909200018621, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "1M", "op": "put", "median_s": 0.00031756699945617584, "min_s": 0.00025656399975559907, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "16M", "op": "put", "median_s": 0.0005432144998849253, "min_s": 0.0004982539994671242, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "256M", "op": "put", "median_s": 0.005400060000283702, "min_s": 0.005321698999978253, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "bytes", "size": "1G", "op": "put", "median_s": 0.019787981500030583, "min_s": 0.019579648999751953, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "1M", "op": "put", "median_s": 0.0006410545001926948, "min_s": 0.0006003979997331044, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "16M", "op": "put", "median_s": 0.027706765999937488, "min_s": 0.02700134099995921, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "256M", "op": "put", "median_s": 0.2996012515000075, "min_s": 0.2990555389997098, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "torch", "size": "1G", "op": "put", "median_s": 1.207203655000285, "min_s": 1.2061575049992825, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "1M", "op": "put", "median_s": 0.000651123000352527, "min_s": 0.0006126329999460722, "n": 200, "payload": 1218492}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "16M", "op": "put", "median_s": 0.002735642000061489, "min_s": 0.0025940920004359214, "n": 40, "payload": 19496064}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "256M", "op": "put", "median_s": 0.03723261650020504, "min_s": 0.03705283900035283, "n": 8, "payload": 311932170}
+{"runtime": "ray", "scenario": "put", "kind": "arrow", "size": "1G", "op": "put", "median_s": 0.154097316500156, "min_s": 0.1498722230007843, "n": 4, "payload": 1247728313}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "1M", "op": "put", "median_s": 0.00043403600011515664, "min_s": 0.00039223299972945824, "n": 200, "payload": 1048576}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "16M", "op": "put", "median_s": 0.0018928545005110209, "min_s": 0.0017597000005480368, "n": 40, "payload": 16777216}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "256M", "op": "put", "median_s": 0.006719654500557226, "min_s": 0.006557967999469838, "n": 8, "payload": 268435456}
+{"runtime": "ray", "scenario": "put", "kind": "nested", "size": "1G", "op": "put", "median_s": 0.021271588499075733, "min_s": 0.020936842000082834, "n": 4, "payload": 1073741824}
+{"runtime": "ray", "done": "put", "wall_s": 33.2}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1M", "op": "get", "median_s": 9.474299986322876e-05, "min_s": 8.355200043297373e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1M", "op": "put+get", "median_s": 0.0004678095001509064, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1M", "op": "touch", "median_s": 1.8282000382896513e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "16M", "op": "get", "median_s": 9.773050078365486e-05, "min_s": 8.944100045482628e-05, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "16M", "op": "put+get", "median_s": 0.0007111969989637146, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "16M", "op": "touch", "median_s": 6.451500030379975e-05, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "256M", "op": "get", "median_s": 0.00014043650025996612, "min_s": 0.0001264889997401042, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "256M", "op": "put+get", "median_s": 0.005425427500085789, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "256M", "op": "touch", "median_s": 0.0008053415003814735, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1G", "op": "get", "median_s": 0.00017144950015790528, "min_s": 0.0001502230006735772, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1G", "op": "put+get", "median_s": 0.020974455500436306, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "numpy", "size": "1G", "op": "touch", "median_s": 0.0030459455001619062, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1M", "op": "get", "median_s": 0.00016533449979760917, "min_s": 0.00014935900071577635, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1M", "op": "put+get", "median_s": 0.0004761359996336978, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1M", "op": "touch", "median_s": 1.871150016086176e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "16M", "op": "get", "median_s": 0.0014795024999330053, "min_s": 0.001425194999683299, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "16M", "op": "put+get", "median_s": 0.002041815499069344, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "16M", "op": "touch", "median_s": 5.7940499573305715e-05, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "256M", "op": "get", "median_s": 0.13071152700013045, "min_s": 0.13003704699985974, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "256M", "op": "put+get", "median_s": 0.13638395750149357, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "256M", "op": "touch", "median_s": 0.0007249939999383059, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1G", "op": "get", "median_s": 0.521516064500247, "min_s": 0.5190742239992687, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1G", "op": "put+get", "median_s": 0.5418170319999263, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "bytes", "size": "1G", "op": "touch", "median_s": 0.0030206504998204764, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1M", "op": "get", "median_s": 0.00040763850029179594, "min_s": 0.00037492400042538065, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1M", "op": "put+get", "median_s": 0.0010138515008293325, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1M", "op": "touch", "median_s": 3.073699917877093e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "16M", "op": "get", "median_s": 0.0031229589994836715, "min_s": 0.003011840999533888, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "16M", "op": "put+get", "median_s": 0.019553543000256468, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "16M", "op": "touch", "median_s": 0.00010037999982159818, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "256M", "op": "get", "median_s": 0.2724714285004666, "min_s": 0.27149914700021327, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "256M", "op": "put+get", "median_s": 0.5758491715014316, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "256M", "op": "touch", "median_s": 0.0008655395004097954, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1G", "op": "get", "median_s": 1.097454697000103, "min_s": 1.0829559310004697, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1G", "op": "put+get", "median_s": 2.270893593999972, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "torch", "size": "1G", "op": "touch", "median_s": 0.0031961370004864875, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1M", "op": "get", "median_s": 0.00020523850071185734, "min_s": 0.00014763099898118526, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1M", "op": "put+get", "median_s": 0.0010496084996702848, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1M", "op": "touch", "median_s": 5.553399932978209e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "16M", "op": "get", "median_s": 0.0002672575001270161, "min_s": 0.00024246400062111206, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "16M", "op": "put+get", "median_s": 0.004112497500500467, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "16M", "op": "touch", "median_s": 0.00012231200071255444, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "256M", "op": "get", "median_s": 0.00035239499993622303, "min_s": 0.00031033299819682725, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "256M", "op": "put+get", "median_s": 0.050393668499964406, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "256M", "op": "touch", "median_s": 0.0009335945005659596, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1G", "op": "get", "median_s": 0.0004477494994716835, "min_s": 0.000429113999416586, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1G", "op": "put+get", "median_s": 0.14775819350052188, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "arrow", "size": "1G", "op": "touch", "median_s": 0.003082515499954752, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1M", "op": "get", "median_s": 0.00011657400045805844, "min_s": 0.00010269299855281133, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1M", "op": "put+get", "median_s": 0.0005281425001157913, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1M", "op": "touch", "median_s": 4.7412499952770304e-05, "n": 200}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "16M", "op": "get", "median_s": 0.00012422300005709985, "min_s": 0.00010961800035147462, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "16M", "op": "put+get", "median_s": 0.0020834255001318525, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "16M", "op": "touch", "median_s": 8.250350037997123e-05, "n": 40}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "256M", "op": "get", "median_s": 0.00017529599972476717, "min_s": 0.00016654499995638616, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "256M", "op": "put+get", "median_s": 0.006762904999959574, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "256M", "op": "touch", "median_s": 0.000701742499586544, "n": 8}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1G", "op": "get", "median_s": 0.0001947129994732677, "min_s": 0.00017762000061338767, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1G", "op": "put+get", "median_s": 0.021562616000665003, "n": 4}
+{"runtime": "ray", "scenario": "get", "kind": "nested", "size": "1G", "op": "touch", "median_s": 0.0024910239999371697, "n": 4}
+{"runtime": "ray", "done": "get", "wall_s": 47.0}
+{"runtime": "ray", "scenario": "return", "kind": "none", "size": "0", "op": "call", "median_s": 0.0003831549993265071}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "1M", "op": "return", "median_s": 0.0009040749991982011, "min_s": 0.0008220499985327478, "overhead_s": 0.000520919999871694, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "16M", "op": "return", "median_s": 0.001141312500294589, "min_s": 0.0010682119991543004, "overhead_s": 0.0007581575009680819, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "256M", "op": "return", "median_s": 0.0064350965003541205, "min_s": 0.0062982479994389, "overhead_s": 0.006051941501027613, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "numpy", "size": "1G", "op": "return", "median_s": 0.02106063700011873, "min_s": 0.020611982999980683, "overhead_s": 0.020677482000792224, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "1M", "op": "return", "median_s": 0.0008832710000206134, "min_s": 0.0008132769999065204, "overhead_s": 0.0005001160006941063, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "16M", "op": "return", "median_s": 0.0024430075000054785, "min_s": 0.0023449370000889758, "overhead_s": 0.0020598525006789714, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "256M", "op": "return", "median_s": 0.14538610950057773, "min_s": 0.14409419399999024, "overhead_s": 0.14500295450125122, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "bytes", "size": "1G", "op": "return", "median_s": 0.5918231779996859, "min_s": 0.5899982820010337, "overhead_s": 0.5914400230003594, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "1M", "op": "return", "median_s": 0.0014870574996166397, "min_s": 0.001417834000676521, "overhead_s": 0.0011039025002901326, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "16M", "op": "return", "median_s": 0.0334693149998202, "min_s": 0.030733257999600028, "overhead_s": 0.03308616000049369, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "256M", "op": "return", "median_s": 0.601091418499891, "min_s": 0.5963190000002214, "overhead_s": 0.6007082635005645, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "torch", "size": "1G", "op": "return", "median_s": 2.352699150999797, "min_s": 2.343382274999385, "overhead_s": 2.3523159960004705, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "1M", "op": "return", "median_s": 0.001234053499501897, "min_s": 0.0011619939996307949, "overhead_s": 0.0008508985001753899, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "16M", "op": "return", "median_s": 0.0035468030009724316, "min_s": 0.003378415000042878, "overhead_s": 0.0031636480016459245, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "256M", "op": "return", "median_s": 0.035841101999722014, "min_s": 0.03525175799950375, "overhead_s": 0.03545794700039551, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "arrow", "size": "1G", "op": "return", "median_s": 0.14155213950016332, "min_s": 0.14074019300096552, "overhead_s": 0.1411689845008368, "n": 4}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "1M", "op": "return", "median_s": 0.0009875294999801554, "min_s": 0.0009090769999602344, "overhead_s": 0.0006043745006536483, "n": 200}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "16M", "op": "return", "median_s": 0.002517576000172994, "min_s": 0.0023896809998404933, "overhead_s": 0.002134421000846487, "n": 40}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "256M", "op": "return", "median_s": 0.007292940000297676, "min_s": 0.007215589999759686, "overhead_s": 0.006909785000971169, "n": 8}
+{"runtime": "ray", "scenario": "return", "kind": "nested", "size": "1G", "op": "return", "median_s": 0.021935548500550794, "min_s": 0.02161661100035417, "overhead_s": 0.021552393501224287, "n": 4}
+{"runtime": "ray", "done": "return", "wall_s": 47.4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "none", "size": "0", "op": "call", "median_s": 0.0008125360000121873}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "1M", "op": "pipeline", "median_s": 0.0014658230002169148, "min_s": 0.0013474089992087102, "overhead_s": 0.0006532870002047275, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "16M", "op": "pipeline", "median_s": 0.0017454019998695003, "min_s": 0.0016782959992269753, "overhead_s": 0.000932865999857313, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "256M", "op": "pipeline", "median_s": 0.00790915200013842, "min_s": 0.007770374000756419, "overhead_s": 0.007096616000126232, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "numpy", "size": "1G", "op": "pipeline", "median_s": 0.02414765750108927, "min_s": 0.023689012999966508, "overhead_s": 0.023335121501077083, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "1M", "op": "pipeline", "median_s": 0.0014665809994767187, "min_s": 0.0013652970010298304, "overhead_s": 0.0006540449994645314, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "16M", "op": "pipeline", "median_s": 0.0030695119994561537, "min_s": 0.002998952000780264, "overhead_s": 0.0022569759994439664, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "256M", "op": "pipeline", "median_s": 0.14978229999996984, "min_s": 0.14922050299901457, "overhead_s": 0.14896976399995765, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "bytes", "size": "1G", "op": "pipeline", "median_s": 0.594089004000125, "min_s": 0.5914266049985599, "overhead_s": 0.5932764680001128, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "1M", "op": "pipeline", "median_s": 0.002396052500444057, "min_s": 0.0018787580011121463, "overhead_s": 0.0015835165004318696, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "16M", "op": "pipeline", "median_s": 0.024711256999580655, "min_s": 0.01716368500092358, "overhead_s": 0.023898720999568468, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "256M", "op": "pipeline", "median_s": 0.5864271054997516, "min_s": 0.5787683960006689, "overhead_s": 0.5856145694997394, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "torch", "size": "1G", "op": "pipeline", "median_s": 2.370954172499296, "min_s": 2.3272515980006574, "overhead_s": 2.3701416364992838, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "1M", "op": "pipeline", "median_s": 0.0018233790005979245, "min_s": 0.0017297989998041885, "overhead_s": 0.0010108430005857372, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "16M", "op": "pipeline", "median_s": 0.004403863001243735, "min_s": 0.00425826700120524, "overhead_s": 0.003591327001231548, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "256M", "op": "pipeline", "median_s": 0.037800091000463, "min_s": 0.03665674199874047, "overhead_s": 0.03698755500045081, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "arrow", "size": "1G", "op": "pipeline", "median_s": 0.14413650200003758, "min_s": 0.14355168000111007, "overhead_s": 0.1433239660000254, "n": 4}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "1M", "op": "pipeline", "median_s": 0.0015337975000875304, "min_s": 0.0014135029996396042, "overhead_s": 0.0007212615000753431, "n": 200}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "16M", "op": "pipeline", "median_s": 0.003203180999662436, "min_s": 0.003064200998778688, "overhead_s": 0.002390644999650249, "n": 40}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "256M", "op": "pipeline", "median_s": 0.008873995499925513, "min_s": 0.008678707999933977, "overhead_s": 0.008061459499913326, "n": 8}
+{"runtime": "ray", "scenario": "pipeline", "kind": "nested", "size": "1G", "op": "pipeline", "median_s": 0.025901846500346437, "min_s": 0.025439532000746112, "overhead_s": 0.02508931050033425, "n": 4}
+{"runtime": "ray", "done": "pipeline", "wall_s": 49.6}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1K", "op": "put", "per_object_s": 0.00015491627840001455, "n": 10000}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1K", "op": "get", "per_object_s": 1.5765627099972335e-05, "n": 10000, "call_s": 0.36701595800150244}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "64K", "op": "put", "per_object_s": 0.00015728540270010854, "n": 10000}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "64K", "op": "get", "per_object_s": 4.3688355599988426e-05, "n": 10000, "call_s": 0.6335786820000067}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1M", "op": "put", "per_object_s": 0.000308610641113205, "n": 2048}
+{"runtime": "ray", "scenario": "many", "kind": "bytes", "size": "1M", "op": "get", "per_object_s": 0.0004827516000975862, "n": 2048, "call_s": 1.117223978999391}
+{"runtime": "ray", "done": "many", "wall_s": 6.9}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "16M", "op": "put", "median_s": 0.0016238890000295214, "min_s": 0.0005256340000414639, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "256M", "op": "put", "median_s": 0.01054797399990548, "min_s": 0.010396391000085714, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "1G", "op": "put", "median_s": 0.03740449149995584, "min_s": 0.03710876100012683, "n": 4, "payload": 1073741824}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "16M", "op": "put", "median_s": 0.0006077435000406695, "min_s": 0.0005541420000554353, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "256M", "op": "put", "median_s": 0.010630431499976112, "min_s": 0.010571527000138303, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "torch", "size": "1G", "op": "put", "median_s": 0.038161821499898, "min_s": 0.03786945300021216, "n": 4, "payload": 1073741824}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "16M", "op": "put", "median_s": 0.0018476180000561726, "min_s": 0.0017482090001976758, "n": 40, "payload": 19496064}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "256M", "op": "put", "median_s": 0.005914480499995989, "min_s": 0.005776776999937283, "n": 8, "payload": 311932170}
+{"runtime": "chimaera", "scenario": "put", "kind": "arrow", "size": "1G", "op": "put", "median_s": 0.01956431300004624, "min_s": 0.01946775099986553, "n": 4, "payload": 1247728313}
+{"runtime": "chimaera", "done": "put", "wall_s": 17.2}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "get", "median_s": 0.001794980999989093, "min_s": 0.0017096420001507795, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "put+get", "median_s": 0.002750935499989282, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "touch", "median_s": 0.00010217049998573202, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "get", "median_s": 0.133894041999838, "min_s": 0.13342237799997747, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "put+get", "median_s": 0.14375124199978018, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "touch", "median_s": 0.0008143960001234518, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1G", "op": "get", "median_s": 0.5363185615000248, "min_s": 0.5333418459999848, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1G", "op": "put+get", "median_s": 0.5720353195001735, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1G", "op": "touch", "median_s": 0.0031651174999751674, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "16M", "op": "get", "median_s": 7.27230000165946e-05, "min_s": 5.635699994854804e-05, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "16M", "op": "put+get", "median_s": 0.0007262090000494936, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "16M", "op": "touch", "median_s": 7.787300000927644e-05, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "256M", "op": "get", "median_s": 0.00011888649999036716, "min_s": 0.00011803899997175904, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "256M", "op": "put+get", "median_s": 0.010072953999952006, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "256M", "op": "touch", "median_s": 0.0008349744999804898, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1G", "op": "get", "median_s": 0.0001245059999064324, "min_s": 0.00011719299982360099, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1G", "op": "put+get", "median_s": 0.03560724199996912, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "torch", "size": "1G", "op": "touch", "median_s": 0.00309441249999054, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "16M", "op": "get", "median_s": 0.00013746299998729228, "min_s": 0.00011595299997679831, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "16M", "op": "put+get", "median_s": 0.0019314754999868455, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "16M", "op": "touch", "median_s": 0.00023550899993551866, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "256M", "op": "get", "median_s": 0.00023490349997246085, "min_s": 0.0002287649999743735, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "256M", "op": "put+get", "median_s": 0.005679796499862277, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "256M", "op": "touch", "median_s": 0.0011862310000196885, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1G", "op": "get", "median_s": 0.000359592499989958, "min_s": 0.00034198599996670964, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1G", "op": "put+get", "median_s": 0.01872007599990866, "n": 4}
+{"runtime": "chimaera", "scenario": "get", "kind": "arrow", "size": "1G", "op": "touch", "median_s": 0.00409456350007531, "n": 4}
+{"runtime": "chimaera", "done": "get", "wall_s": 23.2}

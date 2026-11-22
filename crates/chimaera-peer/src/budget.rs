@@ -212,19 +212,27 @@ pub fn private_bytes(pid: u32) -> Option<u64> {
     }
 }
 
-/// What a process holds between calls (see [`parse_status_held`]); the
-/// private memory where there is no arena.
-pub fn held_bytes(pid: u32) -> Option<u64> {
+/// A process's private memory (see [`private_bytes`]) and what it holds
+/// between calls (see [`parse_status_held`]; None: the private memory, where
+/// there is no arena), from one read of its status: both are taken after
+/// every call.
+pub fn private_and_held(pid: u32) -> Option<(u64, Option<u64>)> {
     if cfg!(target_os = "linux") {
-        read(format!("/proc/{pid}/status")).and_then(|s| parse_status_held(&s))
+        let s = read(format!("/proc/{pid}/status"))?;
+        Some((parse_status_private(&s)?, parse_status_held(&s)))
     } else {
-        private_bytes(pid)
+        private_bytes(pid).map(|p| (p, None))
     }
 }
 
-/// Free space on the filesystem holding objects below which new calls wait:
-/// writing an object there would fail part-way.
+/// Free space on the filesystem holding objects below which new calls wait
+/// (writing an object there would fail part-way): 512 MiB, or a tenth of a
+/// smaller filesystem, so it stays under what spilling keeps free (a fifth).
 pub const DISK_RESERVE: u64 = 512 << 20;
+
+fn disk_reserve(total: u64) -> u64 {
+    DISK_RESERVE.min(total / 10)
+}
 
 /// Bytes free to unprivileged writers on the filesystem holding `path`.
 pub fn disk_free(path: &Path) -> Option<u64> {
@@ -257,9 +265,9 @@ pub fn spill_for_space(free: u64, total: u64) -> u64 {
 /// Why new calls wait for disk, or None: the objects' filesystem is under
 /// DISK_RESERVE free. A fixed amount, not a fraction: a large disk that is
 /// mostly full but has room keeps working.
-pub fn disk_wait(free: Option<u64>, dir: &Path) -> Option<String> {
-    let free = free?;
-    (free < DISK_RESERVE).then(|| {
+pub fn disk_wait(space: Option<(u64, u64)>, dir: &Path) -> Option<String> {
+    let (free, total) = space?;
+    (free < disk_reserve(total)).then(|| {
         format!(
             "the filesystem holding objects ({}) has {} MiB free; new calls wait for room \
              (finished calls' arguments and ended runs' stored values are deleted)",
@@ -348,11 +356,17 @@ mod tests {
         assert_eq!(parse_status_private("Name: x\n"), None);
         // New calls wait only when the objects' filesystem is nearly full.
         let dir = Path::new("/tmp/objects");
+        let big = 400u64 << 30;
         assert!(
-            disk_wait(Some(100 << 20), dir).is_some_and(|w| w.contains("100 MiB free") && w.contains("/tmp/objects"))
+            disk_wait(Some((100 << 20, big)), dir)
+                .is_some_and(|w| w.contains("100 MiB free") && w.contains("/tmp/objects"))
         );
-        assert_eq!(disk_wait(Some(20 << 30), dir), None);
+        assert_eq!(disk_wait(Some((20 << 30, big)), dir), None);
         assert_eq!(disk_wait(None, dir), None, "unknown free space never blocks");
+        // A small filesystem waits only below a tenth of it, under the fifth
+        // that spilling keeps free, so spilling always gets there first.
+        assert_eq!(disk_wait(Some((100 << 20, 700 << 20)), dir), None);
+        assert!(disk_wait(Some((60 << 20, 700 << 20)), dir).is_some());
         assert_eq!(spill_for_space(100 << 20, 1000 << 20), 100 << 20, "a 1000 MiB tmpfs keeps 200 MiB free");
         assert_eq!(spill_for_space(500 << 20, 1000 << 20), 0);
         assert!(disk_free(Path::new("/")).is_some_and(|b| b > 0));

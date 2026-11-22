@@ -1,0 +1,21 @@
+# Head-to-head on one machine: Ray vs Chimaera
+# (c7i.4xlarge, 16 vCPU), one after the other.
+#   anyscale job submit -f deploy/anyscale/eval-1node.job.yaml --wait
+name: chimaera-eval-1node
+cloud: anyscale_v2_default_cloud
+compute_config:
+  cloud: anyscale_v2_default_cloud
+  head_node:
+    instance_type: c7i.4xlarge
+    # Schedulable head: both runtimes use the whole machine.
+    resources:
+      CPU: 16
+  worker_nodes: []
+working_dir: .
+excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
+entrypoint: bash deploy/anyscale/run_eval_multi.sh
+env_vars:
+  # Timed repetitions per workload after a warm-up (the job's hour bounds it).
+  EVAL_MIN_SECONDS: "60"
+max_retries: 0
+timeout_s: 3600

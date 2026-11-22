@@ -13,8 +13,8 @@ The other examples show planned API and say which phase adds it.
 | Phase | Adds |
 |---|---|
 | M1 (today) | The local runtime: functions, futures, maps, actors, pools, options, recovery, accounting, reattach. Streaming generators are finishing. |
-| P2 (today) | The rest of Tier 1: forwarding, multiple returns, per-call actor options, concurrency groups, `ch.actor`, subtree cancel, `Run.cancel`, priority, `ch.Queue`, `ch.Topic`. |
-| P3 | Several machines: clusters on SSH, Kubernetes, Slurm and clouds, `ch.Store`, placement, `ch.cluster()`, shipped environments. |
+| P2 (today) | The rest of Tier 1: forwarding, multiple returns, per-call actor options, concurrency groups, `ch.actor`, subtree cancel, `Run.cancel`, priority, `ch.coord.Queue`, `ch.coord.Topic`. |
+| P3 | Several machines: clusters on SSH, Kubernetes, Slurm and clouds, `ch.coord.Store`, placement, `ch.runs.cluster()`, shipped environments. |
 | P4 | CPU at scale: sources, sinks and shuffle, autoscaled and shared pools, metrics. |
 | P5 | Accelerators and gangs: device plugins, rank groups and collectives, reservations, compiled graphs. |
 | P6 | Elastic infrastructure: autoscaling providers, tenants, budgets. |
@@ -24,7 +24,7 @@ The other examples show planned API and say which phase adds it.
 1. **Five things to start:** `@ch.remote`, `.remote()`, `.map()`, `.result()` or `await`, and `Class.remote()`.
 2. **One handle type.** A call returns a `Future[T]`. Anything that yields many values returns `Results[T]`: maps, generators, subscriptions, watches.
 3. **Settings are keyword options**, checked where you write them. A typo fails on that line with a suggestion. Your own keyword arguments never collide with options, because `.remote(...)` takes only your arguments.
-4. **The same words mean the same thing everywhere.** `key=` is a stable identity (get or create); `lifetime="run"` or `"detached"` says what outlives the script.
+4. **The same words mean the same thing everywhere.** `name=` is a stable identity (get or create) for actors, pools, queues, topics and groups; `detach=True` says something outlives the script.
 5. **Three ways to run many copies of a class:** an actor is one identity, a pool is interchangeable replicas, a gang is SPMD ranks.
 6. **Options never change a return type.** Generators are recognized from the function, multiple returns use `.split()`, gangs use `.gang()`.
 7. **`async def` never changes semantics.** An async method runs one call at a time per actor, like a plain one, unless you ask for concurrency.
@@ -135,14 +135,14 @@ no argument a local peer starts on demand. See [deploy.md](deploy.md).
 ### Options, scopes and partial application
 
 Set options on the decorator, on one call with `.options(...)`, or for a block
-with `with ch.options(...)`. The closest setting wins. Sizes need a byte unit.
+with `with ch.defaults(...)`. The closest setting wins. Sizes need a byte unit.
 **Runs today:**
 
 ```python run
 heavy = word_count.options(cpus=2, memory="512 MiB")
 assert heavy.remote("a b c").result() == 3
 
-with ch.options(deadline="30s"):
+with ch.defaults(deadline="30s"):
     assert word_count.remote("x").result() == 1
 
 @ch.remote
@@ -163,7 +163,7 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 | `deadline` | Relative (`"30s"`) or a `datetime`; children inherit the earliest one. |
 | `concurrency` | Calls an actor may run at once (default 1). |
 | `max_in_flight`, `max_in_flight_bytes` | Bounds for a map's window. |
-| `key`, `lifetime`, `restart`, `max_restarts` | Actor identity and recovery. `restart="checkpoint"` acts like `"fresh"` until durable actors (P3). |
+| `name`, `detach`, `restart`, `max_restarts` | Actor identity and recovery. |
 | `replicas` | Pool size, or `ch.auto(...)` (P4 controller). |
 | `latency="interactive"` | Never batch these calls. |
 | `adaptive` | `"on"`, `"observe"` (record proposals only) or `"frozen"`. Accepted today; the live controllers that read it arrive in P4. |
@@ -174,7 +174,7 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 
 ```python run
 futures = [word_count.remote("a " * n) for n in range(5)]
-assert ch.gather(*futures) == [0, 1, 2, 3, 4]
+assert ch.get(futures) == [0, 1, 2, 3, 4]
 assert sorted(f.result() for f in ch.as_completed(futures)) == [0, 1, 2, 3, 4]
 ```
 
@@ -190,7 +190,7 @@ words = ch.put(["blue", "sky"] * 50_000)
 def count(items: list[str], word: str) -> int:
     return items.count(word)
 
-assert ch.gather(count.remote(words, "blue"), count.remote(words, "sky")) == [50_000, 50_000]
+assert ch.get([count.remote(words, "blue"), count.remote(words, "sky")]) == [50_000, 50_000]
 ```
 
 `ch.put` returns an already-finished `Future[T]`, so there is one handle
@@ -220,7 +220,7 @@ except ch.Infeasible as e:
 | You see | It means |
 |---|---|
 | Your own exception | Your code raised it; it ran once (unless listed in `retry_exceptions`). |
-| `ch.InfrastructureFailure`, `ch.WorkerCrashed` | Workers kept dying until the attempts ran out. |
+| `ch.InfrastructureFailure`, `ch.errors.WorkerCrashed` | Workers kept dying until the attempts ran out. |
 | `ch.OutOfMemory` | Over `memory_limit`; carries the peak and the limit. |
 | `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died. |
 | `ch.Infeasible` | Nothing can ever run this request; the message names the constraint. |
@@ -229,22 +229,25 @@ except ch.Infeasible as e:
 | `ch.OptionsError` | Options conflict; the message names each field and where it was set. |
 | `TimeoutError` | Your wait ended; the call is still running. |
 
-`ch.NotFound` means nothing exists under a name (`ch.actor(key)`), `ch.Closed`
-that a queue or topic was closed, `ch.VersionConflict` that a store's
-compare-and-set lost, and `ch.LeaseLost` that a fenced write's lock passed to
-someone else. `ch.GangFailed` means every generation of a gang lost a rank.
+`ch.NotFound` means nothing exists under a name (`ch.actor(name)`), `ch.errors.Closed`
+that a queue or topic was closed, `ch.errors.VersionConflict` that a store's
+compare-and-set lost, and `ch.errors.LeaseLost` that a fenced write's lock passed to
+someone else. `ch.errors.GangFailed` means every generation of a gang lost a rank.
+`ch.errors.QuorumLost` (an `InfrastructureFailure`) means a group of the cluster lost
+the majority of its peers and took no writes for a minute; the message names
+the group, and calls go through again once enough of its peers are back.
 `ch.EnvironmentMismatch` is planned, for a driver whose environment no peer
 can run.
 
 ### Actors: names, pools, context
 
-`key=` gets or creates one named actor. A pool is a set of interchangeable
+`name=` gets or creates one named actor. A pool is a set of interchangeable
 replicas; `pool.method.map(items)` spreads calls across them. Inside a call,
 `ch.context()` says who you are. **Runs today:**
 
 ```python run
-a = Counter.options(key="docs/counter").remote()
-b = Counter.options(key="docs/counter").remote()
+a = Counter.options(name="docs/counter").remote()
+b = Counter.options(name="docs/counter").remote()
 a.increment.remote(5).result()
 assert b.increment.remote(1).result() == 6
 
@@ -269,13 +272,13 @@ assert whoami.remote().result() and ch.context() is None   # None in the driver
 ### Runs, reattaching, explaining
 
 Every script gets a run. `ch.init()` returns it; a `Run` is its id string, so
-another process can reattach with `ch.attach(run_id)`, even after the local
+another process can reattach with `ch.runs.attach(run_id)`, even after the local
 peer restarted. `run.tasks()` lists its calls, `run.cancel()` stops them all,
 and any call can explain what happened to it. **Runs today:**
 
 ```python run
 run = ch.init()
-assert ch.attach(run).status()             # this run's calls, counted by state
+assert ch.runs.attach(run).status()             # this run's calls, counted by state
 
 f = word_count.remote("explain me")
 f.result()
@@ -296,7 +299,7 @@ def shout(word: str) -> None:
     print(word.upper())
 
 shout.remote("kept").result()
-assert any(line.endswith("stdout| KEPT") for line in ch.current_run().logs())
+assert any(line.endswith("stdout| KEPT") for line in ch.runs.current_run().logs())
 ```
 
 ### Dynamic graphs and multiple returns
@@ -321,6 +324,14 @@ lo, hi = bounds.remote([4, 1, 9]).split()
 assert add.remote(lo, hi).result() == 10
 ```
 
+A consumer of one value decodes only that value. Where the values are stored
+depends on the cluster. On a few peers, a result is one file: each peer
+fetches it once for all of its consumers. When the consumers spread out, about
+one per peer as in a large shuffle, each value of 64 KiB or more is a stored
+object of its own, and a consumer fetches only its value. The executor picks
+the layout from the live peer count (`worth_splitting` in `_executor.py`: one
+more fetch is weighed as 1 MiB of transfer). Parts are freed with their result.
+
 `future.cancel()` cancels the call and every call it started that has not
 finished, including calls a cancelled body starts afterwards. Cancellation is
 cooperative: a running body stops when it checks `ch.context().cancelled()`,
@@ -331,7 +342,7 @@ for capacity on a peer (higher first); it never stops a running call.
 
 `.options()` on a method sets things for one call. `@ch.method` sets them for
 every call of a method. A concurrency group runs its methods beside the actor's
-other calls, so a slow call does not block them. `ch.actor(key)` finds a named
+other calls, so a slow call does not block them. `ch.actor(name)` finds a named
 actor from anywhere. An actor handle reserves the names `close` and `id`
 (`handle.close()` ends the actor), so give methods other names. **Runs today:**
 
@@ -352,7 +363,7 @@ class Service:
     def pair(self) -> tuple[str, str]:
         return "a", "b"
 
-svc = Service.options(key="docs/service").remote()
+svc = Service.options(name="docs/service").remote()
 busy = svc.slow.remote(2.0)
 assert svc.ping.remote().result(timeout=1.5) == "pong"     # not stuck behind slow()
 try:
@@ -366,14 +377,14 @@ assert ch.actor("docs/service").ping.remote().result() == "pong"
 
 ### Queues and topics
 
-A `ch.Queue` is a bounded first-in, first-out queue any process can use: pass
-it to calls, or share it by `key=`. A full queue makes `put` wait. Iterating
-takes items until the queue is closed and empty. A `ch.Topic` keeps a bounded
+A `ch.coord.Queue` is a bounded first-in, first-out queue any process can use: pass
+it to calls, or share it by `name=`. A full queue makes `put` wait. Iterating
+takes items until the queue is closed and empty. A `ch.coord.Topic` keeps a bounded
 log and delivers every item to every subscriber. Both are held by an actor,
 so they last as long as their run and are not replicated. **Runs today:**
 
 ```python run
-q = ch.Queue(maxsize=100)
+q = ch.coord.Queue(maxsize=100)
 
 @ch.remote
 def total(q) -> int:
@@ -385,7 +396,7 @@ for i in range(10):
 q.close()
 assert t.result() == 45
 
-topic = ch.Topic(retain=100)
+topic = ch.coord.Topic(retain=100)
 sub = topic.subscribe("earliest")
 for i in range(3):
     topic.publish(i).result()
@@ -397,7 +408,7 @@ assert list(sub) == [0, 1, 2]
 
 ### Replicated state and coordination
 
-A `ch.Store` namespace holds keys replicated with Raft: it survives the loss
+A `ch.coord.Store` namespace holds keys replicated with Raft: it survives the loss
 of any process and a minority of peers. Operations on one namespace are
 linearizable. Every change bumps the namespace's revision. A key's version is
 the revision of its last change, so `if_version` is a compare-and-set, and 0
@@ -406,12 +417,12 @@ means the key must not exist. Values are pickled and limited to 1 MiB; store a
 spread heavy traffic across several namespaces. **Runs today:**
 
 ```python run
-store = ch.Store("docs")
+store = ch.coord.Store("docs")
 v1 = store.put("config", {"lr": 3e-4}, if_version=0)     # create only if absent
 v2 = store.put("config", {"lr": 1e-4}, if_version=v1)    # compare-and-set
 try:
     store.put("config", {"lr": 9.9}, if_version=v1)      # stale version
-except ch.VersionConflict as e:
+except ch.errors.VersionConflict as e:
     assert e.version == v2
 assert store.get("config") == {"lr": 1e-4}
 assert store.counter("seen").add(2) == 2
@@ -427,7 +438,7 @@ assert (event.kind, event.key, event.value) == ("put", "jobs/1", "queued")
 ```
 
 `lock()` returns a lease: its `token` grows with every grant, and a write with
-`fence=lease` fails with `ch.LeaseLost` once another holder has taken over.
+`fence=lease` fails with `ch.errors.LeaseLost` once another holder has taken over.
 This is the safe way to elect a leader. `barrier(key, parties).wait()` blocks
 until that many participants arrive, round after round. `ttl=` makes a key
 expire. A watch that falls behind the namespace's bounded change log delivers
@@ -435,13 +446,13 @@ the current value of every key and continues; it may repeat a change, but it
 never misses one. Anyone who holds the cluster token can write values that
 readers unpickle, the same trust that running calls requires.
 
-`ch.Queue(key=..., durable=True)` keeps a queue in a store, so it outlives any
+`ch.coord.Queue(name=..., durable=True)` keeps a queue in a store, so it outlives any
 process. A consumer `claim`s an item: the item is removed when the block
 finishes, and delivered again if the block raises or the consumer dies.
 **Runs today:**
 
 ```python run
-jobs = ch.Queue(key="docs/jobs", durable=True)
+jobs = ch.coord.Queue(name="docs/jobs", durable=True)
 jobs.put("resize image 7")
 with jobs.claim(lease="30s") as job:
     assert job == "resize image 7"
@@ -450,25 +461,25 @@ assert jobs.qsize() == 0
 
 ### The cluster
 
-`ch.cluster()` reports what the connected peer knows about the cluster, and
+`ch.runs.cluster()` reports what the connected peer knows about the cluster, and
 `ch.context().node` names the peer a call runs on. **Runs today:**
 
 ```python run
-nodes = ch.cluster().nodes()
+nodes = ch.runs.cluster().nodes()
 assert nodes and all(n.cpus > 0 for n in nodes)
-assert ch.cluster().resources()["cpus"] >= 1
+assert ch.runs.cluster().resources()["cpus"] >= 1
 ```
 
-`ch.cluster().events(kinds, since=)` streams what the cluster does: members
+`ch.runs.cluster().events(kinds, since=)` streams what the cluster does: members
 joining and leaving (`member`), actors starting, restarting and dying
 (`actor`), calls failing for good (`task_failed`), controller `decision`s and
 `drain`s. By default it starts at what happens next and waits for more;
 `since=0` begins at the oldest the peer still holds, and `follow=False` stops
-at the newest. Events are notifications; `Run.outcomes()` and `ch.actor(key)`
+at the newest. Events are notifications; `Run.outcomes()` and `ch.actor(name)`
 are the durable record. **Runs today:**
 
 ```python run
-stream = ch.cluster().events(["actor"])
+stream = ch.runs.cluster().events(["actor"])
 temp = Counter.remote()
 temp.close()
 for event in stream:                      # Event(seq, at, kind, node, run, task, actor, message, detail)
@@ -483,7 +494,7 @@ A pool spreads calls over interchangeable replicas, sending each call to the
 least busy one. `route(key)` pins a key to one replica, and resizing moves
 only a few keys. `resize(n)` and `upgrade(...)` change the replicas without
 dropping calls: a leaving replica takes no new calls and closes once its calls
-finish. `key=` names a pool that other processes and calls share; it can be
+finish. `name=` names a pool that other processes and calls share; it can be
 passed to a call like any value. `replicas=ch.auto(initial, min=, max=)` grows
 the pool when its calls back up and shrinks it after a quiet minute, and
 `pool.decisions` says why. **Runs today:**
@@ -504,8 +515,8 @@ pool.upgrade(Model, "weights-v2", surge=1)            # one replica at a time
 assert pool.generate.remote("hi").result() == "weights-v2: hi"
 pool.close()
 
-shared = Model.options(key="docs/model", replicas=ch.auto(1, max=4)).pool("weights-v1")
-assert len(Model.options(key="docs/model").pool()) == 1   # a second handle on the same replicas
+shared = Model.options(name="docs/model", replicas=ch.auto(1, max=4)).pool("weights-v1")
+assert len(Model.options(name="docs/model").pool()) == 1   # a second handle on the same replicas
 shared.close()
 ```
 
@@ -525,17 +536,17 @@ class Embedder:
         return [len(t) for t in texts]        # one call for up to 32 texts
 
 embedder = Embedder.remote()
-assert ch.gather(*(embedder.embed.remote(t) for t in ["a", "bb", "ccc"])) == [1, 2, 3]
+assert ch.get((embedder.embed.remote(t) for t in ["a", "bb", "ccc"])) == [1, 2, 3]
 ```
 
 ### Partitioned data
 
-`ch.partitions(...)` cuts input into partitions: a list, a file glob (one
+`ch.data.partitions(...)` cuts input into partitions: a list, a file glob (one
 partition per file; `.jsonl`, `.csv`, `.parquet` or lines), or any
 `ext.Source`. `columns=` and `filter=` are pushed down where the format
 allows. `reduce_by_key` regroups `(key, value)` results by key between calls,
 so the data moves between workers, not through the driver. Its result is a
-`ch.Partitioned`: iterate it for each partition's pairs, or call `to_dict()`.
+`ch.data.Partitioned`: iterate it for each partition's pairs, or call `to_dict()`.
 `write` stores each partition from the worker that holds it, then commits once. **Runs today:**
 
 ```python run
@@ -553,7 +564,7 @@ def count_words(lines) -> list[tuple[str, int]]:
     return list(counts.items())
 
 lines = ["the cat", "the dog", "a cat"] * 10
-totals = count_words.map(ch.partitions(lines, n=3)).reduce_by_key(operator.add, partitions=2)
+totals = count_words.map(ch.data.partitions(lines, n=3)).reduce_by_key(operator.add, partitions=2)
 assert totals.to_dict()["cat"] == 20
 manifest = totals.write(ext.FileSink(tempfile.mkdtemp())).result()   # one file per partition
 assert manifest["rows"] == 4 and len(manifest["parts"]) == 2
@@ -564,9 +575,9 @@ assert manifest["rows"] == 4 and len(manifest["parts"]) == 2
 ```python
 # Durable actors (main session, landed): state survives the process; a
 # repeated command id returns the stored reply.
-@ch.remote(state=ch.State(), restart="checkpoint")
+@ch.remote(state=ch.durable.State(), restart="checkpoint")
 class Cart: ...
-cart = Cart.options(key="cart/42").remote()
+cart = Cart.options(name="cart/42").remote()
 
 # Durable workflows (P3): replayed from history after any process dies.
 @ch.remote(workflow="durable")
@@ -581,7 +592,7 @@ async def checkout(order):
 def report(df): ...
 
 # Placement (P3): hard requirements, preferences, affinity and spreading.
-@ch.remote(placement=ch.Placement(require={"zone": "us-east1-b"}, spread="rack"))
+@ch.remote(placement=ch.dist.Placement(require={"zone": "us-east1-b"}, spread="rack"))
 def shard(i): ...
 ```
 
@@ -603,9 +614,9 @@ hardware):
 ```python run
 @ch.remote
 def where() -> str:
-    return ch.device()          # "cuda:0", "xla:0", "hpu", "xpu:0", "mps" or "cpu", no torch import
+    return ch.dist.device()          # "cuda:0", "xla:0", "hpu", "xpu:0", "mps" or "cpu", no torch import
 
-assert where.remote().result() == "cpu" and ch.devices() == []
+assert where.remote().result() == "cpu" and ch.dist.devices() == []
 try:
     where.options(gpus=64).remote().result()
 except ch.Infeasible as e:
@@ -614,7 +625,7 @@ except ch.Infeasible as e:
 
 ```python
 @ch.remote(gpus=8, device="cuda:H100")
-def train_step(shard): ...       # ch.devices(): kind, id, index, torch, backend, model, memory_bytes
+def train_step(shard): ...       # ch.dist.devices(): kind, id, index, torch, backend, model, memory_bytes
 ```
 
 ### Gangs and collectives
@@ -682,11 +693,11 @@ def world() -> int:
 assert world.options(ranks=ch.auto(2, min=1, max=4)).gang().result() == [2, 2]  # starts at 2
 ```
 
-**Groups of actors you already have.** `ch.group(*actors)` makes them one
+**Groups of actors you already have.** `ch.dist.group(*actors)` makes them one
 group, ranked in the order given. Pass the handle to them; inside a member,
 `handle.join()` is its `Group`, with the same collectives and `torch()` as a
 gang's rank. The first `join()` in each member waits for all of them.
-`ch.group(..., key=k)` again with the same key starts a new generation, for a
+`ch.dist.group(..., name=k)` again with the same key starts a new generation, for a
 changed set of actors. **Runs today:**
 
 ```python run
@@ -695,12 +706,12 @@ class Learner:
     def __init__(self, weight: int):
         self.weight = weight
 
-    def average(self, handle: ch.GroupHandle) -> float:
+    def average(self, handle: ch.dist.GroupHandle) -> float:
         group = handle.join()
         return group.all_reduce(self.weight) / group.size   # sum by default; op= any function
 
 learners = [Learner.remote(w) for w in (1, 2, 6)]
-handle = ch.group(*learners)
+handle = ch.dist.group(*learners)
 assert [f.result() for f in [l.average.remote(handle) for l in learners]] == [3.0] * 3
 ```
 
@@ -739,7 +750,7 @@ assert row_sum.options(ranks=4).gang().result() == [1, 1, 5, 5]
 
 ### Reservations
 
-`ch.reserve(bundles, strategy=)` holds resources on peers before anything
+`ch.dist.reserve(bundles, strategy=)` holds resources on peers before anything
 runs there: one bundle per dict (`cpus`, `gpus`, `memory`, `device`,
 `resources`), placed `"pack"` (one peer when it fits), `"spread"` (different
 peers), or the `"strict_"` versions of either, which are infeasible rather than
@@ -749,7 +760,7 @@ resources; `release()` gives them back. Calls in one bundle share its process,
 so give each parallel worker its own bundle. **Runs today:**
 
 ```python run
-with ch.reserve([{"cpus": 1}, {"cpus": 1}], strategy="pack") as res:
+with ch.dist.reserve([{"cpus": 1}, {"cpus": 1}], strategy="pack") as res:
     @ch.remote
     def node_of() -> str:
         return ch.context().node
@@ -768,7 +779,44 @@ in one atomic step: a burst against stale reports can over-commit briefly
 before one reservation backs off. Atomic holds come with the shard's gang
 commit.
 
-### Device transport, compiled graphs, budgets (P5)
+### Budgets
+
+`budget={"cpu_seconds": ..., "gpu_seconds": ...}` caps what a call and every
+call made inside it may use, in seconds or durations (`"8h"`). Once either is
+used up, the call and everything it submitted are cancelled with
+`ch.errors.BudgetExceeded` (a `ch.Cancelled`), whose message names the budget and
+what was used. Usage is charged while calls run, about once a second, so one
+long call is stopped too:
+- **CPU seconds:** a call's measured CPU when it has its worker to itself, else its CPU grant times the time it ran.
+- **GPU seconds:** its GPUs times that time.
+
+A budget covers the call until it finishes. A call inside a budgeted call
+can't set its own budget (`ch.OptionsError`): budgets don't nest. **Runs
+today:**
+
+```python run
+import time
+
+@ch.remote
+def trial(seconds: float) -> float:
+    end = time.process_time() + seconds
+    while time.process_time() < end:
+        pass
+    return seconds
+
+@ch.remote(cpus=0.1)
+def search(n: int) -> float:
+    return sum(ch.get((trial.remote(1.0) for _ in range(n))))
+
+try:
+    search.options(budget={"cpu_seconds": 2}).remote(16).result()
+except ch.errors.BudgetExceeded as e:
+    print(e)  # budget exceeded: cpu_seconds=2 allowed, 2.31 used by this call and the calls it made
+else:
+    raise AssertionError("16 CPU-seconds of trials should not fit a 2-second budget")
+```
+
+### Device transport, compiled graphs (P5)
 
 ```python
 @ch.remote(transport="device")     # tensors move GPU to GPU, not through host memory
@@ -780,9 +828,6 @@ def serve(request):
     return model.generate.remote(tokens)
 fast = serve.compile(max_in_flight=2)        # reusable channels, no per-call bookkeeping
 reply = fast.remote("hello").result()
-
-with ch.options(budget={"gpu_seconds": 3600}):
-    sweep()
 ```
 
 ## Tier 4: extending Chimaera (`chimaera.ext`)
@@ -814,7 +859,7 @@ class Total(ext.Sink):
 def keep(rows) -> list[int]:
     return list(rows)
 
-assert keep.map(ch.partitions(Squares(25))).write(Total()).result() == sum(x * x for x in range(25))
+assert keep.map(ch.data.partitions(Squares(25))).write(Total()).result() == sum(x * x for x in range(25))
 ```
 
 `ext.register_serializer(cls, dumps=, loads=)` pickles a type your way;
@@ -839,7 +884,7 @@ class QueueDepth(ext.Controller):             # proposals go through canary and 
 | Elastic training | `ranks=ch.auto(...)`, `generation`, `GangFailed`, checkpoints |
 | Model serving with batching | keyed `Pool`, `batch=`, `replicas=ch.auto`, `deadline`, `Overloaded`, generator methods, `upgrade`, `ch.graph` |
 | Work queues | `Queue` with `claim` |
-| RL rollout loops | generator-method rollout pool, learner gang, `ch.group().broadcast` |
+| RL rollout loops | generator-method rollout pool, learner gang, `ch.dist.group().broadcast` |
 | Hyperparameter search with early stopping | trials as calls or gangs, `context().report()`, `Topic`, `as_completed`, subtree `cancel`, `budget` |
 | Sharded state, locks, leader election | `Store` |
 | Sagas | durable workflows with `try`/`except` and `command_id` |

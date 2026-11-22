@@ -19,15 +19,15 @@ def shout(tag):
     print(f"hello from {tag}", flush=True)
     return ch.context().node
 
-me = [n.peer for n in ch.cluster().nodes() if n.this_peer][0]
-others = [n.peer for n in ch.cluster().nodes() if not n.this_peer]
+me = [n.peer for n in ch.runs.cluster().nodes() if n.this_peer][0]
+others = [n.peer for n in ch.runs.cluster().nodes() if not n.this_peer]
 for peer in others:
-    pinned = shout.options(placement=ch.Placement(require={"node": peer}))
+    pinned = shout.options(placement=ch.dist.Placement(require={"node": peer}))
     assert pinned.remote(peer[:8]).result(timeout=60) == peer
 deadline = time.time() + 10
 want = {f"hello from {p[:8]}" for p in others}
 while time.time() < deadline:
-    kept = {line.split("| ", 1)[1] for line in ch.current_run().logs() if "hello from" in line}
+    kept = {line.split("| ", 1)[1] for line in ch.runs.current_run().logs() if "hello from" in line}
     if kept >= want:
         break
     time.sleep(0.2)

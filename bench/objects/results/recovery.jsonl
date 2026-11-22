@@ -1,0 +1,10 @@
+{"runtime": "ray", "scenario": "recovery", "kind": "task_result", "size": "1M", "op": "get_after_node_loss", "seconds": 13.674921791999623, "error": null}
+{"runtime": "ray", "scenario": "recovery", "kind": "task_put", "size": "1M", "op": "get_after_node_loss", "seconds": 12.058968876999643, "error": "OwnerDiedError: Failed to retrieve object 00310a0f0a45af5cffffffffffffffffffffffff0100000002e1f505. To see information about where this ObjectRef was created in Python, set the environment variable RAY_record_ref_cre"}
+{"runtime": "ray", "scenario": "recovery", "kind": "task_result", "size": "256M", "op": "get_after_node_loss", "seconds": 12.401781077000123, "error": null}
+{"runtime": "ray", "scenario": "recovery", "kind": "task_put", "size": "256M", "op": "get_after_node_loss", "seconds": 12.071565283000382, "error": "OwnerDiedError: Failed to retrieve object 00d950ec0ccf9d2affffffffffffffffffffffff0100000002e1f505. To see information about where this ObjectRef was created in Python, set the environment variable RAY_record_ref_cre"}
+{"runtime": "ray", "done": "recovery", "wall_s": 110.5}
+{"runtime": "chimaera", "scenario": "recovery", "kind": "task_result", "size": "1M", "op": "get_after_node_loss", "seconds": 0.00022448799973062705, "error": null}
+{"runtime": "chimaera", "scenario": "recovery", "kind": "task_put", "size": "1M", "op": "get_after_node_loss", "seconds": 0.00019134499962092377, "error": null}
+{"runtime": "chimaera", "scenario": "recovery", "kind": "task_result", "size": "256M", "op": "get_after_node_loss", "seconds": 0.000179650998688885, "error": null}
+{"runtime": "chimaera", "scenario": "recovery", "kind": "task_put", "size": "256M", "op": "get_after_node_loss", "seconds": 0.00017163000120490324, "error": null}
+{"runtime": "chimaera", "done": "recovery", "wall_s": 20.6}

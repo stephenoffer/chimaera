@@ -144,9 +144,9 @@ def test_skypilot_spares_launch_join_and_drain_before_teardown(tmp_path, monkeyp
         path.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
     monkeypatch.setenv("CHIMAERA_CLUSTER_TOKEN", "t")
-    ch.Store("provisioner/sky").delete("spares")
+    ch.coord.Store("provisioner/sky").delete("spares")
     peers = [node(2, 0, address="10.0.0.6:7700"), node(2, 0, address="10.0.0.5:7700")]
-    monkeypatch.setattr(ch, "cluster", lambda: type("View", (), {"nodes": lambda self: peers})())
+    monkeypatch.setattr(ch.runs, "cluster", lambda: type("View", (), {"nodes": lambda self: peers})())
 
     def calls(pool):
         for c in pool._children:

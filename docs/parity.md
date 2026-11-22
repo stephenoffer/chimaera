@@ -26,15 +26,15 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
 | `ray.init()` starts or finds a local cluster | `ch.init()`, or nothing: the first `.remote()` starts a local peer (130–180 ms measured, 37 MB idle) | Today |
-| `ray.init(address=...)`, `"auto"` | `ch.init(cluster="profile" \| "chimaera://host:port" \| "auto")` | P3 |
-| Ray Client (`ray://`), deprecated in 2.60 | Remote drivers connect over TCP to a peer started with `--client-listen` (today); connecting through any peer with a versioned protocol and no version lock-step is P3 | Today / P3 |
+| `ray.init(address=...)`, `"auto"` | `ch.init(cluster="profile" \| "chimaera://host:port" \| "auto")` | Partly today (profiles, `tcp://`, `$CHIMAERA_ADDRESS`) / P3 (`"auto"`) |
+| Ray Client (`ray://`), deprecated in 2.60 | Remote drivers connect over TCP to a peer started with `--client-listen` (today); connecting through any peer with a versioned protocol and no version lock-step is P3 | Today (any peer of a profile) / P3 (version-skew tests) |
 | `namespace=` | Key prefix `"ns/name"` | Today |
 | `num_cpus`, `num_gpus`, `resources`, `labels` on `init` (caps for tests and CI) | `ch.init(cpus=, memory=, gpus=)` caps the local peer; cluster peers advertise what they were granted | New (P3) |
 | `logging_config=LoggingConfig(encoding="JSON", log_level=...)` | `ch.init(log_format="json", log_level=...)`, applied to every executor | New (P4) |
 | `log_to_driver`, worker stdout forwarded with a prefix and de-duplicated | Task output reaches the driver at its log level (Today); de-duplication of repeated lines | Today / New (P4) |
 | `JobConfig(metadata=...)` | `ch.init(metadata={...})` on the run record | New (P3) |
-| `enable_resource_isolation`, `system_reserved_*` | The agent always runs in its own reserved cgroup when delegation exists (requirement P6); attempts get their own when `accounting="isolated"` | Today (attempts) / M2 (agent) |
-| `ray.shutdown()`, `is_initialized()` | Shim; a run ends when its process exits unless detached | Today |
+| `enable_resource_isolation`, `system_reserved_*` | The agent always runs in its own reserved cgroup when delegation exists (requirement P6); attempts get their own when `accounting="isolated"` | Today (attempts; the agent moves into its own cgroup) / M2 (a reservation for it) |
+| `ray.shutdown()`, `is_initialized()` | `ch.shutdown(cancel=)`; the shim calls `ch.shutdown(cancel=True)` | Today |
 | `local_mode` (removed in 2.60) | Local runs use the cluster path already | Today |
 
 ### Tasks and futures
@@ -42,15 +42,15 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
 | `@ray.remote`, `.remote()`, `.options()` | `@ch.remote`, `.remote()`, `.options()`; a plain call runs locally | Today |
-| `ray.get(refs, timeout=)` | `future.result(timeout=)`, `ch.gather(*fs)`, `await future` | Today |
-| `ray.wait(refs, num_returns, timeout, fetch_local)` | `ch.as_completed(fs)`; readiness never moves data, so `fetch_local=False` is the only behaviour | Today |
-| `ObjectRef.future()`, `_on_completed(cb)` | `Future` implements the `concurrent.futures.Future` protocol: `add_done_callback`, `exception`, `done`, `running` | New (P3) |
+| `ray.get(refs, timeout=)` | `future.result(timeout=)`, `ch.get(fs)`, `await future` | Today |
+| `ray.wait(refs, num_returns, timeout, fetch_local)` | `ch.wait(fs, num_returns=, timeout=)` returns `(done, pending)`; `ch.as_completed(fs)`; `fetch_local=True` copies finished values to this host | Today |
+| `ObjectRef.future()`, `_on_completed(cb)` | `Future` implements the `concurrent.futures.Future` protocol: `add_done_callback`, `exception`, `done`, `running` | Today (`done`, `running`, `cancelled`, `add_done_callback`, `exception`) |
 | `num_returns=n` | `returns=n`, `.split()` | Today |
 | Generator tasks (`num_returns="streaming"`), `_generator_backpressure_num_objects` | Generator functions return `Results`, bounded ahead of the consumer (`max_in_flight=`), replayed after a worker dies | Today |
 | `num_returns="dynamic"` (deprecated) | Generators | Today |
 | Nested tasks | Calls inside calls; a returned future is forwarded without holding a worker | Today |
 | `ray.cancel(ref, force=, recursive=True)` | `future.cancel(force=)` cancels the subtree; `cancel(children=False)` keeps children | Today / New (P3) |
-| A running task gets `KeyboardInterrupt` on cancel | A running call gets `ch.Cancelled` raised at its next bytecode boundary after a 2 s cooperative grace; `force=True` kills the process | New (P3) |
+| A running task gets `KeyboardInterrupt` on cancel | A running call gets `ch.Cancelled` raised at its next bytecode boundary after a 2 s cooperative grace; `force=True` kills the process | Today (interrupted after 2 s, executor killed after 5 s) / P3 (actor methods) |
 | `max_retries` (default 3), `retry_exceptions` | `max_attempts`, `retry_exceptions`, within the effects contract (`external` calls never repeat) | Today |
 | `max_calls` (recycle the worker after N calls; 1 for GPU tasks) | `max_calls=` option; leaking workers are also rotated by measurement (Today) | New (P3) |
 | `name=` and `_labels` on tasks | `name=` and `tags=` options, shown in `explain`, `top`, the dashboard and metrics | New (P3) |
@@ -66,14 +66,14 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | `max_concurrency`, async actors, threaded actors | `concurrency=`; `async def` never changes semantics on its own | Today |
 | `concurrency_groups`, `@ray.method(concurrency_group=)` | `groups=`, `@ch.method(group=)` | Today |
 | `allow_out_of_order_execution` (default on for threaded and async actors) | With `concurrency > 1`, calls start as their inputs become ready; with `concurrency=1`, in submission order | New (P3) |
-| `name`, `namespace`, `get_if_exists=True`, `ray.get_actor` | `key=` (get or create), `ch.actor(key)` | Today |
-| `get_if_exists=False` (create only; `ActorAlreadyExistsError`) | `if_exists="error"` with `key=`; raises `ch.AlreadyExists` | New (P3) |
-| `ray.util.list_named_actors(all_namespaces)` | `ch.cluster().actors(prefix=...)` | New (P3) |
-| `lifetime="detached"` | `lifetime="run"` (default for keyed actors) or `"detached"` | Today |
+| `name`, `namespace`, `get_if_exists=True`, `ray.get_actor` | `name=` (get or create), `ch.actor(name)` | Today |
+| `get_if_exists=False` (create only; `ActorAlreadyExistsError`) | `if_exists="error"` with `name=`; raises `ch.AlreadyExists` | New (P3) |
+| `ray.util.list_named_actors(all_namespaces)` | `ch.runs.cluster().actors(prefix=...)` | New (P3) |
+| `detach=True` | `lifetime="run"` (default for keyed actors) or `"detached"` | Today |
 | Non-detached actors die with their owner or when no handle is left | Unkeyed actors end when their last handle is dropped or their creating call's scope ends (structured lifetimes, D4) | New (D4, P3) |
 | `max_restarts`, `max_task_retries` | `restart="fresh"`, `max_restarts`, `max_attempts`; `restart="checkpoint"` for durable state | Today |
 | `ActorUnavailableError`; `was_current_actor_reconstructed` | `ch.ActorRestarting` (transient, retryable) vs `ch.ActorDied`; `ch.context().restarted` | New (P3) |
-| `max_pending_calls` → `PendingCallsLimitExceeded` | `max_pending_calls=` enforced per handle, raising `ch.Overloaded(retry_after)` | New (P3) |
+| `max_pending_calls` → `PendingCallsLimitExceeded` | `max_pending_calls=` enforced per handle, raising `ch.errors.Overloaded(retry_after)` | New (P3) |
 | `ray.kill(actor)`, `no_restart=False` | `handle.close()`; `handle.restart()` forces a restart under the actor's policy | Today / New (P3) |
 | `__ray_terminate__` (kill after pending calls) | `handle.close(drain=True)` | New (P3) |
 | `ray.actor.exit_actor()` | `ch.context().exit()` from inside a method: queued calls fail with `ch.ActorDied`, `__exit__` runs | New (P3) |
@@ -89,16 +89,16 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
 | `ray.put` | `ch.put` returns a finished `Future`; content-addressed, stored once | Today |
-| Owner death → `OwnerDiedError`; `put` objects cannot be rebuilt | Owners are agents with successors (D3); `put` values get one replica under budget (D5) | New (D2–D5, M2–M3) |
+| Owner death → `OwnerDiedError`; `put` objects cannot be rebuilt | Owners are agents with successors (D3); `put` values get one replica under budget (D5) | Partly today (stored objects copied to the ring successor, Linux) / M2–M3 (lineage, budgeted replicas) |
 | Lineage reconstruction (`max_lineage_bytes`) | Rebuild lost values by replaying replayable producers, cut points chosen by cost (D5, §10) | M2 (plan item 6) / New (D5) |
 | Reference counting and borrowing | A value lives while a future, a pickled future or a pending dependent refers to it, and at most until its run ends (design.md amendment 14) | Today (needs api.md text) |
 | Nested refs stay refs | Same | Today |
 | Zero-copy numpy (read-only arrays) | Copy-on-write mappings: arrays arrive writable, writes stay in the call | Today |
 | Spilling to disk / S3 | Disk: Today (`stores.rs`); object-store URI target: M3 | Today / M3 |
-| `register_serializer` / `deregister_serializer` | `ext.register_serializer` / `ext.unregister_serializer` | P4 |
-| `inspect_serializability` | Submission preflight names the unpicklable variable and its path | Today (CH108 for oversized closures) / P3 (full path) |
-| `ray memory`, `get_object_locations` | `chimaera memory RUN` and `ch.cluster().objects(run=)`: owner, holders, size, who pins it | New (P4) |
-| `ObjectStoreFullError`, `OutOfDiskError` | `ch.DiskFull` with the budget and the largest holders; objects spill before that | M3 |
+| `register_serializer` / `deregister_serializer` | `ext.register_serializer` / `ext.unregister_serializer` | Today (`ext.register_serializer`) / P4 (deregister) |
+| `inspect_serializability` | Submission preflight names the unpicklable variable and its path | Today (names the argument or captured variable) / P3 (path inside the object) |
+| `ray memory`, `get_object_locations` | `chimaera memory RUN` and `ch.runs.cluster().objects(run=)`: owner, holders, size, who pins it | New (P4) |
+| `ObjectStoreFullError`, `OutOfDiskError` | `ch.DiskFull` with the budget and the largest holders; objects spill before that | Partly today (an `OSError` naming the disk and its free space) / M3 (`ch.DiskFull`) |
 | `put(_tensor_transport="nixl")` | `ch.put(tensor, transport="device")` | P5 |
 | Ray Direct Transport (alpha), `tensor_transport=` on methods | `transport="device"` on any call or method; transport negotiated per pair (D5) | P5 |
 
@@ -106,31 +106,31 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
-| `num_cpus`, `memory`, `num_gpus`, `resources` | `cpus`, `memory`, `gpus`, `resources`; omitted values are learned from earlier calls | Today (cpus, memory) / P3 (resources) / P5 (gpus assigned) |
+| `num_cpus`, `memory`, `num_gpus`, `resources` | `cpus`, `memory`, `gpus`, `resources`; omitted values are learned from earlier calls | Today (cpus, memory, whole GPUs assigned) / P3 (resources) |
 | Fractional `num_gpus` | `gpus=0.5` after a measured peak, capped at 0.8 of the fraction; MIG and MPS partitions as devices | P5 |
-| `accelerator_type`, 15 accelerator families | `device="kind:model"` for cuda, rocm, tpu, neuron, hpu, xpu, mps; `ext.DevicePlugin` for the rest | P5 |
-| `"DEFAULT"` (pack, prefer nodes holding large arguments) | Placement ladder with input locality (D6) | Today (locality on localhost clusters) / M2 (ladder) |
-| `"SPREAD"`, `NodeAffinitySchedulingStrategy`, `NodeLabelSchedulingStrategy`, `label_selector`, `fallback_strategy` | `placement=ch.Placement(require=, prefer=, spread=, near=)` | P3 |
-| Placement groups: `PACK`, `SPREAD`, `STRICT_*`, `bundle_label_selector`, `topology_strategy` | `ch.reserve(shapes, placement=Placement(pack="nvlink" \| "host" \| "rack", spread=...), key=, lifetime=)`; strict = `require`, soft = `prefer` | P5 |
-| `get_placement_group(name)`, `placement_group_table`, `get_current_placement_group`, `capture_child_tasks` | `ch.reservation(key)`, `ch.cluster().reservations()`, `ch.context().reservation`; calls made inside a call placed in a reservation stay in it unless they say otherwise | New (P5) |
+| `accelerator_type`, 15 accelerator families | `device="kind:model"` for cuda, rocm, tpu, neuron, hpu, xpu, mps; `ext.DevicePlugin` for the rest | Today (`device=` selectors) / P5 (`ext.DevicePlugin`) |
+| `"DEFAULT"` (pack, prefer nodes holding large arguments) | Placement ladder with input locality (D6) | Today (local first, then 2 sampled peers plus input holders, then other cells) / M2 (late binding, stealing) |
+| `"SPREAD"`, `NodeAffinitySchedulingStrategy`, `NodeLabelSchedulingStrategy`, `label_selector`, `fallback_strategy` | `placement=ch.dist.Placement(require=, prefer=, spread=, near=)` | Today (`require`, `prefer`; the shim maps affinity and labels) / P3 (`spread`, `near`) |
+| Placement groups: `PACK`, `SPREAD`, `STRICT_*`, `bundle_label_selector`, `topology_strategy` | `ch.dist.reserve(shapes, placement=Placement(pack="nvlink" \| "host" \| "rack", spread=...), key=, lifetime=)`; strict = `require`, soft = `prefer` | Today (`ch.dist.reserve` with pack, spread, strict) / P5 (atomic holds, `key=`, `lifetime=`) |
+| `get_placement_group(name)`, `placement_group_table`, `get_current_placement_group`, `capture_child_tasks` | `ch.reservation(key)`, `ch.runs.cluster().reservations()`, `ch.context().reservation`; calls made inside a call placed in a reservation stay in it unless they say otherwise | Partly today (the shim's `get_placement_group`, one process) / P5 |
 | `ray.util.tpu` slice helpers | `device="tpu:v5p"` gangs with slice-shaped reservations; JAX coordinator variables set | P5 |
-| `autoscaler.sdk.request_resources` | `ch.cluster().request(shapes, until=)` | New (P6) |
+| `autoscaler.sdk.request_resources` | `ch.runs.cluster().request(shapes, until=)` | New (P6) |
 | `experimental.set_resource` | `chimaera peer label/resource set` on a live peer | New (P3) |
-| No fairness between jobs; no quotas | Weighted DRF across tenants and runs; delegated quota envelopes (§6) | P6 / New (D6) |
+| No fairness between jobs; no quotas | Weighted DRF across tenants and runs; delegated quota envelopes (§6) | Today (per-tenant caps and cluster shares) / P6 (weighted DRF) |
 
 ### Environments and deployment
 
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
 | `runtime_env={"env_vars"}` | `ch.init(env=)` | Today |
-| `working_dir`, `py_modules`, `excludes` | `ch.Env(files=[...], exclude=[...])`, content-addressed, size-capped by budget not by a fixed 500 MiB | P3 |
-| `pip`, `uv`, `conda`, `image_uri`, `py_executable` | `ch.Env(pip=, uv_lock=, conda=, image=, python=)`; a `uv run` driver's lock is used automatically | P3 |
+| `working_dir`, `py_modules`, `excludes` | `ch.Env(files=[...], exclude=[...])`, content-addressed, size-capped by budget not by a fixed 500 MiB | Today (the project's source ships automatically) / P3 (`ch.Env(files=, exclude=)`) |
+| `pip`, `uv`, `conda`, `image_uri`, `py_executable` | `ch.Env(pip=, uv_lock=, conda=, image=, python=)`; a `uv run` driver's lock is used automatically | Today (a project's `uv.lock` is installed on the peers) / P3 (pip, conda, image, python) |
 | `worker_process_setup_hook` | `ch.Env(setup=callable)` | New (P3) |
 | `RuntimeEnvConfig(setup_timeout_seconds, eager_install)` | Environments are built before admission (never on a call's critical path); `ch.Env(build_timeout=)` | P3 |
 | Runtime-env plugins, nsight/rocprof wrappers | `ext.EnvPlugin`; `chimaera profile --nsight` | New (P4) |
-| `ray start`, `ray up`/`down`, KubeRay, Slurm community scripts | `chimaera peer start --seeds`, providers for SSH, Kubernetes (StatefulSet, no operator), Slurm, SkyPilot (deploy.md) | Today (SSH, k8s, Slurm launchers in tree) / P3 |
+| `ray start`, `ray up`/`down`, KubeRay, Slurm community scripts | `chimaera peer start --seeds`, providers for SSH, Kubernetes (StatefulSet, no operator), Slurm, SkyPilot (deploy.md) | Today (SSH, k8s, Slurm, SkyPilot) |
 | `ray attach/exec/rsync`, `get-head-ip` | `chimaera exec/attach/sync --cluster`; there is no head | New (P3) |
-| `JobSubmissionClient` and REST API, entrypoint resources, list and delete | `chimaera submit/logs/inspect/cancel`, a Python `ch.jobs` client and the same over HTTP on any peer | P3 / New (P3) |
+| `JobSubmissionClient` and REST API, entrypoint resources, list and delete | `chimaera submit/logs/inspect/cancel`, a Python `ch.jobs` client and the same over HTTP on any peer | Partly today (`chimaera run --detach`, `logs`, `inspect`, `Run.cancel()`) / P3 (submit, cancel command, `ch.jobs`, HTTP) |
 | `experimental.sandbox` (gVisor actors for agentic code) | `@ch.remote(sandbox=ch.Sandbox(image=, network=False, ttl=))` on tenant sandboxes | New (P6) |
 | Java and C++ calls | Python only; the wire protocol is protobuf, so other clients are possible later | Won't |
 
@@ -138,18 +138,18 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
-| `ray.util.queue.Queue` | `ch.Queue`; durable with `key=, durable=True` and `claim()` | Today |
-| Internal KV (private) | `ch.Store`: linearizable, compare-and-set, watches, TTLs, counters | Today |
+| `ray.util.queue.Queue` | `ch.coord.Queue`; durable with `name=, durable=True` and `claim()` | Today |
+| Internal KV (private) | `ch.coord.Store`: linearizable, compare-and-set, watches, TTLs, counters | Today |
 | No locks, barriers or leader election | `store.lock(ttl)` with fencing tokens, `store.barrier`, `store.counter` | Today |
-| No pub/sub | `ch.Topic` | Today |
+| No pub/sub | `ch.coord.Topic` | Today |
 
 ### GPUs, collectives, compiled graphs
 
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
-| `ray.get_gpu_ids()`, `get_accelerator_ids()` | `ch.devices()`, `ch.device()` | P5 |
-| `ray.util.collective` (NCCL, GLOO; allreduce, allgather, broadcast, reduce, reducescatter, send/recv, barrier, multi-GPU variants, custom backends) | `ch.context().gang` and `ch.group(*actors)` with the same operations; `reduce`, multi-GPU variants and `ext.CollectiveBackend` | P5 / New (P5) |
-| Placement-group SPMD by hand | `.gang()` with rank variables for PyTorch, JAX and DeepSpeed; elastic `ranks=ch.auto(...)` | P5 |
+| `ray.get_gpu_ids()`, `get_accelerator_ids()` | `ch.dist.devices()`, `ch.dist.device()` | Today (`ch.dist.devices()`, `ch.dist.device()`) |
+| `ray.util.collective` (NCCL, GLOO; allreduce, allgather, broadcast, reduce, reducescatter, send/recv, barrier, multi-GPU variants, custom backends) | `ch.context().gang` and `ch.dist.group(*actors)` with the same operations; `reduce`, multi-GPU variants and `ext.CollectiveBackend` | Today (barrier, all_gather, all_reduce, broadcast; the shim adds reduce) / P5 (reducescatter, send/recv, multi-GPU, `ext.CollectiveBackend`) |
+| Placement-group SPMD by hand | `.gang()` with rank variables for PyTorch, JAX and DeepSpeed; elastic `ranks=ch.auto(...)` | Today (`.gang()` with elastic ranks; ranks placed one at a time) |
 | `ray.dag`, Compiled Graphs (`experimental_compile`, NCCL channels) | `@ch.graph`, `.compile(max_in_flight=)` | P5 |
 | `visualize()` | `graph.explain()` renders the compiled plan | New (P5) |
 | `register_tensor_transport`, NIXL memory registration | `ext.Transport`; NIXL and UCX registration are admission resources | New (P5) |
@@ -159,10 +159,10 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
 | Task events and the State API (tasks) | `future.explain()`, `run.tasks()`, `chimaera inspect/explain`, with attempts, physical measurements and the waiting reason | Today |
-| State API for actors, objects, workers, summaries | `ch.cluster().actors()/objects()/workers()`, `chimaera list actors\|objects\|workers` | New (P3–P4) |
-| `ray.nodes()`, `cluster_resources()`, `available_resources()` | `ch.cluster().nodes()`, `.resources()`; available vs total | Today / New (P3, available) |
+| State API for actors, objects, workers, summaries | `ch.runs.cluster().actors()/objects()/workers()`, `chimaera list actors\|objects\|workers` | New (P3–P4) |
+| `ray.nodes()`, `cluster_resources()`, `available_resources()` | `ch.runs.cluster().nodes()`, `.resources()`; available vs total | Today (CPUs in use) / P3 (available memory and GPUs) |
 | Dashboard (jobs, nodes, actors, tasks, logs, Grafana) | Served by any peer from fan-out queries; no head to host it (D8) | New (P4) |
-| Prometheus metrics, Grafana dashboards | Prometheus and OTLP export with bounded cardinality | P4 |
+| Prometheus metrics, Grafana dashboards | Prometheus and OTLP export with bounded cardinality | Today (`/metrics` when `CHIMAERA_METRICS_LISTEN` is set) / P4 (OTLP, dashboards) |
 | `ray.util.metrics` (Counter, Gauge, Histogram) | `ch.metrics.counter/gauge/histogram` | New (P4) |
 | `ray.timeline()` (Chrome trace) | `chimaera timeline RUN` writes a Perfetto/Chrome trace | New (P4) |
 | `ray stack`, py-spy flame graphs, memray, GPU profilers | `chimaera stack CALL` (remote unwinding, PEP 768 on 3.14+), `chimaera profile CALL --cpu/--memory/--gpu` | New (P4) |
@@ -177,21 +177,21 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
-| `ray.util.multiprocessing.Pool` | `chimaera.multiprocessing.Pool` with the same methods | New (P3) |
-| `ray.util.joblib` backend | `chimaera.joblib` backend (`parallel_backend("chimaera")`) | New (P3) |
+| `ray.util.multiprocessing.Pool` | `chimaera.multiprocessing.Pool` with the same methods | Today (compat shim) |
+| `ray.util.joblib` backend | `import chimaera.joblib`, then `parallel_config(backend="chimaera")`: each batch is one call; an error cancels the batches still running | Today |
 | Dask on Ray | `dask.compute(..., scheduler=chimaera.dask.get)` | New (P4) |
 | Spark on Ray | Not a core concern | Won't |
-| `concurrent.futures` (not offered by Ray) | `ch.executor()` is a `concurrent.futures.Executor` | New (P3) |
+| `concurrent.futures` (not offered by Ray) | `ch.Executor` is a `concurrent.futures.Executor` | Today |
 | Ray programs unchanged | `python -m chimaera.compat.ray app.py` | Today |
 
 ### CLI
 
 | Ray 2.60 | Chimaera | Status |
 |---|---|---|
-| `start`, `stop`, `status` | `chimaera peer start/stop`, `chimaera status` (says why work waits) | Today |
+| `start`, `stop`, `status` | `chimaera peer start`, `chimaera stop`, `chimaera status` (says why work waits) | Today |
 | `list`, `get`, `summary` (tasks) | `chimaera inspect`, `explain` | Today |
 | `memory`, `timeline`, `stack`, `debug`, `kill-actor`, `drain-node`, `health-check`, `check-open-ports`, `cluster-dump`, `microbenchmark`, `dashboard` | `chimaera memory/timeline/stack/debug/kill/drain/doctor/dump/bench/dashboard` | `doctor` Today; rest New (P3–P4) |
-| `job submit/stop/status/logs/list/delete` | `chimaera submit/cancel/inspect/logs/runs` | P3 |
+| `job submit/stop/status/logs/list/delete` | `chimaera submit/cancel/inspect/logs/runs` | Partly today (`logs`, `inspect`) / P3 (submit, cancel, runs) |
 
 ## 2. Beyond Ray: what other runtimes do better
 
@@ -206,25 +206,25 @@ are out of scope.
 | `as_completed(...).add(f)` for dynamic frontiers (crawlers, search, rollouts) | Dask | `ch.as_completed(fs)` returns an iterator with `.add(future)` | New (P3) |
 | A waiting task gives back its slot (`secede`/`rejoin`) | Dask | Automatic: a call blocked on other calls releases its CPU and keeps its memory charge | Today |
 | Fire and forget | Dask | Dropping a future releases its result; the call still runs | Today |
-| Retrieve a call by id from another process, later | Modal (`FunctionCall.from_id`, 7 days), Temporal handles | `run.future(call_id)`; retention follows the run's lifetime | New (P3) |
-| `concurrent.futures`-compatible executor with callbacks | Flux, mpi4py | `ch.executor()`; `Future.add_done_callback` | New (P3) |
+| Retrieve a call by id from another process, later | Modal (`FunctionCall.from_id`, 7 days), Temporal handles | `run.future(call_id)`; retention follows the run's lifetime | Partly today (`ch.runs.attach(run).outcomes()`) / P3 (`run.future(id)`) |
+| `concurrent.futures`-compatible executor with callbacks | `ch.Executor`; `Future.add_done_callback` | `ch.executor()`; `Future.add_done_callback` | Today |
 | Sync and async from one API | Modal `.aio`, Monarch | Every `Future` is awaitable; `.remote()` never blocks | Today |
 | Retries with backoff and jitter | Celery, Modal | Retries of listed exceptions and actor restarts back off exponentially with jitter by default | New (P3) |
-| Ordered `map` with `return_exceptions` | Modal | `fn.map(items, errors="return")` yields exceptions in place | New (P3) |
+| Ordered `map` with `return_exceptions` | Modal | `fn.map(items, errors="return")` yields exceptions in place | Today (`Results.outcomes()`) |
 | Per-task timeouts | Modal, Temporal | `deadline=` | Today |
 
 ### Actors
 
 | Feature | From | Chimaera | Status |
 |---|---|---|---|
-| Virtual actors: get-or-activate by key, idle passivation, reactivation anywhere | Orleans, Akka, Dapr, Restate | `key=` with `idle=`; single activation guaranteed by a fenced generation | New (D4, M3) |
+| Virtual actors: get-or-activate by key, idle passivation, reactivation anywhere | Orleans, Akka, Dapr, Restate | `name=` with `idle=`; single activation guaranteed by a fenced generation | New (D4, M3) |
 | Many cheap actors per process | Orleans, Akka, Erlang | `process="shared"` | New (D4, P2–M3) |
-| Actor meshes: slicing, call all and gather, call one, stream replies | Monarch | `.gang()` returns a mesh; `mesh.method.remote()` returns `Results`; `mesh[i]`, `mesh.slice(dp=0)`, `.reduce(op)` | New (D4, P5) |
+| Actor meshes: slicing, call all and gather, call one, stream replies | Monarch | `.gang()` returns a mesh; `mesh.method.remote()` returns `Results`; `mesh[i]`, `mesh.slice(dp=0)`, `.reduce(op)` | Partly today (`g[i]`, call every rank, `Group.mesh`) / P5 (slicing, reduce, streamed replies) |
 | Load-balanced routing and sticky sessions over replicas | torchforge, Modal `@sessioned` | `pool.method.remote()` goes to the least busy replica; `pool.route(key)` | Today |
 | Lifecycle hooks (`@enter`, `@exit`, `__cleanup__`) | Modal, Monarch | `__enter__` / `__exit__` on the class | New (D4, P2) |
 | Supervision trees, fail-fast by default | Monarch, Erlang | Child lifetimes follow the creating scope; `actor.watch()`; errors propagate | New (D4, P3) |
 | Restart intensity and backoff | Erlang/OTP, Akka | `max_restarts=(count, window)`; exponential backoff with jitter | New (P3) |
-| Links and monitors | Erlang/OTP | `actor.watch()` yields `ActorDied` and restart events | New (P3) |
+| Links and monitors | Erlang/OTP | `actor.watch()` yields `ActorDied` and restart events | Partly today (a stream of actor events) / P3 (`actor.watch()`) |
 | Reentrancy control | Orleans | Call cycles are detected and reported as `ch.Deadlock`; `concurrency>1` or groups allow overlap | New (P3) |
 | Durable reminders | Orleans, Dapr | `start_after=` on an actor method call; durable when longer than the journal window | New (P3) |
 | Live migration and rebalancing | Orleans (experimental) | Shared actors move between executors (actor-packing controller); durable actors restart elsewhere from state | New (M3) |
@@ -236,36 +236,36 @@ are out of scope.
 |---|---|---|---|
 | `scatter(broadcast=True)` | Dask | `ch.put` plus pipelined broadcast trees for popular values | Today (put) / New (D5, M3) |
 | Spill, pause and terminate thresholds per worker | Dask | One memory pool per peer: spill at 80%, pause admission under pressure, stop the call furthest over its reservation | Today |
-| Graceful retirement that migrates data | Dask Active Memory Manager | `chimaera drain PEER` moves objects, journals and durable actors before the peer leaves | New (M3) |
+| Graceful retirement that migrates data | Dask Active Memory Manager | `chimaera drain PEER` moves objects, journals and durable actors before the peer leaves | Partly today (SIGTERM lets running calls finish) / M3 (moving data, `chimaera drain`) |
 | One-sided RDMA buffers | Monarch, NIXL, `torch.distributed._transport` | `transport="device"`: handle on the control path, bytes moved one-sided | P5 |
 | Peer-to-peer shuffle | Dask | `reduce_by_key` (Today on one peer); disk shuffle across peers | Today / M3 |
 | External payload storage | Temporal | Spill target URI for values and checkpoints | M3 |
-| Code and environment sync to every host | Monarch (RDMA file sync), Modal images | Content-addressed `ch.Env(files=...)`, one copy per peer | P3 |
+| Code and environment sync to every host | Monarch (RDMA file sync), Modal images | Content-addressed `ch.Env(files=...)`, one copy per peer | Today (one project archive per content, unpacked once per peer) / P3 (`ch.Env(files=)`) |
 
 ### Coordination
 
 | Feature | From | Chimaera | Status |
 |---|---|---|---|
-| Named persistent Dict and Queue | Modal, Dask | `ch.Store` namespaces; `ch.Queue(key=, durable=True)` | Today |
+| Named persistent Dict and Queue | Modal, Dask | `ch.coord.Store` namespaces; `ch.coord.Queue(name=, durable=True)` | Today |
 | Lock, barrier, counter | Dask | `store.lock`, `store.barrier`, `store.counter` | Today |
 | Semaphore (lease-based) and Event | Dask | `store.semaphore(key, n, ttl=)`; an event is a key plus `store.watch` | New (P3) |
 | Global rate limits and per-key concurrency | Dramatiq, Hatchet, DBOS, Inngest | `limit=ch.Limit(key, rate=, concurrency=)`, enforced by delegated token shares | New (D6, P4) |
-| Pub/sub | Orleans streams (Dask removed its own) | `ch.Topic` | Today |
-| CRDT replicated maps | Akka Distributed Data | Not offered: `ch.Store` is linearizable and sharded by namespace | Won't |
+| Pub/sub | Orleans streams (Dask removed its own) | `ch.coord.Topic` | Today |
+| CRDT replicated maps | Akka Distributed Data | Not offered: `ch.coord.Store` is linearizable and sharded by namespace | Won't |
 
 ### Durability
 
 | Feature | From | Chimaera | Status |
 |---|---|---|---|
 | Workflows replayed from history after any crash | Temporal, DBOS, Restate | `workflow="durable"` | Today |
-| Workflow id as idempotency key | DBOS, Temporal | `key=` on a call: a second submission with the same key returns the first call's future | New (P3) |
-| Durable sleep for days | Temporal, DBOS | `await ch.workflow.sleep("2d")` inside a durable workflow | New (P3) |
-| Signals, queries, updates | Temporal | Signals through a durable `ch.Queue`, state published to `ch.Store`; no separate signal API | Today (building blocks) |
-| Patch markers for in-flight code | Temporal | `ch.workflow.patched("change-id")` | New (P3) |
+| Workflow id as idempotency key | DBOS, Temporal | `key=` on a call: a second submission with the same key returns the first call's future | Partly today (`command_id=` on durable actors) / P3 (function calls) |
+| Durable sleep for days | Temporal, DBOS | `await ch.durable.sleep("2d")` inside a durable workflow | Partly today (`await ch.durable.sleep(seconds)`) / P3 (durations) |
+| Signals, queries, updates | Temporal | Signals through a durable `ch.coord.Queue`, state published to `ch.coord.Store`; no separate signal API | Today (building blocks) |
+| Patch markers for in-flight code | Temporal | `ch.durable.patched("change-id")` | New (P3) |
 | History compaction | Temporal (`continue_as_new`, 51,200-event cap) | Workflow history snapshots automatically; no cap to manage | New (M3) |
 | Fork, rewind and resume an execution | DBOS | `chimaera replay RUN --from CALL` | New (P6) |
 | Exactly-once state changes co-committed with the checkpoint | DBOS transactions, Restate virtual objects | Durable actors: state, reply and outbox commit together | Today |
-| HA cron schedules | Celery Beat (no HA), Modal, Temporal | `fn.options(key=...).schedule(cron=...)` held by a metadata group | New (P4) |
+| HA cron schedules | Celery Beat (no HA), Modal, Temporal | `fn.options(name=...).schedule(cron=...)` held by a metadata group | New (P4) |
 | Delayed start, ETA, countdown | Celery, DBOS, Temporal | `start_after=` | New (P3) |
 
 ### Scheduling and resources
@@ -274,20 +274,20 @@ are out of scope.
 |---|---|---|---|
 | Fractional, device-specific and variant resources | HyperQueue | `gpus=0.5`; `device="cuda:GPU-<uuid>"`; `device=[...]` as a fallback list | P5 / New (P5) |
 | GPU fallback lists | Modal | `device=["cuda:H100", "cuda:A100-80GB"]` | New (P5) |
-| Fairness keys across tenants | Temporal, Hatchet | Weighted DRF across tenants and runs | P6 |
+| Fairness keys across tenants | Temporal, Hatchet | Weighted DRF across tenants and runs | Today (tenant caps and shares) / P6 (weighted DRF) |
 | Root-task admission that prevents memory blow-up | Dask | Credit-based submission and memory-aware admission | Today |
-| Resource-signal placement | Orleans | Cost model on measured load, input locality and learned compute (D6) | Today (locality) / M2 |
-| Hierarchical schedulers | Flux | Peer, cell and fleet tiers (D1) | M2–M5 |
-| Backlog-driven allocation on Slurm | HyperQueue, Parsl | Slurm provider asks for allocations from per-shape demand | P6 |
+| Resource-signal placement | Orleans | Cost model on measured load, input locality and learned compute (D6) | Today (load, locality, learned run time and memory) / M2 (the rest of D6) |
+| Hierarchical schedulers | Flux | Peer, cell and fleet tiers (D1) | Today (cells hand work to each other) / M5 (fleet scheduler) |
+| Backlog-driven allocation on Slurm | HyperQueue, Parsl | Slurm provider asks for allocations from per-shape demand | Today (`SlurmSpares` grows on backlog) / P6 (demand per shape) |
 | Topology levels with required and preferred per level, segment sizes | Kueue TAS, Slurm topology/block | `Placement(pack=..., segment=...)` over the topology graph (D9) | P5 |
 
 ### GPU and training
 
 | Feature | From | Chimaera | Status |
 |---|---|---|---|
-| Gang-scheduled multi-node clusters with RDMA | Modal `@clustered` | `.gang()` | P5 |
+| Gang-scheduled multi-node clusters with RDMA | Modal `@clustered` | `.gang()` | Partly today (`.gang()`) / P5 (RDMA setup, all-or-nothing placement) |
 | Replica groups with per-step commit and recovery from a peer | torchft | Gangs of replica groups; partial restart (L13) | P5 |
-| Elastic resharding after losing a slice | Cloud Pathways | `ranks=ch.auto(min, max)`, new generation per membership change | P5 |
+| Elastic resharding after losing a slice | Cloud Pathways | `ranks=ch.auto(min, max)`, new generation per membership change | Today (`ranks=ch.auto(min, max)`) |
 | KV-aware routing hooks | Dynamo | `pool.route(key)` and an `ext.Router` for custom policies | Today (route) / New (P5) |
 | GPU memory snapshots | Modal (alpha) | Not offered: cuda-checkpoint is single-node and skips UVM; revisit when it matures | Won't |
 | Interactive SPMD from a notebook | Monarch | A notebook is a driver; gangs and meshes work from it, and the run survives the kernel | P5 |
@@ -302,10 +302,10 @@ are out of scope.
 | Rolling upgrades across versions | (Orleans and Flux need lockstep) | `feature_level` gating, N/N−1 protocol (design.md amendment 12) | M5 |
 | Python-defined images and secrets | Modal | `ch.Env(image=, pip=, secrets=[...])` | P3 / New (P3, secrets) |
 | Sandboxes for untrusted code | Modal, Ray (experimental) | `sandbox=ch.Sandbox(...)` | New (P6) |
-| SQL over live telemetry | Monarch | `ch.cluster().query(sql)` executed on the peers (D8) | New (P4) |
+| SQL over live telemetry | Monarch | `ch.runs.cluster().query(sql)` executed on the peers (D8) | New (P4) |
 | One-file performance report | Dask `performance_report` | `chimaera report RUN --html` | New (P4) |
 | Spans | Dask | OpenTelemetry spans, propagated through calls | New (P4) |
-| Per-call logs | Modal | `future.logs()`, `chimaera logs CALL` | New (P3) |
+| Per-call logs | Modal | `future.logs()`, `chimaera logs CALL` | Partly today (`Run.logs()` lines carry the call id; `chimaera logs -f`) / P3 (`future.logs()`) |
 | Mesh-wide debugger, py-spy stacks, Perfetto profiles | Monarch | `chimaera debug`, `chimaera stack`, `chimaera timeline` | New (P4) |
 | Local equals remote | Modal `.local()` | A plain call runs locally | Today |
 | Edited code used on the next run | Modal `serve` | Today: an edited module is used by the next run | Today |
@@ -368,7 +368,7 @@ Notes on three rows:
   with fsync.
 - **Fresh handle.** That row uses the private `ch._future._future_from_key`, so each get asks the peer and decodes 10k
   handles, as Ray's does.
-- **Wait.** There is no `ch.wait`. The port makes 1,000 `next()` calls on one `ch.as_completed`.
+- **Wait.** The port predates `ch.wait`: it makes 1,000 `next()` calls on one `ch.as_completed`.
 
 **Not comparable**, so left out:
 - **Small `put` and `get` calls**, direct and through the remote driver:
@@ -399,7 +399,7 @@ The table below is from timing loops at load 6–9.
 |---|---:|---:|
 | Task round trip | 530–628 µs | 386–391 µs |
 | Actor round trip | 607–826 µs | 171–177 µs |
-| One commit (a `ch.Store.put`) | 165–200 µs | — |
+| One commit (a `ch.coord.Store.put`) | 165–200 µs | — |
 | One RPC to the peer, no commit | 33 µs | — |
 
 - **Submission is not the gap.** `.remote()` costs 21–25 µs in the Chimaera driver against 40–50 µs in Ray's, which
@@ -441,25 +441,36 @@ failover. Its numbers are the floor under the real path, and the headroom is wha
 
 ### First steps on the real runtime
 
-The first two steps of D2 are now in the tree ([bench/proto/local-group](../bench/proto/local-group/RESULTS.md)):
+The first steps of D2 are now in the tree ([bench/proto/local-group](../bench/proto/local-group/RESULTS.md)):
 - **No log:** a local peer's group applies commands without a Raft log.
-- **Durability where needed:** an attached run's per-call commands commit without waiting for durability. They
-  become durable within 500 ms. Detached runs, actors, store writes and external effects stay durable.
+- **Ordinary calls:** an attached run's per-call commands go to an in-memory overlay with no database write. The
+  overlay is written durably within 500 ms. Detached runs, actors, store writes and external effects commit durably
+  at once.
+- **Executor:** it no longer rescans the actor class on every method call.
+- **Early outcome:** an attached run's caller gets the outcome as soon as the executor returns. The publication
+  follows and is the record. This takes another ~35 µs off a local call: tasks 199–202 µs, actor calls ~220 µs
+  (same-snapshot A/B).
 
-Release builds of the same live tree, three alternating runs at the same load:
+Release builds from one snapshot, identical except for the switch, three alternating runs at load 23–30:
 
-| Measurement | Before | After |
-|---|---:|---:|
-| Sync task round trip, p50 | 499–525 µs | 257–260 µs |
-| Sync actor call round trip, p50 | 530–624 µs | 285–319 µs |
-| One commit, p50 | 139–346 µs | 31 µs (attached call) |
+| Measurement | Before | After | Ray 2.60, same laptop |
+|---|---:|---:|---:|
+| Sync task round trip, p50 | 595–640 µs | 247–296 µs | 386–391 µs |
+| Sync actor call round trip, p50 | 641–654 µs | 276–296 µs | 166–181 µs |
+| One group proposal, p50 | 347 µs | 22 µs (attached call) | — |
 
-- **Tests:** the Raft crash tests pass, and each fails against a deliberate durability bug. The Python suite passes:
-  269 passed, 5 skipped, 0 failed, including the SIGKILL-mid-run recovery test.
-- **Against Ray:** Ray's actor round trip here is 167–177 µs. Chimaera's local actor call goes from about 3× slower
-  to about 1.7× slower.
-- **What is left:** the per-call stages in the driver, peer and executor, about 200 µs. Commits are now about 60 µs
-  of the round trip.
+The Ray numbers were taken at load 6–20.
+
+- **Tests:**
+  - A randomized test checks the overlay against an in-memory map.
+  - Crash tests check what survives an abort.
+  - Each test fails against a deliberate bug.
+  - The Python suite: 298 passed, 5 skipped, 0 failed.
+- **Against Ray:** local task calls are now about half of Ray's. Local actor calls take 190–200 µs in calm runs,
+  against Ray's 163–185 µs, down from 3.5× Ray's.
+- **What is left:** two group proposals (~44 µs), the executor (~46 µs CPU), the peer's core loop (~34 µs) and
+  about six thread wake-ups. Ray's actor call skips the agent entirely, so closing this needs D2's direct actor
+  path.
 
 ### What closes each gap
 
@@ -470,7 +481,7 @@ Release builds of the same live tree, three alternating runs at the same load:
 | Concurrent and async actors (0.24–0.46×) | Batch Execute frames for every actor, not only one-at-a-time actors. Run coroutines on the executor's own loop with no thread-pool hop. Index the mailbox by readiness instead of scanning it. | D4 | Same per-call cost as one-at-a-time actors. Async actors then scale with frame coalescing, as Ray's n:n benchmarks do. |
 | n:n and 1:n actor calls (0.24–0.50×) | Per-pair channels with 50 µs coalescing only under load. No shared commit log between pairs. | D2, D4 | Throughput scales with cores. Today every call on the peer serializes through one Raft log writer. |
 | Put bandwidth (0.24×, 0.65×) | Hash large puts on several threads while copying, or name puts above a size threshold by a random id and hash only when the value crosses machines. | D5 | Single-threaded blake3 on every put caps throughput at the hash rate. Ray's 54 GB/s here is a memcpy. |
-| Placement groups (not built) | `ch.reserve`: a two-phase commit in one metadata group per gang. | D6, D9 | Phase P5. |
+| Placement groups (not built) | `ch.dist.reserve`: a two-phase commit in one metadata group per gang. | D6, D9 | Phase P5. |
 | Peer CPU under load | All of the above. Each call then costs ≤ 30 µs of agent CPU (§14) instead of ~140 µs. | D2 | Less sensitivity to a busy machine. |
 
 Async task submission, `wait`, gets of objects holding many refs, and the remote-driver rows already beat Ray. They
@@ -497,6 +508,15 @@ otherwise.
 
 ## 5. The gap list in delivery order
 
+**Audit, 2026-11-21.** Every row in §1 and §2 not marked Today or Won't was checked against the code and the tests in
+`python/tests`:
+- 127 rows were checked.
+- 7 are now Today and 37 are partly Today; their status cells above say which part.
+- 83 are still missing.
+- One Today row was wrong (`peer stop`) and is fixed.
+
+The list below is the original plan and still names the missing parts.
+
 Everything marked New above, grouped by phase. "Effort" is a rough size: S under a day, M a few days, L a week or
 more.
 
@@ -509,13 +529,13 @@ more.
 
 **P2 / P3 (API, same machine first)**
 - `process="shared"`, `__enter__`/`__exit__`, structured actor lifetimes, `actor.watch()`, `ch.Deadlock`. M
-- `if_exists="error"`, `ch.cluster().actors()`, `ch.ActorRestarting`, `ch.context().restarted/exit()`, `handle.restart()`, `close(drain=True)`, `max_pending_calls`. M
+- `if_exists="error"`, `ch.runs.cluster().actors()`, `ch.ActorRestarting`, `ch.context().restarted/exit()`, `handle.restart()`, `close(drain=True)`, `max_pending_calls`. M
 - Interrupting cancel, `cancel(children=False)`, `max_calls`, `name=`/`tags=`, ready-order start for `concurrency>1`. M
-- `Future.add_done_callback`, `ch.executor()`, `as_completed(...).add()`, `run.future(id)`, `map(errors="return")`. S
+- `as_completed(...).add()`, `run.future(id)`, `map(errors="return")`. S
 - Call `key=` as idempotency key, `start_after=`, retry backoff, `max_restarts=(n, window)`. M
-- `ch.workflow.sleep`, `ch.workflow.patched`. M
+- `ch.durable.sleep`, `ch.durable.patched`. M
 - `store.semaphore`. S
-- `chimaera.multiprocessing.Pool`, joblib backend. S
+- `chimaera.multiprocessing.Pool` (the Ray compat shim has one today). S
 - `ch.Env` fields: `files`, `exclude`, `pip`, `uv_lock`, `conda`, `image`, `python`, `setup`, `secrets`, `build_timeout`; one `uv sync` per peer per lock digest. L
 - `ch.init(cpus=, memory=, gpus=, log_format=, metadata=)`; `future.logs()`; `ch.jobs` client and HTTP API; `chimaera exec/attach/sync`. M
 
@@ -526,17 +546,17 @@ more.
 - Actor-packing controller; workflow history snapshots; spill to an object-store URI. M
 
 **P4 (observability)**
-- Dashboard on any peer; `ch.cluster().query(sql)` with DataFusion; `chimaera top/stack/profile/debug/timeline/memory/report`. L
+- Dashboard on any peer; `ch.runs.cluster().query(sql)` with DataFusion; `chimaera top/stack/profile/debug/timeline/memory/report`. L
 - `ch.metrics`; OpenTelemetry propagation; JSON logs and de-duplicated task output; notebook reprs and progress. M
 - `ch.Limit` flow control; HA schedules; `ext.EnvPlugin`; Dask scheduler adapter. M
 
 **P5 / M4 (accelerators)**
 - Device plugins with fallback lists and device-specific requests; fractional GPUs after measurement. M
 - Gangs as meshes (`mesh.method.remote`, slicing, reduce); replica groups; hierarchical communicator setup with shrink and grow. L
-- `ch.reserve` lifecycle (`key=`, `lifetime=`, `ch.reservation`, inherited by child calls); topology levels with segments; isolation tokens (IMEX channels, ComputeDomains). L
+- `ch.dist.reserve` lifecycle (`key=`, `lifetime=`, `ch.reservation`, inherited by child calls); topology levels with segments; isolation tokens (IMEX channels, ComputeDomains). L
 - `transport="device"` over NIXL/UCX, `ch.put(..., transport="device")`, `ext.Transport`, `ext.CollectiveBackend`, `graph.explain()`. L
 - XID-tiered health with repair throttling. M
 
 **M5 / P6 (fleet)**
 - Cells, ambassadors and summaries, global directory, scoped names, delegated quotas, `durability="region"`. L
-- `ch.cluster().request(...)`, Slurm backlog allocation, `ch.Sandbox`, `chimaera replay --from`. M
+- `ch.runs.cluster().request(...)`, Slurm backlog allocation, `ch.Sandbox`, `chimaera replay --from`. M

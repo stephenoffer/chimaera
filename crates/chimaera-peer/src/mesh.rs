@@ -30,30 +30,64 @@ impl tonic::service::Interceptor for AddToken {
         if let Some(v) = &self.0 {
             req.metadata_mut().insert("authorization", v.clone());
         }
+        req.metadata_mut().insert(LEVEL_HEADER, chimaera_proto::PEER_LEVEL.into());
         Ok(req)
     }
 }
 
-/// Refuses mesh calls that do not carry this cluster's token. Compares
-/// blake3 digests, whose equality check runs in constant time.
+/// The peer protocol level a mesh call carries (see `chimaera_proto::PEER_LEVEL`).
+const LEVEL_HEADER: &str = "chimaera-level";
+
+/// Refuses calls that carry neither this cluster's token nor, from clients,
+/// a driver credential issued from it (see `crate::auth`).
 #[derive(Clone)]
-pub struct CheckToken(Option<blake3::Hash>);
+pub struct CheckToken {
+    verifier: Option<crate::auth::Verifier>,
+    /// Callers are peers, which must present the token itself and run at
+    /// this peer level.
+    peers: bool,
+}
 
 impl CheckToken {
-    pub fn new(token: Option<&str>) -> CheckToken {
-        CheckToken(token.map(|t| blake3::hash(t.as_bytes())))
+    /// For the mesh, whose callers are peers.
+    pub fn peers(token: Option<&str>) -> CheckToken {
+        CheckToken { verifier: token.map(crate::auth::Verifier::new), peers: true }
+    }
+
+    /// For drivers and the CLI on other machines; `Hello` checks their wire
+    /// version. Each request gets its `auth::Caller`.
+    pub fn clients(token: Option<&str>) -> CheckToken {
+        CheckToken { peers: false, ..CheckToken::peers(token) }
     }
 }
 
 impl tonic::service::Interceptor for CheckToken {
-    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
-        let Some(want) = &self.0 else { return Ok(req) };
-        let got =
-            req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|s| s.strip_prefix("Bearer "));
-        match got {
-            Some(t) if blake3::hash(t.as_bytes()) == *want => Ok(req),
-            _ => Err(Status::unauthenticated("missing or wrong cluster token")),
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        let level = req.metadata().get(LEVEL_HEADER).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<u32>().ok());
+        if self.peers && level != Some(chimaera_proto::PEER_LEVEL) {
+            let theirs = level.map_or_else(|| "a release without levels".to_string(), |l| format!("level {l}"));
+            return Err(Status::failed_precondition(format!(
+                "a peer at {theirs} called this peer at level {}: every peer of a cluster must run the same \
+                 release (upgrade by restarting the peers onto the new one)",
+                chimaera_proto::PEER_LEVEL
+            )));
         }
+        let Some(verifier) = &self.verifier else {
+            req.extensions_mut().insert(crate::auth::Caller::Admin); // --insecure: anyone is trusted
+            return Ok(req);
+        };
+        let bearer =
+            req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|s| s.strip_prefix("Bearer "));
+        let caller = match bearer {
+            Some(b) if self.peers => verifier.is_token(b).then_some(crate::auth::Caller::Admin),
+            Some(b) => verifier.caller(b),
+            None => None,
+        };
+        let Some(caller) = caller else {
+            return Err(Status::unauthenticated("missing or wrong cluster token or driver credential"));
+        };
+        req.extensions_mut().insert(caller);
+        Ok(req)
     }
 }
 
@@ -61,10 +95,12 @@ const MAX_MESSAGE: usize = 256 << 20;
 const FETCH_CHUNK: usize = 4 << 20;
 /// Objects this large come over several streams at once (the guides measured
 /// 8-10x from multiple connections on large transfers).
-const PARALLEL_FETCH: u64 = 64 << 20;
+const PARALLEL_FETCH: u64 = 1 << 20;
 /// Peers asked for an object (holders included) before it counts as lost.
 const REPLICA_SEARCH: usize = 8;
 const FETCH_RANGES: u64 = 8;
+/// TCP connections per peer that bulk fetches spread over (see channel_lane).
+const FETCH_LANES: usize = 4;
 /// Transfers this large teach the bandwidth estimate.
 const RATE_SAMPLE_MIN: u64 = 1 << 20;
 /// Objects fetched this recently are offered as locality hints.
@@ -133,6 +169,8 @@ pub struct MeshClient {
     fetched: Mutex<HashMap<u64, (u64, u64)>>,
     /// Objects fetched recently (locality hints for other peers).
     recent: Mutex<VecDeque<(Instant, Vec<u8>)>>,
+    /// Which peer holds the parts of results fetched here (see parts).
+    parts: crate::parts::Hints,
     /// Objects other peers asked this one for, and when: their fetched copy
     /// already makes a replica unnecessary (see objplane).
     served: Mutex<HashMap<Vec<u8>, Instant>>,
@@ -223,6 +261,7 @@ impl MeshClient {
             bandwidth: Mutex::new(HashMap::new()),
             fetched: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
+            parts: crate::parts::Hints::default(),
             served: Mutex::new(HashMap::new()),
             received: Mutex::new(Vec::new()),
             swim: Mutex::new(Swim::new(me_node, swim_inc(me_inc), me_node, swim_config())),
@@ -231,8 +270,16 @@ impl MeshClient {
     }
 
     fn channel(&self, addr: &str) -> Result<Rpc, std::io::Error> {
+        self.channel_lane(addr, 0)
+    }
+
+    /// A connection to `addr`: lane 0 is the shared one; bulk transfers
+    /// spread over lanes 1..=FETCH_LANES, each its own TCP connection, since
+    /// one HTTP/2 connection carries all its streams on one socket.
+    fn channel_lane(&self, addr: &str, lane: usize) -> Result<Rpc, std::io::Error> {
+        let key = if lane == 0 { addr.to_string() } else { format!("{addr}#{lane}") };
         let mut chans = self.channels.lock().expect("lock");
-        let ch = match chans.get(addr) {
+        let ch = match chans.get(&key) {
             Some(c) => c.clone(),
             None => {
                 let scheme = if self.tls.is_some() { "https" } else { "http" };
@@ -245,20 +292,31 @@ impl MeshClient {
                     .tcp_nodelay(true)
                     .http2_keep_alive_interval(Duration::from_secs(5))
                     .keep_alive_timeout(Duration::from_secs(5))
-                    // Objects stream over these channels: windows sized for
-                    // bulk transfer (and grown with the measured bandwidth-delay
-                    // product), not HTTP/2's 64 KiB default.
+                    // Objects stream over these channels: fixed windows sized
+                    // for bulk transfer. (hyper's adaptive window would override
+                    // them and start from HTTP/2's 64 KiB, which holds one stream
+                    // to about 250 MB/s at this RTT.)
                     .initial_stream_window_size(8 << 20)
                     .initial_connection_window_size(32 << 20)
-                    .http2_adaptive_window(true)
                     .connect_lazy();
-                chans.insert(addr.to_string(), c.clone());
+                chans.insert(key, c.clone());
                 c
             }
         };
         Ok(pb::mesh_client::MeshClient::with_interceptor(ch, self.auth.clone())
             .max_decoding_message_size(MAX_MESSAGE)
             .max_encoding_message_size(MAX_MESSAGE))
+    }
+
+    fn rpc_lane(&self, node: u64, lane: usize) -> Result<Rpc, std::io::Error> {
+        let addr = self
+            .members
+            .read()
+            .expect("lock")
+            .get(&node)
+            .map(|p| p.member.addr.clone())
+            .ok_or_else(|| std::io::Error::other(format!("unknown node {node}")))?;
+        self.channel_lane(&addr, lane)
     }
 
     fn rpc(&self, node: u64) -> Result<Rpc, std::io::Error> {
@@ -356,6 +414,7 @@ impl MeshClient {
             return None;
         }
         p.dead = true;
+        crate::counters::PEERS_DECLARED_DEAD.add(1);
         Some(p.member.clone())
     }
 
@@ -450,6 +509,15 @@ impl MeshClient {
         Ok(())
     }
 
+    /// `node`'s copy of a run's output (see `runlogs::serve`).
+    pub async fn logs(&self, node: u64, logs: pb::LogsRequest) -> std::io::Result<pb::LogsReply> {
+        let wait = Duration::from_millis(u64::from(logs.wait_ms.min(30_000)));
+        let req = pb::MeshLogsRequest { cluster: self.cluster.clone(), logs: Some(logs) };
+        let mut c = self.rpc(node)?;
+        let r = tokio::time::timeout(CALL_TIMEOUT + wait, c.logs(req)).await.map_err(std::io::Error::other)?;
+        Ok(r.map_err(status_err)?.into_inner())
+    }
+
     pub async fn forget(&self, node: u64, mut req: pb::ForgetRequest) -> std::io::Result<()> {
         req.cluster = self.cluster.clone();
         let mut c = self.rpc(node)?;
@@ -459,20 +527,36 @@ impl MeshClient {
 
     /// Ask `node` to keep a copy of an object this peer stores (it pulls the
     /// bytes from here, to its disk).
-    pub async fn replicate(&self, node: u64, run: &[u8], object: &[u8], size: u64) -> std::io::Result<()> {
+    /// Ask `node` to keep a copy of `object`. With `wait`, the answer comes
+    /// once the copy is made, so an error means there is no copy.
+    pub async fn replicate(&self, node: u64, run: &[u8], object: &[u8], size: u64, wait: bool) -> std::io::Result<()> {
         let req = pb::ReplicateRequest {
             cluster: self.cluster.clone(),
             run: run.to_vec(),
             object_id: object.to_vec(),
             size,
             from_node: self.me.node_id,
+            wait,
         };
         let mut c = self.rpc(node)?;
-        tokio::time::timeout(CALL_TIMEOUT, c.replicate(req))
+        // A waited copy is one transfer: allow it 25 MB/s at worst.
+        let limit = if wait { CALL_TIMEOUT + Duration::from_secs_f64(size as f64 / 25e6) } else { CALL_TIMEOUT };
+        tokio::time::timeout(limit, c.replicate(req))
             .await
             .map_err(std::io::Error::other)?
             .map_err(status_err)?;
         Ok(())
+    }
+
+    /// What `node`'s object store holds (objplane::inventory, as JSON).
+    pub async fn inventory(&self, node: u64) -> std::io::Result<String> {
+        let mut c = self.rpc(node)?;
+        let req = pb::InventoryRequest { cluster: self.cluster.clone() };
+        let r = tokio::time::timeout(CALL_TIMEOUT, c.inventory(req))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(status_err)?;
+        Ok(r.into_inner().json)
     }
 
     /// Another peer asked for `object` (it will hold a copy).
@@ -510,6 +594,15 @@ impl MeshClient {
                 }
             });
         }
+    }
+
+    /// The groups the peer at `addr` leads, asked without gossip: for a peer
+    /// still starting, before it is a member.
+    pub async fn leads(&self, addr: &str, timeout: Duration) -> std::io::Result<Vec<u32>> {
+        let mut c = self.channel(addr)?;
+        let req = pb::PingRequest { cluster: self.cluster.clone(), ..Default::default() };
+        let r = tokio::time::timeout(timeout, c.ping(req)).await.map_err(std::io::Error::other)?;
+        Ok(r.map_err(status_err)?.into_inner().leading)
     }
 
     /// Probe `node` directly, gossiping membership both ways.
@@ -641,7 +734,7 @@ impl MeshClient {
         if got.is_err() {
             // Small, or a peer that does not serve ranges: one stream.
             tokio::fs::File::create(&tmp).await?;
-            got = self.fetch_range(node, run, object, 0, 0, &tmp).await;
+            got = self.fetch_range(node, run, object, 0, 0, &tmp, 0).await;
         }
         match got {
             Ok(n) => {
@@ -678,7 +771,10 @@ impl MeshClient {
         tokio::fs::File::create(tmp).await?.set_len(size).await?;
         let parts = ranges(size, FETCH_RANGES);
         let got: u64 = futures_util::future::try_join_all(
-            parts.iter().map(|&(off, len)| self.fetch_range(node, run, object, off, len, tmp)),
+            parts
+                .iter()
+                .enumerate()
+                .map(|(i, &(off, len))| self.fetch_range(node, run, object, off, len, tmp, 1 + i % FETCH_LANES)),
         )
         .await?
         .into_iter()
@@ -691,6 +787,7 @@ impl MeshClient {
 
     /// Write bytes [offset, offset+len) of the object (len 0: to the end) into
     /// `path` at the same offset, checking each chunk.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_range(
         &self,
         node: u64,
@@ -699,9 +796,9 @@ impl MeshClient {
         offset: u64,
         len: u64,
         path: &Path,
+        lane: usize,
     ) -> std::io::Result<u64> {
-        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-        let mut c = self.rpc(node)?;
+        let mut c = self.rpc_lane(node, lane)?;
         let req = pb::FetchRequest {
             cluster: self.cluster.clone(),
             run: run.to_vec(),
@@ -711,18 +808,47 @@ impl MeshClient {
             len,
         };
         let mut stream = c.fetch(req).await.map_err(status_err)?.into_inner();
-        let mut f = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-        f.seek(std::io::SeekFrom::Start(offset)).await?;
-        let (mut total, mut got) = (None, 0u64);
-        while let Some(chunk) = stream.message().await.map_err(status_err)? {
-            total.get_or_insert(chunk.total);
-            if !chunk.checksum.is_empty() && blake3::hash(&chunk.data).as_bytes()[..16] != chunk.checksum[..] {
-                return Err(std::io::Error::other(format!("corrupt chunk at byte {} from node {node}", offset + got)));
+        // A blocking writer checks and writes each chunk (pwrite at its offset)
+        // while the next one arrives: hashing and disk work stay off the async
+        // workers and overlap the network.
+        let (wtx, mut wrx) = tokio::sync::mpsc::channel::<(Vec<u8>, Vec<u8>)>(4);
+        let target = path.to_path_buf();
+        let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&target)?;
+            let mut got = 0u64;
+            while let Some((data, checksum)) = wrx.blocking_recv() {
+                if !checksum.is_empty() && blake3::hash(&data).as_bytes()[..16] != checksum[..] {
+                    return Err(std::io::Error::other(format!(
+                        "corrupt chunk at byte {} from node {node}",
+                        offset + got
+                    )));
+                }
+                f.write_all_at(&data, offset + got)?;
+                got += data.len() as u64;
             }
-            got += chunk.data.len() as u64;
-            f.write_all(&chunk.data).await?;
+            Ok(got)
+        });
+        let mut total = None;
+        let mut received = Ok(());
+        loop {
+            match stream.message().await {
+                Ok(Some(chunk)) => {
+                    total.get_or_insert(chunk.total);
+                    if wtx.send((chunk.data, chunk.checksum)).await.is_err() {
+                        break; // the writer stopped: its error says why
+                    }
+                }
+                Ok(None) => break,
+                Err(s) => {
+                    received = Err(status_err(s));
+                    break;
+                }
+            }
         }
-        f.flush().await?;
+        drop(wtx);
+        let got = writer.await.map_err(std::io::Error::other)??;
+        received?;
         if total.is_some_and(|t| t != got) || (len > 0 && got != len) {
             return Err(std::io::Error::other(format!("short fetch: {got} of {total:?} bytes")));
         }
@@ -804,9 +930,17 @@ impl MeshClient {
         if dest.exists() {
             return Ok(());
         }
+        // A part of a result of several values is asked for by id alone: it is
+        // where that result came from (see parts).
+        let hinted = if holders.is_empty() { self.parts.holder(run, object) } else { Vec::new() };
+        let holders = if holders.is_empty() { &hinted[..] } else { holders };
         let gate = self.inflight.lock().expect("lock").entry(dest.clone()).or_default().clone();
         let held = gate.lock().await;
-        let result = if dest.exists() { Ok(()) } else { self.fetch_from(run, object, size, holders, &dest).await };
+        let result = if dest.exists() {
+            Ok(())
+        } else {
+            self.fetch_from(run, object, size, holders, &dest).await.map(|node| self.parts.learn(run, &dest, node))
+        };
         drop(held);
         let mut inflight = self.inflight.lock().expect("lock");
         if Arc::strong_count(&gate) <= 2 {
@@ -822,7 +956,7 @@ impl MeshClient {
         size: u64,
         holders: &[u64],
         dest: &Path,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u64> {
         let mut candidates: Vec<u64> = holders.iter().copied().filter(|n| *n != self.me.node_id).collect();
         if candidates.is_empty() {
             candidates = self.live_others().iter().map(|p| p.member.node_id).collect();
@@ -832,7 +966,7 @@ impl MeshClient {
         candidates.sort_by(|a, b| self.bandwidth(*b).unwrap_or(0.0).total_cmp(&self.bandwidth(*a).unwrap_or(0.0)));
         for &node in &candidates {
             match self.fetch(node, run, object, size, dest).await {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(node),
                 Err(e) => last = e,
             }
         }
@@ -854,7 +988,7 @@ impl MeshClient {
             }
             tried.push(node);
             if self.fetch(node, run, object, size, dest).await.is_ok() {
-                return Ok(());
+                return Ok(node);
             }
         }
         Err(last)
@@ -922,6 +1056,40 @@ impl Transport for MeshTransport {
             Ok(r.into_inner().body)
         })
     }
+
+    fn send_snapshot(&self, target: u64, addr: &str, group: u32, header: Vec<u8>, file: std::fs::File) -> RpcFuture {
+        let client = self.0.channel(addr);
+        let cluster = self.0.cluster.clone();
+        Box::pin(async move {
+            use futures_util::StreamExt;
+            let mut c = client?;
+            let size = file.metadata()?.len();
+            let first = pb::SnapshotChunk { cluster, group, header, size, data: Vec::new() };
+            let rest = snapshot_chunks(tokio::fs::File::from_std(file), FETCH_CHUNK)
+                .map(|data| pb::SnapshotChunk { data, ..Default::default() });
+            let r = c
+                .install_snapshot(futures_util::stream::once(async move { first }).chain(rest))
+                .await
+                .map_err(|s| std::io::Error::other(format!("node {target}: {}", s.message())))?;
+            Ok(r.into_inner().body)
+        })
+    }
+}
+
+/// `file`'s bytes in pieces of at most `chunk`. A read error ends the stream
+/// early; the receiver then sees fewer bytes than the header announced.
+fn snapshot_chunks(file: tokio::fs::File, chunk: usize) -> impl tokio_stream::Stream<Item = Vec<u8>> + Send + 'static {
+    futures_util::stream::unfold(file, move |mut f| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; chunk];
+        match f.read(&mut buf).await {
+            Ok(0) | Err(_) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((buf, f))
+            }
+        }
+    })
 }
 
 // ---- server -----------------------------------------------------------------
@@ -987,10 +1155,47 @@ impl pb::mesh_server::Mesh for MeshService {
             Some(g) => g,
             None => self.0.starter.ensure(r.group).await.map_err(|e| Status::unavailable(e.to_string()))?,
         };
-        let body = chimaera_raft::handle_rpc(&group, kind, &r.body, &self.0.scratch)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let body =
+            chimaera_raft::handle_rpc(&group, kind, &r.body).await.map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(pb::RaftReply { body }))
+    }
+
+    async fn install_snapshot(
+        &self,
+        req: Request<Streaming<pb::SnapshotChunk>>,
+    ) -> Result<Response<pb::RaftReply>, Status> {
+        use tokio::io::AsyncWriteExt;
+        let mut chunks = req.into_inner();
+        let first = chunks.message().await?.ok_or_else(|| Status::invalid_argument("an empty snapshot stream"))?;
+        self.0.check(&first.cluster)?;
+        // Unique per transfer: two installs of one group may overlap.
+        let path = self.0.scratch.join(format!("incoming-{}-{}.snap", first.group, crate::router::now_ns()));
+        let written = async {
+            let mut f = tokio::fs::File::create(&path).await?;
+            let mut n = 0u64;
+            while let Some(chunk) = chunks.message().await.map_err(std::io::Error::other)? {
+                f.write_all(&chunk.data).await?;
+                n += chunk.data.len() as u64;
+            }
+            f.flush().await?;
+            Ok::<u64, std::io::Error>(n)
+        }
+        .await;
+        let reply = match written {
+            Ok(n) if n == first.size => {
+                let group = match self.0.router()?.hosted(first.group) {
+                    Some(g) => g,
+                    None => self.0.starter.ensure(first.group).await.map_err(|e| Status::unavailable(e.to_string()))?,
+                };
+                let r = chimaera_raft::handle_snapshot(&group, &first.header, &path).await;
+                tracing::info!(group = first.group, bytes = n, "installed a snapshot streamed from a peer");
+                r.map_err(|e| Status::internal(e.to_string()))
+            }
+            Ok(n) => Err(Status::data_loss(format!("the snapshot stream ended after {n} of {} bytes", first.size))),
+            Err(e) => Err(Status::internal(e.to_string())),
+        };
+        let _ = tokio::fs::remove_file(&path).await;
+        Ok(Response::new(pb::RaftReply { body: reply? }))
     }
 
     async fn propose(&self, req: Request<pb::ProposeRequest>) -> Result<Response<pb::ProposeReply>, Status> {
@@ -1015,6 +1220,13 @@ impl pb::mesh_server::Mesh for MeshService {
         self.0.check(&r.cluster)?;
         let router = self.0.router()?;
         let mut reply = pb::ReadReply::default();
+        if r.list_runs_group > 0 {
+            match router.runs_of(r.list_runs_group) {
+                Some(runs) => reply.runs = runs,
+                None => reply.error = "group not hosted here".into(),
+            }
+            return Ok(Response::new(reply));
+        }
         let vshard = r
             .tasks
             .first()
@@ -1162,11 +1374,30 @@ impl pb::mesh_server::Mesh for MeshService {
         Ok(Response::new(pb::ForgetReply {}))
     }
 
+    async fn logs(&self, req: Request<pb::MeshLogsRequest>) -> Result<Response<pb::LogsReply>, Status> {
+        let r = req.into_inner();
+        self.0.check(&r.cluster)?;
+        let logs = r.logs.unwrap_or_default();
+        crate::runlogs::serve(&self.0.code, &logs)
+            .await
+            .map(Response::new)
+            .map_err(|e| Status::internal(format!("reading run output: {e}")))
+    }
+
     async fn push_logs(&self, req: Request<pb::PushLogsRequest>) -> Result<Response<pb::PushLogsReply>, Status> {
         let r = req.into_inner();
         self.0.check(&r.cluster)?;
         let _ = self.0.core.send(CoreMsg::RemoteLogs { run: r.run, lines: r.lines }).await;
         Ok(Response::new(pb::PushLogsReply {}))
+    }
+
+    async fn inventory(&self, req: Request<pb::InventoryRequest>) -> Result<Response<pb::InventoryReply>, Status> {
+        self.0.check(&req.into_inner().cluster)?;
+        let dir = self.0.objects.dir().to_path_buf();
+        let json = tokio::task::spawn_blocking(move || crate::objplane::inventory(&dir).to_string())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(pb::InventoryReply { json }))
     }
 
     /// Keep a copy of another peer's object. With an in-memory store the copy
@@ -1179,18 +1410,16 @@ impl pb::mesh_server::Mesh for MeshService {
         if r.run.is_empty() || r.object_id.len() != 16 {
             return Err(Status::invalid_argument("replicate names a run and a 16-byte object id"));
         }
-        let (mesh, objects) = (self.0.mesh.clone(), self.0.objects.clone());
-        tokio::spawn(async move {
+        let (mesh, objects, wait) = (self.0.mesh.clone(), self.0.objects.clone(), r.wait);
+        let copy = async move {
             let dest = objects.path(&r.run, &r.object_id);
             if tokio::fs::symlink_metadata(&dest).await.is_ok() {
-                return;
+                return Ok(());
             }
-            let disk = objects.spill_dir().map(|d| d.join(hex(&r.run)).join(hex(&r.object_id)));
-            let got = mesh.fetch(r.from_node, &r.run, &r.object_id, r.size, disk.as_deref().unwrap_or(&dest)).await;
-            if let Err(e) = got {
-                tracing::debug!("replica of {} from node {}: {e}", hex(&r.object_id), r.from_node);
-                return;
-            }
+            let disk = objects.spill_path(&r.run, &r.object_id);
+            mesh.fetch(r.from_node, &r.run, &r.object_id, r.size, disk.as_deref().unwrap_or(&dest))
+                .await
+                .map_err(|e| format!("replica of {} from node {}: {e}", hex(&r.object_id), r.from_node))?;
             if let Some(disk) = disk {
                 let link = dest.with_extension("part-replica");
                 let _ = tokio::fs::remove_file(&link).await;
@@ -1200,11 +1429,73 @@ impl pb::mesh_server::Mesh for MeshService {
                     tokio::fs::rename(&link, &dest).await
                 };
                 if let Err(e) = made.await {
-                    tracing::debug!("replica of {}: cannot link it: {e}", hex(&r.object_id));
                     let _ = tokio::fs::remove_file(&disk).await;
+                    return Err(format!("replica of {}: cannot link it: {e}", hex(&r.object_id)));
                 }
             }
-        });
+            Ok(())
+        };
+        if wait {
+            copy.await.map_err(Status::unavailable)?;
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = copy.await {
+                    tracing::warn!("{e}");
+                }
+            });
+        }
         Ok(Response::new(pb::ReplicateReply {}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::service::Interceptor;
+
+    #[test]
+    fn a_peer_from_another_release_is_refused() {
+        let mut check = super::CheckToken::peers(Some("secret"));
+        let mut add = super::AddToken(Some("Bearer secret".parse().unwrap()));
+        let ok = add.call(tonic::Request::new(())).unwrap();
+        assert!(check.call(ok).is_ok());
+        let mut old = tonic::Request::new(());
+        old.metadata_mut().insert("authorization", "Bearer secret".parse().unwrap());
+        let e = check.call(old).unwrap_err();
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition);
+        assert!(e.message().contains("same release"), "{}", e.message());
+        let mut other = add.call(tonic::Request::new(())).unwrap();
+        other.metadata_mut().insert(super::LEVEL_HEADER, (chimaera_proto::PEER_LEVEL + 1).into());
+        assert_eq!(check.call(other).unwrap_err().code(), tonic::Code::FailedPrecondition);
+        // Drivers carry no level: only their token is checked here.
+        let mut clients = super::CheckToken::clients(Some("secret"));
+        let mut driver = tonic::Request::new(());
+        driver.metadata_mut().insert("authorization", "Bearer secret".parse().unwrap());
+        assert!(clients.call(driver).is_ok());
+        assert_eq!(clients.call(tonic::Request::new(())).unwrap_err().code(), tonic::Code::Unauthenticated);
+        // A driver credential is its tenant on the client listener, and no peer on the mesh.
+        let bearer = format!("Bearer {}", crate::auth::credential("secret", "alice"));
+        let mut with = |b: &str| {
+            let mut r = add.call(tonic::Request::new(())).unwrap();
+            r.metadata_mut().insert("authorization", b.parse().unwrap());
+            r
+        };
+        let seen = clients.call(with(&bearer)).unwrap();
+        assert_eq!(seen.extensions().get::<crate::auth::Caller>(), Some(&crate::auth::Caller::Tenant("alice".into())));
+        assert_eq!(check.call(with(&bearer)).unwrap_err().code(), tonic::Code::Unauthenticated);
+        let admin = clients.call(with("Bearer secret")).unwrap();
+        assert_eq!(admin.extensions().get::<crate::auth::Caller>(), Some(&crate::auth::Caller::Admin));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_goes_out_in_pieces_no_larger_than_a_chunk() {
+        use futures_util::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.snap");
+        let bytes: Vec<u8> = (0..(10 << 20) + 17).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let chunks: Vec<Vec<u8>> = super::snapshot_chunks(file, super::FETCH_CHUNK).collect().await;
+        assert!(chunks.iter().all(|c| !c.is_empty() && c.len() <= super::FETCH_CHUNK));
+        assert_eq!(chunks.concat(), bytes);
     }
 }

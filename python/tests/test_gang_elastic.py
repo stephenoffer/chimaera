@@ -16,15 +16,15 @@ def train():
     g = ch.context().gang
     where = g.all_gather(ch.context().node)
     if g.rank == 0:
-        ch.Store("elastic").put(f"where/{g.generation}", where)
+        ch.coord.Store("elastic").put(f"where/{g.generation}", where)
     if g.generation == 1:
         time.sleep(600)  # stays busy until a peer is lost
     return g.rank, g.size, g.generation
 
-victim = [n.peer for n in ch.cluster().nodes() if n.address.endswith(":{port}")][0]
+victim = [n.peer for n in ch.runs.cluster().nodes() if n.address.endswith(":{port}")][0]
 gang = train.options(ranks=ch.auto(min=2, max=12)).gang()
 deadline = time.monotonic() + 120
-while (where := ch.Store("elastic").get("where/1")) is None and time.monotonic() < deadline:
+while (where := ch.coord.Store("elastic").get("where/1")) is None and time.monotonic() < deadline:
     time.sleep(0.2)
 print("READY", len(where or []), victim in (where or []), flush=True)
 out = gang.result(timeout=240)

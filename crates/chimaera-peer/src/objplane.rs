@@ -73,6 +73,77 @@ pub fn object_dir(dir: &Path, peer_hex: &str) -> PathBuf {
     dir.join("objects")
 }
 
+/// Where objects in memory spill to: the directories in `CHIMAERA_SPILL_DIR`
+/// when set (colon-separated, like PATH; any filesystem: larger local disks,
+/// or a network mount such as NFS, EFS or FSx, like Ray's filesystem
+/// spilling), each in a directory of this peer's own so peers can share
+/// them; else `<dir>/spill`. Spilled objects go to each in turn, and are read
+/// by mapping their file there, wherever that is.
+pub fn spill_dirs(dir: &Path, peer_hex: &str) -> Vec<PathBuf> {
+    let own = format!("chimaera-{}", &peer_hex[..16]);
+    let listed: Vec<PathBuf> = std::env::var_os("CHIMAERA_SPILL_DIR")
+        .map(|v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).map(|p| p.join(&own)).collect())
+        .unwrap_or_default();
+    if listed.is_empty() { vec![dir.join("spill")] } else { listed }
+}
+
+/// What a peer's object store holds, from its directory (what `ray memory`
+/// reports for Ray's store): objects in memory and on disk (spilled, or
+/// replicas of other peers' objects), per run and the largest; the NumPy
+/// arenas of live processes; the pre-zeroed reserve.
+pub fn inventory(objects: &Path) -> serde_json::Value {
+    let (mut mem, mut disk) = ((0u64, 0u64), (0u64, 0u64));
+    let mut runs = Vec::new();
+    let mut largest: Vec<(u64, String, &'static str)> = Vec::new();
+    for run in std::fs::read_dir(objects).into_iter().flatten().flatten() {
+        let name = run.file_name().to_string_lossy().into_owned();
+        if !is_object_name(&name) {
+            continue;
+        }
+        let (mut rm, mut rd, mut n) = (0u64, 0u64, 0u64);
+        for e in std::fs::read_dir(run.path()).into_iter().flatten().flatten() {
+            let obj = e.file_name().to_string_lossy().into_owned();
+            let Ok(link) = e.metadata() else { continue }; // does not follow symlinks
+            if !is_object_name(&obj) {
+                continue; // a temporary or a partial transfer
+            }
+            let on_disk = link.file_type().is_symlink();
+            let size = if on_disk { std::fs::metadata(e.path()).map_or(0, |m| m.len()) } else { link.len() };
+            n += 1;
+            if on_disk {
+                rd += size;
+                disk = (disk.0 + 1, disk.1 + size);
+            } else {
+                rm += size;
+                mem = (mem.0 + 1, mem.1 + size);
+            }
+            largest.push((size, format!("{name}/{obj}"), if on_disk { "disk" } else { "memory" }));
+        }
+        runs.push(serde_json::json!({"run": name, "objects": n, "memory_bytes": rm, "disk_bytes": rd}));
+    }
+    largest.sort_by(|a, b| b.0.cmp(&a.0));
+    largest.truncate(10);
+    let arenas: Vec<serde_json::Value> = std::fs::read_dir(objects.join(".arena"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            serde_json::json!({"pid": e.file_name().to_string_lossy(), "bytes": crate::stores::dir_bytes(&e.path())})
+        })
+        .collect();
+    serde_json::json!({
+        "object_dir": objects.display().to_string(),
+        "huge_pages": huge_tmpfs_mounts(&std::fs::read_to_string("/proc/self/mounts").unwrap_or_default())
+            .iter().any(|m| objects.starts_with(m)),
+        "in_memory": {"objects": mem.0, "bytes": mem.1},
+        "on_disk": {"objects": disk.0, "bytes": disk.1},
+        "arenas": arenas,
+        "reserve_bytes": crate::stores::dir_bytes(&objects.join(".reserve")),
+        "runs": runs,
+        "largest": largest.iter().map(|(s, p, w)| serde_json::json!({"object": p, "bytes": s, "where": w})).collect::<Vec<_>>(),
+    })
+}
+
 fn pid_alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks that the process exists.
     pid > 0
@@ -93,26 +164,37 @@ pub fn sweep_arenas(objects: &Path) -> usize {
     n
 }
 
-/// Reserve classes: files of 2^class bytes (2 MiB .. 1 GiB), the same
+/// Reserve classes: files of 2^class bytes (256 KiB .. 1 GiB), the same
 /// classes writers ask for (chimaera-py's objects.rs).
-const MIN_CLASS: u32 = 21;
+const MIN_CLASS: u32 = 18;
 const MAX_CLASS: u32 = 30;
-/// A class nobody asked for in this long gives back one file.
+/// A class gets files only once it missed this many times within MISS_WINDOW:
+/// a one-off large array is not worth idle pre-zeroed memory, which the pool
+/// counts as used.
+const MISSES_TO_FILL: usize = 2;
+const MISS_WINDOW: Duration = Duration::from_secs(10);
+/// A class nobody asked for in this long gives back one file (large classes
+/// sooner: their idle pages cost more).
 const DECAY: Duration = Duration::from_secs(60);
+const DECAY_LARGE: Duration = Duration::from_secs(10);
+const LARGE_CLASS: u32 = 26;
 
 /// Pre-zeroed tmpfs files that writers take by rename, so a new object or
 /// NumPy array starts on pages that are already allocated and zeroed: no
 /// page faults where the copy or the computation happens. The kernel's
 /// zeroing (the bulk of a fresh page's cost) moves to this thread.
 ///
-/// Demand-driven: a writer that finds no file of its class leaves
-/// `want-<class>`; each want doubles that class's target, and targets decay
-/// by one file per idle minute. The whole reserve stays under `budget`.
+/// Demand-driven: a writer that finds no file of its class leaves a
+/// `want-<class>-...` marker per miss. A class that misses MISSES_TO_FILL
+/// times within MISS_WINDOW gets its target doubled (at least one file), and
+/// targets decay by one file per idle DECAY (DECAY_LARGE for large classes).
+/// The whole reserve stays under `budget`.
 pub struct Reserve {
     dir: PathBuf,
     budget: u64,
     target: [u32; 32],
     last_want: [Option<std::time::Instant>; 32],
+    misses: [std::collections::VecDeque<std::time::Instant>; 32],
     seq: u64,
 }
 
@@ -125,7 +207,7 @@ impl Reserve {
                 let _ = std::fs::remove_file(e.path());
             }
         }
-        Reserve { dir, budget, target: [0; 32], last_want: [None; 32], seq: 0 }
+        Reserve { dir, budget, target: [0; 32], last_want: [None; 32], misses: Default::default(), seq: 0 }
     }
 
     /// One round: read wants and stock, decay idle classes, fill what is
@@ -136,12 +218,20 @@ impl Reserve {
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if let Some(k) = name.strip_prefix("want-").and_then(|k| k.parse::<u32>().ok()) {
+            if let Some(k) = name.strip_prefix("want-").and_then(|r| r.split('-').next()?.parse::<u32>().ok()) {
                 let _ = std::fs::remove_file(e.path());
                 if (MIN_CLASS..=MAX_CLASS).contains(&k) {
-                    let t = &mut self.target[k as usize];
-                    *t = (*t * 2).clamp(1, (self.budget >> k).max(1) as u32);
-                    self.last_want[k as usize] = Some(now);
+                    let i = k as usize;
+                    let recent = &mut self.misses[i];
+                    recent.push_back(now);
+                    while recent.front().is_some_and(|t| now.duration_since(*t) > MISS_WINDOW) {
+                        recent.pop_front();
+                    }
+                    if recent.len() >= MISSES_TO_FILL {
+                        let t = &mut self.target[i];
+                        *t = (*t * 2).clamp(1, (self.budget / class_bytes(k)).max(1) as u32);
+                    }
+                    self.last_want[i] = Some(now);
                 }
             } else if let Some(k) = name.split_once('-').and_then(|(k, _)| k.parse::<u32>().ok())
                 && (MIN_CLASS..=MAX_CLASS).contains(&k)
@@ -151,7 +241,8 @@ impl Reserve {
         }
         for k in MIN_CLASS..=MAX_CLASS {
             let i = k as usize;
-            if self.target[i] > 0 && self.last_want[i].is_none_or(|t| now.duration_since(t) >= DECAY) {
+            let decay = if k >= LARGE_CLASS { DECAY_LARGE } else { DECAY };
+            if self.target[i] > 0 && self.last_want[i].is_none_or(|t| now.duration_since(t) >= decay) {
                 self.target[i] -= 1;
                 self.last_want[i] = Some(now);
             }
@@ -162,15 +253,15 @@ impl Reserve {
         // What is missing, smallest classes first, within the budget; filled
         // by FILLERS threads at once (zeroing pages is the kernel's work, and
         // one thread cannot keep up with a burst of new objects).
-        let mut bytes: u64 = (MIN_CLASS..=MAX_CLASS).map(|k| (stock[k as usize].len() as u64) << k).sum();
+        let mut bytes: u64 = (MIN_CLASS..=MAX_CLASS).map(|k| stock[k as usize].len() as u64 * class_bytes(k)).sum();
         let mut todo: Vec<(u32, u64)> = Vec::new();
         for k in MIN_CLASS..=MAX_CLASS {
             let mut have = stock[k as usize].len();
-            while have < self.target[k as usize] as usize && bytes + (1u64 << k) <= self.budget {
+            while have < self.target[k as usize] as usize && bytes + class_bytes(k) <= self.budget {
                 self.seq += 1;
                 todo.push((k, self.seq));
                 have += 1;
-                bytes += 1 << k;
+                bytes += class_bytes(k);
             }
         }
         let dir = &self.dir;
@@ -189,7 +280,7 @@ impl Reserve {
 }
 
 /// Threads filling the reserve at once.
-const FILLERS: usize = 4;
+const FILLERS: usize = 8;
 
 /// Create `<dir>/<k>-<seq>`: 2^k bytes of allocated, zeroed pages.
 fn fill(dir: &Path, k: u32, seq: u64) -> std::io::Result<PathBuf> {
@@ -197,7 +288,7 @@ fn fill(dir: &Path, k: u32, seq: u64) -> std::io::Result<PathBuf> {
         use std::os::fd::AsRawFd;
         let tmp = dir.join(format!(".fill-{k}-{seq}"));
         let done = dir.join(format!("{k}-{seq}"));
-        let len = 1usize << k;
+        let len = class_bytes(k) as usize;
         let r = (|| {
             let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
             f.set_len(len as u64)?; // first: a huge-page tmpfs then allocates huge pages
@@ -256,20 +347,40 @@ pub fn memory_limit(objects: &Path) -> u64 {
         .unwrap_or_else(|| fs_size(objects).map_or(0, |b| b / 10 * 9))
 }
 
+/// Publish the bytes of objects in memory (the core measures them each
+/// second) to `<objects>/.usage` as (sequence, bytes), little-endian u64s.
+/// Writers compare it, plus what they wrote since, with the memory limit:
+/// the filesystem's own usage counts everyone else's files too.
+pub fn publish_usage(objects: &Path, bytes: u64) {
+    use std::os::unix::fs::FileExt;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&seq.to_le_bytes());
+    buf[8..].copy_from_slice(&bytes.to_le_bytes());
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(objects.join(".usage")) {
+        let _ = f.write_all_at(&buf, 0);
+    }
+}
+
 /// Start the object plane of an in-memory store at `objects` whose spill
-/// directory (on disk) is `spill`: tell writers where things are (the
+/// directories (on disk) are `spill`: tell writers where things are (the
 /// `.plane` file, read by chimaera-py's _objects), keep the page reserve
 /// filled, and sweep the arenas of exited processes. A store on disk
-/// (`spill` None) only gets the sweeping.
-pub fn start(objects: PathBuf, spill: Option<PathBuf>) {
+/// (`spill` empty) only gets the sweeping.
+pub fn start(objects: PathBuf, spill: Vec<PathBuf>) {
     let mut reserve = None;
-    if let Some(spill) = &spill {
+    if let Ok(spill) = std::env::join_paths(&spill)
+        && !spill.is_empty()
+    {
         let limit = memory_limit(&objects);
         let dir = objects.join(".reserve");
-        let plane = format!("reserve={}\nspill={}\nlimit={limit}\n", dir.display(), spill.display());
+        let plane = format!("reserve={}\nspill={}\nlimit={limit}\n", dir.display(), spill.to_string_lossy());
         if let Err(e) = crate::stores::write_atomic(&objects.join(".plane"), plane.as_bytes()) {
             tracing::warn!("object plane: cannot write {}: {e}", objects.join(".plane").display());
         }
+        // Small: the reserve is memory the pool counts, so idle pre-zeroed pages
+        // must not crowd out calls; larger objects fault their pages in.
         reserve = Some(Reserve::new(dir, (2u64 << 30).min(limit / 16)));
     }
     let _ = std::thread::Builder::new().name("chimaera-objplane".into()).spawn(move || {
@@ -290,11 +401,17 @@ pub fn start(objects: PathBuf, spill: Option<PathBuf>) {
     });
 }
 
+/// Bytes in a reserve file of class `k`: 2^k plus 1/64 of it (the same
+/// formula as chimaera-py's objects.rs), so a power-of-two payload plus its
+/// header fits its own class.
+fn class_bytes(k: u32) -> u64 {
+    (1u64 << k) + (1u64 << k >> 6).max(4096)
+}
+
 /// How long a new object waits before it is replicated (see watch).
 #[cfg(target_os = "linux")]
 const REPLICA_DELAY: Duration = Duration::from_secs(1);
 
-#[cfg(target_os = "linux")]
 fn is_object_name(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -381,9 +498,18 @@ fn watch(
             }
             if ev.wd == root {
                 if ev.mask & libc::IN_ISDIR != 0 && is_object_name(&name) {
-                    let wd = add(&objects.join(&name), RUN_MASK);
+                    let dir = objects.join(&name);
+                    let wd = add(&dir, RUN_MASK);
                     if wd >= 0 {
-                        runs.insert(wd, objects.join(&name));
+                        runs.insert(wd, dir.clone());
+                    }
+                    // Objects linked or renamed in before the watch existed
+                    // raised no event: replicate what is already there.
+                    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                        let f = e.file_name().to_string_lossy().into_owned();
+                        if is_object_name(&f) {
+                            replicate_one(&dir, &f, mesh, rt);
+                        }
                     }
                 }
                 continue;
@@ -401,32 +527,55 @@ fn watch(
             } else {
                 ev.mask & libc::IN_CREATE != 0 && ev.mask & libc::IN_ISDIR == 0 // a hard link from an arena
             };
-            if !local || !is_object_name(&name) {
-                continue;
+            if local && is_object_name(&name) {
+                replicate_one(run_dir, &name, mesh, rt);
             }
-            let path = run_dir.join(&name);
-            let (Some(run), Some(object)) =
-                (run_dir.file_name().and_then(|r| decode_hex(&r.to_string_lossy())), decode_hex(&name))
-            else {
-                continue;
-            };
-            let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else { continue };
-            let Some(node) = mesh.successor() else { continue };
-            let mesh = mesh.clone();
-            rt.spawn(async move {
-                // A moment's grace: an object a reader on another peer fetches
-                // meanwhile already has its copy, and the replica would only
-                // compete with that reader for this peer's bandwidth.
-                tokio::time::sleep(REPLICA_DELAY).await;
-                if mesh.was_served(&object) || tokio::fs::metadata(&path).await.is_err() {
-                    return; // fetched elsewhere already, or freed
-                }
-                if let Err(e) = mesh.replicate(node, &run, &object, size).await {
-                    tracing::debug!("replicate {} to node {node}: {e}", path.display());
-                }
-            });
         }
     }
+}
+
+/// Copy `<run_dir>/<name>` to this peer's successor after REPLICA_DELAY,
+/// unless another peer fetched it meanwhile (that copy suffices) or it was
+/// freed. The grace keeps a replica from competing with a reader on another
+/// peer for this peer's bandwidth.
+#[cfg(target_os = "linux")]
+fn replicate_one(
+    run_dir: &Path,
+    name: &str,
+    mesh: &std::sync::Arc<crate::mesh::MeshClient>,
+    rt: &tokio::runtime::Handle,
+) {
+    let path = run_dir.join(name);
+    let (Some(run), Some(object)) =
+        (run_dir.file_name().and_then(|r| decode_hex(&r.to_string_lossy())), decode_hex(name))
+    else {
+        return;
+    };
+    let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else { return };
+    let Some(node) = mesh.successor() else { return };
+    let mesh = mesh.clone();
+    rt.spawn(async move {
+        tokio::time::sleep(REPLICA_DELAY).await;
+        // At most REPLICAS_AT_ONCE copies in flight; the rest wait their turn.
+        let Ok(_turn) = replica_turns().acquire().await else { return };
+        if mesh.was_served(&object) || tokio::fs::metadata(&path).await.is_err() {
+            return;
+        }
+        if let Err(e) = mesh.replicate(node, &run, &object, size, true).await {
+            crate::counters::REPLICATION_FAILURES.add(1);
+            tracing::warn!("no replica of {} on node {node}: {e}", path.display());
+        }
+    });
+}
+
+/// Replicas being copied at once, from one peer.
+#[cfg(target_os = "linux")]
+const REPLICAS_AT_ONCE: usize = 8;
+
+#[cfg(target_os = "linux")]
+fn replica_turns() -> &'static tokio::sync::Semaphore {
+    static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    TURNS.get_or_init(|| tokio::sync::Semaphore::new(REPLICAS_AT_ONCE))
 }
 
 #[cfg(target_os = "linux")]
@@ -456,31 +605,54 @@ mod tests {
     }
 
     #[test]
+    fn the_inventory_tells_memory_from_disk_and_skips_partial_files() {
+        let (mem, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let run = "aa".repeat(16);
+        let (a, b) = ("01".repeat(16), "02".repeat(16));
+        std::fs::create_dir_all(mem.path().join(&run)).unwrap();
+        std::fs::write(mem.path().join(&run).join(&a), vec![0u8; 3000]).unwrap();
+        std::fs::write(disk.path().join(&b), vec![0u8; 5000]).unwrap();
+        std::os::unix::fs::symlink(disk.path().join(&b), mem.path().join(&run).join(&b)).unwrap();
+        std::fs::write(mem.path().join(&run).join(format!("{a}.tmp1-2")), b"partial").unwrap();
+        let inv = inventory(mem.path());
+        assert_eq!(inv["in_memory"]["bytes"], 3000);
+        assert_eq!(inv["on_disk"]["bytes"], 5000);
+        assert_eq!(inv["runs"][0]["objects"], 2, "the temporary is not an object");
+        assert_eq!(inv["largest"][0]["where"], "disk");
+    }
+
+    #[test]
     fn the_reserve_follows_demand_within_its_budget() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join(".reserve");
         let mut r = Reserve::new(dir.clone(), 9 << 20);
+        let want = |k: u32, n: u32| std::fs::write(dir.join(format!("want-{k}-1-{n}")), b"").unwrap();
+        let files = || -> Vec<String> {
+            let mut v: Vec<String> =
+                std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            v.sort();
+            v
+        };
         r.tick();
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing until someone asks");
-        std::fs::write(dir.join("want-21"), b"").unwrap();
+        assert!(files().is_empty(), "nothing until someone asks");
+        want(21, 0);
         r.tick();
-        let files: Vec<String> =
-            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-        assert_eq!(files.len(), 1, "one 2 MiB file after one want: {files:?}");
-        assert!(files[0].starts_with("21-"));
-        assert_eq!(std::fs::metadata(dir.join(&files[0])).unwrap().len(), 2 << 20);
-        for _ in 0..4 {
-            std::fs::write(dir.join("want-21"), b"").unwrap();
+        assert!(files().is_empty(), "one miss is a one-off: no idle pages for it");
+        want(21, 1);
+        r.tick();
+        let f = files();
+        assert_eq!(f.len(), 1, "a second miss within the window fills one 2 MiB file: {f:?}");
+        assert!(f[0].starts_with("21-"));
+        assert_eq!(std::fs::metadata(dir.join(&f[0])).unwrap().len(), class_bytes(21));
+        for n in 2..6 {
+            want(21, n);
             r.tick();
         }
-        let n = std::fs::read_dir(&dir).unwrap().count();
-        assert_eq!(n, 4, "doubling stops at the 9 MiB budget (four 2 MiB files)");
-        std::fs::write(dir.join("want-30"), b"").unwrap();
+        assert_eq!(files().len(), 4, "doubling stops at the 9 MiB budget (four 2 MiB files)");
+        want(26, 0);
+        want(26, 1);
         r.tick();
-        assert!(
-            !std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with("30-")),
-            "a 1 GiB file does not fit the budget"
-        );
+        assert!(!files().iter().any(|n| n.starts_with("26-")), "a 64 MiB file does not fit the 9 MiB budget");
     }
 
     #[test]

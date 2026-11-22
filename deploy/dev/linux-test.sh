@@ -10,7 +10,7 @@ mkdir -p /tmp/src
 tar -C /src --exclude=./target --exclude='./.venv*' --exclude=./.git -cf - . | tar -C /tmp/src -xf -
 rm -f /tmp/src/python/chimaera/_native*.so
 python3 -m venv /tmp/venv >/dev/null
-/tmp/venv/bin/pip install -q --upgrade pip maturin cloudpickle pytest pytest-timeout numpy
+/tmp/venv/bin/pip install -q --upgrade pip maturin cloudpickle pytest pytest-timeout numpy "mypy>=1.10,<3"
 cd /tmp/src
 cargo build -q -p chimaera-peer
 VIRTUAL_ENV=/tmp/venv /tmp/venv/bin/maturin develop -q 2>&1 | grep -v "^warning" || true

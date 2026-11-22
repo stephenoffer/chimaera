@@ -1,5 +1,5 @@
 """``ray.nodes()``, ``ray.cluster_resources()`` and ``ray.available_resources()``
-from ``ch.cluster()``: what the connected peer knows about the cluster."""
+from ``ch.runs.cluster()``: what the connected peer knows about the cluster."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ def nodes() -> list[dict[str, Any]]:
     """One Ray-shaped record per peer. ``NodeID`` is the peer id, the value of
     its ``node`` label, so ``NodeAffinitySchedulingStrategy(node_id)`` works."""
     out = []
-    for n in ch.cluster().nodes():
+    for n in ch.runs.cluster().nodes():
         host, _, port = n.address.rpartition(":")
         resources: dict[str, float] = {"CPU": n.cpus, "memory": float(n.memory_bytes), f"node:{host}": 1.0}
         if n.gpus:
@@ -45,7 +45,7 @@ def available_resources() -> dict[str, float]:
     """CPUs not in use on the live peers, by their last load reports; memory and
     GPUs as capacity (Chimaera does not reserve them ahead of a call yet)."""
     free = cluster_resources()
-    free["CPU"] = max(0.0, free.get("CPU", 0.0) - sum(n.cpu_used for n in ch.cluster().nodes() if n.alive))
+    free["CPU"] = max(0.0, free.get("CPU", 0.0) - sum(n.cpu_used for n in ch.runs.cluster().nodes() if n.alive))
     return free
 
 
@@ -54,4 +54,4 @@ def this_node_id() -> str:
     ctx = ch.context()
     if ctx is not None:
         return ctx.node
-    return next(n.peer for n in ch.cluster().nodes() if n.this_peer)
+    return next(n.peer for n in ch.runs.cluster().nodes() if n.this_peer)

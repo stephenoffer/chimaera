@@ -3,7 +3,11 @@ processes, peers killed or paused mid-run."""
 
 from __future__ import annotations
 
+import collections
+import json
 import os
+import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -186,7 +190,7 @@ def blob(n):
 def total(*parts):
     return sum(len(b) for _, b in parts), sorted({p for p, _ in parts})
 
-placed = collections.Counter(ch.gather(*(where.remote(i) for i in range(90)), timeout=120))
+placed = collections.Counter(ch.get((where.remote(i) for i in range(90)), timeout=120))
 print("PEERS", len(placed))
 parts = [blob.remote(2 << 20) for _ in range(9)]
 n, producers = total.remote(*parts).result(timeout=120)
@@ -231,6 +235,27 @@ print("HOMES", len(homes))
     assert int(lines(out, "HOMES")[0]) >= 2, "six actors should not all land on one peer"
 
 
+def test_a_burst_of_actors_spreads_over_the_peers(three):
+    # Actors that ask for no CPUs change no peer's load when placed: a burst
+    # of them must still spread, not land on whichever peer looked emptiest.
+    out = three.run(
+        0,
+        WHERE
+        + """
+@ch.remote
+class Where:
+    def home(self):
+        return peer_name()
+
+actors = [Where.remote() for _ in range(90)]
+homes = collections.Counter(ch.get((a.home.remote() for a in actors), timeout=180))
+print("HOMES", len(homes), max(homes.values()))
+"""
+    )
+    peers, most = map(int, lines(out, "HOMES")[0].split())
+    assert peers == 3 and most <= 45, f"90 actors over 3 peers: {peers} peers used, {most} on the busiest"
+
+
 def test_a_peer_killed_mid_run_loses_no_results():
     c = Cluster(3)
     try:
@@ -244,7 +269,7 @@ def work(i):
     return i * i
 
 futs = [work.remote(i) for i in range(240)]
-values = ch.gather(*futs, timeout=240)
+values = ch.get(futs, timeout=240)
 print("OK", values == [i * i for i in range(240)])
 """,
         )
@@ -275,7 +300,7 @@ run = ch.init(detach=True)
 futs = [work.remote(i) for i in range(300)]
 # Report the run only once the cluster holds all 300 calls: a submission
 # the ingress never acknowledged dies with it.
-while sum(ch.current_run().status().values()) < 300:
+while sum(ch.runs.current_run().status().values()) < 300:
     time.sleep(0.05)
 print("RUN", run)
 """,
@@ -287,7 +312,7 @@ print("RUN", run)
             1,
             f"""
 import chimaera as ch
-run = ch.attach({run_id!r})
+run = ch.runs.attach({run_id!r})
 run.wait(timeout=180)
 values = [v for _, v, e in run.outcomes() if e is None]
 errors = [e for _, v, e in run.outcomes() if e is not None]
@@ -316,7 +341,7 @@ def work(i):
     return i
 
 futs = [work.remote(i) for i in range(400)]
-values = ch.gather(*futs, timeout=300)
+values = ch.get(futs, timeout=300)
 print("EXACT", values == list(range(400)))
 """,
         )
@@ -347,7 +372,7 @@ def work(i):
     return i
 
 futs = [work.remote(i) for i in range(200)]
-values = ch.gather(*futs, timeout=300)
+values = ch.get(futs, timeout=300)
 print("EXACT", values == list(range(200)))
 """,
         )
@@ -384,7 +409,7 @@ import chimaera as ch
 def add(a, b):
     return a + b
 
-print("SUM", sum(ch.gather(*(add.remote(i, i) for i in range(50)), timeout=120)))
+print("SUM", sum(ch.get((add.remote(i, i) for i in range(50)), timeout=120)))
 """,
             timeout=180,
         )
@@ -406,7 +431,7 @@ import chimaera as ch
 def add(a, b):
     return a + b
 
-print("SUM", sum(ch.gather(*(add.remote(i, i) for i in range(60)), timeout=120)))
+print("SUM", sum(ch.get((add.remote(i, i) for i in range(60)), timeout=120)))
 """
     try:
         assert lines(c.run(0, add), "SUM") == [str(sum(2 * i for i in range(60)))]
@@ -423,6 +448,127 @@ print("SUM", sum(ch.gather(*(add.remote(i, i) for i in range(60)), timeout=120))
         assert open(os.path.join(c.dir(2), "peer-id")).read() != old_id
         # The cluster keeps serving, through the rejoined peer too.
         assert lines(c.run(2, add, timeout=180), "SUM") == [str(sum(2 * i for i in range(60)))]
+    finally:
+        c.close()
+
+
+DETACHED_ADDS = """
+import time
+import chimaera as ch
+
+@ch.remote
+def add(i):
+    return i + 1000
+
+run = ch.init(detach=True)
+futs = [add.remote(i) for i in range(50)]
+print("SUM", sum(ch.get(futs, timeout=120)))
+print("RUN", run)
+"""
+
+
+def read_detached(c: Cluster, i: int, run_id: str) -> list[str]:
+    out = c.run(
+        i,
+        f"""
+import chimaera as ch
+run = ch.runs.attach({run_id!r})
+run.wait(timeout=120)
+print("VALUES", sorted(v for _, v, e in run.outcomes() if e is None) == [i + 1000 for i in range(50)])
+""",
+        timeout=240,
+    )
+    return lines(out, "VALUES")
+
+
+def test_a_whole_unsynced_cluster_rebooting_at_once_keeps_its_groups(monkeypatch):
+    # Every voter of every group comes back from an unclean reboot. Discarding
+    # state that no other voter still leads would lose the groups for good.
+    monkeypatch.setenv("CHIMAERA_RAFT_SYNC", "none")
+    c = Cluster(3)
+    try:
+        out = c.run(0, DETACHED_ADDS)
+        run_id = lines(out, "RUN")[0]
+        ids = {}
+        for i in range(3):
+            c.signal(i, signal.SIGKILL)
+            marker = os.path.join(c.dir(i), "raft-boot")
+            boot, *rest = open(marker).read().splitlines()
+            with open(marker, "w") as f:  # as if every machine had rebooted
+                f.write("\n".join(["another-boot", *rest]) + "\n")
+            ids[i] = open(os.path.join(c.dir(i), "peer-id")).read()
+        for i in range(3):
+            c.start(i)
+        c.wait_ready(range(3), timeout=120)
+        # A peer that finds the other two already leading every group may still
+        # rejoin as new (they hold a majority); a majority must have kept state.
+        kept = [i for i in range(3) if "keeping its state" in c.log(i)]
+        assert len(kept) >= 2, [c.log(i)[-1500:] for i in range(3)]
+        for i in kept:
+            assert open(os.path.join(c.dir(i), "peer-id")).read() == ids[i]
+        live = kept[0]
+        assert read_detached(c, live, run_id) == ["True"]
+    finally:
+        c.close()
+
+
+def status(c: Cluster, i: int) -> dict:
+    out = subprocess.run([BIN, "--dir", c.dir(i), "status", "--json"], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_a_peer_serves_while_some_groups_have_no_quorum():
+    c = Cluster(3)
+    try:
+        run_id = lines(c.run(0, DETACHED_ADDS), "RUN")[0]
+        for i in range(3):
+            c.signal(i, signal.SIGKILL)
+        c.start(0)  # alone: no group has a majority
+        c.wait_ready([0], timeout=60)
+        time.sleep(5)
+        assert c.procs[0].poll() is None, c.log(0)[-2000:]
+        alone = status(c, 0)
+        assert alone["leaderless_groups"] == [0, 1, 2, 3, 4], alone  # the directory and the data groups
+        assert all(g["leader"] == "" for g in alone["groups"]) and len(alone["groups"]) == 5, alone["groups"]
+        c.start(1)  # a majority again: the groups come back without a restart
+        c.wait_ready([1])
+        assert read_detached(c, 0, run_id) == ["True"]
+        deadline = time.monotonic() + 30
+        while (back := status(c, 0))["leaderless_groups"] and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert back["leaderless_groups"] == [] and all(g["leader"] for g in back["groups"]), back
+    finally:
+        c.close()
+
+
+def test_cluster_recover_rebuilds_groups_whose_other_voters_are_gone():
+    c = Cluster(3, spares=1)
+    try:
+        run_id = lines(c.run(0, DETACHED_ADDS), "RUN")[0]
+        for i in range(3):
+            c.signal(i, signal.SIGKILL)
+        for i in (1, 2):
+            shutil.rmtree(c.dir(i))  # their machines are gone for good
+        # The spare gives peer 0 up too, so only peer 0 can find the spare again:
+        # its seeds are gone, and it rejoins through the members it recorded.
+        deadline = time.monotonic() + 60
+        while not any("retiring it" in ln and f"addr={c.addrs[0]}" in ln for ln in c.log(3).splitlines()):
+            assert time.monotonic() < deadline, c.log(3)[-2000:]
+            time.sleep(0.5)
+        recover = [BIN, "--dir", c.dir(0), "cluster", "recover", "--group"]
+        refused = subprocess.run([*recover, "1"], capture_output=True, text=True, timeout=60)
+        assert refused.returncode != 0 and "--force-new-quorum" in refused.stderr
+        for g in range(c.data_groups + 1):
+            r = subprocess.run([*recover, str(g), "--force-new-quorum"], capture_output=True, text=True, timeout=60)
+            assert r.returncode == 0, r.stderr
+        c.start(0)
+        c.wait_ready([0], timeout=60)
+        assert read_detached(c, 0, run_id) == ["True"]
+        deadline = time.monotonic() + 60
+        while "adding a voter" not in c.log(0) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert "adding a voter" in c.log(0), "the spare is added back as a voter"
     finally:
         c.close()
 
@@ -455,7 +601,7 @@ def where(i):
     time.sleep(0.05)
     return peer_name()
 
-print("PEERS", len(set(ch.gather(*(where.remote(i) for i in range(60)), timeout=60))))
+print("PEERS", len(set(ch.get((where.remote(i) for i in range(60)), timeout=60))))
 """)
         assert int(lines(out, "PEERS")[0]) >= 3, "work crosses peers (the spare runs work too) over TLS"
         # The spare restarts with the right token but a certificate from another CA.
@@ -510,9 +656,156 @@ def test_a_driver_on_another_machine_runs_over_tcp_and_moves_large_values(tcp):
     assert lines(out, "REMOTE ") == ["True"], "the driver must not have fallen back to a local peer"
 
 
+def test_a_driver_on_another_chimaera_version_than_the_cluster_is_told(tcp):
+    connect = "import chimaera as ch\nch.init()\nprint('CONNECTED', ch._runtime.Runtime.get().remote)\n"
+    same = tcp.remote(1, connect)
+    assert lines(same, "CONNECTED ") == ["True"] and "CH116" not in same.stderr, same.stderr[-2000:]
+    other = tcp.remote(1, "import chimaera._runtime as r\nr.VERSION = '0.0.1'\n" + connect)
+    assert lines(other, "CONNECTED ") == ["True"], other.stderr[-2000:]
+    assert "CH116" in other.stderr and "0.0.1" in other.stderr, other.stderr[-2000:]
+
+
 def test_a_client_without_the_cluster_token_is_rejected(tcp):
     out = tcp.remote(0, "import chimaera as ch\nch.init()\n", token=False)
     assert out.returncode != 0 and "token" in out.stderr, out.stderr[-2000:]
+
+
+def test_the_cli_lists_inspects_and_cancels_a_run_from_any_peer_over_tcp():
+    # Four peers, groups of three voters: some peer holds no replica of the run's group.
+    c = Cluster(4, clients=True)
+    try:
+        out = c.run(
+            0,
+            """
+import time
+import chimaera as ch
+
+@ch.remote
+def nap(i):
+    time.sleep(120)
+
+run = ch.init(detach=True)
+futs = [nap.remote(i) for i in range(4)]
+while sum(ch.runs.current_run().status().values()) < 4:
+    time.sleep(0.05)
+print("RUN", run)
+""",
+        )
+        run_id = lines(out, "RUN")[0]
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CHIMAERA_")}
+
+        def cli(i: int, *args: str, token: bool = True) -> subprocess.CompletedProcess:
+            e = dict(env, CHIMAERA_TOKEN_FILE=c.token) if token else env
+            cmd = [BIN, *args, "--cluster", f"tcp://{c.client_addrs[i]}"]
+            return subprocess.run(cmd, env=e, capture_output=True, text=True, timeout=60)
+
+        for i in range(4):
+            listed = cli(i, "runs", "--json")
+            assert listed.returncode == 0, listed.stderr
+            runs = {r["run"]: r for r in json.loads(listed.stdout)["runs"]}
+            assert runs[run_id]["state"] == "active" and runs[run_id]["detached"], runs
+            assert runs[run_id]["command"].endswith(".py"), runs[run_id]
+            shown = cli(i, "inspect", run_id, "--json")
+            assert json.loads(shown.stdout)["state"] == "Active", (i, shown.stdout, shown.stderr)
+        cancelled = cli(3, "cancel", run_id)
+        assert cancelled.returncode == 0 and "cancelled" in cancelled.stdout, cancelled.stdout + cancelled.stderr
+        for i in range(4):
+            shown = json.loads(cli(i, "inspect", run_id, "--json").stdout)
+            assert shown["state"] == "Cancelled" and sum(shown["tasks"].values()) == 4, (i, shown)
+        refused = cli(0, "runs", token=False)
+        assert refused.returncode != 0 and "token" in refused.stderr, refused.stderr
+        program = "import chimaera as ch; ch.init(); print('REMOTE', ch._runtime.Runtime.get().remote)"
+        ran = subprocess.run(
+            [BIN, "run", "--cluster", f"tcp://{c.client_addrs[2]}", "--", sys.executable, "-c", program],
+            env=dict(env, CHIMAERA_TOKEN_FILE=c.token, PYTHONPATH=os.path.join(REPO, "python")),
+            cwd=c.root,  # a remote run ships its working directory
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert lines(ran, "REMOTE") == ["True"], ran.stderr[-2000:]
+    finally:
+        c.close()
+
+
+def test_a_driver_credential_reaches_only_its_tenants_work(tcp):
+    def credential(tenant: str) -> str:
+        cmd = [BIN, "cluster", "credential", "--tenant", tenant, "--token-file", tcp.token]
+        return tcp.write_token(f"cred-{tenant}", subprocess.run(cmd, capture_output=True, text=True, check=True).stdout)
+
+    def driver(cred: str, code: str) -> subprocess.CompletedProcess:
+        home = tempfile.mkdtemp(prefix="chr", dir="/tmp")
+        env = {"CHIMAERA_ADDRESS": f"tcp://{tcp.client_addrs[0]}", "CHIMAERA_HOME": home, "CHIMAERA_TOKEN_FILE": cred}
+        return run_script(code, timeout=180, env=env)
+
+    alice, bob = credential("alice"), credential("bob")
+    out = driver(
+        alice,
+        """
+import chimaera as ch
+
+@ch.remote
+class Counter:
+    def __init__(self):
+        self.n = 0
+    def add(self):
+        self.n += 1
+        return self.n
+
+run = ch.init(detach=True)
+c = Counter.options(name="counter", detach=True).remote()
+print("ADD", c.add.remote().result(timeout=60))
+ch.coord.Store("shared").put("k", "alice's")
+print("TENANT", ch._runtime.Runtime.get().tenant)
+print("RUN", run)
+""",
+    )
+    assert lines(out, "ADD") == ["1"] and lines(out, "TENANT") == ["alice"], out.stderr[-2000:]
+    run_id = lines(out, "RUN")[0]
+    out = driver(
+        bob,
+        f"""
+import chimaera as ch
+print("STORE", ch.coord.Store("shared").get("k"))
+try:
+    ch.actor("counter")
+except ch.NotFound:
+    print("ACTOR hidden")
+try:
+    ch.runs.attach({run_id!r}).status()
+except Exception as e:
+    print("RUN", type(e).__name__, "no run" in str(e))
+# A client that claims alice's tenant itself: the peer still knows it is bob.
+ch._runtime.Runtime.get().client.set_tenant("alice")
+try:
+    print("FORGED read", ch.coord.Store("shared").get("k"))
+except Exception as e:
+    print("FORGED", "credential is for tenant bob" in str(e))
+ch._runtime.Runtime.get().tenant = "alice"
+try:
+    ch.actor("counter")  # alice's named actor's id
+    print("FORGED actor found")
+except ch.NotFound:
+    print("FORGED actor hidden")
+""",
+    )
+    assert lines(out, "STORE") == ["None"], out.stderr[-2000:]
+    assert lines(out, "ACTOR") == ["hidden"] and lines(out, "RUN")[0].endswith("True"), out.stdout + out.stderr[-2000:]
+    assert lines(out, "FORGED") == ["True", "actor hidden"], out.stdout + out.stderr[-2000:]
+    claims = driver(bob, "import chimaera as ch\nch.init(tenant='alice')\n")
+    assert claims.returncode != 0 and "credential is for tenant bob" in claims.stderr, claims.stderr[-2000:]
+
+    def cli(cred: str, *args: str) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CHIMAERA_")}
+        cmd = [BIN, *args, "--cluster", f"tcp://{tcp.client_addrs[1]}"]
+        return subprocess.run(cmd, env=dict(env, CHIMAERA_TOKEN_FILE=cred), capture_output=True, text=True, timeout=60)
+
+    listed = lambda cred: {r["run"] for r in json.loads(cli(cred, "runs", "--json").stdout)["runs"]}  # noqa: E731
+    assert run_id in listed(alice) and run_id in listed(tcp.token) and run_id not in listed(bob)
+    for args in (["inspect", run_id], ["cancel", run_id], ["logs", run_id]):
+        refused = cli(bob, *args)
+        assert refused.returncode != 0 and "no run" in refused.stderr, (args, refused.stderr)
+    assert "cancelled" in cli(alice, "cancel", run_id).stdout
 
 
 def test_a_client_reaches_a_tls_cluster_only_with_its_ca():
@@ -534,7 +827,7 @@ def test_a_durable_actor_survives_the_loss_of_its_peer():
             0,
             WHERE
             + """
-@ch.remote(state=ch.State())
+@ch.remote(state=ch.durable.State())
 class Ledger:
     def __init__(self):
         self.total = 0
@@ -546,7 +839,7 @@ class Ledger:
     def where(self):
         return peer_name(), self.total
 
-ledger = Ledger.options(key="ledger", lifetime="detached").remote()
+ledger = Ledger.options(name="ledger", detach=True).remote()
 for i in range(10):
     ledger.add.remote(i).result(timeout=60)
 print("HOST", ledger.where.remote().result(timeout=60)[0])
@@ -577,15 +870,15 @@ import collections, chimaera as ch
 def where(i):
     return ch.context().node
 
-zone = {n.peer: n.labels.get("zone") for n in ch.cluster().nodes()}
+zone = {n.peer: n.labels.get("zone") for n in ch.runs.cluster().nodes()}
 print("ZONES", sorted(v for v in zone.values() if v))
-a = collections.Counter(zone[p] for p in ch.gather(*(where.options(placement=ch.Placement(require={"zone": "a"})).remote(i) for i in range(30)), timeout=120))
+a = collections.Counter(zone[p] for p in ch.get((where.options(placement=ch.dist.Placement(require={"zone": "a"})).remote(i) for i in range(30)), timeout=120))
 print("REQUIRE_A", dict(a))
 target = next(p for p, z in zone.items() if z == "b")
-pinned = set(ch.gather(*(where.options(placement=ch.Placement(require={"node": target})).remote(i) for i in range(10)), timeout=120))
+pinned = set(ch.get((where.options(placement=ch.dist.Placement(require={"node": target})).remote(i) for i in range(10)), timeout=120))
 print("PINNED", pinned == {target})
 try:
-    where.options(placement=ch.Placement(require={"zone": "nowhere"})).remote(0).result(timeout=30)
+    where.options(placement=ch.dist.Placement(require={"zone": "nowhere"})).remote(0).result(timeout=30)
 except ch.Infeasible as e:
     print("INFEASIBLE", "zone=nowhere" in str(e))
 """
@@ -598,6 +891,37 @@ def test_placement_requirements_choose_peers_by_label():
         assert lines(out, "ZONES ") == ["['a', 'b', 'b']"]
         assert lines(out, "REQUIRE_A ") == ["{'a': 30}"], "a required label must keep every call on matching peers"
         assert lines(out, "PINNED ") == ["True"] and lines(out, "INFEASIBLE ") == ["True"]
+    finally:
+        c.close()
+
+
+def test_prints_reach_the_driver_from_peers_outside_the_runs_group():
+    # Five peers, groups of three voters: two peers hold no replica of the run's
+    # group, so they learn where its driver is from the work they are sent.
+    c = Cluster(5, labels={i: f"slot=s{i}" for i in range(5)})
+    try:
+        out = c.run(
+            0,
+            """
+import time
+import chimaera as ch
+
+@ch.remote
+def say(slot, i):
+    print("PRINTED", slot, i, flush=True)
+
+print("RUN", ch.init())
+slots = [f"s{i}" for i in range(5)]
+ch.get([say.options(placement=ch.dist.Placement(require={"slot": s})).remote(s, i) for s in slots for i in range(4)], timeout=120)
+time.sleep(3)  # output is shipped to the driver's peer on the next housekeeping tick
+""",
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        printed = collections.Counter(re.findall(r"PRINTED (s\d) ", out.stdout))
+        assert printed == {f"s{i}": 4 for i in range(5)}, out.stdout[-3000:]
+        # The run's whole output, asked at a peer that is not its home.
+        logs = subprocess.run([BIN, "--dir", c.dir(3), "logs", lines(out, "RUN")[0]], capture_output=True, text=True, timeout=60)
+        assert collections.Counter(re.findall(r"PRINTED (s\d) ", logs.stdout)) == printed, logs.stdout + logs.stderr
     finally:
         c.close()
 
@@ -638,7 +962,7 @@ def slow(i):
     return peer_name()
 
 t = time.time()
-where = collections.Counter(ch.gather(*(slow.remote(i) for i in range(40)), timeout=240))
+where = collections.Counter(ch.get((slow.remote(i) for i in range(40)), timeout=240))
 print("WHERE", dict(where), round(time.time() - t, 1), flush=True)
 """,
         )
@@ -648,5 +972,73 @@ print("WHERE", dict(where), round(time.time() - t, 1), flush=True)
         assert driver.returncode == 0, out[-2000:] + err[-3000:]
         line = [ln for ln in out.splitlines() if ln.startswith("WHERE")][0]
         assert "'p1'" in line, f"no queued work moved to the peer that joined: {line}"
+    finally:
+        c.close()
+
+
+def test_a_replacement_voter_installs_a_snapshot_streamed_over_the_network(monkeypatch):
+    # Snapshots every 64 KiB of log, so the groups purge their early log and a
+    # new voter can only catch up from a snapshot sent between peers.
+    monkeypatch.setenv("CHIMAERA_RAFT_SNAPSHOT_BYTES", str(64 << 10))
+    c = Cluster(3, spares=1)
+    # One call at a time: each is its own log entries (submit, grant,
+    # publish...), so the run's group passes the 1000 entries a snapshot keeps.
+    work = """
+import warnings
+import chimaera as ch
+
+warnings.simplefilter("ignore")  # CH101: one call at a time, on purpose
+
+@ch.remote
+def add(a, b):
+    return a + b
+
+print("SUM", sum(add.remote(i, i).result(timeout=60) for i in range(1500)))
+"""
+    try:
+        assert lines(c.run(0, work, timeout=600), "SUM") == [str(sum(2 * i for i in range(1500)))]
+        c.signal(1, signal.SIGKILL)
+        deadline = time.monotonic() + 120
+        while "installed a snapshot streamed from a peer" not in c.log(3) and time.monotonic() < deadline:
+            time.sleep(1)
+        assert "installed a snapshot streamed from a peer" in c.log(3), c.log(3)[-3000:]
+        assert lines(c.run(0, work, timeout=600), "SUM") == [str(sum(2 * i for i in range(1500)))]
+    finally:
+        c.close()
+
+
+def test_voters_and_leaders_spread_to_peers_that_joined_later(monkeypatch):
+    # Founders hold every seat when the cluster forms. Once membership is
+    # steady, seats and leadership move so later peers share the commits.
+    import json
+
+    monkeypatch.setenv("CHIMAERA_REBALANCE_SECONDS", "2")
+    c = Cluster(3, spares=3)
+
+    def leading() -> dict[int, list[int]]:
+        led = {}
+        for i in range(6):
+            r = subprocess.run([BIN, "--dir", c.dir(i), "status", "--json"], capture_output=True, text=True, timeout=30)
+            led[i] = next(n for n in json.loads(r.stdout)["nodes"] if n["this_peer"])["leading"]
+        return led
+
+    try:
+        deadline = time.monotonic() + 240
+        led = leading()
+        while sum(1 for g in led.values() if g) < 5 and time.monotonic() < deadline:
+            time.sleep(2)
+            led = leading()
+        assert sum(1 for g in led.values() if g) >= 5, led
+        assert any(led[i] for i in (3, 4, 5)), f"a peer that joined later leads a group: {led}"
+        add = """
+import chimaera as ch
+
+@ch.remote
+def add(a, b):
+    return a + b
+
+print("SUM", sum(ch.get([add.remote(i, i) for i in range(60)], timeout=120)))
+"""
+        assert lines(c.run(4, add), "SUM") == [str(sum(2 * i for i in range(60)))]
     finally:
         c.close()

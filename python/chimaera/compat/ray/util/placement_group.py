@@ -1,4 +1,4 @@
-"""``ray.util.placement_group`` over ``ch.reserve``: bundles held on peers,
+"""``ray.util.placement_group`` over ``ch.dist.reserve``: bundles held on peers,
 and ``PlacementGroupSchedulingStrategy(pg, i)`` runs a task or actor within
 bundle ``i``. Named placement groups are found by name in this process."""
 
@@ -28,7 +28,7 @@ def _bundle(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 class PlacementGroup:
-    def __init__(self, reservation: ch.Reservation, bundle_specs: list[dict[str, Any]], name: str) -> None:
+    def __init__(self, reservation: ch.dist.Reservation, bundle_specs: list[dict[str, Any]], name: str) -> None:
         self._res, self.bundle_specs, self.name = reservation, bundle_specs, name
         self.id = f"pg-{id(self):x}"
         self._next = itertools.count()
@@ -69,12 +69,12 @@ def placement_group(
     if strategy not in _STRATEGIES:
         raise ValueError(f"Invalid placement group strategy {strategy}. Supported strategies are: {list(_STRATEGIES)}.")
     if lifetime == "detached":
-        raise unsupported("placement_group(lifetime='detached')", why="reservations end with the run that made them")
+        raise unsupported("placement_group(detach=True)", why="reservations end with the run that made them")
     if bundle_label_selector:
-        raise unsupported("placement_group(bundle_label_selector=...)", use="ch.reserve bundles with device=")
+        raise unsupported("placement_group(bundle_label_selector=...)", use="ch.dist.reserve bundles with device=")
     if not bundles or any(not b for b in bundles):
         raise ValueError("Bundles must be a non-empty list of non-empty resource dicts.")
-    pg = PlacementGroup(ch.reserve([_bundle(b) for b in bundles], strategy=_STRATEGIES[strategy]), list(bundles), name)
+    pg = PlacementGroup(ch.dist.reserve([_bundle(b) for b in bundles], strategy=_STRATEGIES[strategy]), list(bundles), name)
     if name:
         _named[name] = pg
     return pg

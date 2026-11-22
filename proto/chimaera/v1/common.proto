@@ -53,6 +53,7 @@ message ErrorRecord {
     DATA_LOST = 9;
     ACTOR_DIED = 10;
     COMMAND_CONFLICT = 11;
+    BUDGET = 12;          // its budget, or an enclosing call's, ran out
   }
   Kind kind = 1;
   string type_name = 2;
@@ -118,6 +119,11 @@ message Policy {
   // the peer learns per-item time and CPU under that function's profile.
   bytes profile_digest = 24;
   uint32 items = 25;
+  // budget={...}: the most the call and every call made inside it may use;
+  // 0 = no limit. Calls made inside a budgeted call inherit these and the root.
+  double budget_cpu_seconds = 26;
+  double budget_gpu_seconds = 27;
+  TaskKey budget_root = 28;     // the budgeted call; unset on the root itself
 }
 
 // What a function's recent calls used (chimaera_core::profile::Summary).

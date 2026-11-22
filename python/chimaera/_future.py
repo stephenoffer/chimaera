@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import queue
 import sys
+import threading
 import time
 import warnings
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator
-from typing import Any, Generic, NamedTuple, TypeVar
+from collections.abc import AsyncIterator, Callable, Generator, Iterable, Iterator
+from typing import Any, Generic, NamedTuple, TypeVar, overload
 
 from . import _context, _serde, _values
 from ._errors import StreamInterrupted, from_outcome
@@ -89,6 +91,17 @@ class Future(Generic[T]):
                 sys.stderr.write(f"chimaera: done-callback raised {e!r}\n")
 
     def add_done_callback(self, fn: Callable[[Future[T]], object]) -> None:
+        """Call ``fn(self)`` once the call has finished: at once if it has,
+        else on a thread for callbacks, in the order they were added, so a
+        slow callback delays only the callbacks after it, never results."""
+        if self.done():
+            fn(self)
+        else:
+            self._callbacks.append(lambda f: _callback_queue().put((fn, f)))
+
+    def _on_done(self, fn: Callable[[Future[T]], object]) -> None:
+        """For the runtime's own bookkeeping: ``fn`` runs on the thread that
+        delivers outcomes, so it must be quick and never wait."""
         if self.done():
             fn(self)
         else:
@@ -167,16 +180,29 @@ class Future(Generic[T]):
         raise exc
 
     def cancel(self, *, force: bool = False) -> bool:
-        """Request cancellation. True if cancellation won; False if the call had
-        already produced its outcome (which is kept)."""
+        """Ask the call, and every call it started, to stop; returns at once.
+        True if it had not finished (its result then raises ``ch.Cancelled``,
+        unless it finishes first), False if it had (its outcome is kept).
+
+        A running call that does not stop by itself is interrupted after 2 s
+        and its worker stopped after 5 s (``force=True``: at once). An actor
+        method's cancellation stays cooperative: check ``ch.context().cancelled()``."""
         if self.done():
             return self._cancelled()
         self._rt.client.cancel(self.key, force)
-        self._wait(30.0)
+        return True
+
+    def cancelled(self) -> bool:
+        """True once the call ended because it was cancelled (or ran out of
+        its deadline or budget)."""
         return self._cancelled()
 
+    def running(self) -> bool:
+        """True while the call runs on a worker (asks its peer)."""
+        return not self.done() and self.explain().get("state") == "Running"
+
     def _cancelled(self) -> bool:
-        return self._outcome is not None and self._outcome[0] == "err" and self._outcome[1] in ("cancelled", "deadline")
+        return self._outcome is not None and self._outcome[0] == "err" and self._outcome[1] in ("cancelled", "deadline", "budget")
 
     def split(self, n: int | None = None) -> tuple[Future[Any], ...]:
         """One future per value of a call that returns several (``returns=n``).
@@ -195,7 +221,7 @@ class Future(Generic[T]):
         self._rt.client.flush()
         return self._rt.client.explain(self.key)
 
-    def __await__(self):  # type: ignore[no-untyped-def]
+    def __await__(self) -> Generator[Any, None, T]:
         if not self.done():
             loop = asyncio.get_running_loop()
             waiter = loop.create_future()
@@ -203,7 +229,7 @@ class Future(Generic[T]):
             def wake(_: Future[T]) -> None:
                 loop.call_soon_threadsafe(lambda: waiter.done() or waiter.set_result(None))
 
-            self.add_done_callback(wake)
+            self._on_done(wake)
             self._rt.client.flush()
             yield from waiter.__await__()
         return self._value_or_raise()
@@ -219,21 +245,59 @@ class Future(Generic[T]):
 
     def __del__(self) -> None:
         rt = self._rt
-        if self._escaped or rt is None or sys.is_finalizing():
+        if self._escaped or rt is None or sys.is_finalizing() or rt.forked:
             return
         if self._put is not None:
-            # A ch.put value nothing else refers to: free its files now rather
-            # than at the end of the run. Values already read stay mapped.
+            # A ch.put value nothing else refers to, whose readers have
+            # finished: free its files now, here and on the peers that fetched
+            # them, rather than at the end of the run. Values already read
+            # stay mapped.
+            released = []
             for path in self._owned or ():
                 try:
                     os.unlink(path)
                 except OSError:
+                    pass
+                try:
+                    released.append(bytes.fromhex(os.path.basename(path)))
+                except ValueError:
+                    pass
+            # A task's own puts stay for the run: an executor's session owns
+            # no run, and a peer releases only the requesting session's values.
+            if released and not rt.in_executor:
+                try:
+                    rt.client.release_objects(self._put[0], released)
+                except Exception:  # noqa: S110 -- best effort during garbage collection
                     pass
             return
         try:
             rt.release_later(self.key)
         except Exception:  # noqa: S110 -- best effort during garbage collection
             return
+
+
+_callbacks: queue.SimpleQueue[tuple[Callable[[Any], object], Any]] | None = None
+_callbacks_lock = threading.Lock()
+
+
+def _callback_queue() -> queue.SimpleQueue[tuple[Callable[[Any], object], Any]]:
+    """The queue of user done-callbacks, run in order by one daemon thread."""
+    global _callbacks
+    with _callbacks_lock:
+        if _callbacks is None:
+            q: queue.SimpleQueue[tuple[Callable[[Any], object], Any]] = queue.SimpleQueue()
+
+            def run() -> None:
+                while True:
+                    fn, f = q.get()
+                    try:
+                        fn(f)
+                    except Exception as e:  # one callback's error must not stop the others
+                        sys.stderr.write(f"chimaera: done-callback raised {e!r}\n")
+
+            threading.Thread(target=run, name="chimaera-callbacks", daemon=True).start()
+            _callbacks = q
+    return _callbacks
 
 
 class _Part(Future[Any]):
@@ -268,6 +332,9 @@ class _Part(Future[Any]):
 
     def add_done_callback(self, fn: Callable[[Future[Any]], object]) -> None:
         self._parent.add_done_callback(lambda _: fn(self))
+
+    def _on_done(self, fn: Callable[[Future[Any]], object]) -> None:
+        self._parent._on_done(lambda _: fn(self))
 
     def cancel(self, *, force: bool = False) -> bool:
         """Cancels the whole call the part belongs to."""
@@ -395,79 +462,6 @@ def _note_serial_wait(f: Future[Any]) -> None:
         )
 
 
-class Stream(Generic[T]):
-    """The items of a generator call, in order, as the generator yields them.
-
-    Iterate it (``for x in fn.remote(...)``, or ``async for``). The generator
-    runs at most a window of items ahead of you (``max_in_flight``, default
-    64). If its worker dies, the generator runs again and the items you
-    already have are skipped, so a generator should yield the same items each
-    time (the default ``deterministic=True``). An error raised in the
-    generator is raised here after the items before it. ``close()`` stops it.
-    """
-
-    def __init__(self, fut: Future[int], window: int) -> None:
-        self._fut = fut
-        self.key = fut.key
-        self._rt = fut._rt
-        self._items: dict[int, tuple[Any, ...]] = {}
-        self._next = 0
-        self._window = window
-        self._credited = 0
-        self._rt._streams[self.key] = self
-
-    def __repr__(self) -> str:
-        return f"<Stream {self.key[16:].hex()[:12]} at item {self._next}>"
-
-    def _add(self, index: int, outcome: tuple[Any, ...]) -> None:
-        """An item arrived (dispatcher thread; a replayed attempt repeats indices)."""
-        if index >= self._next:
-            self._items.setdefault(index, outcome)
-
-    def __iter__(self) -> Stream[T]:
-        return self
-
-    def __next__(self) -> T:
-        rt = self._rt
-        rt.client.flush()
-        with rt.cond:
-            while self._next not in self._items:
-                if self._fut.done():
-                    count = self._fut._value_or_raise()  # the generator's error, if it raised
-                    if self._next >= count:
-                        raise StopIteration
-                    raise StreamInterrupted(f"the stream ended after {self._next} of {count} items")
-                rt.cond.wait(1.0)
-            outcome = self._items.pop(self._next)
-        self._next += 1
-        if self._next - self._credited >= max(1, self._window // 2):
-            self._credited = self._next
-            rt.client.stream_credit(self.key, self._next)
-        return rt.read_value(outcome)
-
-    def __aiter__(self) -> Stream[T]:
-        return self
-
-    async def __anext__(self) -> T:
-        # StopIteration cannot cross a thread boundary into a coroutine.
-        end = object()
-        item = await asyncio.to_thread(lambda: next(self, end))
-        if item is end:
-            raise StopAsyncIteration
-        return item
-
-    def close(self) -> None:
-        """Stop the generator; items not taken yet are dropped."""
-        self._fut.cancel()
-
-    def __enter__(self) -> Stream[T]:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        if not self._fut.done():
-            self.close()
-
-
 class ObjectRef:
     """A value stored once with ``ch.put`` and passed by reference."""
 
@@ -506,7 +500,7 @@ def _resolved_future(run: bytes, object_id: bytes, inline: bytes | None, size: i
 PUT_INLINE = 256 << 10
 
 
-def put(value: Any) -> Future[Any]:
+def put(value: T) -> Future[T]:
     """Store `value` once and return a finished future for it. Pass the
     future to any number of calls: each reads the stored value instead of
     receiving a copy. Identical values share one copy."""
@@ -518,21 +512,117 @@ def put(value: Any) -> Future[Any]:
     assert run is not None
     # Small values travel in the handle itself (as Ray's below 100 KB): up to
     # this size a file costs more than carrying the bytes.
-    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, max(rt.inline_limit, PUT_INLINE))
+    # Inside a call, named like its results (the run's first four bytes):
+    # the call may return the handle, and the peer keeps results, not the
+    # run's other values, once the run ends.
+    prefix = run[:4] if ctx is not None else b""
+    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, max(rt.inline_limit, PUT_INLINE), prefix)
     f = _resolved_future(run, object_id, inline, size)
     if owned:
         f._escaped, f._owned = False, owned
     return f
 
 
-def gather(*futures: Future[Any], timeout: float | None = None) -> list[Any]:
-    """Wait for all; return their values in order. Raises the first error."""
+@overload
+def get(x: Future[T], /, *, timeout: float | None = None) -> T: ...
+@overload
+def get(x: Iterable[Future[T]], /, *, timeout: float | None = None) -> list[T]: ...
+def get(x: Any, /, *, timeout: float | None = None) -> Any:
+    """The value of a future, or the values of an iterable of futures in
+    order. Waits for them; raises the first error. A ``timeout`` (seconds, for
+    all of them) raises ``TimeoutError`` and leaves the calls running."""
+    if isinstance(x, Future):
+        return x.result(timeout)
+    if isinstance(x, (str, bytes)) or not isinstance(x, Iterable):
+        raise TypeError(f"ch.get takes a future or an iterable of futures, not {type(x).__name__}")
+    futures = list(x)
+    for f in futures:
+        if not isinstance(f, Future):
+            raise TypeError(f"ch.get takes futures, not {type(f).__name__}")
+    return _values_of(futures, timeout)
+
+
+def wait(
+    futures: Iterable[Future[T]],
+    /,
+    *,
+    num_returns: int | None = None,
+    timeout: float | None = None,
+    fetch_local: bool = False,
+) -> tuple[list[Future[T]], list[Future[T]]]:
+    """Wait until ``num_returns`` of ``futures`` are done (default: all), or
+    ``timeout`` seconds pass. Returns ``(done, pending)``, each in the order
+    given. Values are not decoded; with ``fetch_local`` the done ones' stored
+    bytes are brought to this machine first (as Ray's ``ray.wait`` does by
+    default), so reading them later does not wait on the network."""
+    fs = list(futures)
+    want = len(fs) if num_returns is None else num_returns
+    if not 0 <= want <= len(fs):
+        raise ValueError(f"num_returns={num_returns}: there are {len(fs)} futures")
+    deadline = None if timeout is None else time.monotonic() + timeout
+    if fs:
+        rt = fs[0]._rt
+        rt.client.flush()
+        with rt.cond:
+            while sum(f.done() for f in fs) < want:
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    break
+                rt.cond.wait(1.0 if left is None else min(1.0, left))
+    done = [f for f in fs if f.done()]
+    if fetch_local and done:
+        from . import _objects
+
+        rt = done[0]._rt
+        for f in done:
+            if f._outcome is not None:
+                _objects.prefetch(f._outcome, rt.object_dir, rt.localize)
+    return done, [f for f in fs if not f.done()]
+
+
+def _values_of(futures: list[Future[T]], timeout: float | None) -> list[T]:
+    """Every future's value, in order (``ch.get`` of a list)."""
     deadline = None if timeout is None else time.monotonic() + timeout
     out = []
+    held = 0
     for f in futures:
         left = None if deadline is None else max(0.0, deadline - time.monotonic())
         out.append(f.result(left))
+        if f._put is None and f._outcome is not None and f._outcome[0] == "ok":
+            # A Linux arena array's stored size is only the frame that links
+            # it, but it pins its pages while held here: count its bytes.
+            nbytes = getattr(out[-1], "nbytes", 0)
+            held += max(f._outcome[4], nbytes if isinstance(nbytes, int) else 0)
+            _note_gathered(held, len(out), len(futures))
     return out
+
+
+# CH117: results one ch.get has read past this many stored bytes (None: a
+# quarter of this machine's memory).
+GATHER_WARN_BYTES: int | None = None
+_gather_warned = False
+
+
+def _note_gathered(held: int, done: int, total: int) -> None:
+    """A driver that gathers everything holds everything: warn once before a
+    ch.get's results outgrow this machine (Ray's head node runs out of memory
+    on the same program, with no message)."""
+    global _gather_warned
+    limit = GATHER_WARN_BYTES
+    if limit is None:
+        try:
+            limit = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 4
+        except (ValueError, OSError):
+            return
+    if _gather_warned or held <= limit:
+        return
+    _gather_warned = True
+    warnings.warn(
+        f"CH117: ch.get has read {done} of {total} results, {held >> 20} MiB stored, past a quarter of this "
+        "machine's memory, and holds them all at once. Consume results as they finish (ch.as_completed, or "
+        "fn.map(items)) or reduce them inside calls.",
+        stacklevel=3,
+    )
 
 
 class _AsyncWaker:
@@ -554,7 +644,7 @@ class _AsyncWaker:
         for f in futures:
             if id(f) not in self._registered:
                 self._registered.add(id(f))
-                f.add_done_callback(self._wake)
+                f._on_done(self._wake)
 
     def _wake(self, _: Future[Any]) -> None:
         loop, event = self._loop, self._event
@@ -677,7 +767,19 @@ class Results(Generic[T]):
         self._exhausted = False
         self._closed = False
         self._waker = _AsyncWaker()
+        self._registry: set[Any] | None = None
         self._fill()
+        if self._slots:
+            # Until read to the end or closed, the driver finishes it at exit.
+            rt = next(iter(self._slots.values())).fut._rt
+            if not rt.in_executor:
+                self._registry = rt._open_maps
+                self._registry.add(self)
+
+    def _end(self) -> None:
+        if self._registry is not None:
+            self._registry.discard(self)
+            self._registry = None
 
     # ---- submission ----------------------------------------------------------
 
@@ -782,6 +884,7 @@ class Results(Generic[T]):
         if self._buf:
             return self._buf.popleft()
         if self._closed or not self._slots:
+            self._end()
             raise StopIteration
         if self._ordered:
             slot = self._pop_ordered()
@@ -825,6 +928,7 @@ class Results(Generic[T]):
                 yield self._item_future(slot, j)
                 continue
             if self._closed or not self._slots:
+                self._end()
                 return
             slot = self._pop_ordered()
             for j in range(slot.k):
@@ -861,6 +965,7 @@ class Results(Generic[T]):
         if self._closed:
             return
         self._closed = True
+        self._end()
         close = getattr(self._source, "close", None)
         if callable(close):
             close()
@@ -882,6 +987,7 @@ class Results(Generic[T]):
     async def __anext__(self) -> T:
         if not self._buf:
             if self._closed or not self._slots:
+                self._end()
                 raise StopAsyncIteration
             if self._ordered:
                 slot = self._pop_ordered()
@@ -904,3 +1010,88 @@ class Results(Generic[T]):
         return value
 
 
+class Stream(Results[T]):
+    """The items of a generator call, in order, as the generator yields them.
+
+    Iterate it (``for x in fn.remote(...)``, or ``async for``). The generator
+    runs at most a window of items ahead of you (``max_in_flight``, default
+    64). If its worker dies, the generator runs again and the items you
+    already have are skipped, so a generator should yield the same items each
+    time (the default ``deterministic=True``). An error raised in the
+    generator is raised here after the items before it. ``close()`` stops it.
+    """
+
+    def __init__(self, fut: Future[int], window: int) -> None:
+        self._fut = fut
+        self.key = fut.key
+        self._rt = fut._rt
+        self._items: dict[int, tuple[Any, ...]] = {}
+        self._next = 0
+        self._window = window
+        self._credited = 0
+        self._rt._streams[self.key] = self
+        if not self._rt.in_executor:
+            self._rt._stream_keys.add(self.key)
+
+    def __repr__(self) -> str:
+        return f"<Stream {self.key[16:].hex()[:12]} at item {self._next}>"
+
+    def _add(self, index: int, outcome: tuple[Any, ...]) -> None:
+        """An item arrived (dispatcher thread; a replayed attempt repeats indices)."""
+        if index >= self._next:
+            self._items.setdefault(index, outcome)
+
+    def __iter__(self) -> Stream[T]:
+        return self
+
+    def __next__(self) -> T:
+        rt = self._rt
+        rt.client.flush()
+        with rt.cond:
+            while self._next not in self._items:
+                if self._fut.done():
+                    count = self._fut._value_or_raise()  # the generator's error, if it raised
+                    if self._next >= count:
+                        raise StopIteration
+                    raise StreamInterrupted(f"the stream ended after {self._next} of {count} items")
+                rt.cond.wait(1.0)
+            outcome = self._items.pop(self._next)
+        self._next += 1
+        if self._next - self._credited >= max(1, self._window // 2):
+            self._credited = self._next
+            rt.client.stream_credit(self.key, self._next)
+        return rt.read_value(outcome)
+
+    def __aiter__(self) -> Stream[T]:
+        return self
+
+    async def __anext__(self) -> T:
+        # StopIteration cannot cross a thread boundary into a coroutine.
+        end = object()
+        item = await asyncio.to_thread(lambda: next(self, end))
+        if item is end:
+            raise StopAsyncIteration
+        return item
+
+    def close(self) -> None:
+        """Stop the generator; items not taken yet are dropped."""
+        self._fut.cancel()
+
+    def __enter__(self) -> Stream[T]:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if not self._fut.done():
+            self.close()
+
+    def outcomes(self) -> Iterator[Outcome]:
+        """(index, value, None) for every item; the generator's own error, if
+        it raised one, is raised after its last item."""
+        for i, value in enumerate(self):
+            yield Outcome(i, value, None)
+
+    def futures(self) -> Iterator[Future[T]]:
+        raise TypeError("a generator call's items are values, not calls: iterate it, or pass it to fn.map(...)")
+
+    def map(self, fn: Any, *, ordered: bool = True) -> Results[Any]:
+        return fn.map(self, ordered=ordered)

@@ -22,6 +22,20 @@ pytest:
 	VIRTUAL_ENV=$(CURDIR)/.venv .venv/bin/maturin develop -q
 	.venv/bin/python -m pytest python/tests -q
 
+# A wheel that carries the peer binary, so `pip install` gives a working
+# `chimaera` with no Rust toolchain; wheel-smoke installs it in a fresh venv.
+TARGET ?= $(or $(CARGO_TARGET_DIR),target)
+.PHONY: wheel wheel-smoke
+wheel:
+	cargo build --release --locked -p chimaera-peer
+	mkdir -p python/chimaera/_bin
+	install -m 755 $(TARGET)/release/chimaera python/chimaera/_bin/chimaera
+	.venv/bin/maturin build --release --out dist
+	rm -rf python/chimaera/_bin  # in a checkout, the peer comes from target/
+
+wheel-smoke: wheel
+	PYTHON=$(CURDIR)/.venv/bin/python deploy/dev/wheel-smoke.sh
+
 # Deeper property run of the shard state machine (default is 512 histories).
 proptest-deep:
 	PROPTEST_CASES=20000 cargo test -p chimaera-core invariants_hold

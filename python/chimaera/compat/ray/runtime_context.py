@@ -14,7 +14,7 @@ class RuntimeContext:
     def get_job_id(self) -> str:
         """The Chimaera run id (Ray's job id)."""
         ctx = ch.context()
-        return ctx.run_id if ctx is not None else ch.current_run().id
+        return ctx.run_id if ctx is not None else ch.runs.current_run().id
 
     def get_task_id(self) -> str | None:
         ctx = ch.context()
@@ -34,7 +34,7 @@ class RuntimeContext:
         """The call's granted devices by Ray's resource names, as the call numbers them."""
         names = {"cuda": "GPU", "rocm": "GPU", "tpu": "TPU", "neuron": "neuron_cores", "hpu": "HPU", "xpu": "GPU", "mps": "GPU"}
         out: dict[str, list[str]] = {}
-        for d in ch.devices():
+        for d in ch.dist.devices():
             out.setdefault(names[d["kind"]], []).append(str(d["index"]))
         return out
 

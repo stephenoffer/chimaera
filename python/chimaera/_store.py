@@ -1,4 +1,4 @@
-"""Replicated keys, counters, locks and barriers: ``ch.Store``.
+"""Replicated keys, counters, locks and barriers: ``ch.coord.Store``.
 
 A namespace lives in one Raft group, so its operations are linearizable and
 survive the loss of a minority of peers. Every change bumps the namespace's

@@ -1,4 +1,4 @@
-"""``ray.util.collective`` on Chimaera: collective groups of actors, over ``ch.group``.
+"""``ray.util.collective`` on Chimaera: collective groups of actors, over ``ch.dist.group``.
 
 A group is declared from the driver (``create_collective_group``) or by each
 actor (``init_collective_group``); the collectives run inside the actors and
@@ -33,12 +33,12 @@ class Backend:
 
 
 TTL = "24h"
-_groups: dict[str, Any] = {}  # group name -> this actor's ch.Group
+_groups: dict[str, Any] = {}  # group name -> this actor's ch.dist.Group
 _lock = threading.Lock()
 
 
-def _declared() -> ch.Store:
-    return ch.Store("ray-collective")
+def _declared() -> ch.coord.Store:
+    return ch.coord.Store("ray-collective")
 
 
 def create_collective_group(
@@ -62,7 +62,7 @@ def create_collective_group(
 
     native = [a._actor if isinstance(a, ActorHandle) else a for a in actors]
     ordered = [a for _, a in sorted(zip(ranks, native, strict=True), key=lambda ra: ra[0])]
-    _declared().put(group_name, ch.group(*ordered, key=f"ray-{group_name}"), ttl=TTL)
+    _declared().put(group_name, ch.dist.group(*ordered, name=f"ray-{group_name}"), ttl=TTL)
 
 
 def init_collective_group(
@@ -76,11 +76,11 @@ def init_collective_group(
         raise ValueError(f"rank {rank} is not in [0, {world_size})")
     if group_name in _groups:
         raise RuntimeError("Trying to initialize a group a second time.")
-    store = ch.Store(f"ray-collective/{group_name}")
+    store = ch.coord.Store(f"ray-collective/{group_name}")
     store.put(f"member/{rank}", ctx.actor_id, ttl=TTL)
     round_ = store.barrier("init", world_size).wait()  # the same number on every rank
     members = tuple(store.get(f"member/{r}") for r in range(world_size))
-    joined = ch.GroupHandle(f"ray-init-{group_name}", round_, members).join()
+    joined = ch.dist.GroupHandle(f"ray-init-{group_name}", round_, members).join()
     with _lock:
         _groups[group_name] = joined
 

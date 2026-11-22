@@ -13,6 +13,10 @@
 //!   command of a detached run, which must resume after a crash) is written
 //!   with the overlay in one `Durability::Immediate` commit, which survives
 //!   the peer process dying on the local peer's no-sync backend.
+//! - A batch that starts an external call (`StartExternal`) is also synced to
+//!   disk before its reply, so the record that the call started survives the
+//!   machine too: after a power loss the call is `OutcomeUnknown`, never run
+//!   a second time.
 //! - The overlay is also written durably once it is `CHECKPOINT_EVERY` old or
 //!   holds `MAX_OVERLAY` entries. A crash loses at most that much of an
 //!   attached run's calls, whose driver loses its connection to the peer in
@@ -64,12 +68,15 @@ impl Applier {
     pub(crate) fn start(
         group: u32,
         db: Arc<Database>,
+        path: std::path::PathBuf,
         events: tokio::sync::mpsc::Sender<GroupEvents>,
     ) -> io::Result<Applier> {
         let (tx, rx) = mpsc::channel::<Proposal>();
         let overlay = Arc::new(RwLock::new(Overlay::default()));
         let (d, o) = (db.clone(), overlay.clone());
-        std::thread::Builder::new().name(format!("apply-{group}")).spawn(move || run(group, &d, &o, &events, &rx))?;
+        std::thread::Builder::new()
+            .name(format!("apply-{group}"))
+            .spawn(move || run(group, &d, &path, &o, &events, &rx))?;
         Ok(Applier { tx, group, db, overlay })
     }
 
@@ -90,6 +97,7 @@ impl Applier {
 fn run(
     group: u32,
     db: &Database,
+    path: &std::path::Path,
     overlay: &RwLock<Overlay>,
     events: &tokio::sync::mpsc::Sender<GroupEvents>,
     rx: &mpsc::Receiver<Proposal>,
@@ -121,7 +129,10 @@ fn run(
         if detached.len() > MAX_CACHED_RUNS {
             detached.clear();
         }
-        match apply(db, group, &shard, overlay, &batch, &mut detached) {
+        let starts_external = batch.iter().any(|(c, _)| matches!(c.body, Some(pb::shard_cmd::Body::StartExternal(_))));
+        let applied = apply(db, group, &shard, overlay, &batch, &mut detached)
+            .and_then(|a| if starts_external { sync(path).map(|()| a) } else { Ok(a) });
+        match applied {
             Ok((replies, evs)) => {
                 for ((_, tx), reply) in batch.into_iter().zip(replies) {
                     let _ = tx.send(Ok(reply));
@@ -142,6 +153,16 @@ fn run(
 }
 
 type Applied = (Vec<pb::ShardReply>, Vec<chimaera_core::shard::Event>);
+
+#[cfg(test)]
+static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Push the state database's committed writes to the disk.
+fn sync(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(test)]
+    SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::fs::File::open(path)?.sync_data()
+}
 
 /// Apply `batch`: to the overlay when it holds only an attached run's call
 /// commands and the overlay is young and small, otherwise durably with it.
@@ -379,6 +400,26 @@ mod tests {
         panic!("database lock never released");
     }
 
+    /// Starting an external call syncs the state to disk before the reply,
+    /// so a power loss cannot erase the record that it started; ordinary
+    /// calls never wait for a sync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_external_calls_start_is_synced_before_its_reply() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, _events, g) = open(dir.path(), false).await;
+        let before = super::SYNCS.load(Ordering::Relaxed);
+        for i in 0..20 {
+            g.propose(&submit(i)).await.unwrap();
+        }
+        assert_eq!(super::SYNCS.load(Ordering::Relaxed), before, "ordinary calls are not synced");
+        let run = Id::derive(0, 3, &[b"run"]);
+        let tk = Tk { run, task: run.child(&[&0u64.to_le_bytes()]) };
+        let start = pb::StartExternal { task: Some(tk.pb()), attempt: 1, peer: None };
+        g.propose(&cmd(pb::shard_cmd::Body::StartExternal(start))).await.unwrap();
+        assert!(super::SYNCS.load(Ordering::Relaxed) > before, "the start of an external call is synced");
+    }
+
     /// The overlay over the database reads exactly like one map, through
     /// random writes, deletes and write-outs, with other groups' keys on both
     /// sides of the group's range.
@@ -544,6 +585,7 @@ mod tests {
 
     const CRASH_DIR: &str = "CHIMAERA_TEST_CRASH_DIR";
     const CRASH_MODE: &str = "CHIMAERA_TEST_CRASH_MODE";
+    const CRASH_EXIT: i32 = 86;
 
     /// The child of the crash tests: create a run (detached or not), submit 40
     /// calls, optionally sit idle, then die without any shutdown or drop. A
@@ -569,19 +611,34 @@ mod tests {
         if mode == "idle" {
             std::thread::sleep(super::CHECKPOINT_EVERY * 3);
         }
-        std::process::abort();
+        // Exit without running a destructor, so the database is never closed;
+        // not abort(), which hands the process to macOS's crash reporter and
+        // left children stuck exiting for hours when it stalled.
+        std::process::exit(CRASH_EXIT);
     }
 
-    /// Run `crash_child` in `mode`, then reopen its directory.
+    /// Run `crash_child` in `mode` (failing, not hanging, if it does not die
+    /// within a minute), then reopen its directory.
     async fn after_crash(mode: &str) -> (tempfile::TempDir, crate::Group) {
         let dir = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "local::tests::crash_child", "--nocapture"])
             .env(CRASH_DIR, dir.path())
             .env(CRASH_MODE, mode)
-            .status()
+            .spawn()
             .unwrap();
-        assert!(!status.success(), "the child aborts after its writes");
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the crash child did not exit within 60 s");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(status.code(), Some(CRASH_EXIT), "the child dies right after its writes");
         let (_host, _events, g) = open(dir.path(), false).await;
         (dir, g)
     }

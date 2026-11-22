@@ -55,7 +55,7 @@ with square.map(huge_iterable) as stream:           # stop early safely
 The runtime keeps a bounded number of items in flight and batches fast items
 for you. Leaving the `with` block cancels whatever is still running.
 
-To wait on a handful of futures, use `ch.gather(*futures)` (values in order) or
+To wait on a handful of futures, use `ch.get(futures)` (values in order) or
 `ch.as_completed(futures)` (futures as they finish).
 
 A generator function streams its items back as it yields them:
@@ -102,11 +102,11 @@ t.close()
 say so: `@ch.remote(concurrency=4)`.
 
 An actor's state normally lives only in its process. Give the class
-`state=ch.State()` and every call that returns commits the instance's
+`state=ch.durable.State()` and every call that returns commits the instance's
 attributes before its reply goes out:
 
 ```python
-@ch.remote(state=ch.State())
+@ch.remote(state=ch.durable.State())
 class Account:
     def __init__(self):
         self.balance = 0
@@ -115,7 +115,7 @@ class Account:
         self.balance += amount
         return self.balance
 
-a = Account.options(key="account/42").remote()
+a = Account.options(name="account/42").remote()
 a.deposit.options(command_id="order-17").remote(5).result()   # 5
 a.deposit.options(command_id="order-17").remote(5).result()   # 5 again: not deposited twice
 ```
@@ -123,7 +123,7 @@ a.deposit.options(command_id="order-17").remote(5).result()   # 5 again: not dep
 If its process or its peer dies, the actor comes back with the last
 committed state, without running `__init__` again. A call that raises
 commits nothing. Reusing a `command_id` with different arguments raises
-`ch.CommandConflict`. The state is stored inline, so keep it under 1 MiB
+`ch.errors.CommandConflict`. The state is stored inline, so keep it under 1 MiB
 pickled, and a durable actor runs one call at a time.
 
 ## 5. Ask for resources
@@ -170,7 +170,7 @@ Every script gets a run id (`ch.init()` returns it). Another process can
 reattach and read the results, even after the local peer restarted:
 
 ```python
-run = ch.attach("0000...")         # the run id
+run = ch.runs.attach("0000...")         # the run id
 run.wait()
 for task_id, value, error in run.outcomes():
     ...
@@ -187,7 +187,7 @@ workflow:
 async def nightly(day):
     raw = await extract.remote(day)
     clean = await transform.remote(raw)
-    started = ch.workflow.now()
+    started = await ch.durable.now()
     return await load.remote(clean, started)
 ```
 
@@ -195,9 +195,9 @@ If its worker dies, the workflow runs again from the top, and each call it
 already made is answered from the run's record instead of running twice. So
 it must make the same calls, in the same order, every time: anything that
 varies (the time, random numbers, an API response) goes through
-`ch.workflow.now()`, `ch.workflow.random()` or `ch.workflow.record(fn, ...)`.
+`await ch.durable.now()`, `ch.durable.random()` or `ch.durable.record(fn, ...)`.
 A replay that asks for something different at a step raises
-`ch.WorkflowDivergence`.
+`ch.errors.WorkflowDivergence`.
 
 ## 8. Environment variables
 
@@ -216,6 +216,8 @@ secrets this way: the run's variables are stored with the run. Put secrets
 
 ```bash
 chimaera status
+chimaera runs                # recent runs: their ids, state and the command that started them
+chimaera logs RUN
 chimaera inspect RUN
 chimaera explain RUN --task TASK
 chimaera explain RUN --decisions

@@ -1,4 +1,4 @@
-"""ch.Store: versions and compare-and-set, counters, locks with fencing,
+"""ch.coord.Store: versions and compare-and-set, counters, locks with fencing,
 barriers, watches and TTLs; and fencing across a leader failover."""
 
 from __future__ import annotations
@@ -14,20 +14,20 @@ import pytest
 import chimaera as ch
 
 
-def ns() -> ch.Store:
-    return ch.Store(f"test-{uuid.uuid4().hex[:8]}")
+def ns() -> ch.coord.Store:
+    return ch.coord.Store(f"test-{uuid.uuid4().hex[:8]}")
 
 
 def test_versions_make_compare_and_set():
     s = ns()
     v1 = s.put("cfg", {"lr": 3e-4}, if_version=0)
     assert s.get("cfg") == {"lr": 3e-4} and s.version("cfg") == v1
-    with pytest.raises(ch.VersionConflict) as info:
+    with pytest.raises(ch.errors.VersionConflict) as info:
         s.put("cfg", "other", if_version=0)
     assert info.value.version == v1
     v2 = s.put("cfg", {"lr": 1e-4}, if_version=v1)
     assert v2 > v1
-    with pytest.raises(ch.VersionConflict):
+    with pytest.raises(ch.errors.VersionConflict):
         s.delete("cfg", if_version=v1)
     assert s.delete("cfg") and not s.delete("cfg")
     assert s.get("cfg", "gone") == "gone" and s.version("cfg") == 0
@@ -52,7 +52,7 @@ def bump(store, n):
 
 def test_counters_are_atomic_across_calls():
     s = ns()
-    ch.gather(*(bump.remote(s, 25) for _ in range(8)), timeout=120)
+    ch.get((bump.remote(s, 25) for _ in range(8)), timeout=120)
     assert s.counter("hits").value() == 200
 
 
@@ -67,7 +67,7 @@ def locked_increment(store, k):
 
 def test_a_lock_excludes_other_holders():
     s = ns()
-    ch.gather(*(locked_increment.remote(s, 10) for _ in range(6)), timeout=180)
+    ch.get((locked_increment.remote(s, 10) for _ in range(6)), timeout=180)
     assert s.get("n") == 60, "a lost update means two holders ran at once"
 
 
@@ -79,7 +79,7 @@ def test_a_stale_holder_is_fenced_after_its_lease_expires():
     b = s.lock("leader", ttl="10s", timeout=10).acquire()
     try:
         assert b.token > a.token and s.holder("leader") == b.holder
-        with pytest.raises(ch.LeaseLost):
+        with pytest.raises(ch.errors.LeaseLost):
             s.put("state", "late write from a", fence=a)
         s.put("state", "from b", fence=b)
         assert s.get("state") == "from b"
@@ -95,8 +95,8 @@ def meet(store, parties):
 
 def test_a_barrier_releases_everyone_together():
     s = ns()
-    assert ch.gather(*(meet.remote(s, 3) for _ in range(3)), timeout=120) == [1, 1, 1]
-    assert ch.gather(*(meet.remote(s, 3) for _ in range(3)), timeout=120) == [2, 2, 2]
+    assert ch.get((meet.remote(s, 3) for _ in range(3)), timeout=120) == [1, 1, 1]
+    assert ch.get((meet.remote(s, 3) for _ in range(3)), timeout=120) == [2, 2, 2]
 
 
 def test_watch_delivers_changes_in_order():
@@ -141,7 +141,7 @@ def test_ttl_entries_expire():
 
 FAILOVER_A = """
 import time, chimaera as ch
-s = ch.Store("failover")
+s = ch.coord.Store("failover")
 lease = s.lock("leader", ttl="1500ms").acquire()
 s.put("state", "a", fence=lease)
 print("TOKEN", lease.token, flush=True)
@@ -151,7 +151,7 @@ while not __import__("os").path.exists(PROCEED):
 try:
     s.put("state", "late a", fence=lease)
     print("FENCED no")
-except ch.LeaseLost:
+except ch.errors.LeaseLost:
     print("FENCED yes")
 """
 
@@ -184,7 +184,7 @@ def test_fencing_holds_across_a_leader_failover():
             2,
             """
 import chimaera as ch
-s = ch.Store("failover")
+s = ch.coord.Store("failover")
 b = s.lock("leader", ttl="30s", timeout=60).acquire()
 s.put("state", "b", fence=b)
 print("B", b.token, s.get("state"))
@@ -210,8 +210,8 @@ def qkey() -> str:
 def test_durable_queue_is_fifo_and_bounded():
     import queue
 
-    q = ch.Queue(maxsize=3, key=qkey(), durable=True)
-    assert isinstance(q, ch.Queue)
+    q = ch.coord.Queue(maxsize=3, name=qkey(), durable=True)
+    assert isinstance(q, ch.coord.Queue)
     for i in range(3):
         q.put(i)
     with pytest.raises(queue.Full):
@@ -222,12 +222,12 @@ def test_durable_queue_is_fifo_and_bounded():
     q.put("last")
     q.close()
     assert list(q) == ["last"]
-    with pytest.raises(ch.Closed):
+    with pytest.raises(ch.errors.Closed):
         q.put("after close")
 
 
 def test_a_failed_claim_is_delivered_again():
-    q = ch.Queue(key=qkey(), durable=True)
+    q = ch.coord.Queue(name=qkey(), durable=True)
     q.put("job")
     with pytest.raises(RuntimeError):
         with q.claim() as item:
@@ -247,7 +247,7 @@ def die_holding_a_claim(q):
 
 
 def test_an_item_whose_consumer_died_is_delivered_again():
-    q = ch.Queue(key=qkey(), durable=True)
+    q = ch.coord.Queue(name=qkey(), durable=True)
     q.put("job")
     with pytest.raises(ch.InfrastructureFailure):
         die_holding_a_claim.remote(q).result(timeout=60)
@@ -261,18 +261,18 @@ def consume_all(q):
 
 def test_durable_queue_is_shared_by_key_across_calls():
     key = qkey()
-    q = ch.Queue(key=key, durable=True)
+    q = ch.coord.Queue(name=key, durable=True)
     for i in range(20):
         q.put(i)
     q.close()
-    parts = ch.gather(*(consume_all.remote(ch.Queue(key=key, durable=True)) for _ in range(3)), timeout=120)
+    parts = ch.get((consume_all.remote(ch.coord.Queue(name=key, durable=True)) for _ in range(3)), timeout=120)
     assert sorted(x for p in parts for x in p) == list(range(20))
 
 
 def test_cluster_reports_this_peer():
-    nodes = ch.cluster().nodes()
+    nodes = ch.runs.cluster().nodes()
     assert len(nodes) == 1 and nodes[0].alive and nodes[0].this_peer
-    assert ch.cluster().resources()["cpus"] == nodes[0].cpus > 0
+    assert ch.runs.cluster().resources()["cpus"] == nodes[0].cpus > 0
 
     @ch.remote
     def where():

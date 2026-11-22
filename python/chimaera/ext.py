@@ -10,7 +10,7 @@
         def write(self, part_id, items): ...  # idempotent per part; returns a receipt
         def commit(self, receipts): ...       # called once, with every receipt
 
-Sources feed ``ch.partitions(source)``; sinks receive ``Results.write(sink)``
+Sources feed ``ch.data.partitions(source)``; sinks receive ``Results.write(sink)``
 and ``reduce_by_key(...).write(sink)``. Both are pickled to the workers that
 read and write, so keep their state small (paths, URIs, credentials names).
 """

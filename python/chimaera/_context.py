@@ -18,7 +18,7 @@ class TaskContext:
     deadline_unix_ms: int
     actor: bytes = b""
     # A durable workflow: its calls are fingerprinted so a replay that makes
-    # different calls is caught (ch.workflow helpers need it set).
+    # different calls is caught (ch.durable helpers need it set).
     workflow: bool = False
     _children: int = 0
     _reports: int = 0
@@ -60,7 +60,7 @@ class TaskContext:
 
     @property
     def node(self) -> str:
-        """The peer (hex id) this call runs on, as ``ch.cluster().nodes()`` names it."""
+        """The peer (hex id) this call runs on, as ``ch.runs.cluster().nodes()`` names it."""
         from ._runtime import Runtime
 
         return Runtime.get().info["peer"].hex()

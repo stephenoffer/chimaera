@@ -16,7 +16,7 @@ def hold(i):
     time.sleep(0.4)
     return (t, time.time())
 
-spans = ch.gather(*[hold.remote(i) for i in range(4)], timeout=60)
+spans = ch.get([hold.remote(i) for i in range(4)], timeout=60)
 overlap = any(a[0] < b[1] - 0.05 and b[0] < a[1] - 0.05 for i, a in enumerate(spans) for b in spans[i + 1:])
 print("OVERLAP", overlap)
 if TENANT == "capped":
@@ -61,3 +61,48 @@ def test_a_malformed_quota_setting_stops_the_peer():
 
     with open(os.path.join(home, "peer.log")) as f:
         assert "is not tenant=cpus" in f.read()  # the peer says why it refused to start
+
+
+SHARE_SCRIPT = """
+import time, chimaera as ch
+ch.init(tenant=TENANT)
+
+@ch.remote(cpus=1)
+def hold(i):
+    t = time.time()
+    time.sleep(1.0)
+    return t, time.time(), ch.context().node
+
+start = time.time()
+spans = ch.get([hold.remote(i) for i in range(12)], timeout=120)
+edges = sorted([(a, 1) for a, _, _ in spans] + [(b, -1) for _, b, _ in spans], key=lambda e: (e[0], e[1]))
+running = peak = 0
+for _, step in edges:
+    running += step
+    peak = max(peak, running)
+print("RESULT", round(time.time() - start, 2), peak, len({n for _, _, n in spans}))
+"""
+
+
+def test_a_cluster_share_caps_a_tenant_across_peers(monkeypatch):
+    from test_cluster import Cluster
+
+    monkeypatch.setenv("CHIMAERA_TENANT_SHARES", "ml=2")
+    cluster = Cluster(2)  # 4 CPUs each: 8 in all
+    try:
+
+        def run(tenant):
+            out = cluster.run(0, SHARE_SCRIPT.replace("TENANT", repr(tenant)))
+            assert out.returncode == 0, out.stderr[-2000:]
+            seconds, peak, _ = next(ln for ln in out.stdout.splitlines() if ln.startswith("RESULT")).split()[1:]
+            return float(seconds), int(peak)
+
+        seconds, peak = run("ml")
+        # 12 one-second calls, 2 at a time across the cluster: about 6 s. A per-peer
+        # cap of 2 would allow 4 at once (about 3 s). Peers admitting before they
+        # hear each other's report may overshoot briefly, never for the whole run.
+        assert seconds >= 4.5, (seconds, peak)
+        open_seconds, open_peak = run("web")  # no share: uses the whole cluster
+        assert open_seconds < 3.5 and open_peak > 2, (open_seconds, open_peak)
+    finally:
+        cluster.close()

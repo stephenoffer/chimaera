@@ -6,6 +6,8 @@ import threading
 import time
 import uuid
 
+import pytest
+
 import chimaera as ch
 
 
@@ -90,13 +92,13 @@ def ask_shared(pool, n):
 
 def test_a_keyed_pool_is_shared_with_calls_and_other_handles():
     key = f"shared-{uuid.uuid4().hex[:8]}"
-    pool = Model.options(key=key, replicas=2).pool()
+    pool = Model.options(name=key, replicas=2).pool()
     try:
         mine = sorted({pool.who.remote().result(timeout=60) for _ in range(20)})
         assert len(mine) == 2
         # A task given the pool reaches the same replicas, and so does a second handle.
         assert ask_shared.remote(pool, 20).result(timeout=60) == mine
-        again = Model.options(key=key).pool()
+        again = Model.options(name=key).pool()
         assert sorted({again.who.remote().result(timeout=60) for _ in range(20)}) == mine
         # Growing it through one handle shows up in the other.
         pool.resize(3)
@@ -119,3 +121,33 @@ def test_auto_replicas_grow_under_load():
         assert [f.result(timeout=120)[1] for f in futures] == list(range(60))
     finally:
         pool.close()
+
+
+def test_a_routed_call_holds_its_replica_through_a_resize():
+    @ch.remote
+    class Slow:
+        def nap(self, seconds):
+            time.sleep(seconds)
+            return "done"
+
+    pool = Slow.options(replicas=2).pool()
+    try:
+        newest = pool._replicas[1]  # the one a shrink retires
+        key = next(k for k in range(1000) if pool._replica_for(str(k).encode()) is newest)
+        f = pool.route(key).nap.remote(2.0)
+        time.sleep(0.3)
+        pool.resize(1)
+        assert f.result(timeout=60) == "done", "the replica waited for its routed call"
+    finally:
+        pool.close()
+
+
+def test_a_method_the_pool_hides_is_named():
+    @ch.remote
+    class Sized:
+        def resize(self, n):
+            return n
+
+    with pytest.warns(UserWarning, match="Sized defines resize, which a pool handle reserves"):
+        pool = Sized.options(replicas=1).pool()
+    pool.close()

@@ -72,9 +72,9 @@ _INFRA: tuple[tuple[type[BaseException], type[RayError]], ...] = (
     (ch.Cancelled, TaskCancelledError),
     (ch.ActorDied, ActorDiedError),
     (ch.OutOfMemory, OutOfMemoryError),
-    (ch.DataLost, ObjectLostError),
+    (ch.errors.DataLost, ObjectLostError),
     (ch.InfrastructureFailure, WorkerCrashedError),
-    (ch.Overloaded, PendingCallsLimitExceeded),
+    (ch.errors.Overloaded, PendingCallsLimitExceeded),
 )
 
 _dual: dict[type[BaseException], type[RayTaskError]] = {}
@@ -109,7 +109,7 @@ def translate(exc: BaseException) -> BaseException | None:
             out: BaseException = ray_type(str(exc))
             break
     else:
-        if isinstance(exc, ch.ChimaeraError) and not isinstance(exc, ch.RemoteError):
+        if isinstance(exc, ch.ChimaeraError) and not isinstance(exc, ch.errors.RemoteError):
             return None  # Infeasible, OutcomeUnknown, ...: no Ray equivalent, keep Chimaera's
         out = _task_error(exc)
     have = list(getattr(out, "__notes__", ()))  # a task error already copied the cause's notes

@@ -1,0 +1,20 @@
+# GPU check: Chimaera's CUDA discovery, grants and an NCCL gang on one node
+# with 4 NVIDIA A10G GPUs (g5.12xlarge), at most 30 minutes. Until this has
+# passed on hardware, CUDA support stays marked unverified (docs/deploy.md).
+#   anyscale job submit -f deploy/anyscale/gpu-check.job.yaml --wait
+name: chimaera-gpu-check
+cloud: anyscale_v2_default_cloud
+compute_config:
+  cloud: anyscale_v2_default_cloud
+  head_node:
+    instance_type: g5.12xlarge
+    # Schedulable head: this run has no workers.
+    resources:
+      CPU: 48
+      GPU: 4
+  worker_nodes: []
+working_dir: .
+excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
+entrypoint: bash deploy/anyscale/run_gpu_check.sh
+max_retries: 0
+timeout_s: 1800

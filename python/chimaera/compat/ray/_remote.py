@@ -109,7 +109,7 @@ class RemoteFunction:
     """A Ray remote function. ``.remote()`` returns a ``chimaera.Future``, or a
     list of them with ``num_returns=n``."""
 
-    def __init__(self, fn: Callable[..., Any], options: Mapping[str, Any], base: ch.RemoteFunction | None = None) -> None:
+    def __init__(self, fn: Callable[..., Any], options: Mapping[str, Any], base: ch.typing.RemoteFunction | None = None) -> None:
         if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
             raise unsupported("a generator remote function", use="generator functions in chimaera directly", lands="M1")
         self._fn = fn
@@ -139,7 +139,7 @@ class RemoteFunction:
 class ActorClass:
     """A Ray actor class. ``.remote()`` returns an ``ActorHandle``."""
 
-    def __init__(self, cls: type, options: Mapping[str, Any], base: ch.ActorClass[Any] | None = None) -> None:
+    def __init__(self, cls: type, options: Mapping[str, Any], base: ch.typing.ActorClass[Any] | None = None) -> None:
         self._cls = cls
         self._options = dict(options)
         groups = _options.translate(self._options, _options.ACTOR).pop("groups", None)  # fail at decoration, as Ray does
@@ -158,7 +158,7 @@ class ActorClass:
         opts.pop("groups", None)
         key = _options.actor_key(self._options, _default_namespace)
         if key:
-            opts["key"] = key
+            opts["name"] = key
         if "concurrency" not in opts and _has_async_methods(self._cls):
             opts["concurrency"] = 1000  # Ray's default for async actors
         args, kwargs = _as_ray(args, kwargs)
@@ -172,12 +172,12 @@ class ActorClass:
 
 
 class ActorHandle:
-    """A Ray actor handle over a ``chimaera.Actor``: methods by name, with
+    """A Ray actor handle over a ``chimaera.typing.Actor``: methods by name, with
     Ray's ``num_returns`` (a list of refs) and per-call ``.options()``."""
 
     __slots__ = ("_actor",)
 
-    def __init__(self, actor: ch.Actor[Any]) -> None:
+    def __init__(self, actor: ch.typing.Actor[Any]) -> None:
         self._actor = actor
 
     def __getattr__(self, name: str) -> ActorMethod:
@@ -242,7 +242,7 @@ def _default_namespace() -> str:
     if _state.namespace:
         return _state.namespace
     ctx = ch.context()
-    return f"run-{ctx.run_id if ctx is not None else ch.current_run().id}"
+    return f"run-{ctx.run_id if ctx is not None else ch.runs.current_run().id}"
 
 
 def make(obj: Any, options: Mapping[str, Any]) -> RemoteFunction | ActorClass:

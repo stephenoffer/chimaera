@@ -142,6 +142,7 @@ fn kind_name(k: pb::error_record::Kind) -> &'static str {
         K::DataLost => "data_lost",
         K::ActorDied => "actor_died",
         K::CommandConflict => "command_conflict",
+        K::Budget => "budget",
     }
 }
 
@@ -158,6 +159,7 @@ fn kind_from(name: &str) -> pb::error_record::Kind {
         "worker_crashed" => K::WorkerCrashed,
         "data_lost" => K::DataLost,
         "actor_died" => K::ActorDied,
+        "budget" => K::Budget,
         _ => K::User,
     }
 }
@@ -284,6 +286,14 @@ fn policy_from(d: &Bound<'_, PyDict>) -> PyResult<pb::Policy> {
         max_in_flight: d.get_item("max_in_flight")?.map_or(Ok(0), |v| v.extract())?,
         profile_digest: d.get_item("profile_digest")?.map_or(Ok(Vec::new()), |v| v.extract())?,
         items: d.get_item("items")?.map_or(Ok(0), |v| v.extract())?,
+        budget_cpu_seconds: get_f("budget_cpu_seconds")?,
+        budget_gpu_seconds: get_f("budget_gpu_seconds")?,
+        budget_root: d
+            .get_item("budget_root")?
+            .map(|v| v.extract::<Vec<u8>>())
+            .transpose()?
+            .filter(|k| k.len() == 32)
+            .map(|k| pb::TaskKey { run: k[..16].to_vec(), task: k[16..].to_vec() }),
     })
 }
 
@@ -299,6 +309,10 @@ fn policy_py<'py>(py: Python<'py>, p: &pb::Policy) -> PyResult<Bound<'py, PyDict
     d.set_item("deterministic", p.deterministic)?;
     d.set_item("source", &p.source)?;
     d.set_item("max_in_flight", p.max_in_flight)?;
+    d.set_item("budget_cpu_seconds", p.budget_cpu_seconds)?;
+    d.set_item("budget_gpu_seconds", p.budget_gpu_seconds)?;
+    let root = p.budget_root.as_ref().map_or_else(Vec::new, |k| [k.run.as_slice(), k.task.as_slice()].concat());
+    d.set_item("budget_root", PyBytes::new(py, &root))?;
     Ok(d)
 }
 
@@ -405,41 +419,7 @@ impl CallSpec {
 
 // ---- client ---------------------------------------------------------------
 
-type PeerClient =
-    pb::peer_client::PeerClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, Auth>>;
-
-/// Adds the cluster token to every call (TCP clients; the local socket needs none).
-#[derive(Clone)]
-struct Auth(Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>);
-
-impl tonic::service::Interceptor for Auth {
-    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        if let Some(v) = &self.0 {
-            req.metadata_mut().insert("authorization", v.clone());
-        }
-        Ok(req)
-    }
-}
-
-/// A channel to a peer: `tcp://host:port` (TLS when `ca` names the cluster's
-/// ca.pem, verifying the name every peer certificate carries) or a Unix socket path.
-async fn channel(address: &str, ca: Option<&str>) -> Result<tonic::transport::Channel, String> {
-    let Some(hostport) = address.strip_prefix("tcp://") else {
-        return chimaera_proto::uds::connect(address.to_string()).await.map_err(|e| e.to_string());
-    };
-    let scheme = if ca.is_some() { "https" } else { "http" };
-    let mut ep = tonic::transport::Endpoint::from_shared(format!("{scheme}://{hostport}"))
-        .map_err(|e| e.to_string())?
-        .connect_timeout(Duration::from_secs(10));
-    if let Some(ca) = ca {
-        let pem = std::fs::read(ca).map_err(|e| format!("{ca}: {e}"))?;
-        let tls = tonic::transport::ClientTlsConfig::new()
-            .ca_certificate(tonic::transport::Certificate::from_pem(pem))
-            .domain_name("chimaera-peer");
-        ep = ep.tls_config(tls).map_err(|e| e.to_string())?;
-    }
-    ep.connect().await.map_err(|e| e.to_string())
-}
+use chimaera_proto::client::{Auth, PeerClient, channel};
 
 struct Shared {
     events: Mutex<VecDeque<pb::SessionEvent>>,
@@ -496,6 +476,8 @@ struct Client {
     peer: PeerClient,
     shared: Arc<Shared>,
     info: pb::PeerInfo,
+    /// Who store requests are for (`set_tenant`); the peer checks it against the credential.
+    tenant: Mutex<String>,
 }
 
 impl Client {
@@ -566,17 +548,14 @@ impl Client {
         token: Option<String>,
         ca: Option<String>,
     ) -> PyResult<Client> {
-        let auth = token
-            .map(|t| format!("Bearer {}", t.trim()).parse())
-            .transpose()
-            .map_err(|_| PyValueError::new_err("the cluster token must be printable ASCII"))?;
+        let auth = Auth::bearer(token.as_deref()).map_err(PyValueError::new_err)?;
         py.detach(|| {
             runtime().block_on(async move {
                 let ch = channel(&socket, ca.as_deref())
                     .await
                     .map_err(|e| PyConnectionError::new_err(format!("cannot connect to {socket}: {e}")))?;
                 let mut peer =
-                    pb::peer_client::PeerClient::with_interceptor(ch, Auth(auth)).max_decoding_message_size(256 << 20);
+                    pb::peer_client::PeerClient::with_interceptor(ch, auth).max_decoding_message_size(256 << 20);
                 let info = peer
                     .hello(pb::ClientHello { wire_version: chimaera_proto::WIRE_VERSION, client, ..Default::default() })
                     .await
@@ -619,7 +598,7 @@ impl Client {
                         }
                     }
                 });
-                Ok(Client { peer, shared, info })
+                Ok(Client { peer, shared, info, tenant: Mutex::new("default".into()) })
             })
         })
     }
@@ -683,6 +662,11 @@ impl Client {
         self.shared.send(pb::client_msg::Msg::AttachRun(run.to_vec()));
     }
 
+    /// The tenant store requests are for: the run's.
+    fn set_tenant(&self, tenant: String) {
+        *self.tenant.lock().expect("lock") = tenant;
+    }
+
     /// Finish (or cancel) any run by id: its unfinished calls are cancelled.
     fn end_run(&self, run: Vec<u8>, cancel: bool) {
         self.shared.flush();
@@ -738,6 +722,13 @@ impl Client {
     fn watch(&self, keys: Vec<Vec<u8>>) -> PyResult<()> {
         let tasks = keys.iter().map(|k| task_key(k)).collect::<PyResult<_>>()?;
         self.shared.send(pb::client_msg::Msg::Watch(pb::WatchMsg { tasks }));
+        Ok(())
+    }
+
+    /// Free ch.put values on every peer: their futures were dropped and the
+    /// calls that read them have finished.
+    fn release_objects(&self, run: Vec<u8>, object_ids: Vec<Vec<u8>>) -> PyResult<()> {
+        self.shared.send(pb::client_msg::Msg::ReleaseObjects(pb::ReleaseObjects { run, object_ids }));
         Ok(())
     }
 
@@ -926,7 +917,7 @@ impl Client {
             other => return Err(PyValueError::new_err(format!("unknown store op {other:?}"))),
         };
         let write = pb::StoreWrite {
-            tenant: "default".into(),
+            tenant: self.tenant.lock().expect("lock").clone(),
             namespace,
             op: op as i32,
             key,
@@ -969,7 +960,7 @@ impl Client {
             other => return Err(PyValueError::new_err(format!("unknown store read {other:?}"))),
         };
         let read = pb::StoreRead {
-            tenant: "default".into(),
+            tenant: self.tenant.lock().expect("lock").clone(),
             namespace,
             kind: kind as i32,
             key,

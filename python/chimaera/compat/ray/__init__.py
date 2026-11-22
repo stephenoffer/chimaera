@@ -74,7 +74,7 @@ def init(
     """Connect to the local Chimaera peer (started on demand)."""
     if _state.initialized:
         if ignore_reinit_error:
-            return types.SimpleNamespace(run_id=ch.current_run().id, dashboard_url=None)
+            return types.SimpleNamespace(run_id=ch.runs.current_run().id, dashboard_url=None)
         raise RuntimeError("Maybe you called ray.init twice by accident? Pass ignore_reinit_error=True to allow it.")
     if local_mode:
         raise unsupported("local_mode=True", why="local runs already use the same path as a cluster")
@@ -93,9 +93,9 @@ def init(
         if extra:
             raise unsupported(f"runtime_env keys {sorted(extra)}", use="ch.Env", lands="P3")
         env = dict(runtime_env["env_vars"])
-    run_id = ch.init(env=env)
+    run = ch.init(env=env)
     _state.initialized, _state.namespace = True, namespace
-    return types.SimpleNamespace(run_id=run_id, dashboard_url=None)
+    return types.SimpleNamespace(run_id=run.id, dashboard_url=None)
 
 
 def is_initialized() -> bool:
@@ -103,8 +103,10 @@ def is_initialized() -> bool:
 
 
 def shutdown() -> None:
-    """Forget ``ray.init``. The run itself finishes when the process exits."""
+    """End the run as Ray ends its job: unfinished tasks are cancelled, and a
+    later ``ray.init`` starts a new run."""
     _state.initialized, _state.namespace = False, None
+    ch.shutdown(cancel=True)
 
 
 def remote(*args: Any, **kwargs: Any) -> Any:
@@ -225,13 +227,13 @@ def cancel(ref: Any, *, force: bool = False, recursive: bool = True) -> None:
 
 def get_gpu_ids() -> list[int]:
     """The GPUs this call was granted, as it numbers them (torch's ``cuda:N``)."""
-    return [d["index"] for d in ch.devices() if d["kind"] in ("cuda", "rocm", "xpu", "mps")]
+    return [d["index"] for d in ch.dist.devices() if d["kind"] in ("cuda", "rocm", "xpu", "mps")]
 
 
 def kill(actor: Any, *, no_restart: bool = True) -> None:
     if isinstance(actor, ActorHandle):
         actor = actor._actor
-    if not isinstance(actor, ch.Actor):
+    if not isinstance(actor, ch.typing.Actor):
         raise ValueError(f"ray.kill() only supported for actors. For tasks, use ray.cancel(). Got {type(actor).__name__}.")
     if not no_restart:
         raise unsupported("kill(no_restart=False)", why="a killed actor is not restarted")

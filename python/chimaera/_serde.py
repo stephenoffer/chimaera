@@ -26,6 +26,7 @@ import mmap
 import os
 import pickle
 import struct
+import sys
 import threading
 import types
 from typing import Any, Callable
@@ -36,6 +37,17 @@ from . import _native
 
 MAGIC = b"CHO1"
 _HEAD = struct.Struct("<4sIIIQ")
+# A tuple stored element by element: each element a complete object behind an
+# offset table, so a reader that needs one element (one value of a call that
+# returns several) decodes and touches only that element.
+SEQ_MAGIC = b"CHS1"
+_SEQ_HEAD = struct.Struct("<4sII")  # magic, reserved, count
+_SEQ_ITEM = struct.Struct("<QQ")  # offset, length
+# A tuple whose large elements are objects of their own (written beside it,
+# named in its table), so a reader that needs one element fetches only that
+# element's bytes from another peer. Same header as SEQ_MAGIC.
+PARTS_MAGIC = b"CHP1"
+_PART_ITEM = struct.Struct("<16sQQ")  # part object id (zeros: in this file), offset, length
 _ALIGN = 64
 _OOB_MIN = 64 * 1024  # smaller buffers stay inside the pickle
 EXTERNAL = 1  # header flag: a blob-id table follows the buffer lengths
@@ -67,6 +79,17 @@ class _Pickler(pickle.Pickler):
         if isinstance(obj, (type, types.FunctionType)) and getattr(obj, "__module__", None) == "__main__":
             raise _MainRefused("refers to __main__")
         return NotImplemented
+
+
+class _CloudPickler(cloudpickle.Pickler):
+    """cloudpickle, refusing open text files: it would read the whole file in
+    the sender and deliver a copy of its contents in place of the file."""
+
+    def reducer_override(self, obj: Any) -> Any:
+        if isinstance(obj, io.TextIOWrapper) and obj not in (sys.stdin, sys.stdout, sys.stderr):
+            name = getattr(obj, "name", "?")
+            raise pickle.PicklingError(f"an open file ({name!r}) cannot be sent; pass its path and open it in the call")
+        return super().reducer_override(obj)
 
 
 # Containers at least this long are checked for plain data (see plain_tree).
@@ -143,7 +166,7 @@ def dumps_parts(
         main = _pickle(value, _Pickler, keep)
     except (pickle.PicklingError, AttributeError, TypeError):
         buffers.clear()  # the failed attempt may have kept some already
-        main = _pickle(value, cloudpickle.Pickler, keep)
+        main = _pickle(value, _CloudPickler, keep)
     flags = EXTERNAL if any(b != _NO_BLOB for _, b, _ in buffers) else 0
     if any(o for _, _, o in buffers):
         flags |= OFFSETS
@@ -194,10 +217,103 @@ def _blob_view(blob_dir: str, blob_id: bytes) -> memoryview:
     return memoryview(_map(path))
 
 
+def dumps_seq(
+    value: tuple[Any, ...], external: Callable[[memoryview], bytes | tuple[bytes, int] | None] | None = None
+) -> tuple[list[bytes | memoryview], int, int]:
+    """Encode a tuple element by element (see SEQ_MAGIC); same result shape as
+    ``dumps_parts``."""
+    return pack_seq([dumps_parts(v, external) for v in value])
+
+
+def pack_seq(
+    encoded: list[tuple[list[bytes | memoryview], int, int]], ids: list[bytes | None] | None = None
+) -> tuple[list[bytes | memoryview], int, int]:
+    """A tuple from its elements as ``dumps_parts`` encodes them; same result
+    shape. An element with an id in `ids` is already stored as that object
+    and is only named here (see PARTS_MAGIC). Elements start on aligned
+    offsets, so their buffers stay aligned in a mapped file."""
+    ids = ids or [None] * len(encoded)
+    split = any(ids)
+    item = _PART_ITEM if split else _SEQ_ITEM
+    head = _SEQ_HEAD.pack(PARTS_MAGIC if split else SEQ_MAGIC, 0, len(encoded))
+    pos = len(head) + item.size * len(encoded)
+    spans = []
+    for (_, size, _), part in zip(encoded, ids):
+        if part is not None:
+            spans.append((0, size))
+            continue
+        pos += _pad(pos)
+        spans.append((pos, size))
+        pos += size
+    if split:
+        table = b"".join(_PART_ITEM.pack(part or _NO_BLOB, o, n) for part, (o, n) in zip(ids, spans))
+    else:
+        table = b"".join(_SEQ_ITEM.pack(o, n) for o, n in spans)
+    out: list[bytes | memoryview] = [head, table]
+    at = len(head) + item.size * len(encoded)
+    for (parts, size, _), (off, _), part in zip(encoded, spans, ids):
+        if part is None:
+            out.append(b"\0" * (off - at))
+            out.extend(parts)
+            at = off + size
+    return out, at, sum(n for _, _, n in encoded)
+
+
+def _seq_spans(view: memoryview) -> list[tuple[bytes, int, int]] | None:
+    """A stored tuple's table: (part id or zeros, offset, length) per element."""
+    magic = bytes(view[:4])
+    if magic not in (SEQ_MAGIC, PARTS_MAGIC):
+        return None
+    _, _, n = _SEQ_HEAD.unpack_from(view, 0)
+    if magic == SEQ_MAGIC:
+        return [(_NO_BLOB, *_SEQ_ITEM.unpack_from(view, _SEQ_HEAD.size + _SEQ_ITEM.size * i)) for i in range(n)]
+    return [_PART_ITEM.unpack_from(view, _SEQ_HEAD.size + _PART_ITEM.size * i) for i in range(n)]
+
+
+def _element(view: memoryview, entry: tuple[bytes, int, int], blob_dir: str | None) -> Any:
+    part, off, n = entry
+    if part == _NO_BLOB:
+        return loads(view[off : off + n], blob_dir)
+    if blob_dir is None:
+        raise ValueError("this value is stored in parts but no run directory was given")
+    return loads(_blob_view(blob_dir, part), blob_dir)  # fetched from the peer that wrote it
+
+
+def table_size(count: int) -> int:
+    """Bytes that hold the table of a stored tuple of `count` values, in either layout."""
+    return _SEQ_HEAD.size + _PART_ITEM.size * count
+
+
+def part_id(data: bytes | memoryview | mmap.mmap, index: int, count: int) -> bytes | None:
+    """The object element `index` of a stored tuple of `count` values is kept
+    in, when it is an object of its own (see PARTS_MAGIC). `data` needs only
+    the table (see table_size)."""
+    view = memoryview(data)
+    if bytes(view[:4]) != PARTS_MAGIC or _SEQ_HEAD.unpack_from(view, 0)[2] != count:
+        return None  # one file, or not the count the reader expects (an error when it is read)
+    part = _PART_ITEM.unpack_from(view, _SEQ_HEAD.size + _PART_ITEM.size * index)[0]
+    return None if part == _NO_BLOB else part
+
+
+def loads_part(data: bytes | memoryview | mmap.mmap, index: int, count: int, blob_dir: str | None = None) -> Any:
+    """Element `index` of a stored tuple of `count` values: only that element
+    is decoded (and fetched) when it was stored element by element."""
+    view = memoryview(data)
+    spans = _seq_spans(view)
+    if spans is None or len(spans) != count:
+        from ._future import pick
+
+        return pick(loads(view, blob_dir), index, count)
+    return _element(view, spans[index], blob_dir)
+
+
 def loads(data: bytes | memoryview | mmap.mmap, blob_dir: str | None = None) -> Any:
     """Decode an object. `blob_dir` is the run's object directory, where any
-    external buffers and promoted arguments live."""
+    external buffers, promoted arguments and parts live."""
     view = memoryview(data)
+    spans = _seq_spans(view)
+    if spans is not None:
+        return tuple(_element(view, e, blob_dir) for e in spans)
     magic, flags, n, _, main_len = _HEAD.unpack_from(view, 0)
     if magic != MAGIC:
         raise ValueError("not a Chimaera object")
@@ -231,6 +347,26 @@ def loads(data: bytes | memoryview | mmap.mmap, blob_dir: str | None = None) -> 
         return pickle.loads(main, buffers=bufs)
     finally:
         _reading.blob_dir = previous
+
+
+def external_blobs(head: bytes | memoryview) -> list[bytes]:
+    """The blob ids an encoded value links (its external buffers, or the
+    parts of a tuple stored in parts), from its header alone; `head` must hold
+    the whole header (see header_size)."""
+    view = memoryview(head)
+    if bytes(view[:4]) == PARTS_MAGIC:
+        return [part for part, _, _ in _seq_spans(view) or () if part != _NO_BLOB]
+    magic, flags, n, _, _ = _HEAD.unpack_from(view, 0)
+    if magic != MAGIC or not flags & EXTERNAL:
+        return []
+    off = _HEAD.size + 8 * n
+    ids = [bytes(view[off + 16 * i : off + 16 * (i + 1)]) for i in range(n)]
+    return [b for b in ids if b != _NO_BLOB]
+
+
+def header_size(n_buffers: int) -> int:
+    """Upper bound on the header of a value with `n_buffers` buffers."""
+    return _HEAD.size + 32 * n_buffers
 
 
 def load_blob(blob_id: bytes) -> Any:

@@ -49,12 +49,25 @@ async def async_squares(n):
         yield i * i
 
 
+@ch.remote
+def evens(n):
+    return (i for i in range(n) if i % 2 == 0)  # returns a generator; is not one
+
+
 def produced(path):
     try:
         with open(path) as f:
             return len(f.read().splitlines())
     except FileNotFoundError:
         return 0
+
+
+def test_a_function_that_returns_a_generator_says_so_instead_of_hanging():
+    # It used to stream to nobody: .result() gave the item count, or hung
+    # once more than a window of items were waiting.
+    for n in (10, 1000):
+        with pytest.raises(TypeError, match="returned a generator"):
+            evens.remote(n).result(timeout=30)
 
 
 def test_items_arrive_in_order_and_the_stream_ends():

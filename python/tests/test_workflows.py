@@ -4,6 +4,9 @@ something else diverges."""
 
 from __future__ import annotations
 
+import asyncio
+import gc
+
 import os
 import random
 import signal
@@ -36,8 +39,8 @@ async def pipeline(path, pids):
 
 @ch.remote(workflow="durable")
 async def draws(pids):
-    r = ch.workflow.random()
-    t = ch.workflow.now()
+    r = await ch.durable.random()
+    t = await ch.durable.now()
     with open(pids, "a") as f:
         f.write(f"{os.getpid()} {r} {t}\n")
     time.sleep(1.0)
@@ -50,6 +53,17 @@ async def nondeterministic(path, pids):
     with open(pids, "a") as f:
         f.write(f"{os.getpid()}\n")
     time.sleep(1.0)
+    return first
+
+
+@ch.remote(workflow="durable")
+async def dropped_step(path, pids):
+    first = await step.remote(1, path)  # its future is dropped at once
+    gc.collect()
+    time.sleep(1.5)  # long enough for a release of that step to reach the peer
+    with open(pids, "a") as f:
+        f.write(f"{os.getpid()}\n")
+    time.sleep(1.0)  # the test kills the worker here, once
     return first
 
 
@@ -96,10 +110,20 @@ def test_a_replay_that_makes_a_different_call_diverges():
     d = tempfile.mkdtemp()
     f = nondeterministic.remote(os.path.join(d, "steps"), os.path.join(d, "pids"))
     kill_first_run(os.path.join(d, "pids"))
-    with pytest.raises(ch.WorkflowDivergence):
+    with pytest.raises(ch.errors.WorkflowDivergence):
         f.result(timeout=120)
+
+
+def test_a_replay_reads_a_step_whose_future_was_dropped():
+    # The replay answers the step from the run's record: dropping the step's
+    # future must not have released that record.
+    d = tempfile.mkdtemp()
+    f = dropped_step.remote(os.path.join(d, "steps"), os.path.join(d, "pids"))
+    kill_first_run(os.path.join(d, "pids"))
+    assert f.result(timeout=120) == 10
+    assert lines(os.path.join(d, "steps")) == ["1"], "the step ran once"
 
 
 def test_workflow_helpers_need_a_workflow():
     with pytest.raises(RuntimeError, match="workflow='durable'"):
-        ch.workflow.now()
+        asyncio.run(ch.durable.now())

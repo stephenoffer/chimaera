@@ -35,12 +35,12 @@ This is early software. What works today and what does not:
 | Functions, futures as dependencies, `map`, actors, pools | Working, on one machine |
 | Retries, `OutcomeUnknown` for external effects, memory limits, cancellation, deadlines | Working |
 | Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |
-| Restarting the peer mid-run and reattaching with `ch.attach(run_id)` | Working |
+| Restarting the peer mid-run and reattaching with `ch.runs.attach(run_id)` | Working |
 | Several peers: replicated shard groups, placement across peers, objects fetched between peers, failover, dead voters replaced | Working on localhost clusters and on 4 cloud machines (Ray comparison in [qualification](docs/qualification.md)); per-call throughput across machines still trails Ray |
 | Peer authentication: cluster token, mutual TLS | Working on localhost clusters |
-| Durable actors (`state=ch.State()`): committed state, idempotent command ids, restart from the committed state | Working |
+| Durable actors (`state=ch.durable.State()`): committed state, idempotent command ids, restart from the committed state | Working |
 | Learned reservations, memory-aware admission, large values stored once ([details](#what-chimaera-does-for-you)) | Working on one machine; placement across peers weighs input locality and memory |
-| Streaming generator calls (`ch.Stream`, bounded ahead of the consumer, replayed after a worker dies) | Working |
+| Streaming generator calls (`ch.typing.Stream`, bounded ahead of the consumer, replayed after a worker dies) | Working |
 | Durable workflows (`workflow="durable"`): replay answered from the run's record, divergence detected | Working |
 | GPU gangs, shuffles | Not yet |
 
@@ -133,14 +133,14 @@ counter = Counter.remote()
 counter.increment.remote(add.remote(1, 2)).result()   # 3
 ```
 
-`Counter.options(key="counter/main").remote()` gets or creates a named actor.
+`Counter.options(name="counter/main").remote()` gets or creates a named actor.
 `Counter.options(replicas=4).pool()` makes independent replicas; `pool.increment.map(items)`
 spreads calls across them.
 
 ### Options
 
 Set them on the decorator, on one call with `.options(...)`, or
-for a block with `with ch.options(...)`. The closest setting wins, and a typo
+for a block with `with ch.defaults(...)`. The closest setting wins, and a typo
 fails where you wrote it.
 
 ```python
@@ -148,7 +148,7 @@ fails where you wrote it.
 def heavy(x): ...
 
 heavy.options(cpus=1).remote(5)
-with ch.options(deadline="30s"):
+with ch.defaults(deadline="30s"):
     heavy.remote(6)
 ```
 
@@ -198,7 +198,7 @@ Chimaera does instead, with no option to set.
 | An actor whose method waits on I/O runs its calls one at a time, and nothing says why they queue | A call queued at an actor says how many are ahead; when that method is learned to mostly wait, it suggests `@ch.method(concurrency=N)` |
 | A full disk shows up as a bare `No space left on device` deep in a worker, leaving partial files | The error names the disk, its free space and what to do; the partial file is removed |
 | `logging` inside tasks goes nowhere | Task log records reach the driver at the driver's log level |
-| The object store's directory fills the disk with what finished jobs left behind | A run's stored arguments and `ch.put` values are deleted when the run ends; its results are kept for a day so `ch.attach` can read them |
+| The object store's directory fills the disk with what finished jobs left behind | A run's stored arguments and `ch.put` values are deleted when the run ends; its results are kept for a day so `ch.runs.attach` can read them |
 | In a container, the object store and memory monitor are sized from host memory, or from the wrong cgroup | The memory pool and CPU capacity come from the tightest limit on the process's cgroup and every cgroup above it |
 | Everything learned is lost with the cluster | Profiles are saved by each peer, reloaded on restart, and shared between peers on the same hardware |
 
@@ -213,7 +213,10 @@ exercised by the test suite.
 ## The `chimaera` command
 
 ```bash
-chimaera status                          # CPU in use, queue, why work is waiting
+chimaera status                          # CPU in use, queue, why work is waiting, peers, groups and their leaders
+chimaera runs                            # the cluster's runs, newest first (ids, state, command)
+chimaera logs RUN [--follow]             # what a run's calls printed, from every peer
+chimaera cancel RUN                      # cancel a run's unfinished calls
 chimaera inspect RUN                     # a run's calls by state
 chimaera explain RUN --task TASK         # one call: attempts, measurements, waiting reason
 chimaera explain RUN --decisions         # what the runtime tuned, and why
@@ -221,6 +224,14 @@ chimaera profiles [--fn NAME]            # what was learned per function, and wh
 chimaera doctor                          # what this host supports
 chimaera stop                            # stop the local peer
 ```
+
+`status`, `runs`, `logs`, `cancel`, `inspect` and `explain` ask the local peer,
+or a cluster with `--cluster NAME` (a profile in
+`~/.config/chimaera/clusters.toml`) or `--cluster tcp://host:port`. Without
+the flag they ask what a script here would use: `$CHIMAERA_CLUSTER`,
+`$CHIMAERA_ADDRESS`, then the profile file's `default`. `--dir` or
+`$CHIMAERA_HOME` always means that local peer. `chimaera run --cluster NAME --
+python app.py` runs a program against a cluster.
 
 ## Repository layout
 

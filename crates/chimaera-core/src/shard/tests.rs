@@ -201,6 +201,70 @@ fn chain_becomes_ready_after_producer_publishes() {
     assert_eq!(dup.outcome, Some(pb::Outcome { attempt: 1, peer: Some(peer_pb(p)), ..obj(1) }));
 }
 
+fn publish_raw(h: &mut Harness, tk: Tk, attempt: u32, p: PeerInc, o: pb::Outcome) -> Applied {
+    h.raw(
+        Body::Publish(pb::PublishResults {
+            entries: vec![pb::PublishEntry {
+                task: Some(tk.pb()),
+                attempt,
+                peer: Some(peer_pb(p)),
+                outcome: Some(o),
+                forward_to: None,
+            }],
+        }),
+        tk.v(),
+    )
+}
+
+#[test]
+fn a_dependent_submitted_for_a_peer_is_granted_there_in_the_commit_that_readies_it() {
+    let mut h = Harness::new(ShardState::new());
+    let (a, b) = (task_id(V, 0), task_id(V, 1));
+    let p = (peer(0), 1);
+    assert_eq!(status(&h.submit(spec(a, &[], pb::Effects::None, 3), Some(p)).0), Status::Granted);
+    let (ack_b, _) = h.submit(spec(b, &[a], pb::Effects::None, 3), Some(p));
+    assert_eq!(ack_b.state(), TState::Pending);
+    let applied = publish_raw(&mut h, a, 1, p, obj(1));
+    let rec = h.task(b).unwrap();
+    assert_eq!(rec.state(), TState::Running, "granted, no placement round");
+    assert_eq!(rec.attempts.last().and_then(|a| a.peer.clone()), Some(peer_pb(p)));
+    assert!(applied.events.contains(&Event::Granted { task: b, attempt: 1, peer: p, speculative: false }));
+    assert!(!applied.events.contains(&Event::Ready(b)), "no Ready: the leader must not place it again");
+}
+
+#[test]
+fn a_dependent_whose_peer_was_retired_meanwhile_is_placed_as_usual() {
+    let mut h = Harness::new(ShardState::new());
+    let (a, b) = (task_id(V, 0), task_id(V, 1));
+    let (p, q) = ((peer(0), 1), (peer(1), 1));
+    assert_eq!(status(&h.submit(spec(a, &[], pb::Effects::None, 3), Some(p)).0), Status::Granted);
+    h.submit(spec(b, &[a], pb::Effects::None, 3), Some(q));
+    h.retire(q);
+    let applied = publish_raw(&mut h, a, 1, p, obj(1));
+    assert_eq!(h.task(b).unwrap().state(), TState::Ready);
+    assert!(applied.events.contains(&Event::Ready(b)));
+}
+
+#[test]
+fn a_call_waiting_on_many_inputs_is_not_rewritten_as_each_finishes() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let ins: Vec<Tk> = (0..3).map(|i| task_id(V, i)).collect();
+    let d = task_id(V, 9);
+    for &t in &ins {
+        h.submit(spec(t, &[], pb::Effects::None, 3), Some(p));
+    }
+    h.submit(spec(d, &ins, pb::Effects::None, 3), None);
+    let before = h.task(d).unwrap().encode_to_vec();
+    h.publish(ins[0], 1, p, obj(1));
+    h.publish(ins[1], 1, p, obj(2));
+    assert_eq!(h.task(d).unwrap().encode_to_vec(), before, "only the counter moved");
+    assert_eq!(read::deps_left(&h.a, d), Some(1));
+    h.publish(ins[2], 1, p, obj(3));
+    assert_eq!(h.task(d).unwrap().state(), TState::Ready);
+    assert_eq!(read::deps_left(&h.a, d), None, "counter gone once ready");
+}
+
 #[test]
 fn failed_prerequisite_completes_dependents_with_causal_error() {
     let mut h = Harness::new(ShardState::new());
@@ -432,6 +496,30 @@ fn durable_actor_commands_are_deduplicated() {
     assert_eq!(rec.state(), AState::Dead, "a terminal end is never restarted");
 }
 
+fn releases(events: &[Event], tk: Tk) -> bool {
+    events.iter().any(|e| matches!(e, Event::Releasable { task, .. } if *task == tk))
+}
+
+#[test]
+fn a_released_result_leaves_a_small_tombstone_and_resubmission_is_answered() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let a = task_id(V, 0);
+    // A typical call: its arguments travel inline in the spec.
+    let mut s = spec(a, &[], pb::Effects::None, 3);
+    s.args = Some(pb::ObjectRef { inline_data: vec![7; 1024], size: 1024, ..Default::default() });
+    h.submit(s, Some(p));
+    h.publish(a, 1, p, obj(1));
+    let full = h.task(a).unwrap().encoded_len();
+    h.raw(Body::Release(pb::Release { tasks: vec![a.pb()] }), V);
+    let tomb = h.task(a).unwrap().encoded_len();
+    assert!(tomb <= 40 && tomb * 10 < full, "{tomb} bytes left of {full}");
+    // The same id again: answered from the tombstone, never run twice.
+    let (ack, ev) = h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
+    assert_ne!(status(&ack), Status::Granted);
+    assert!(!ev.iter().any(|e| matches!(e, Event::Granted { .. } | Event::Ready(_))));
+}
+
 #[test]
 fn a_result_stays_pinned_until_its_dependents_complete() {
     let mut h = Harness::new(ShardState::new());
@@ -442,7 +530,7 @@ fn a_result_stays_pinned_until_its_dependents_complete() {
     h.publish(a, 1, p, obj(1));
     // The client drops its handle to `a`, but `b` has not run yet.
     let r = h.raw(Body::Release(pb::Release { tasks: vec![a.pb()] }), V);
-    assert!(!r.events.contains(&Event::Releasable(a)));
+    assert!(!releases(&r.events, a));
     h.grant(b, p, false);
     let done = h.raw(
         Body::Publish(pb::PublishResults {
@@ -456,7 +544,18 @@ fn a_result_stays_pinned_until_its_dependents_complete() {
         }),
         V,
     );
-    assert!(done.events.contains(&Event::Releasable(a)), "{:?}", done.events);
+    assert!(releases(&done.events, a), "{:?}", done.events);
+    // The event carries the result for the peer to free; the record shrinks to
+    // a tombstone that still answers "done".
+    let freed = done.events.iter().find_map(|e| match e {
+        Event::Releasable { task, object } if *task == a => object.clone(),
+        _ => None,
+    });
+    assert!(freed.is_some(), "the released result's object is handed to the peer");
+    let tomb = h.task(a).unwrap();
+    assert_eq!(tomb.state(), TState::Done);
+    assert!(tomb.spec.is_none() && tomb.attempts.is_empty(), "spec and attempts dropped");
+    assert!(tomb.outcome.as_ref().is_some_and(is_ok), "the outcome stays: replay and attach read it");
     // A dependent submitted before its producer still pins it.
     let (c, d) = (task_id(V, 2), task_id(V, 3));
     h.submit(spec(d, &[c], pb::Effects::None, 3), None);
@@ -1104,10 +1203,11 @@ fn child_and_forward_entries_expire_with_their_run() {
     h.submit(child_of(c, root), Some(p));
     h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
     forward(&mut h, a, 1, p, f); // f never arrives
+    h.raw(charge(root, 1.0, 0.0, 10.0, 0.0), V);
     h.raw(Body::RunFinish(pb::RunFinish { run: run_id(V).to_vec(), state: 0 }), V);
     h.hlc += hlc::from_ms(DEFAULT_RUN_RETENTION_MS + 1);
     h.raw(Body::Gc(pb::Gc { max_keys: 1000 }), V);
-    for tag in [keys::CHILD, keys::FORWARD] {
+    for tag in [keys::CHILD, keys::FORWARD, keys::BUDGET] {
         assert!(h.a.scan_prefix(&keys::pairs_of_run(V, tag, &run_id(V)), usize::MAX).is_empty(), "tag {tag}");
     }
 }
@@ -1321,4 +1421,43 @@ fn a_started_external_attempt_cannot_be_given_back() {
     let ack = h.fail(tk, attempt, (peer(1), 1), pb::record_failure::Kind::Requeued, b"");
     assert_eq!(status(&ack), Status::Stale);
     assert_eq!(h.task(tk).unwrap().state(), TState::Running);
+}
+
+fn charge(root: Tk, cpu: f64, gpu: f64, limit_cpu: f64, limit_gpu: f64) -> Body {
+    Body::Charge(pb::Charge {
+        root: Some(root.pb()),
+        cpu_seconds: cpu,
+        gpu_seconds: gpu,
+        limit_cpu_seconds: limit_cpu,
+        limit_gpu_seconds: limit_gpu,
+    })
+}
+
+#[test]
+fn a_spent_budget_cancels_its_call_and_the_calls_it_made() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (root, child, grandchild, other) = (task_id(V, 0), task_id(V, 1), task_id(V, 2), task_id(V, 3));
+    h.submit(spec(root, &[], pb::Effects::None, 3), Some(p));
+    h.submit(child_of(child, root), Some(p));
+    h.submit(child_of(grandchild, child), Some(p));
+    h.submit(spec(other, &[], pb::Effects::None, 3), Some(p));
+    assert_eq!(status(&first_ack(&h.raw(charge(root, 6.0, 0.0, 10.0, 0.0), V).reply)), Status::Accepted);
+    h.raw(charge(root, 0.0, 500.0, 10.0, 0.0), V); // no GPU limit: GPU seconds alone never cancel
+    assert_eq!(err_kind(&h.task(root).unwrap()), None, "under its limit the call runs on");
+    h.raw(charge(root, 4.5, 0.0, 10.0, 0.0), V); // 10.5 > 10
+    for t in [root, child, grandchild] {
+        assert_eq!(err_kind(&h.task(t).unwrap()), Some(Kind::Budget), "{t:?}");
+    }
+    let Some(pb::outcome::Value::Err(e)) = h.task(root).unwrap().outcome.and_then(|o| o.value) else { panic!() };
+    assert_eq!(e.message, "budget exceeded: cpu_seconds=10 allowed, 10.50 used by this call and the calls it made");
+    assert_eq!(h.task(other).unwrap().state(), TState::Running, "unrelated work is untouched");
+    // Later charges for the finished call are dropped, and so are its totals.
+    assert_eq!(status(&first_ack(&h.raw(charge(root, 1.0, 0.0, 10.0, 0.0), V).reply)), Status::Existing);
+    assert!(h.a.get(&keys::of_producer(V, keys::BUDGET, root.pair())).is_none());
+    // A GPU limit is checked the same way.
+    let gpu_root = task_id(V, 4);
+    h.submit(spec(gpu_root, &[], pb::Effects::None, 3), Some(p));
+    h.raw(charge(gpu_root, 0.0, 3601.0, 0.0, 3600.0), V);
+    assert_eq!(err_kind(&h.task(gpu_root).unwrap()), Some(Kind::Budget));
 }

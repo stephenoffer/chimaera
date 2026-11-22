@@ -1,6 +1,6 @@
-"""Partitioned data: ``ch.partitions`` inputs, ``reduce_by_key`` and sinks.
+"""Partitioned data: ``ch.data.partitions`` inputs, ``reduce_by_key`` and sinks.
 
-    counts = count_words.map(ch.partitions("logs/*.jsonl", columns=["text"]))
+    counts = count_words.map(ch.data.partitions("logs/*.jsonl", columns=["text"]))
     totals = counts.reduce_by_key(operator.add)        # Partitioned
     manifest = totals.write(ext.FileSink("out/")).result()
 

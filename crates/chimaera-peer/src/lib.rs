@@ -1,19 +1,26 @@
 //! The Chimaera peer agent.
 
 pub mod accounting;
+pub mod auth;
 pub mod budget;
+pub mod budgets;
 pub mod cluster;
 pub mod core;
+pub mod counters;
 pub mod devices;
 pub mod durability;
 pub mod executor;
+pub mod fleet;
+pub mod gc;
 pub mod ingress;
+pub mod keyed_queue;
 pub mod labels;
 pub mod launch;
 pub mod logship;
 pub mod mesh;
 pub mod notices;
 pub mod objplane;
+pub mod parts;
 pub mod profiles;
 pub mod prom;
 pub mod quotas;
@@ -21,5 +28,6 @@ pub mod router;
 pub mod runlogs;
 pub mod runtime;
 pub mod stores;
+pub mod target;
 pub mod tls;
 pub mod topology;

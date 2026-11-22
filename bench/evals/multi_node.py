@@ -111,9 +111,15 @@ def launch_peers(dist: str, peer_env: dict[str, str] | None = None) -> tuple[lis
                 except subprocess.TimeoutExpired:
                     self.proc.kill()
             if wipe:  # the next launch founds a new cluster
+                import glob
                 import shutil
 
                 shutil.rmtree(PEER_DIR, ignore_errors=True)
+                # On Linux the objects live in /dev/shm under the peer's id,
+                # outside PEER_DIR; left there, the next pass's peers would
+                # find less shared memory and fall back to disk.
+                for d in glob.glob("/dev/shm/chimaera-*"):
+                    shutil.rmtree(d, ignore_errors=True)
 
     groups = max(8, 2 * len(ips))
     hosts = [
@@ -139,9 +145,9 @@ def peer_logs() -> str:
 
     ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
     out = []
-    for h in peer_hosts():
+    for ref in [h.log_tail.remote() for h in peer_hosts()]:  # asked all at once
         try:
-            out.append(ray.get(h.log_tail.remote(), timeout=30))
+            out.append(ray.get(ref, timeout=30))
         except Exception as e:  # noqa: BLE001
             out.append(f"(no log: {e})")
     ray.shutdown()
@@ -153,7 +159,7 @@ def peer_settings() -> list[str]:
 
     ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
     try:
-        return [ray.get(h.settings.remote(), timeout=30) for h in peer_hosts()]
+        return ray.get([h.settings.remote() for h in peer_hosts()], timeout=30)
     except Exception as e:  # noqa: BLE001
         return [f"(unavailable: {e})"]
     finally:
@@ -166,7 +172,7 @@ def peer_cpu() -> list[float]:
 
     ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
     try:
-        return [ray.get(h.cpu_seconds.remote(), timeout=30) for h in peer_hosts()]
+        return ray.get([h.cpu_seconds.remote() for h in peer_hosts()], timeout=30)
     except Exception:  # noqa: BLE001
         return []
     finally:
@@ -178,9 +184,11 @@ def stop_peers(wipe: bool = False) -> None:
 
     ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
     names = [f"chimaera-peer-{n['NodeID']}" for n in ray.nodes() if n["Alive"]]
-    for h in peer_hosts():
+    hosts = peer_hosts()
+    stops = [h.stop.remote(wipe) for h in hosts]  # all peers drain at once
+    for h, ref in zip(hosts, stops):
         try:
-            ray.get(h.stop.remote(wipe), timeout=90)
+            ray.get(ref, timeout=90)
             ray.kill(h)
         except Exception as e:  # noqa: BLE001
             print("stop:", e)
@@ -206,7 +214,7 @@ def total_cpus(rt: str) -> int:
         return int(ray.cluster_resources().get("CPU", 1))
     import chimaera as ch
 
-    return int(sum(n.cpus for n in ch.cluster().nodes()))
+    return int(sum(n.cpus for n in ch.runs.cluster().nodes()))
 
 
 def busy(seconds: float) -> int:
@@ -271,7 +279,7 @@ def run_workload(rt: str, name: str) -> dict:
         remote = ch.remote
 
         def get(x, timeout=None):
-            return ch.gather(*x, timeout=timeout) if isinstance(x, list) else x.result(timeout)
+            return ch.get(x, timeout=timeout) if isinstance(x, list) else x.result(timeout)
 
     _INIT = True
     cpus = total_cpus(rt)
@@ -406,7 +414,7 @@ def run_workload(rt: str, name: str) -> dict:
                 return sum(ray.get([child.remote(i) for i in range(n)]))
             import chimaera as ch
 
-            return sum(ch.gather(*[child.remote(i) for i in range(n)]))
+            return sum(ch.get([child.remote(i) for i in range(n)]))
 
         parent = remote(parent_fn)
         t0 = time.perf_counter()

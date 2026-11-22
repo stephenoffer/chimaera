@@ -96,7 +96,7 @@ def pack(paths: list[str]) -> tuple[bytes, bytes] | None:
         raise ValueError(
             f"your project's directories hold {total >> 20} MiB of files, over the {_max_bytes() >> 20} MiB a remote "
             f"run ships (CHIMAERA_PROJECT_MAX_BYTES); the largest: {listed}. Move data out of {dirs[0]} "
-            "(read it with ch.partitions or ch.put instead)"
+            "(read it with ch.data.partitions or ch.put instead)"
         )
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
@@ -138,6 +138,7 @@ def ensure(object_dir: str, run: bytes, cache: str) -> None:
                 os.rename(tmp, target)
             except OSError:  # another worker unpacked it first
                 shutil.rmtree(tmp, ignore_errors=True)
+        os.utime(target)  # used now: the peer's sweep keeps it (chimaera-peer gc.rs)
         dirs = sorted(os.path.join(target, d) for d in os.listdir(target))
         sys.path[:0] = dirs
         locked = [d for d in dirs if os.path.exists(os.path.join(d, "uv.lock"))]
@@ -192,6 +193,7 @@ def _use_locked_env(project: str, envs: str) -> None:
             if done.returncode != 0:
                 raise RuntimeError(f"installing the project's uv.lock on this peer failed:\n{done.stderr[-2000:]}")
             open(os.path.join(env, ".chimaera-ready"), "w").close()
+    os.utime(env)  # used now: the peer's sweep keeps it (chimaera-peer gc.rs)
     packages = os.path.join(env, "lib", f"python{sys.version_info.major}.{sys.version_info.minor}", "site-packages")
     sys.path.insert(0, packages)
     site.addsitedir(packages)  # .pth files (editable installs, namespace packages)

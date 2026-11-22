@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import random
+import subprocess
+import tempfile
 import time
 
 import pytest
 
 import chimaera as ch
+from conftest import BIN, run_script
 
 
 @ch.remote
@@ -71,7 +74,7 @@ def test_calls_through_one_handle_run_in_submission_order():
     log = Log.remote()
     rng = random.Random(7)
     futs = [log.append.remote(i, rng.choice([0, 0, 0, 0.001])) for i in range(1000)]
-    ch.gather(*futs, timeout=120)
+    ch.get(futs, timeout=120)
     assert log.get.remote().result(timeout=30) == list(range(1000))
 
 
@@ -79,7 +82,7 @@ def test_concurrency_control_shows_overlap_and_reordering():
     # The control proves the ordering test above can detect reordering.
     actor = Overlapping.remote()
     futs = [actor.append.remote(i, 0.05 if i % 2 == 0 else 0.001) for i in range(40)]
-    ch.gather(*futs, timeout=120)
+    ch.get(futs, timeout=120)
     items, max_active = actor.get.remote().result(timeout=30)
     assert max_active > 1, "concurrency=4 should overlap calls"
     assert sorted(items) == list(range(40)) and items != list(range(40)), "overlapping calls finish out of order"
@@ -87,7 +90,7 @@ def test_concurrency_control_shows_overlap_and_reordering():
 
 def test_async_methods_do_not_overlap_by_default():
     c = AsyncCounter.remote()
-    ch.gather(*(c.work.remote(i) for i in range(50)), timeout=60)
+    ch.get((c.work.remote(i) for i in range(50)), timeout=60)
     max_active, order = c.stats.remote().result(timeout=30)
     assert max_active == 1, "writing async def must not change the actor's concurrency"
     assert order == list(range(50))
@@ -127,9 +130,9 @@ def test_futures_flow_into_actor_calls_without_driver_fetch():
 
 def test_keyed_actor_is_get_or_create():
     name = f"registry-{time.time_ns()}"
-    a = Log.options(key=name).remote()
+    a = Log.options(name=name).remote()
     a.append.remote("x").result(timeout=30)
-    b = Log.options(key=name).remote()
+    b = Log.options(name=name).remote()
     assert b.id == a.id
     assert b.get.remote().result(timeout=30) == ["x"]
 
@@ -168,12 +171,44 @@ def test_many_idle_actors_do_not_starve_tasks():
     # Actors that did not ask for CPU hold none: tasks still run.
     n = int(ch._runtime.Runtime.get().info["usable_cores"]) + 4
     actors = [Log.remote() for _ in range(n)]
-    ch.gather(*(a.append.remote(1) for a in actors), timeout=60)
+    ch.get((a.append.remote(1) for a in actors), timeout=60)
 
     @ch.remote
     def plain(x):
         return x
 
-    assert ch.gather(*(plain.remote(i) for i in range(20)), timeout=60) == list(range(20))
+    assert ch.get((plain.remote(i) for i in range(20)), timeout=60) == list(range(20))
     for a in actors:
         a.close()
+
+
+def test_a_call_to_an_actor_closed_before_it_started_fails_instead_of_waiting():
+    home = tempfile.mkdtemp(prefix="cha", dir="/tmp")  # a fresh peer: every CPU is free
+    try:
+        out = run_script(
+        """
+        import chimaera as ch
+
+        cores = int(ch._runtime.Runtime.get().info["usable_cores"])
+
+        @ch.remote(cpus=cores)
+        class Big:
+            def ping(self):
+                return 1
+
+        holder = Big.remote()        # takes every CPU
+        waiting = Big.remote()       # waits for CPUs
+        call = waiting.ping.remote()
+        waiting.close()
+        try:
+            call.result(timeout=30)
+        except TimeoutError:
+            print("HUNG")
+        except Exception as e:
+            print("FAILED", e)
+        """,
+            home=home,
+        )
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=30)
+    assert "FAILED the actor ended before it started" in out.stdout, out.stdout + out.stderr

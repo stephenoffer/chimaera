@@ -28,6 +28,8 @@ pub const READY: u8 = b'Q';
 pub const ACTOR: u8 = b'A';
 pub const ACTOR_HOST: u8 = b'H';
 pub const ACTOR_CMD: u8 = b'C';
+pub const BUDGET: u8 = b'W'; // budgeted call -> CPU and GPU seconds charged to it, in this vshard
+pub const DEPS_LEFT: u8 = b'I'; // pending call -> prerequisites it still waits on
 
 // Group-wide tags.
 pub const OWNED: u8 = b'V';
@@ -62,6 +64,16 @@ pub fn submission_key(v: u16, tenant: &str, key: &str) -> Vec<u8> {
 
 pub fn task(v: u16, run: &Id, task: &Id) -> Vec<u8> {
     let mut k = base(v, TASK, 32);
+    k.extend_from_slice(&run.0);
+    k.extend_from_slice(&task.0);
+    k
+}
+
+/// How many prerequisites a pending call still waits on: kept apart from its
+/// record so each finished prerequisite rewrites four bytes, not the call's
+/// whole spec.
+pub fn deps_left(v: u16, run: &Id, task: &Id) -> Vec<u8> {
+    let mut k = base(v, DEPS_LEFT, 32);
     k.extend_from_slice(&run.0);
     k.extend_from_slice(&task.0);
     k

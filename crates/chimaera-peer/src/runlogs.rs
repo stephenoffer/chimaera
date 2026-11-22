@@ -29,6 +29,12 @@ pub struct RunLogs {
 }
 
 impl RunLogs {
+    /// `run` expired: its output goes with it.
+    pub fn remove(&mut self, code: &CodeStore, run: &[u8]) {
+        self.open.remove(run);
+        let _ = std::fs::remove_file(path(code, run));
+    }
+
     /// Append one chunk of a call's output.
     pub fn append(&mut self, code: &CodeStore, run: &[u8], task: &[u8], stream: &str, text: &str) -> io::Result<()> {
         if !self.open.contains_key(run) {
@@ -100,9 +106,39 @@ pub fn read(path: &Path, offset: u64, max: usize) -> io::Result<(Vec<u8>, u64, u
     Ok((buf, next, size))
 }
 
+/// Answer a `Logs` request from this peer's copy: up to 1 MiB after
+/// `offset`, waiting up to `wait_ms` (at most 30 s) for some.
+pub async fn serve(code: &CodeStore, r: &chimaera_core::pb::LogsRequest) -> io::Result<chimaera_core::pb::LogsReply> {
+    let path = path(code, &r.run);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(u64::from(r.wait_ms.min(30_000)));
+    loop {
+        let (p, offset) = (path.clone(), r.offset);
+        let (text, next, size) =
+            tokio::task::spawn_blocking(move || read(&p, offset, 1 << 20)).await.map_err(io::Error::other)??;
+        if !text.is_empty() || tokio::time::Instant::now() >= deadline {
+            return Ok(chimaera_core::pb::LogsReply { text, next, size });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_runs_output_is_deleted() {
+        let root = tempfile::tempdir().unwrap();
+        let code = CodeStore::open(root.path().join("code")).unwrap();
+        let mut logs = RunLogs::default();
+        let (run, task) = ([9u8; 16], [1u8; 16]);
+        logs.append(&code, &run, &task, "stdout", "kept until the run expires\n").unwrap();
+        assert!(path(&code, &run).exists());
+        logs.remove(&code, &run);
+        assert!(!path(&code, &run).exists());
+        logs.append(&code, &run, &task, "stdout", "a late line reopens it\n").unwrap();
+        assert!(path(&code, &run).exists(), "no stale handle to a deleted file");
+    }
 
     #[test]
     fn appends_prefixed_lines_reads_from_offsets_and_caps_a_run() {

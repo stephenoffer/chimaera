@@ -152,12 +152,18 @@ floor the real path builds on, not Chimaera's.
 **First steps on the runtime.** These are in the tree; see
 [bench/proto/local-group](../bench/proto/local-group/RESULTS.md).
 - **Startup:** a local peer recovers through Raft, then applies commands with no log.
-- **Durability:** an attached run's per-call commands commit non-durably. The next durable commit, at most 500 ms
-  later, persists them, because redb makes durability a prefix. Everything else commits durably.
-- **Speed:** local task and actor round trips halved, to 257–319 µs p50.
-- **Tests:** crash tests check both halves of the contract: a detached run's calls survive an immediate abort, and
-  an attached run's calls survive once the checkpoint window has passed.
+- **Ordinary calls:** an attached run's per-call commands go to an in-memory overlay with no database write.
+- **Durability:** the overlay is written in a durable commit within 500 ms, or with the next command that must be
+  durable. Every database commit is durable, so the overlay is exactly what a crash can lose.
+- **Speed:** local task round trips are 247–296 µs p50, faster than Ray's 386–391 µs. Actor calls are 276–296 µs,
+  against Ray's 166–181 µs.
+- **Tests:** a randomized test checks the overlay against an in-memory map. Crash tests check both halves of the
+  contract: a detached run's calls survive an immediate abort, and an attached run's calls survive once the window
+  has passed.
 - **Snapshots:** local peers no longer write Raft snapshots.
+- **Early outcome** (direct path, stage 1): an attached run's caller gets the outcome when the executor returns,
+  before the publication, which still follows, and before the peer's accounting. Local actor calls are now
+  190–200 µs, against Ray's 163–185 µs.
 
 The journal reuses the shard state machine that exists today (`crates/chimaera-core/src/shard`). The transitions,
 fencing and exactly-one-winner rules are the same; only the replication changes. Raft groups apply commands from a
@@ -172,7 +178,7 @@ keep checking it.
 | `"none"` (default) | Nothing. The call may run before its `Submitted` record is safe. | Safe records replay on the successor. An unsafe record was never acknowledged: the client resubmits it with the same deterministic id, or, for a nested call, the parent's replay resubmits it. |
 | `"idempotent"` | Nothing. Never speculated. | Same as `"none"`. |
 | `"external"` | A `Started` record is safe on both backups: one round trip inside the cell, about 50–200 µs. | `OutcomeUnknown` if `Started` is safe and `Done` is not. Never replayed. |
-| Durable actor command, durable workflow step, `ch.Store` write | A Raft commit in the owning metadata group, batched with others. | Exactly the guarantees in design.md §8. |
+| Durable actor command, durable workflow step, `ch.coord.Store` write | A Raft commit in the owning metadata group, batched with others. | Exactly the guarantees in design.md §8. |
 
 **Call ids are deterministic**: `hash(parent call or client session, submission sequence)`. A resubmission after
 any failure lands on the same id, and the executing peer, the owner and the successor all deduplicate by it. This is
@@ -207,7 +213,9 @@ and peers refuse retired ones.
 
 ### Why the journal is safe
 
-Invariants, each checked by the simulation in §15:
+Invariants, each to be checked by the deterministic simulation planned in §15. It is not built yet:
+`crates/chimaera-sim` is empty. Today the shard state machine's property tests and the local group's crash tests
+(`crates/chimaera-raft/src/local.rs`) cover part of 2 and, on one peer, part of 4.
 
 1. **One owner per call at a time.** Ownership changes only by a directory commit that retires the old owner's
    incarnation. Every message carries the owner's incarnation, and peers refuse retired ones.
@@ -250,7 +258,7 @@ changing semantics.
 
 | Path | Today (local measurement; Ray on the same laptop) | Target | Why it is reachable |
 |---|---|---|---|
-| Local call round trip, warm executor | Task 530–628 µs, actor 607–826 µs p50 on macOS (Ray: 386–391 µs and 171–177 µs); 3.5 ms on Linux | ≤ 150 µs p50, ≤ 400 µs p99 | No commit, one IPC each way; agent work ≤ 10 µs per call. The two commits are ~330 µs of today's task round trip. The prototype's call path measures 17.8 µs p50 with journaling (bench/proto/hotpath). The Linux gap is a known open item. |
+| Local call round trip, warm executor | Task 247–296 µs, actor 276–296 µs p50 on macOS after the first D2 steps (were 595–640 and 641–654; Ray: 386–391 µs and 166–181 µs); Linux not re-measured | ≤ 150 µs p50, ≤ 400 µs p99 | No commit, one IPC each way; agent work ≤ 10 µs per call. The two commits are ~330 µs of today's task round trip. The prototype's call path measures 17.8 µs p50 with journaling (bench/proto/hotpath). The Linux gap is a known open item. |
 | Single-client async tasks | 15,362/s (Ray 10,416/s, 1.47×) | ≥ 3× Ray's `single_client_tasks_async` | Batched submit frames; owner-local placement with lease reuse. |
 | Actor calls, one handle, async | 5,471/s (Ray 16,573/s, 0.33×) | ≥ 1.5× Ray's `1_1_actor_calls_async` | Direct path, no commit, frame coalescing. Prototype: 593k/s against Ray's 19.1k/s on the same machine. |
 | n:n actor calls | 10,489/s (Ray 24,681/s, 0.43×) | ≥ Ray's `n_n_actor_calls_async` per core | Per-pair channels; nothing shared between pairs. Prototype: 1.63M/s against Ray's 26.4k/s. |
@@ -271,7 +279,7 @@ Erlang all show that actors can be cheap. **D4: one decorator, three weights.**
 |---|---|---|---|
 | **Process actor** (default) | `Cls.remote(...)` | One executor process. Full isolation, per-attempt cgroup accounting, its own GPU context. | Models, engines, anything with native threads or devices. |
 | **Shared actor** | `@ch.remote(process="shared")` | A few KB to a few MB inside a shared executor. One call at a time per instance unless `concurrency=` says otherwise. On free-threaded Python, instances run in parallel. | Thousands to hundreds of thousands per peer: sessions, agents, simulations, per-key state. |
-| **Virtual actor** | `Cls.options(key=k, idle="10m")` | Nothing while idle. Activated on its first call anywhere in the cell, passivated after `idle`. | Millions of keyed entities. With `state=ch.State(...)` it keeps its state across passivation and peer loss. |
+| **Virtual actor** | `Cls.options(name=k, idle="10m")` | Nothing while idle. Activated on its first call anywhere in the cell, passivated after `idle`. | Millions of keyed entities. With `state=ch.durable.State(...)` it keeps its state across passivation and peer loss. |
 
 Rules that keep this safe and simple:
 
@@ -390,7 +398,7 @@ same: Inngest, Hatchet, DBOS.)
 
 **Calls later and calls on a schedule.** `fn.options(start_after="10m").remote(x)` (a duration or a `datetime`)
 journals the call now and starts it no earlier than that; long delays move to the run's metadata group so they
-survive anything. `fn.options(key="nightly-report").schedule(cron="0 3 * * *")` registers a schedule in a
+survive anything. `fn.options(name="nightly-report").schedule(cron="0 3 * * *")` registers a schedule in a
 metadata group, whose leader fires it; a leader change cannot double-fire because each firing has a deterministic
 call key. Celery Beat has no HA; this has no single scheduler.
 
@@ -421,7 +429,7 @@ peer look idle (L8). The fleet tier sees only per-cell demand summaries.
   (L3, R6).
 - **The cell directory group** (5 voters on different racks) holds members and incarnations, journal backup
   assignments, the vshard-to-group map and group voter sets. It changes on joins, leaves and splits only.
-- **Metadata groups** (8–64 per cell) hold runs, actor generations, named keys, `ch.Store` namespaces, gangs and
+- **Metadata groups** (8–64 per cell) hold runs, actor generations, named keys, `ch.coord.Store` namespaces, gangs and
   durable actor state. Engineering rules from CockroachDB and TiKV: heartbeats coalesced per peer pair (built),
   idle groups quiesce and send nothing, leaders hold leases so reads need no round trip, one disk writer per peer
   group-commits every group (built). [CockroachDB quiescence][crdbquiesce] · [TiKV hibernate regions][tikvhibernate]
@@ -488,7 +496,7 @@ measurements; these decisions make them cheap enough to keep on and complete eno
   - **IO.** Bytes the runtime moves are exact per call; other network and disk IO come from cgroup `io.stat`, and
     optionally eBPF (under 0.4% overhead reported across 80,000 GPU hosts). [SysOM-AI][sysom]
 - **Telemetry you can query.** Attempt records and sketches are Arrow tables on each peer.
-  `ch.cluster().query("SELECT fn, quantile(mem_peak, 0.99) FROM attempts WHERE run = ? GROUP BY fn")` runs the SQL
+  `ch.runs.cluster().query("SELECT fn, quantile(mem_peak, 0.99) FROM attempts WHERE run = ? GROUP BY fn")` runs the SQL
   on the peers that hold the rows (DataFusion, in the agent) and merges the results, as Monarch does. The same
   query backs `chimaera top`, the dashboard, and coding agents that need machine-readable answers.
   [Monarch observability][monarchobs]
@@ -541,7 +549,7 @@ platform already knows them: Kubernetes DRA ResourceSlices and the `nvidia.com/g
 50 GB/s per GPU), so a cell boundary there would hide the most important edge. [GB200 block scheduling][nvl72slurm]
 · [DRA][dra] · [Topograph][topograph]
 
-**Gangs are placed by domain.** `ranks=16, gpus=1, placement=ch.Placement(pack="nvlink")` asks for two intact
+**Gangs are placed by domain.** `ranks=16, gpus=1, placement=ch.dist.Placement(pack="nvlink")` asks for two intact
 eight-GPU domains or one sixteen-GPU domain. `mesh(dp=2, tp=8)` maps the fastest-varying axis to the fastest domain.
 Each level can be required or preferred, and a segment size lets a job use 16 of an 18-node block so one drained
 node does not strand the rest (Slurm's `--segment`, Kueue's slice-required). The coordinator searches domains
@@ -576,7 +584,7 @@ Chimaera:
 | Health: XID, ECC, thermal, NVLink errors, DCGM diagnostics | Quarantine with probation (R9); checkpoints written after a fault are invalidated (R8) |
 | Preemption and checkpoint/restart | Preemption notices drain and checkpoint (R7); manifest-committed checkpoints (A14) |
 | Elastic training and fault-tolerant restarts | `ranks=ch.auto(min, max)`, new rendezvous generation per membership change |
-| Fast collectives and point-to-point | NCCL/RCCL inside gangs; `ch.group()` over existing actors; device transport for tensors |
+| Fast collectives and point-to-point | NCCL/RCCL inside gangs; `ch.dist.group()` over existing actors; device transport for tensors |
 | Integration with the outer scheduler | Kubernetes DRA claims and Kueue admission, Slurm allocations: Chimaera places inside what it was granted |
 
 **Disaggregated inference** gets what design.md §7 promised: per-stage queues, KV-transfer adapters over NIXL or
@@ -590,7 +598,7 @@ each is an option or a method on something already in hand (proposed API, not ye
 ```python
 import chimaera as ch
 
-@ch.remote(process="shared", idle="10m", state=ch.State())
+@ch.remote(process="shared", idle="10m", state=ch.durable.State())
 class Session:                                    # millions of these; idle ones cost nothing
     def __init__(self):
         self.turns = []
@@ -599,7 +607,7 @@ class Session:                                    # millions of these; idle ones
         self.turns.append(message)
         return len(self.turns)
 
-Session.options(key="user/42").add.remote("hi")   # get or activate by key, anywhere in the cell
+Session.options(name="user/42").add.remote("hi")   # get or activate by key, anywhere in the cell
 
 @ch.remote(limit=ch.Limit("llm-api", rate="50/30s"), effects="idempotent")
 def summarize(text: str) -> str: ...              # one rate limit across the whole fleet
@@ -608,7 +616,7 @@ def summarize(text: str) -> str: ...              # one rate limit across the wh
 class Trainer:
     def step(self, batch) -> float: ...
 
-mesh = Trainer.options(ranks=16, placement=ch.Placement(pack="nvlink")).gang()
+mesh = Trainer.options(ranks=16, placement=ch.dist.Placement(pack="nvlink")).gang()
 losses = list(mesh.step.remote(batch))            # one value per rank, in rank order
 ```
 
@@ -649,13 +657,13 @@ Chimaera reaches the same capability with fewer concepts because several Ray con
 | `ray.get`, `ray.wait`, `ObjectRef`, `ObjectRefGenerator`, `DynamicObjectRefGenerator` | `Future` (`.result()`, `await`) and `Results` (iterate) |
 | Tasks, actor methods, async actors, threaded actors, generators | One decorator; `concurrency=` |
 | `num_cpus`, `num_gpus`, `memory`, `resources`, `accelerator_type` | `cpus`, `memory`, `gpus`, `device`, `resources`, or nothing (learned) |
-| Five scheduling strategies, label selectors, fallback strategies, placement groups | `placement=ch.Placement(require=..., prefer=..., pack=..., spread=...)` and `ch.reserve(...)` |
+| Five scheduling strategies, label selectors, fallback strategies, placement groups | `placement=ch.dist.Placement(require=..., prefer=..., pack=..., spread=...)` and `ch.dist.reserve(...)` |
 | `max_retries`, `retry_exceptions`, `max_task_retries`, `max_restarts` | `effects=` plus `max_attempts`, `retry_exceptions`, `restart`, `max_restarts` |
 | `name`, `namespace`, `get_if_exists`, `lifetime`, `ray.get_actor` | `key=`, `lifetime=`, `ch.actor(key)` |
-| `ray.util.queue`, internal KV, GCS-backed coordination | `ch.Queue`, `ch.Topic`, `ch.Store` |
+| `ray.util.queue`, internal KV, GCS-backed coordination | `ch.coord.Queue`, `ch.coord.Topic`, `ch.coord.Store` |
 | `ActorPool`, Serve-style replica sets | `Class.options(replicas=...).pool(...)` |
-| Placement-group-based SPMD, `ray.util.collective`, Compiled Graph channels | `.gang()` meshes, `ch.group()`, `ch.graph` |
-| State API, `ray.timeline`, `ray memory`, dashboard | `future.explain()`, `run.tasks()`, `ch.cluster()`, `chimaera top/explain/stack` |
+| Placement-group-based SPMD, `ray.util.collective`, Compiled Graph channels | `.gang()` meshes, `ch.dist.group()`, `ch.graph` |
+| State API, `ray.timeline`, `ray memory`, dashboard | `future.explain()`, `run.tasks()`, `ch.runs.cluster()`, `chimaera top/explain/stack` |
 
 **The budget.** Tier 0 needs five names. `chimaera.__all__` has 37 names that are not exceptions today, and 22
 exceptions. The planned phases add seven (`Env`, `reserve`, `reservation`, `group`, `graph`, `device`, `devices`).
@@ -663,7 +671,7 @@ This design adds four (`executor`, `Limit`, `Sandbox`, and the `metrics` submodu
 (`AlreadyExists`, `ActorRestarting`, `Deadlock`). That is 48 names against a budget of 50, and 25 exceptions against
 30, so a few rarely constructed types (`Outcome`, `Partition`, `Subscription`, `Stream`) should leave `__all__`.
 Everything else marked New in [parity.md](parity.md) is an option keyword, a method on an object the user already
-holds, or a name in a submodule (`ch.workflow.patched`, `chimaera.multiprocessing`, `chimaera.ext`). A test should
+holds, or a name in a submodule (`ch.durable.patched`, `chimaera.multiprocessing`, `chimaera.ext`). A test should
 enforce both counts, the way the compat shim test enforces that the shim uses only public API.
 
 New option keywords from this design: `process=`, `idle=`, `durability=`, `start_after=`, `limit=`, `max_calls=`,
@@ -771,7 +779,7 @@ What the numbers say:
 
 | Risk | Check | Gate |
 |---|---|---|
-| The journal protocol loses or duplicates a call | Property tests over the shared state machine (exist), plus a deterministic simulation (turmoil) of owner, backup and executor crashes and partitions over 10,000 seeds, with a history checker | No duplicate publication, no lost acknowledged call, every failing seed reproduces |
+| The journal protocol loses or duplicates a call | Property tests over the shared state machine (exist), plus a deterministic simulation (turmoil) of owner, backup and executor crashes and partitions over 10,000 seeds, with a history checker (planned; `crates/chimaera-sim` is empty) | No duplicate publication, no lost acknowledged call, every failing seed reproduces |
 | Owner failover is slow or wrong | Kill owners, backups, both backups, and owner + one backup during 100k-call runs on a compose cluster | Exactly-once results; successor resumes in < 5 s p99 |
 | The hot path is not faster | `bench/microbench/` ports Ray's own microbenchmark suite; run both on the same machine | Targets in §3 on Linux and macOS |
 | Placement degrades at scale | `placement_sim.py` now; M6 emulator with real code at 100k–262k peers | p99 queueing ≤ 2% of mean service at 90% load |

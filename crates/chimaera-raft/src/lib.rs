@@ -8,10 +8,12 @@ mod backend;
 mod local;
 mod log_store;
 mod network;
+mod recover;
 mod state_machine;
 
 pub use log_store::{DiskWriter, LogStore};
-pub use network::{NetworkFactory, NoTransport, RpcFuture, RpcKind, Transport, handle_rpc};
+pub use network::{NetworkFactory, NoTransport, RpcFuture, RpcKind, Transport, handle_rpc, handle_snapshot};
+pub use recover::force_single_voter;
 pub use state_machine::{GroupEvents, GroupRead, StateMachine};
 
 use chimaera_core::kv::KvRead;
@@ -61,7 +63,8 @@ pub fn raft_config() -> Arc<Config> {
         heartbeat_interval: 300,
         election_timeout_min: 1000,
         election_timeout_max: 2000,
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(50_000),
+        // Snapshots are triggered by size instead (`snapshot_when_due`).
+        snapshot_policy: openraft::SnapshotPolicy::Never,
         max_in_snapshot_log_to_keep: 1000,
         ..Default::default()
     };
@@ -88,6 +91,32 @@ fn open_db(path: &Path, durability: DiskDurability) -> io::Result<Database> {
     db.map_err(log_store::io_err)
 }
 
+/// The least log a group writes between snapshots.
+const SNAPSHOT_MIN_LOG_BYTES: u64 = 64 << 20;
+
+/// Build a snapshot whenever group `raft`'s log since the last one is due
+/// (see [`state_machine::SnapshotDue`]); ends when the group shuts down.
+async fn snapshot_when_due(raft: Raft, due: Arc<state_machine::SnapshotDue>, min: u64) {
+    use openraft::async_runtime::WatchReceiver;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        if raft.metrics().borrow_watched().running_state.is_err() {
+            return;
+        }
+        if due.due(min) && raft.trigger().snapshot().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn compact(db: &mut Database, path: &Path) {
+    match db.compact(redb::CompactionMode::Balanced) {
+        Ok(_) => {}
+        Err(e) => tracing::warn!("could not compact {}: {e}", path.display()),
+    }
+}
+
 /// Opens the peer's raft databases and starts groups on them.
 pub struct RaftHost {
     node_id: NodeId,
@@ -95,9 +124,11 @@ pub struct RaftHost {
     sm_db: Arc<Database>,
     writer: DiskWriter,
     snapshot_dir: PathBuf,
+    sm_path: PathBuf,
     events: tokio::sync::mpsc::Sender<GroupEvents>,
     config: Arc<Config>,
     transport: Arc<dyn Transport>,
+    snapshot_min_log_bytes: u64,
 }
 
 impl RaftHost {
@@ -110,9 +141,16 @@ impl RaftHost {
         durability: DiskDurability,
     ) -> io::Result<(RaftHost, tokio::sync::mpsc::Receiver<GroupEvents>)> {
         std::fs::create_dir_all(dir.join("snapshots"))?;
-        let log_db = Arc::new(open_db(&dir.join("raft-log.redb"), durability)?);
-        let sm_db = Arc::new(open_db(&dir.join("raft-sm.redb"), durability)?);
+        let (log_path, sm_path) = (dir.join("raft-log.redb"), dir.join("raft-sm.redb"));
+        let mut log_db = open_db(&log_path, durability)?;
+        let mut sm_db = open_db(&sm_path, durability)?;
         create_tables(&log_db, &sm_db)?;
+        // Purged logs and expired state leave free pages that redb reuses but
+        // never gives back to the disk; return them at each start.
+        compact(&mut log_db, &log_path);
+        compact(&mut sm_db, &sm_path);
+        state_machine::prune_snapshots(&sm_db, &dir.join("snapshots"), dir)?;
+        let (log_db, sm_db) = (Arc::new(log_db), Arc::new(sm_db));
         let writer = DiskWriter::start(log_db.clone())?;
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
         let host = RaftHost {
@@ -121,9 +159,15 @@ impl RaftHost {
             sm_db,
             writer,
             snapshot_dir: dir.join("snapshots"),
+            sm_path,
             events: tx,
             config: raft_config(),
             transport,
+            // CHIMAERA_RAFT_SNAPSHOT_BYTES: the least log between snapshots.
+            snapshot_min_log_bytes: std::env::var("CHIMAERA_RAFT_SNAPSHOT_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SNAPSHOT_MIN_LOG_BYTES),
         };
         Ok((host, rx))
     }
@@ -141,12 +185,18 @@ impl RaftHost {
         bootstrap: bool,
     ) -> io::Result<Group> {
         let log = LogStore::new(id, self.log_db.clone(), self.writer.clone());
-        let sm = StateMachine::new(id, self.sm_db.clone(), self.events.clone(), self.snapshot_dir.clone());
+        let due = log.due.clone();
+        let sm = StateMachine::new(id, self.sm_db.clone(), self.events.clone(), self.snapshot_dir.clone())
+            .with_due(due.clone());
+        if let Some(Ok(size)) = current_snapshot(&self.sm_db, id).map(|p| std::fs::metadata(p).map(|m| m.len())) {
+            due.last_size.store(size, std::sync::atomic::Ordering::Relaxed);
+        }
         let net = NetworkFactory::new(id, self.transport.clone());
         let raft = Raft::new(self.node_id, self.config.clone(), net, log, sm).await.map_err(log_store::io_err)?;
         if bootstrap && !raft.is_initialized().await.map_err(log_store::io_err)? {
             raft.initialize(members).await.map_err(log_store::io_err)?;
         }
+        tokio::spawn(snapshot_when_due(raft.clone(), due, self.snapshot_min_log_bytes));
         Ok(Group { id, node_id: self.node_id, raft, db: self.sm_db.clone(), local: None })
     }
 
@@ -157,9 +207,48 @@ impl RaftHost {
     pub async fn without_log(&self, group: Group) -> io::Result<Group> {
         group.linearizable().await.map_err(io::Error::other)?;
         let _ = group.raft.shutdown().await;
-        let applier = local::Applier::start(group.id, self.sm_db.clone(), self.events.clone())?;
+        let applier = local::Applier::start(group.id, self.sm_db.clone(), self.sm_path.clone(), self.events.clone())?;
         Ok(Group { local: Some(Arc::new(applier)), ..group })
     }
+}
+
+/// Each group's voters (node id and address) as the state machine under
+/// `dir` last stored them; empty when there is no state. Read before the
+/// host opens the databases, to find who else holds a group's state.
+pub fn stored_voters(dir: &Path) -> io::Result<BTreeMap<u32, Vec<(NodeId, String)>>> {
+    use redb::{ReadableDatabase, ReadableTable};
+    let path = dir.join("raft-sm.redb");
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let db = Database::open(&path).map_err(log_store::io_err)?;
+    let txn = db.begin_read().map_err(log_store::io_err)?;
+    let t = txn.open_table(state_machine::SM_META).map_err(log_store::io_err)?;
+    let mut out = BTreeMap::new();
+    for r in t.iter().map_err(log_store::io_err)? {
+        let (k, v) = r.map_err(log_store::io_err)?;
+        let (group, key) = k.value();
+        if key != "membership" {
+            continue;
+        }
+        let m: openraft::type_config::alias::StoredMembershipOf<TypeConfig> = log_store::dec(v.value())?;
+        let voters = m
+            .membership()
+            .voter_ids()
+            .map(|id| (id, m.membership().get_node(&id).map(|n| n.addr.clone()).unwrap_or_default()))
+            .collect();
+        out.insert(group, voters);
+    }
+    Ok(out)
+}
+
+/// The snapshot file group `group` currently points at, if any.
+fn current_snapshot(sm_db: &Database, group: u32) -> Option<PathBuf> {
+    use redb::{ReadableDatabase, ReadableTable};
+    let txn = sm_db.begin_read().ok()?;
+    let t = txn.open_table(state_machine::SM_META).ok()?;
+    let v = t.get((group, "snapshot")).ok()??;
+    log_store::dec::<String>(v.value()).ok().map(PathBuf::from)
 }
 
 fn create_tables(log_db: &Database, sm_db: &Database) -> io::Result<()> {
@@ -190,6 +279,17 @@ impl GroupWatch {
         let m = self.rx.borrow_and_update();
         (m.current_leader, m.membership_config.membership().voter_ids().collect())
     }
+}
+
+/// One replica's view of its group (see [`Group::stats`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupStats {
+    pub leader: Option<NodeId>,
+    pub voters: Vec<NodeId>,
+    pub last_log: u64,
+    pub applied: u64,
+    /// On the leader: entries the furthest-behind voter lacks. None elsewhere.
+    pub max_lag: Option<u64>,
 }
 
 /// One shard group hosted on this peer.
@@ -263,6 +363,40 @@ impl Group {
         (m.current_leader, m.membership_config.membership().voter_ids().collect())
     }
 
+    /// This replica's view of the group's health.
+    pub fn stats(&self) -> GroupStats {
+        use openraft::async_runtime::WatchReceiver;
+        if self.local.is_some() {
+            return GroupStats {
+                leader: Some(self.node_id),
+                voters: vec![self.node_id],
+                last_log: 0,
+                applied: 0,
+                max_lag: Some(0),
+            };
+        }
+        let rx = self.raft.metrics();
+        let m = rx.borrow_watched();
+        let last_log = m.last_log_index.unwrap_or(0);
+        let voters: Vec<NodeId> = m.membership_config.membership().voter_ids().collect();
+        let matched = |v: &NodeId| m.replication.as_ref()?.get(v)?.as_ref().map(|l| l.index());
+        let max_lag = m.replication.as_ref().map(|_| {
+            voters
+                .iter()
+                .filter(|v| **v != self.node_id)
+                .map(|v| last_log.saturating_sub(matched(v).unwrap_or(0)))
+                .max()
+                .unwrap_or(0)
+        });
+        GroupStats {
+            leader: m.current_leader,
+            voters,
+            last_log,
+            applied: m.last_applied.as_ref().map_or(0, |l| l.index()),
+            max_lag,
+        }
+    }
+
     /// Changes to leadership or membership: `changed` waits for the next one.
     pub fn watch(&self) -> GroupWatch {
         GroupWatch { rx: self.raft.metrics() }
@@ -284,6 +418,15 @@ impl Group {
             .change_membership(voters, false)
             .await
             .map(|_| ())
+            .map_err(|e| ProposeError::Unavailable { group: self.id, reason: e.to_string() })
+    }
+
+    /// Hand leadership to voter `to` (it takes over once caught up).
+    pub async fn transfer_leader(&self, to: NodeId) -> Result<(), ProposeError> {
+        self.raft
+            .trigger()
+            .transfer_leader(to)
+            .await
             .map_err(|e| ProposeError::Unavailable { group: self.id, reason: e.to_string() })
     }
 

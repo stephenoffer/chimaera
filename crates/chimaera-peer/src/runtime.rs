@@ -38,7 +38,7 @@ pub fn default_local_dir() -> PathBuf {
 }
 
 /// Hold an exclusive lock on the data directory for the process lifetime.
-fn lock_dir(dir: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn lock_dir(dir: &Path) -> io::Result<std::fs::File> {
     std::fs::create_dir_all(dir)?;
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("peer.lock"))?;
     match f.try_lock() {
@@ -83,12 +83,19 @@ impl Node {
         let shape = crate::topology::discover();
         let capacity = cpus.unwrap_or_else(|| shape.usable_cores());
         let mut objects = ObjectStore::open(object_dir(dir, &identity))?;
+        // Objects in memory move to disk under pressure (see Core), when the
+        // data directory is on another filesystem: moving them within the
+        // same tmpfs frees nothing and, while copying, takes twice the memory.
         let in_memory = crate::budget::is_tmpfs(objects.dir());
-        if in_memory {
-            // Objects in memory move to disk under pressure (see Core).
-            objects = objects.with_spill(dir.join("spill"));
+        let mut spill = crate::objplane::spill_dirs(dir, &identity.peer.hex());
+        for to in &spill {
+            let _ = std::fs::create_dir_all(to);
         }
-        crate::objplane::start(objects.dir().to_path_buf(), in_memory.then(|| dir.join("spill")));
+        spill.retain(|to| in_memory && !same_filesystem(objects.dir(), to));
+        if !spill.is_empty() {
+            objects = objects.with_spill(spill.clone());
+        }
+        crate::objplane::start(objects.dir().to_path_buf(), spill);
         let code = CodeStore::open(dir.join("code"))?;
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(65536);
         Ok((Node { dir: dir.to_path_buf(), identity, shape, capacity, objects, code, core_tx, core_rx }, lock))
@@ -141,6 +148,7 @@ pub async fn serve(
     clients: Option<ClientListen>,
 ) -> io::Result<()> {
     let Node { dir, identity, shape, capacity, objects, code, core_tx, core_rx } = node;
+    tokio::spawn(crate::gc::every_hour(dir.clone()));
     let client_socket = chimaera_proto::uds::socket_path(&dir, CLIENT_SOCKET);
     let exec_socket = chimaera_proto::uds::socket_path(&dir, EXEC_SOCKET);
     chimaera_proto::uds::prepare(&client_socket)?;
@@ -234,8 +242,10 @@ pub async fn serve(
     if let Some(c) = clients {
         let svc = pb::peer_server::PeerServer::new(crate::ingress::Service(ingress.clone()))
             .max_decoding_message_size(256 << 20);
-        let svc =
-            tonic::service::interceptor::InterceptedService::new(svc, crate::mesh::CheckToken::new(c.token.as_deref()));
+        let svc = tonic::service::interceptor::InterceptedService::new(
+            svc,
+            crate::mesh::CheckToken::clients(c.token.as_deref()),
+        );
         let mut builder = tonic::transport::Server::builder();
         let tls = c.tls.is_some();
         if let Some(cfg) = c.tls {
@@ -310,6 +320,11 @@ fn memory_budget(
         }),
         Err(_) => Ok(budget),
     }
+}
+
+fn same_filesystem(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    matches!((std::fs::metadata(a), std::fs::metadata(b)), (Ok(x), Ok(y)) if x.dev() == y.dev())
 }
 
 /// `path size mtime_ns` of the running binary (what `_runtime` compares).

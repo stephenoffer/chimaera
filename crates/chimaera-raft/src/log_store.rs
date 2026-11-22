@@ -172,12 +172,14 @@ pub struct LogStore {
     db: Arc<Database>,
     writer: DiskWriter,
     tail: Tail,
+    /// Bytes appended since the group's last snapshot (shared with its state machine).
+    pub(crate) due: Arc<crate::state_machine::SnapshotDue>,
 }
 
 impl LogStore {
     pub fn new(group: u32, db: Arc<Database>, writer: DiskWriter) -> LogStore {
         let tail = writer.tail(group);
-        LogStore { group, db, writer, tail }
+        LogStore { group, db, writer, tail, due: Arc::default() }
     }
 
     fn read_meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -316,6 +318,8 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         let seq = self.writer.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let encoded: Vec<(u64, Vec<u8>)> =
             entries.into_iter().map(|e| Ok((e.log_id.index, enc(&e)?))).collect::<io::Result<_>>()?;
+        let bytes: usize = encoded.iter().map(|(_, e)| e.len()).sum();
+        self.due.log_bytes.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
         {
             let mut t = self.tail.lock().expect("tail lock");
             for (idx, e) in &encoded {

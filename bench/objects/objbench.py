@@ -193,6 +193,11 @@ class Runtime:
     def release(self, ref: Any) -> None:
         del ref
 
+    def handles(self, refs: Any) -> Any:
+        """References nested in an argument, passed as references (Ray's
+        default for nested ObjectRefs) so the callee does the get."""
+        return refs
+
 
 class RayRuntime(Runtime):
     name = "ray"
@@ -262,12 +267,12 @@ class ChimaeraRuntime(Runtime):
         return ref.result(timeout)
 
     def get_many(self, refs: list[Any]) -> list[Any]:
-        return self.ch.gather(*refs)
+        return self.ch.get(refs)
 
     def actor(self, cls: type, node: str | None = None, *args: Any) -> Any:
         opts: dict[str, Any] = {"cpus": 1}
         if node is not None:
-            opts["placement"] = self.ch.Placement(require={"node": node})
+            opts["placement"] = self.ch.dist.Placement(require={"node": node})
         a = self.ch.remote(cls).options(**opts).remote(*args)
         a.ready.remote().result()
         return a
@@ -275,11 +280,14 @@ class ChimaeraRuntime(Runtime):
     def call(self, actor: Any, method: str, *args: Any) -> Any:
         return getattr(actor, method).remote(*args)
 
+    def handles(self, refs: Any) -> Any:
+        return self.ch.handles(refs)
+
     def nodes(self) -> list[str]:
-        return sorted(n.peer for n in self.ch.cluster().nodes())
+        return sorted(n.peer for n in self.ch.runs.cluster().nodes())
 
     def here(self) -> str:
-        return next(n.peer for n in self.ch.cluster().nodes() if n.this_peer)
+        return next(n.peer for n in self.ch.runs.cluster().nodes() if n.this_peer)
 
 
 def connect(runtime: str, address: str | None) -> Runtime:
@@ -305,7 +313,7 @@ def _rt_get_many(runtime: str) -> Any:
         return lambda rs: ray.get(rs)
     import chimaera as ch
 
-    return lambda rs: ch.gather(*rs)
+    return lambda rs: ch.get(rs)
 
 
 class Consumer:
@@ -451,7 +459,7 @@ def scenario_get(rt: Runtime, types: list[str], sizes: list[str], node: str | No
             t0 = time.perf_counter()
             ref = rt.put(v)
             tp = time.perf_counter() - t0
-            g, t, _ = rt.get(rt.call(cons, "get_touch", [ref]))
+            g, t, _ = rt.get(rt.call(cons, "get_touch", rt.handles([ref])))
             rt.release(ref)
             if i == 0:
                 continue  # warm-up
@@ -512,7 +520,7 @@ def scenario_many(rt: Runtime, types: list[str], sizes: list[str], **_: Any) -> 
         refs = [rt.put(vals[i % len(vals)]) for i in range(n)]
         t_put = time.perf_counter() - t0
         t0 = time.perf_counter()
-        t_get, _ = rt.get(rt.call(cons, "get_all", refs, True))
+        t_get, _ = rt.get(rt.call(cons, "get_all", rt.handles(refs), True))
         t_e2e = time.perf_counter() - t0
         emit(scenario="many", kind="bytes", size=s, op="put", per_object_s=t_put / n, n=n)
         emit(scenario="many", kind="bytes", size=s, op="get", per_object_s=t_get / n, n=n, call_s=t_e2e)
@@ -560,11 +568,11 @@ def scenario_spill(rt: Runtime, types: list[str], sizes: list[str], capacity: in
         ok = 0
         t0 = time.perf_counter()
         try:
-            g, _, c = rt.get(rt.call(cons, "get_touch", [refs[0]]))
+            g, _, c = rt.get(rt.call(cons, "get_touch", rt.handles([refs[0]])))
             first = g
             per = max(1, (2 * GB) // size)
             for i in range(0, len(refs), per):
-                _, checks = rt.get(rt.call(cons, "get_all_sums", refs[i : i + per]))
+                _, checks = rt.get(rt.call(cons, "get_all_sums", rt.handles(refs[i : i + per])))
                 ok += sum(int(a == b) for a, b in zip(checks, sums[i : i + per]))
         except Exception as e:  # noqa: BLE001
             err = f"{type(e).__name__}: {str(e)[:300]}"
@@ -731,9 +739,9 @@ def _recovery_chimaera(sizes: list[str], timeout: float) -> None:
             stdout=log, stderr=log, start_new_session=True)
 
     def wait_ready(i: int) -> None:
-        sock, deadline = socket_path(os.path.join(root, f"p{i}"), "peer.sock"), time.time() + 60
+        sock, deadline = socket_path(os.path.join(root, f"p{i}"), "peer.sock"), time.monotonic() + 60
         while not os.path.exists(sock):
-            if procs[i].poll() is not None or time.time() > deadline:
+            if procs[i].poll() is not None or time.monotonic() > deadline:
                 raise RuntimeError(f"peer {i} did not start: " + open(os.path.join(root, f"p{i}.log")).read()[-1500:])
             time.sleep(0.05)
 
@@ -746,10 +754,10 @@ def _recovery_chimaera(sizes: list[str], timeout: float) -> None:
     from chimaera._runtime import Runtime
 
     Runtime.get()
-    deadline = time.time() + 60
-    while len(ch.cluster().nodes()) < 3 and time.time() < deadline:
+    deadline = time.monotonic() + 60
+    while len(ch.runs.cluster().nodes()) < 3 and time.monotonic() < deadline:
         time.sleep(0.2)
-    others = [n.peer for n in ch.cluster().nodes() if not n.this_peer]
+    others = [n.peer for n in ch.runs.cluster().nodes() if not n.this_peer]
     peer_index = {}
     for i in (1, 2):
         out = open(os.path.join(root, f"p{i}", "peer-id")).read().strip()
@@ -761,7 +769,7 @@ def _recovery_chimaera(sizes: list[str], timeout: float) -> None:
             n = parse_size(s)
             for case in ("task_result", "task_put"):
                 victim = others[0]
-                place = ch.Placement(prefer=[f"node={victim}"]) if case == "task_result" else ch.Placement(
+                place = ch.dist.Placement(prefer=[f"node={victim}"]) if case == "task_result" else ch.dist.Placement(
                     require={"node": victim})
                 if case == "task_result":
                     target = produce.options(placement=place).remote(n)

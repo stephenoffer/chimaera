@@ -83,7 +83,7 @@ def always_lost():
 
 def test_a_gang_that_keeps_losing_ranks_gives_up_after_max_attempts():
     gang = always_lost.options(ranks=2).gang()
-    with pytest.raises(ch.GangFailed, match="generation 2 lost a rank"):
+    with pytest.raises(ch.errors.GangFailed, match="generation 2 lost a rank"):
         gang.result(timeout=180)
 
 
@@ -120,7 +120,7 @@ def test_an_actor_gang_builds_ranks_together_and_fans_calls_out():
 
 
 def _peer_cpus() -> float:
-    return sum(n.cpus for n in ch.cluster().nodes() if n.alive)
+    return sum(n.cpus for n in ch.runs.cluster().nodes() if n.alive)
 
 
 def test_an_elastic_gang_takes_as_many_ranks_as_the_peers_hold():
@@ -247,12 +247,12 @@ class Member:
 
 def test_actors_made_a_group_meet_and_reduce():
     members = [Member.remote() for _ in range(3)]
-    handle = ch.group(*members, key=f"t-{os.getpid()}")
+    handle = ch.dist.group(*members, name=f"t-{os.getpid()}")
     futures = [m.total.remote(handle, 10 * (i + 1)) for i, m in enumerate(members)]
     assert [f.result(timeout=120) for f in futures] == [(r, 3, handle.generation, 60) for r in range(3)]
     assert handle.explain()["summary"] == "every rank is in collective #1 (all_reduce); none is behind"
     # The same key again is a new generation, here with two of them in another order.
-    again = ch.group(members[2], members[0], key=handle.key)
+    again = ch.dist.group(members[2], members[0], name=handle.key)
     assert again.generation == handle.generation + 1
     pair = [members[2].total.remote(again, 1), members[0].total.remote(again, 2)]
     assert [f.result(timeout=120) for f in pair] == [(0, 2, again.generation, 3), (1, 2, again.generation, 3)]
@@ -262,7 +262,7 @@ def test_actors_made_a_group_meet_and_reduce():
     with pytest.raises(ValueError, match="inside a method"):
         again.join()  # the driver is not a member
     with pytest.raises(TypeError, match="takes actors"):
-        ch.group(where_am_i)
+        ch.dist.group(where_am_i)
     for m in [*members, other]:
         m.close()
 
@@ -294,3 +294,23 @@ def bad_mesh():
 
 def test_a_mesh_must_cover_the_group_and_its_axes_have_no_torch_group():
     assert bad_mesh.options(ranks=2).gang().result(timeout=120) == ["ok", "ok"]
+
+
+def test_a_gang_is_a_future_like_any_call():
+    gang = sums.options(ranks=2).gang()
+    assert isinstance(gang, ch.Future)
+    done, pending = ch.wait([gang], timeout=120)
+    assert done == [gang] and not pending
+
+    @ch.remote
+    def first_of(results):
+        return results[0]
+
+    assert first_of.remote(sums.options(ranks=2).gang()).result(timeout=120) == (3, [0, 1])
+
+    import asyncio
+
+    async def main():
+        return await sums.options(ranks=2).gang()
+
+    assert asyncio.run(main()) == [(3, [0, 1])] * 2

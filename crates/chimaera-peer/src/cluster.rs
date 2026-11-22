@@ -38,6 +38,13 @@ use tokio::sync::{Mutex, mpsc};
 
 const PLAN_FILE: &str = "cluster.plan";
 const HOSTED_FILE: &str = "hosted-groups";
+/// Addresses of the members this peer last knew, one per line: a restart
+/// whose seeds are all gone rejoins through them.
+const MEMBERS_FILE: &str = "members";
+
+fn known_members(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join(MEMBERS_FILE)).unwrap_or_default().lines().map(str::to_string).collect()
+}
 const PING_EVERY: Duration = Duration::from_millis(100);
 const PING_TIMEOUT: Duration = Duration::from_millis(800);
 /// A member whose port refuses connections this long is dead (its process is gone).
@@ -74,21 +81,38 @@ pub fn compute_plan(cluster: &str, data_groups: u32, mut founders: Vec<pb::Membe
     founders.sort_by_key(|m| m.node_id);
     let directory_voters = founders.iter().take(DIRECTORY_VOTERS).map(|m| m.node_id).collect();
     let groups = (1..=data_groups)
-        .map(|g| {
-            let mut ranked: Vec<(u64, u64)> = founders
-                .iter()
-                .map(|m| {
-                    let h = blake3::hash(&[g.to_le_bytes().as_slice(), &m.node_id.to_le_bytes()].concat());
-                    (u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes")), m.node_id)
-                })
-                .collect();
-            ranked.sort();
-            let mut voters: Vec<u64> = ranked.into_iter().take(GROUP_VOTERS).map(|(_, n)| n).collect();
-            voters.sort();
-            pb::GroupVoters { group: g, voters }
-        })
+        .map(|g| pb::GroupVoters { group: g, voters: target_voters(g, &founders, GROUP_VOTERS) })
         .collect();
     pb::ClusterPlan { cluster: cluster.to_string(), data_groups, directory_voters, groups, founders }
+}
+
+/// The `n` members that should vote in group `group`, sorted: each member's
+/// rank is a hash of (group, node), so groups spread over every member and a
+/// member joining or leaving moves few seats. Members labelled with distinct
+/// `zone`s are taken first, so a zone's loss leaves a majority where it can.
+pub fn target_voters(group: u32, members: &[pb::Member], n: usize) -> Vec<u64> {
+    let mut ranked: Vec<(u64, &pb::Member)> = members
+        .iter()
+        .map(|m| {
+            let h = blake3::hash(&[group.to_le_bytes().as_slice(), &m.node_id.to_le_bytes()].concat());
+            (u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes")), m)
+        })
+        .collect();
+    ranked.sort_by_key(|(h, m)| (*h, m.node_id));
+    let mut zones = BTreeSet::new();
+    let mut voters: Vec<u64> = Vec::new();
+    for (_, m) in &ranked {
+        if voters.len() < n && m.labels.get("zone").is_some_and(|z| zones.insert(z.clone())) {
+            voters.push(m.node_id);
+        }
+    }
+    for (_, m) in &ranked {
+        if voters.len() < n && !voters.contains(&m.node_id) {
+            voters.push(m.node_id);
+        }
+    }
+    voters.sort();
+    voters
 }
 
 fn voters_in(plan: &pb::ClusterPlan, group: u32) -> Vec<u64> {
@@ -227,10 +251,78 @@ async fn form(mesh: &MeshClient, cfg: &ClusterConfig) -> io::Result<pb::ClusterP
     }
 }
 
+/// How long a restarting peer looks for leaders of its groups before keeping
+/// state it may have lost (see `durability::guard`).
+const OTHERS_LEAD_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether, for every group whose state is under `raft`, another voter is up
+/// and leads it: then this peer's possibly stale copy is not needed. The
+/// groups and whom to ask come from the stored memberships, the cluster plan,
+/// the hosted-groups file and the seeds: memberships alone can be missing from
+/// unsynced state, and an unknown group must never count as led.
+fn others_lead(raft: &std::path::Path, cfg: &ClusterConfig) -> bool {
+    let stored = chimaera_raft::stored_voters(raft).unwrap_or_else(|e| {
+        tracing::warn!("could not read the stored raft voters ({e}); asking the cluster plan's peers");
+        BTreeMap::new()
+    });
+    let plan = std::fs::read(cfg.dir.join(PLAN_FILE)).ok().and_then(|b| pb::ClusterPlan::decode(b.as_slice()).ok());
+    let me = std::fs::read_to_string(cfg.dir.join("peer-id"))
+        .ok()
+        .and_then(|s| chimaera_core::ids::Id::parse_hex(s.trim()))
+        .map(|peer| crate::stores::Identity { peer, incarnation: 0 }.node_id());
+    let mut groups: BTreeSet<u32> = stored.keys().copied().collect();
+    groups.extend(
+        std::fs::read_to_string(cfg.dir.join(HOSTED_FILE))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok()),
+    );
+    let mut others: BTreeSet<String> = stored.values().flatten().map(|(_, addr)| addr.clone()).collect();
+    others.extend(cfg.seeds.iter().cloned());
+    if let Some(plan) = &plan {
+        groups.extend((0..=plan.data_groups).filter(|g| me.is_some_and(|me| voters_in(plan, *g).contains(&me))));
+        others.extend(plan.founders.iter().map(|m| m.addr.clone()));
+    }
+    others.extend(known_members(&cfg.dir));
+    others.remove(&cfg.advertise);
+    if groups.is_empty() {
+        return true;
+    }
+    let me = pb::Member { addr: cfg.advertise.clone(), ..Default::default() };
+    let Ok(mesh) =
+        MeshClient::new(cfg.cluster.clone(), me, cfg.token.as_deref(), cfg.tls.as_ref().map(|t| t.client.clone()))
+    else {
+        return false;
+    };
+    // Called from the peer's (multi-threaded) runtime, before it serves.
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let deadline = tokio::time::Instant::now() + OTHERS_LEAD_WAIT;
+            loop {
+                let mut led = std::collections::BTreeSet::new();
+                for addr in &others {
+                    if let Ok(g) = mesh.leads(addr, Duration::from_secs(1)).await {
+                        led.extend(g);
+                    }
+                }
+                if groups.iter().all(|g| led.contains(g)) {
+                    return true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+    })
+}
+
 /// Run a cluster peer until shutdown.
 pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     let durability = crate::durability::choose(&cfg.dir.join("raft"))?;
-    let (node, _lock) = Node::open_with(&cfg.dir, cfg.cpus, || crate::durability::guard(&cfg.dir, durability))?;
+    let (node, _lock) = Node::open_with(&cfg.dir, cfg.cpus, || {
+        crate::durability::guard(&cfg.dir, durability, |raft| others_lead(raft, &cfg))
+    })?;
     let me = pb::Member {
         peer: node.identity.peer.to_vec(),
         incarnation: node.identity.incarnation,
@@ -278,7 +370,7 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
         pb::mesh_server::MeshServer::new(MeshService(server.clone()))
             .max_decoding_message_size(256 << 20)
             .max_encoding_message_size(256 << 20),
-        CheckToken::new(cfg.token.as_deref()),
+        CheckToken::peers(cfg.token.as_deref()),
     );
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = &cfg.tls {
@@ -301,9 +393,17 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     let plan = match std::fs::read(&plan_path).ok().and_then(|b| pb::ClusterPlan::decode(b.as_slice()).ok()) {
         Some(p) => {
             // A restart: tell the seeds this incarnation exists (best effort;
-            // SWIM gossip spreads it too) and learn who joined meanwhile.
-            for seed in cfg.seeds.iter().filter(|s| **s != cfg.advertise) {
-                if let Ok(reply) = mesh.join(seed, cfg.seeds.len() as u32).await {
+            // SWIM gossip spreads it too) and learn who joined meanwhile. If no
+            // seed answers (they may all be gone), try the members it knew.
+            let mut joined = false;
+            let known = known_members(&cfg.dir);
+            let seeds = cfg.seeds.iter().filter(|s| **s != cfg.advertise);
+            for addr in seeds.chain(known.iter().filter(|a| !cfg.seeds.contains(a) && **a != cfg.advertise)) {
+                if joined && !cfg.seeds.contains(addr) {
+                    break;
+                }
+                if let Ok(reply) = mesh.join(addr, cfg.seeds.len() as u32).await {
+                    joined = true;
                     for m in reply.members {
                         if m.node_id != me.node_id {
                             mesh.upsert(m);
@@ -371,22 +471,20 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     }
 
     // Every vshard owned by its group (idempotent at epoch 1), and anything
-    // the previous incarnation of this peer held fenced and requeued.
+    // the previous incarnation of this peer held fenced and requeued. Healthy
+    // groups take a moment; one that lost its quorum keeps trying in the
+    // background while this peer serves the others.
+    let prev = (node.identity.incarnation > 1)
+        .then(|| pb::PeerInc { peer: node.identity.peer.to_vec(), inc: node.identity.incarnation - 1 });
+    let mut adopting = tokio::task::JoinSet::new();
     for g in router.data_groups() {
-        let vshards = router.vshards_of(g);
-        let first = vshards[0] as u16;
-        router
-            .propose(first, pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards, epoch: 1 }))
-            .await
-            .map_err(|e| io::Error::other(format!("group {g} did not accept its vshards: {e}")))?;
-        if node.identity.incarnation > 1 {
-            let prev = pb::PeerInc { peer: node.identity.peer.to_vec(), inc: node.identity.incarnation - 1 };
-            router
-                .propose(first, pb::shard_cmd::Body::Retire(pb::RetireIncarnation { peer: Some(prev) }))
-                .await
-                .map_err(io::Error::other)?;
-        }
+        adopting.spawn(adopt_vshards(router.clone(), g, prev.clone()));
     }
+    let all = async { while adopting.join_next().await.is_some() {} };
+    if tokio::time::timeout(ADOPT_WAIT, all).await.is_err() {
+        tracing::warn!("serving while some groups have no leader yet; they are retried in the background");
+    }
+    adopting.detach_all();
     tracing::info!(
         node = me.node_id,
         addr = %cfg.advertise,
@@ -394,7 +492,8 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
         "cluster peer ready"
     );
 
-    tokio::spawn(liveness(router.clone(), mesh.clone(), node.core_tx.clone()));
+    let planned: BTreeMap<u32, usize> = (0..=plan.data_groups).map(|g| (g, voters_in(&plan, g).len())).collect();
+    tokio::spawn(liveness(router.clone(), mesh.clone(), node.core_tx.clone(), planned, cfg.dir.join(MEMBERS_FILE)));
     let clients = cfg.client_listen.map(|addr| runtime::ClientListen {
         addr,
         token: cfg.token.clone(),
@@ -409,13 +508,52 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     served
 }
 
+/// How long startup waits for its groups to accept their vshards before
+/// serving without the ones that have not.
+const ADOPT_WAIT: Duration = Duration::from_secs(15);
+
+/// Have group `g` own its vshards and retire this peer's previous
+/// incarnation there, retrying until the group has a leader again.
+async fn adopt_vshards(router: Arc<Router>, g: u32, prev: Option<pb::PeerInc>) {
+    let vshards = router.vshards_of(g);
+    let first = vshards[0] as u16;
+    let mut warned = Instant::now();
+    loop {
+        let adopt = pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards: vshards.clone(), epoch: 1 });
+        let mut r = router.propose(first, adopt).await.map(|_| ());
+        if let (Ok(()), Some(p)) = (&r, &prev) {
+            let retire = pb::shard_cmd::Body::Retire(pb::RetireIncarnation { peer: Some(p.clone()) });
+            r = router.propose(first, retire).await.map(|_| ());
+        }
+        match r {
+            Ok(()) => return,
+            Err(e) if warned.elapsed() >= Duration::from_secs(30) => {
+                tracing::warn!("group {g} did not accept its vshards yet ({e}); still trying");
+                warned = Instant::now();
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Ping every member; mark silent ones dead; as a group leader, retire dead
 /// incarnations and replace dead voters.
-async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>, core: mpsc::Sender<CoreMsg>) {
+async fn liveness(
+    router: Arc<Router>,
+    mesh: Arc<MeshClient>,
+    core: mpsc::Sender<CoreMsg>,
+    planned: BTreeMap<u32, usize>,
+    members_file: PathBuf,
+) {
     let mut dead_since: BTreeMap<u64, Instant> = BTreeMap::new();
     // Members whose port has refused every probe since then: their process is
     // gone, so they are declared dead after REFUSED_FOR, not after suspicion.
     let mut refused_since: BTreeMap<u64, Instant> = BTreeMap::new();
+    let mut recorded: Vec<String> = Vec::new();
+    // Rebalancing waits for membership to settle, and for a group's last change.
+    let mut stable_since = Instant::now();
+    let mut changed_at: BTreeMap<u32, Instant> = BTreeMap::new();
     let mut tick = tokio::time::interval(PING_EVERY);
     loop {
         tick.tick().await;
@@ -449,9 +587,20 @@ async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>, core: mpsc::Sender
             let mut swim = mesh.swim.lock().expect("lock");
             for (target, reached, refused) in results {
                 swim.probed(now, target, reached);
-                if !refused {
+                // A refusal starts the clock and only an answer stops it: once
+                // the process is gone, later probes may fail other ways (a
+                // reset connection, a reconnect backing off) without it
+                // coming back.
+                if reached {
                     refused_since.remove(&target);
-                } else if refused_since.entry(target).or_insert_with(Instant::now).elapsed() >= REFUSED_FOR {
+                    continue;
+                }
+                let since = if refused {
+                    Some(*refused_since.entry(target).or_insert_with(Instant::now))
+                } else {
+                    refused_since.get(&target).copied()
+                };
+                if since.is_some_and(|t| t.elapsed() >= REFUSED_FOR) {
                     refused_since.remove(&target);
                     swim.fail(now, target);
                 }
@@ -459,6 +608,19 @@ async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>, core: mpsc::Sender
             swim.expire(now);
             swim.take_changes()
         };
+        // Who else is here, for a restart whose seeds are gone. Never
+        // emptied: a peer that finds itself alone keeps the list it had.
+        let mut live: Vec<String> = mesh.live_others().into_iter().map(|p| p.member.addr).collect();
+        live.sort();
+        if live != recorded {
+            stable_since = Instant::now();
+        }
+        if !live.is_empty() && live != recorded {
+            match write_atomic(&members_file, live.join("\n").as_bytes()) {
+                Ok(()) => recorded = live,
+                Err(e) => tracing::warn!("could not record the members: {e}"),
+            }
+        }
         for c in changes {
             let peer = mesh.member(c.node).map(|p| p.member.peer).unwrap_or_default();
             let what = match c.state {
@@ -486,7 +648,92 @@ async fn liveness(router: Arc<Router>, mesh: Arc<MeshClient>, core: mpsc::Sender
                 }
             }
         }
-        replace_voters(&router, &mesh, &dead_since).await;
+        replace_voters(&router, &mesh, &dead_since, &planned).await;
+        if stable_since.elapsed() >= rebalance_after() {
+            rebalance(&router, &mesh, planned.len(), &mut changed_at).await;
+        }
+    }
+}
+
+/// How long membership must be steady before voters and leaders move
+/// (`CHIMAERA_REBALANCE_SECONDS`, default 60).
+fn rebalance_after() -> Duration {
+    static AFTER: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        let s = std::env::var("CHIMAERA_REBALANCE_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        Duration::from_secs(s)
+    })
+}
+
+/// Move one voter seat, or one leadership, toward an even spread, when
+/// membership has been steady. Founders hold every seat when a cluster forms;
+/// without this, peers that join later run calls but never share the
+/// commits, and every call in the cluster commits on the founders.
+///
+/// For each group this peer leads whose voters differ from
+/// [`target_voters`] over the live members: add one missing target as a
+/// learner, then swap it in for one voter that is not a target (one change
+/// per group per `rebalance_after`). Then, if this peer leads more groups
+/// than its share, it hands one to a voter that leads fewer.
+async fn rebalance(
+    router: &Arc<Router>,
+    mesh: &Arc<MeshClient>,
+    groups: usize,
+    changed_at: &mut BTreeMap<u32, Instant>,
+) {
+    let others = mesh.live_others();
+    let mut members: Vec<pb::Member> = others.iter().map(|p| p.member.clone()).collect();
+    members.push(mesh.me.clone());
+    let me = mesh.me.node_id;
+    for g in router.hosted_groups() {
+        if !router.leads(g.id) || changed_at.get(&g.id).is_some_and(|t| t.elapsed() < rebalance_after()) {
+            continue;
+        }
+        let voters: BTreeSet<u64> = g.view().1.into_iter().collect();
+        let target: BTreeSet<u64> = target_voters(g.id, &members, voters.len()).into_iter().collect();
+        let (Some(add), Some(remove)) =
+            (target.difference(&voters).next().copied(), voters.difference(&target).find(|v| **v != me).copied())
+        else {
+            continue;
+        };
+        let Some(addr) = others.iter().find(|p| p.member.node_id == add).map(|p| p.member.addr.clone()) else {
+            continue;
+        };
+        changed_at.insert(g.id, Instant::now());
+        tracing::info!(group = g.id, add, remove, "moving a voter seat to spread the group");
+        if let Err(e) = g.add_learner(add, &addr).await {
+            tracing::warn!(group = g.id, "cannot add learner {add}: {e}");
+            continue;
+        }
+        let next: BTreeSet<u64> = voters.iter().copied().filter(|v| *v != remove).chain([add]).collect();
+        match g.change_voters(next.clone()).await {
+            Ok(()) => mesh.set_voters(g.id, next.into_iter().collect()),
+            Err(e) => tracing::warn!(group = g.id, "membership change failed: {e}"),
+        }
+        return; // one change at a time across the cluster's groups led here
+    }
+    // Leadership: at most an even share of the groups led here.
+    let led = router.leading();
+    let share = groups.div_ceil(members.len().max(1));
+    if led.len() <= share {
+        return;
+    }
+    let leads = |node: u64| {
+        others.iter().find(|p| p.member.node_id == node).and_then(|p| p.load.as_ref()).map(|l| l.leading.len())
+    };
+    for g in router.hosted_groups().into_iter().filter(|g| led.contains(&g.id)) {
+        if changed_at.get(&g.id).is_some_and(|t| t.elapsed() < rebalance_after()) {
+            continue;
+        }
+        let to = g.view().1.into_iter().filter(|v| *v != me).filter_map(|v| leads(v).map(|n| (n, v))).min();
+        if let Some((n, to)) = to.filter(|(n, _)| *n < share) {
+            changed_at.insert(g.id, Instant::now());
+            tracing::info!(group = g.id, to, leads = n, "handing leadership to spread the groups' leaders");
+            if let Err(e) = g.transfer_leader(to).await {
+                tracing::warn!(group = g.id, "leadership transfer failed: {e}");
+            }
+            return;
+        }
     }
 }
 
@@ -511,8 +758,14 @@ fn retire_everywhere(router: &Arc<Router>, m: &pb::Member) {
 }
 
 /// For each group this peer leads, swap voters dead longer than
-/// `REPLACE_AFTER` for live members that do not vote in it yet.
-async fn replace_voters(router: &Arc<Router>, mesh: &Arc<MeshClient>, dead_since: &BTreeMap<u64, Instant>) {
+/// `REPLACE_AFTER` for live members that do not vote in it yet, and add
+/// voters to a group left with fewer than `planned` (after `cluster recover`).
+async fn replace_voters(
+    router: &Arc<Router>,
+    mesh: &Arc<MeshClient>,
+    dead_since: &BTreeMap<u64, Instant>,
+    planned: &BTreeMap<u32, usize>,
+) {
     for g in router.hosted_groups() {
         if !router.leads(g.id) {
             continue;
@@ -520,21 +773,28 @@ async fn replace_voters(router: &Arc<Router>, mesh: &Arc<MeshClient>, dead_since
         let voters: BTreeSet<u64> = g.view().1.into_iter().collect();
         let dead: Vec<u64> =
             voters.iter().copied().filter(|n| dead_since.get(n).is_some_and(|t| t.elapsed() > REPLACE_AFTER)).collect();
-        if dead.is_empty() {
+        let missing = planned.get(&g.id).copied().unwrap_or(GROUP_VOTERS).saturating_sub(voters.len());
+        if dead.is_empty() && missing == 0 {
             continue;
         }
         let mut spares: Vec<_> =
             mesh.live_others().into_iter().filter(|p| !voters.contains(&p.member.node_id)).collect();
         spares.sort_by(|a, b| a.pressure().total_cmp(&b.pressure()));
         let mut next: BTreeSet<u64> = voters.clone();
-        for (gone, spare) in dead.iter().zip(spares.iter()) {
+        let wanted = dead.iter().map(Some).chain(std::iter::repeat_n(None, missing));
+        for (gone, spare) in wanted.zip(spares.iter()) {
             let id = spare.member.node_id;
-            tracing::info!(group = g.id, gone, replacement = id, "replacing a dead voter");
+            match gone {
+                Some(gone) => tracing::info!(group = g.id, gone, added = id, "adding a voter: replacing a dead voter"),
+                None => tracing::info!(group = g.id, added = id, "adding a voter"),
+            }
             if let Err(e) = g.add_learner(id, &spare.member.addr).await {
                 tracing::warn!(group = g.id, "cannot add learner {id}: {e}");
                 continue;
             }
-            next.remove(gone);
+            if let Some(gone) = gone {
+                next.remove(gone);
+            }
             next.insert(id);
         }
         if next != voters
@@ -547,6 +807,18 @@ async fn replace_voters(router: &Arc<Router>, mesh: &Arc<MeshClient>, dead_since
     }
 }
 
+/// `chimaera cluster recover`: with this peer stopped, make it the only voter
+/// of `group` from the state it holds (see `chimaera_raft::force_single_voter`).
+pub fn recover_group(dir: &std::path::Path, group: u32) -> io::Result<u64> {
+    let _lock = runtime::lock_dir(dir)?;
+    let peer = std::fs::read_to_string(dir.join("peer-id"))
+        .ok()
+        .and_then(|s| chimaera_core::ids::Id::parse_hex(s.trim()))
+        .ok_or_else(|| io::Error::other(format!("{} holds no peer identity", dir.display())))?;
+    let node = crate::stores::Identity { peer, incarnation: 0 }.node_id();
+    chimaera_raft::force_single_voter(&dir.join("raft"), group, node)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -554,6 +826,33 @@ mod tests {
 
     fn member(n: u64) -> pb::Member {
         pb::Member { node_id: n, addr: format!("10.0.0.{n}:7000"), cpus: 4.0, ..Default::default() }
+    }
+
+    #[test]
+    fn voters_spread_over_zones_and_a_new_member_moves_few_seats() {
+        let zoned = |n: u64, zone: &str| pb::Member {
+            node_id: n,
+            labels: [("zone".to_string(), zone.to_string())].into(),
+            ..member(n)
+        };
+        let members: Vec<pb::Member> =
+            vec![zoned(1, "a"), zoned(2, "a"), zoned(3, "a"), zoned(4, "b"), zoned(5, "b"), zoned(6, "c")];
+        for g in 0..32 {
+            let v = target_voters(g, &members, 3);
+            let zones: BTreeSet<_> =
+                v.iter().map(|n| members.iter().find(|m| m.node_id == *n).unwrap().labels["zone"].clone()).collect();
+            assert_eq!(zones.len(), 3, "group {g}: {v:?} share a zone");
+        }
+        let before: Vec<pb::Member> = (1..=6).map(member).collect();
+        let after: Vec<pb::Member> = (1..=7).map(member).collect();
+        let moved: usize = (0..64)
+            .map(|g| {
+                let (a, b) = (target_voters(g, &before, 3), target_voters(g, &after, 3));
+                a.iter().filter(|n| !b.contains(n)).count()
+            })
+            .sum();
+        assert!(moved <= 64 * 3 / 3, "a seventh member took {moved} of 192 seats");
+        assert!(moved > 0, "a new member takes some seats");
     }
 
     #[test]

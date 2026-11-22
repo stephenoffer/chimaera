@@ -17,7 +17,7 @@ from .placement_group import (
 )
 
 _ALTERNATIVES = {
-    "state": ("ch.cluster() and `chimaera inspect`", "P3"),
+    "state": ("ch.runs.cluster() and `chimaera inspect`", "P3"),
     "metrics": ("context().report() and the peer /metrics endpoint", "P4"),
     "inspect_serializability": (
         "submission preflight, which names the captured variable",

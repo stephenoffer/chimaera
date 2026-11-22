@@ -1,9 +1,9 @@
-"""The accelerators a call was granted: ``ch.device()`` and ``ch.devices()``.
+"""The accelerators a call was granted: ``ch.dist.device()`` and ``ch.dist.devices()``.
 
     @ch.remote(gpus=1)
     def train(batch):
         import torch
-        model.to(ch.device())          # "cuda:0", "xla:0", "hpu", "xpu:0" or "mps"
+        model.to(ch.dist.device())          # "cuda:0", "xla:0", "hpu", "xpu:0" or "mps"
 
 The peer starts the call's worker with only its granted devices visible
 (``CUDA_VISIBLE_DEVICES`` and the other vendors' variables) and lists them in

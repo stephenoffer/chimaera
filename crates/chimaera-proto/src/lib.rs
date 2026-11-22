@@ -10,12 +10,81 @@ pub mod frame;
 /// committed feature level includes it.
 pub const WIRE_VERSION: u32 = 1;
 
+/// What a peer's replicated state machine and peer-to-peer RPCs understand.
+/// Peers refuse mesh calls from a peer at another level: every replica of a
+/// group must apply its log with the same code. Raise it with any change to
+/// shard commands, their effects, or mesh messages; an upgrade then restarts
+/// every peer onto the new release (docs/deploy.md, "Upgrading").
+pub const PEER_LEVEL: u32 = 1;
+
 #[allow(clippy::all, clippy::pedantic)]
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/chimaera.v1.rs"));
 }
 
 pub use prost::Message;
+
+/// How drivers and the CLI reach a peer: over TCP with the cluster token
+/// (and TLS), or over the local peer's socket.
+#[cfg(feature = "grpc")]
+pub mod client {
+    use std::time::Duration;
+    use tonic::metadata::{Ascii, MetadataValue};
+    use tonic::service::interceptor::InterceptedService;
+    use tonic::transport::Channel;
+
+    pub type PeerClient = crate::v1::peer_client::PeerClient<InterceptedService<Channel, Auth>>;
+
+    /// Adds the cluster token to every call (TCP clients; the local socket needs none).
+    #[derive(Clone)]
+    pub struct Auth(Option<MetadataValue<Ascii>>);
+
+    impl Auth {
+        pub fn bearer(token: Option<&str>) -> Result<Auth, String> {
+            token
+                .map(|t| format!("Bearer {}", t.trim()).parse())
+                .transpose()
+                .map(Auth)
+                .map_err(|_| "the cluster token must be printable ASCII".to_string())
+        }
+    }
+
+    impl tonic::service::Interceptor for Auth {
+        fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+            if let Some(v) = &self.0 {
+                req.metadata_mut().insert("authorization", v.clone());
+            }
+            Ok(req)
+        }
+    }
+
+    /// A channel to a peer: `tcp://host:port` (TLS when `ca` names the cluster's
+    /// ca.pem, verifying the name every peer certificate carries) or a Unix socket path.
+    pub async fn channel(address: &str, ca: Option<&str>) -> Result<Channel, String> {
+        let Some(hostport) = address.strip_prefix("tcp://") else {
+            return crate::uds::connect(address.to_string()).await.map_err(|e| e.to_string());
+        };
+        let scheme = if ca.is_some() { "https" } else { "http" };
+        let mut ep = tonic::transport::Endpoint::from_shared(format!("{scheme}://{hostport}"))
+            .map_err(|e| e.to_string())?
+            .connect_timeout(Duration::from_secs(10));
+        if let Some(ca) = ca {
+            let pem = std::fs::read(ca).map_err(|e| format!("{ca}: {e}"))?;
+            let tls = tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(pem))
+                .domain_name("chimaera-peer");
+            ep = ep.tls_config(tls).map_err(|e| e.to_string())?;
+        }
+        ep.connect().await.map_err(|e| e.to_string())
+    }
+
+    /// A client of the peer at `address` (as for [`channel`]) presenting `token`.
+    pub async fn connect(address: &str, token: Option<&str>, ca: Option<&str>) -> Result<PeerClient, String> {
+        let auth = Auth::bearer(token)?;
+        let ch = channel(address, ca).await?;
+        Ok(crate::v1::peer_client::PeerClient::with_interceptor(ch, auth).max_decoding_message_size(256 << 20))
+    }
+}
 
 /// gRPC over a Unix domain socket (local peers).
 #[cfg(feature = "grpc")]

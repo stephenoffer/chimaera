@@ -1,6 +1,6 @@
-"""Reservations (placement groups): ``ch.reserve(bundles, strategy=...)``.
+"""Reservations (placement groups): ``ch.dist.reserve(bundles, strategy=...)``.
 
-    res = ch.reserve([{"cpus": 2, "gpus": 1}] * 4, strategy="spread").ready()
+    res = ch.dist.reserve([{"cpus": 2, "gpus": 1}] * 4, strategy="spread").ready()
     workers = [Trainer.options(within=res[i]).remote(i) for i in range(4)]
     step.options(within=res[0]).remote(batch)
 
@@ -16,7 +16,8 @@ Calls in one bundle share its host process (threads, up to the bundle's
 CPUs at once); give each parallel worker its own bundle.
 
 Every bundle is held, or none: a try that cannot hold them all within
-``Reservation.HOLD_S`` lets go and tries again after a random pause, so
+``Reservation.HOLD_S`` (or whose holder dies) lets go and tries again after a
+random pause, so
 reservations competing for the same capacity take turns (a try starts only
 when the peers report the CPUs free, and gives everything back if a peer ends
 up over capacity). shortcut: the holds are taken by the client from the peers'
@@ -34,8 +35,8 @@ import threading
 import time
 from typing import Any
 
-from ._errors import Infeasible
-from ._future import Future, gather
+from ._errors import ChimaeraError, Infeasible
+from ._future import Future, get
 from ._options import Placement
 from ._remote import remote
 
@@ -89,7 +90,7 @@ class Bundle:
 
 
 class Reservation:
-    """Resources held on peers for later calls (``ch.reserve``)."""
+    """Resources held on peers for later calls (``ch.dist.reserve``)."""
 
     # One try holds some bundles for at most this long while waiting for the rest.
     HOLD_S = 15.0
@@ -132,20 +133,19 @@ class Reservation:
                     targets = back_off()
                     continue
                 hosts = [self._place(i, t) for i, t in enumerate(targets)]
+                probes = [h.node.remote() for h in hosts]
                 try:
-                    nodes = gather(*(h.node.remote() for h in hosts), timeout=self.HOLD_S)
-                except TimeoutError:
+                    nodes = get(probes, timeout=self.HOLD_S)
+                except (TimeoutError, ChimaeraError):  # slow, or a holder died: this try failed, not the reservation
                     nodes = None
                 # Another reservation may have taken the same CPUs in the meantime:
                 # then neither keeps them, and the random pause picks a winner.
                 if nodes is None or self._overcommitted(nodes):
-                    for h in hosts:
-                        h.close()
+                    _let_go(hosts, probes)
                     targets = back_off()
                     continue
                 if self._released:  # released while this try was waiting
-                    for h in hosts:
-                        h.close()
+                    _let_go(hosts, probes)
                     return
                 self._hosts, self._nodes = hosts, nodes
                 store.put("nodes", nodes, ttl="24h")
@@ -265,6 +265,16 @@ class Reservation:
 
     def __exit__(self, *exc: object) -> None:
         self.release()
+
+
+def _let_go(hosts: list[Any], probes: list[Future[Any]]) -> None:
+    """Give up a try: cancel its probes (a holder that never started would
+    leave its probe unfinished, and the driver waits for those at exit) and
+    close its holders."""
+    for p in probes:
+        p.cancel()
+    for h in hosts:
+        h.close()
 
 
 @remote(cpus=0.01)

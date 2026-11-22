@@ -38,6 +38,12 @@ pub struct Router {
     leading: RwLock<BTreeSet<u32>>,
     leader_hint: Mutex<HashMap<u32, u64>>,
     pub mesh: Option<Arc<MeshClient>>,
+    /// Calls this peer could start now (free CPUs less what is queued),
+    /// published by the core, taken by ingress for local-first grants.
+    local_room: std::sync::atomic::AtomicI64,
+    /// Local-first grants handed out whose work has not reached the queue
+    /// yet: they count against the room the core publishes.
+    local_pending: std::sync::atomic::AtomicI64,
 }
 
 impl Router {
@@ -61,6 +67,8 @@ impl Router {
             groups: RwLock::new(BTreeMap::new()),
             leading: RwLock::new(BTreeSet::new()),
             leader_hint: Mutex::new(HashMap::new()),
+            local_room: std::sync::atomic::AtomicI64::new(0),
+            local_pending: std::sync::atomic::AtomicI64::new(0),
             mesh,
         }
     }
@@ -125,6 +133,39 @@ impl Router {
         self.leader_hint.lock().expect("lock").insert(group, node);
     }
 
+    /// Publish how many more calls this peer could start now, less the
+    /// local-first grants still on their way to the queue.
+    pub fn set_local_room(&self, room: i64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let pending = self.local_pending.load(Relaxed);
+        self.local_room.store((room - pending).max(0), Relaxed);
+    }
+
+    /// Work reached this peer's queue: one fewer grant on its way.
+    pub fn local_arrived(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self.local_pending.fetch_update(Relaxed, Relaxed, |p| Some((p - 1).max(0)));
+    }
+
+    /// Claim up to `want` of the local room; returns how many were claimed.
+    pub fn take_local_room(&self, want: usize) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut have = self.local_room.load(Relaxed);
+        loop {
+            let take = have.min(want as i64).max(0);
+            if take == 0 {
+                return 0;
+            }
+            match self.local_room.compare_exchange_weak(have, have - take, Relaxed, Relaxed) {
+                Ok(_) => {
+                    self.local_pending.fetch_add(take, Relaxed);
+                    return take as usize;
+                }
+                Err(now) => have = now,
+            }
+        }
+    }
+
     /// The last leader this peer heard of for `group`.
     pub fn leader_hint(&self, group: u32) -> Option<u64> {
         self.leader_hint.lock().expect("lock").get(&group).copied()
@@ -134,6 +175,25 @@ impl Router {
     /// A follower's view may lag the leader's.
     pub fn read<T>(&self, vshard: u16, f: impl FnOnce(&dyn KvRead) -> T) -> Option<T> {
         self.hosted(self.group_of(vshard))?.read(f).ok()
+    }
+
+    /// The runs whose records this peer's replica of `group` holds, without
+    /// their environment; None when this peer does not host the group.
+    pub fn runs_of(&self, group: u32) -> Option<Vec<pb::RunRecord>> {
+        let vshards = self.vshards_of(group);
+        let mut runs = self
+            .hosted(group)?
+            .read(|kv| {
+                vshards
+                    .iter()
+                    .flat_map(|v| chimaera_core::shard::read::runs(kv, *v as u16, usize::MAX))
+                    .collect::<Vec<_>>()
+            })
+            .ok()?;
+        for r in &mut runs {
+            r.exec_env = None;
+        }
+        Some(runs)
     }
 
     /// Next local HLC timestamp (monotonic even if the wall clock steps back).
@@ -166,6 +226,15 @@ impl Router {
     /// retrying through elections. Shard commands are idempotent, so a retry
     /// after an ambiguous failure is safe.
     pub async fn propose_cmd(&self, cmd: pb::ShardCmd) -> Result<pb::ShardReply, ProposeError> {
+        crate::counters::PROPOSALS.add(1);
+        let reply = self.propose_until_accepted(cmd).await;
+        if reply.is_err() {
+            crate::counters::PROPOSAL_FAILURES.add(1);
+        }
+        reply
+    }
+
+    async fn propose_until_accepted(&self, cmd: pb::ShardCmd) -> Result<pb::ShardReply, ProposeError> {
         let group = self.group_of(cmd.vshard as u16);
         let Some(mesh) = &self.mesh else {
             let g = self.hosted(group).ok_or(ProposeError::Unavailable { group, reason: "not hosted".into() })?;

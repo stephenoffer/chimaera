@@ -1,0 +1,112 @@
+"""The shared-memory arena (Linux, objects in tmpfs): Python's own large
+blocks (bytes, bytearray, lists) live in files of the object store, so a large
+`bytes` is stored by link like a NumPy array, and fork still gives the child a
+private copy of everything. Where there is no arena (other systems, objects
+on disk) the same values are copied, and every check but the linking holds."""
+
+from __future__ import annotations
+
+import gc
+import os
+import sys
+import time
+
+import chimaera as ch
+from chimaera import _native, _objects
+from chimaera._runtime import Runtime
+
+
+@ch.remote
+def size_and_tail(b: bytes) -> tuple[int, bytes]:
+    return len(b), bytes(b[-16:])
+
+
+def _arena() -> bool:
+    """Whether this process has the arena, checked against where it must."""
+    ch.put(0)  # starts the runtime, which installs the arena where it can
+    rt = Runtime.get()
+    expected = (
+        sys.platform.startswith("linux")
+        and os.environ.get("CHIMAERA_ARENA", "1") != "0"
+        and _objects._in_memory(rt.object_dir)
+    )
+    assert bool(_objects._state["installed"]) == expected, f"arena installed: {_objects._state}, expected {expected}"
+    return expected
+
+
+def _live() -> int:
+    return _native.arena_stats()[0]
+
+
+def _child_ok(status: int) -> bool:
+    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+def test_a_large_bytes_value_is_stored_by_link_again_and_again():
+    arena = _arena()
+    before = _live()
+    b = os.urandom(8 << 20)
+    claims = _native.arena_stats()[3]
+    f = ch.put(b)
+    g = ch.put(b)  # its reference count changed since: the data did not
+    if arena:
+        assert _live() == before + 1, "a large bytes value is allocated in the arena"
+        assert _native.arena_stats()[3] == claims + 2, "both puts linked the bytes instead of copying them"
+    assert ch.get(f) == b and ch.get(g) == b
+    assert size_and_tail.remote(f).result(timeout=60) == (len(b), b[-16:])
+
+
+def test_a_large_buffer_keeps_its_contents_as_it_grows_and_shrinks():
+    _arena()
+    a = bytearray(os.urandom(2 << 20))  # in the arena, resized in place there
+    head = bytes(a[:4096])
+    a.extend(b"x" * (6 << 20))
+    assert len(a) == 8 << 20 and a[:4096] == head and a[-1:] == b"x"
+    del a[1 << 20 :]
+    assert len(a) == 1 << 20 and a[:4096] == head
+    stored = bytes(a)
+    assert ch.get(ch.put(stored)) == stored
+
+
+def test_a_forked_child_does_not_share_reference_counts_with_its_parent():
+    # A large bytes object's header (its reference count) is in the arena
+    # file. Shared between parent and child, the parent dropping references
+    # after the fork would change the child's count: the child would free the
+    # object while still holding it.
+    arena = _arena()
+    before = _live()
+    b = os.urandom(4 << 20)
+    if arena:
+        assert _live() == before + 1
+    held = [b] * 1000
+    pid = os.fork()
+    if pid == 0:
+        ok = False
+        try:
+            time.sleep(0.5)  # the parent drops its 1000 references meanwhile
+            ok = len(held) == 1000 and sys.getrefcount(b) >= 1001
+            del held
+            gc.collect()
+            ok = ok and len(b) == 4 << 20
+        finally:
+            os._exit(0 if ok else 3)
+    del held
+    gc.collect()
+    _, status = os.waitpid(pid, 0)
+    assert _child_ok(status), f"the child saw its parent's reference counts: {status}"
+
+
+def test_a_forked_child_sees_the_parents_writes_made_before_the_fork():
+    # A value stored and then changed by its owner: the owner's pages are
+    # private from the store, and the child must see the owner's current
+    # data, not what was stored.
+    _arena()
+    a = bytearray(2 << 20)
+    f = ch.put(a)  # links `a`'s file where there is an arena
+    a[:4] = b"new!"
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0 if bytes(a[:4]) == b"new!" else 3)
+    _, status = os.waitpid(pid, 0)
+    assert _child_ok(status), "the child saw the stored bytes, not the parent's"
+    assert bytes(ch.get(f)[:4]) == bytes(4), "the stored value kept what was put"

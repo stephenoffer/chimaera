@@ -26,7 +26,7 @@ of waiting for a replacement. ``gang.decisions`` says what each generation
 chose. shortcut: a running generation never grows; new capacity is used by
 the next one.
 
-``ch.group(*actors)`` makes existing actors one group: pass the handle to them,
+``ch.dist.group(*actors)`` makes existing actors one group: pass the handle to them,
 and inside a member ``handle.join()`` is its ``Group``.
 
 ``explain()`` on a gang, actor gang or group handle says which collective each
@@ -34,7 +34,7 @@ rank last entered and names the ranks holding the others up. A collective's
 wait includes its name, so ranks on different code paths hang where
 ``explain()`` names them instead of mixing their data.
 
-shortcut: ranks meet through a ch.Store rendezvous and are placed one by one,
+shortcut: ranks meet through a ch.coord.Store rendezvous and are placed one by one,
 so a gang larger than the free capacity waits at the rendezvous (and retries
 after ``RENDEZVOUS_S``). All-or-nothing placement arrives with the shard's
 gang commit (plan P5).
@@ -352,100 +352,128 @@ def _rank(fn: Any, gang: str, generation: int, rank: int, world: int, args: tupl
                 os.environ[k] = v
 
 
-class Gang(Generic[R]):
-    """A running gang: ``result()`` is every rank's return value, in rank order."""
+@remote(cpus=0.01, latency="interactive")
+def _supervise(fn: Any, args: tuple, kwargs: dict, want: int | Auto, attempts: int, rank_opts: dict) -> list[Any]:
+    """Run a function gang to its end: start its ranks together; when one is
+    lost, stop the others and start the next generation (resized if
+    elastic), up to `attempts`. A rank's own error fails the gang. Each
+    generation is reported, for ``Gang.generation``, ``decisions`` and ``explain``.
 
-    def __init__(self, fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
-        eff = fn.policy()
-        self._want = _wanted(eff.get("ranks"))
-        self._attempts = int(eff.get("max_attempts") or 3)
-        rank_opts = {k: v for k, v in eff.values.items() if k in _RANK_OPTIONS and eff.sources.get(k) != "default"}
-        self._rank_opts = rank_opts
-        self._submit = _rank.options(**rank_opts) if rank_opts else _rank
-        self.size = 0
-        self.decisions: list[str] = []  # an elastic gang's size per generation, and why
-        self._fn, self._args, self._kwargs = fn, args, kwargs
-        self.id = blake3_digest(os.urandom(16))[:8].hex()
-        self.generation = 0
-        self.futures: list[Future[R]] = []
-        self._done = threading.Event()
-        self._result: list[R] | None = None
-        self._error: BaseException | None = None
-        self._cancelled = False
-        self._start()
-        threading.Thread(target=self._supervise, name=f"gang-{self.id}", daemon=True).start()
+    If the supervisor itself is lost with its peer, its retry carries on: the
+    gang is named by this call and its generations are counted in the
+    replicated store, so the next one never reuses a rendezvous."""
+    from ._context import context
+    from ._future import as_completed
+    from ._store import Store
 
-    def _start(self) -> None:
-        self.generation += 1
-        self.size, why = _size(self._want, self._rank_opts, first=self.generation == 1)
-        if why:
-            self.decisions.append(f"generation {self.generation}: {why}")
-        self.futures = [
-            self._submit.remote(self._fn, self.id, self.generation, r, self.size, self._args, self._kwargs)
-            for r in range(self.size)
-        ]
+    from ._runtime import Runtime
 
-    def _supervise(self) -> None:
-        from ._future import as_completed
-
-        while True:
-            lost: BaseException | None = None
-            try:
-                for f in as_completed(self.futures):
-                    f.result()  # raises the rank's error
-            except InfrastructureFailure as e:
-                lost = e
-            except BaseException as e:  # a rank's own error, or the gang was cancelled
-                self._finish(error=e)
-                return
-            if lost is None:
-                self._finish(result=[f.result() for f in self.futures])
-                return
-            # Force: the other ranks may be blocked in a collective with the lost one.
-            for f in self.futures:
-                f.cancel(force=True)
-            if self._cancelled or self.generation >= self._attempts:
-                self._finish(error=GangFailed(f"gang {self.id}: generation {self.generation} lost a rank: {lost}"))
-                return
-            self._start()
-
-    def _finish(self, result: list[R] | None = None, error: BaseException | None = None) -> None:
-        if error is not None:
-            for f in self.futures:
-                f.cancel(force=True)
-        self._result, self._error = result, error
-        self._done.set()
-
-    def result(self, timeout: float | None = None) -> list[R]:
-        if not self._done.wait(timeout):
-            try:
-                held = f": {self.explain()['summary']}"
-            except Exception:  # noqa: BLE001 - the timeout is the error; the explanation is extra
-                held = ""
-            raise TimeoutError(f"gang {self.id} did not finish within {timeout} s{held}")
-        if self._error is not None:
-            raise self._error
-        assert self._result is not None
-        return self._result
-
-    def cancel(self) -> None:
-        self._cancelled = True
-        for f in self.futures:
+    ctx = context()
+    gang = blake3_digest(ctx.run + ctx.task)[:8].hex()
+    store = Store(f"gang/{gang}")
+    generations = store.counter("generation")
+    submit = _rank.options(**rank_opts) if rank_opts else _rank
+    while True:
+        generation = generations.add(1)
+        # A supervisor lost with its peer left its generation's ranks waiting
+        # in a collective, holding their CPUs: end them before the next.
+        for k in store.get(f"ranks/{generation - 1}", []) if generation > 1 else []:
+            Runtime.get().client.cancel(bytes.fromhex(k), True)
+        size, why = _size(want, rank_opts, first=generation == 1)
+        futures = [submit.remote(fn, gang, generation, r, size, args, kwargs) for r in range(size)]
+        store.put(f"ranks/{generation}", [f.key.hex() for f in futures], ttl="24h")
+        report = {"gang": gang, "generation": generation, "size": size, "ranks": [f.key.hex() for f in futures]}
+        ctx.report(**report, **({"decision": f"generation {generation}: {why}"} if why else {}))
+        lost: BaseException | None = None
+        try:
+            for f in as_completed(futures):
+                f.result()  # raises the rank's error
+        except InfrastructureFailure as e:
+            lost = e
+        except BaseException:
+            for f in futures:
+                f.cancel(force=True)  # the others may be blocked in a collective with it
+            raise
+        if lost is None:
+            return [f.result() for f in futures]
+        for f in futures:
             f.cancel(force=True)
+        if generation >= attempts:
+            raise GangFailed(f"gang {gang}: generation {generation} lost a rank: {lost}")
+
+
+class Gang(Future[list[R]]):
+    """A function gang's future: every rank's value, in rank order. Wait for it,
+    ``await`` it, or pass it to another call, as any future. ``generation``,
+    ``size`` and ``decisions`` say how it ran: an elastic gang's size per
+    generation, and why. Cancelling it stops every rank."""
+
+    __slots__ = ()
+
+    def _latest(self, field: str) -> Any:
+        return next((m[field] for m in reversed(self.metrics()) if field in m), None)
+
+    @property
+    def generation(self) -> int:
+        return self._latest("generation") or 0
+
+    @property
+    def size(self) -> int:
+        return self._latest("size") or 0
+
+    @property
+    def decisions(self) -> list[str]:
+        return [m["decision"] for m in self.metrics() if "decision" in m]
 
     def explain(self) -> dict[str, Any]:
-        """Where each rank of the current generation is: its last collective, or
-        why it has not started; ``summary`` names the ranks holding the others up."""
-        futures = list(self.futures)
-        pending = [str(f.explain().get("pending_reason") or "") for f in futures]
-        return _explain(self.id, self.generation, len(futures), pending)
+        """The call's state, and where each rank of the current generation is:
+        its last collective, or why it has not started; ``summary`` names the
+        ranks holding the others up."""
+        info = super().explain()
+        gang, ranks = self._latest("gang"), self._latest("ranks")
+        if gang and ranks:
+            pending = [str(self._rt.client.explain(bytes.fromhex(k)).get("pending_reason") or "") for k in ranks]
+            info.update(_explain(gang, self.generation, len(ranks), pending))
+        else:
+            info.update(generation=0, ranks=[], summary="starting: no rank placed yet")
+        return info
 
-    def __iter__(self) -> Iterator[R]:
-        return iter(self.result())
+    def result(self, timeout: float | None = None) -> list[R]:
+        """Every rank's value. A timeout names the ranks holding the others up."""
+        try:
+            return super().result(timeout)
+        except TimeoutError:
+            if self.done():
+                raise  # a rank's own TimeoutError, not this wait's
+            try:
+                held = f": {self.explain()['summary']}"
+            except Exception:  # noqa: BLE001 -- the timeout is the error; the explanation is extra
+                held = ""
+            raise TimeoutError(f"the gang did not finish within {timeout} s{held}") from None
 
     def __repr__(self) -> str:
-        state = "done" if self._done.is_set() else f"generation {self.generation}"
-        return f"<Gang {self.id} {self.size} ranks, {state}>"
+        state = "done" if self.done() else f"generation {self.generation}"
+        return f"<Gang {self.key[16:].hex()[:12]} {self.size} ranks, {state}>"
+
+
+def start(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Gang[Any]:
+    """``fn.options(ranks=...).gang(*args)``: the gang's supervisor, as a call."""
+    from ._remote import CALL_FUNCTION, Runtime, _site, submit_call
+
+    from ._future import handles, put
+
+    def opaque(a: Any) -> Any:
+        # The supervisor never loads the arguments (only each rank does, as
+        # its own call's): it holds a handle to each, stored once.
+        return handles(a if isinstance(a, Future) else put(a))
+
+    eff = fn.policy()
+    rank_opts = {k: v for k, v in eff.values.items() if k in _RANK_OPTIONS and eff.sources.get(k) != "default"}
+    held = tuple(opaque(a) for a in args), {k: opaque(v) for k, v in kwargs.items()}
+    supervisor = (fn, *held, _wanted(eff.get("ranks")), int(eff.get("max_attempts") or 3), rank_opts)
+    return submit_call(
+        Runtime.get(), _supervise._fn, supervisor, {}, kind=CALL_FUNCTION, eff=_supervise.policy(), site=_site(3), future_cls=Gang
+    )
 
 
 @remote
@@ -591,9 +619,9 @@ _joining_lock = threading.Lock()
 
 @dataclass(frozen=True)
 class GroupHandle:
-    """Actors made one collective group by ``ch.group``. Pass it to them; inside
+    """Actors made one collective group by ``ch.dist.group``. Pass it to them; inside
     a member's method, ``join()`` is that member's ``Group`` (rank in the order
-    given to ``ch.group``). The first ``join()`` in each member waits for all
+    given to ``ch.dist.group``). The first ``join()`` in each member waits for all
     of them, as a gang's rendezvous does."""
 
     key: str
@@ -622,19 +650,19 @@ class GroupHandle:
         return _explain(f"group-{self.key}", self.generation, len(self.members))
 
 
-def group(*actors: Any, key: str | None = None) -> GroupHandle:
+def group(*actors: Any, name: str | None = None) -> GroupHandle:
     """Make `actors` one collective group (ranks in the order given). Calling it
-    again with the same ``key`` starts a new generation, for a changed set."""
+    again with the same ``name`` starts a new generation, for a changed set."""
     from ._store import Store
 
     if not actors:
-        raise ValueError("ch.group needs at least one actor")
+        raise ValueError("ch.dist.group needs at least one actor")
     bad = [a for a in actors if not isinstance(a, Actor)]
     if bad:
-        raise TypeError(f"ch.group takes actors (from Class.remote()), got {bad[0]!r}")
+        raise TypeError(f"ch.dist.group takes actors (from Class.remote()), got {bad[0]!r}")
     ids = tuple(a.id for a in actors)
     if len(set(ids)) != len(ids):
-        raise ValueError("ch.group: an actor appears more than once")
-    key = key or os.urandom(8).hex()
+        raise ValueError("ch.dist.group: an actor appears more than once")
+    key = name or os.urandom(8).hex()
     generation = Store(f"gang/group-{key}").counter("declared").add(1)
     return GroupHandle(key, generation, ids)

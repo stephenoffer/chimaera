@@ -22,8 +22,9 @@ use openraft::{EntryPayload, OptionalSend};
 use prost::Message;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const SM: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sm");
 pub(crate) const SM_META: TableDefinition<(u32, &str), &[u8]> = TableDefinition::new("sm_meta");
@@ -34,6 +35,22 @@ const CHECKPOINT_ENTRIES: u64 = 512;
 /// cannot reuse pages freed by non-durable commits until a durable one, so a
 /// long run of them makes every later commit slower.
 pub(crate) const CHECKPOINT_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Log written since a group's last snapshot, against that snapshot's size.
+/// A snapshot rewrites the group's whole state, so one is due once the log
+/// has outgrown the last snapshot (and `min` bytes): rebuilding then costs no
+/// more than the log it replaces, however large the state grows.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotDue {
+    pub(crate) log_bytes: AtomicU64,
+    pub(crate) last_size: AtomicU64,
+}
+
+impl SnapshotDue {
+    pub(crate) fn due(&self, min: u64) -> bool {
+        self.log_bytes.load(Ordering::Relaxed) >= min.max(self.last_size.load(Ordering::Relaxed))
+    }
+}
 
 /// Events emitted by one apply call of one group, delivered after the commit.
 #[derive(Debug)]
@@ -151,6 +168,7 @@ pub struct StateMachine {
     snapshot_dir: PathBuf,
     since_checkpoint: u64,
     last_checkpoint: std::time::Instant,
+    due: Arc<SnapshotDue>,
 }
 
 impl StateMachine {
@@ -168,7 +186,13 @@ impl StateMachine {
             snapshot_dir,
             since_checkpoint: 0,
             last_checkpoint: std::time::Instant::now(),
+            due: Arc::default(),
         }
+    }
+
+    /// Share the group's snapshot accounting with its log store.
+    pub(crate) fn with_due(self, due: Arc<SnapshotDue>) -> StateMachine {
+        StateMachine { due, ..self }
     }
 
     fn meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> io::Result<Option<T>> {
@@ -184,7 +208,7 @@ impl StateMachine {
     }
 }
 
-type Responder = Option<openraft::storage::ApplyResponder<TypeConfig>>;
+pub(crate) type Responder = Option<openraft::storage::ApplyResponder<TypeConfig>>;
 
 impl RaftStateMachine<TypeConfig> for StateMachine {
     type SnapshotData = std::fs::File;
@@ -237,7 +261,12 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        SnapshotBuilder { group: self.group, db: self.db.clone(), dir: self.snapshot_dir.clone() }
+        SnapshotBuilder {
+            group: self.group,
+            db: self.db.clone(),
+            dir: self.snapshot_dir.clone(),
+            due: self.due.clone(),
+        }
     }
 
     async fn install_snapshot(
@@ -248,23 +277,35 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         let path = snapshot_path(&self.snapshot_dir, self.group, meta);
         let (db, group, meta2) = (self.db.clone(), self.group, meta.clone());
         tokio::task::spawn_blocking(move || -> io::Result<()> {
-            let mut r = BufReader::new(snapshot);
-            let (_, pairs) = read_snapshot(&mut r)?;
-            let txn = db.begin_write().map_err(io_err)?;
+            // The file is in place and synced before the commit that points
+            // at it, and that one commit replaces the state, `applied`, the
+            // membership and the pointer together: a crash leaves either the
+            // old snapshot and state or the new ones, never a mix.
+            let tmp = path.with_extension("tmp");
             {
+                let mut out = std::fs::File::create(&tmp)?;
+                io::copy(&mut BufReader::new(snapshot), &mut out)?;
+                out.sync_all()?;
+            }
+            std::fs::rename(&tmp, &path)?;
+            let mut r = BufReader::new(std::fs::File::open(&path)?);
+            read_meta(&mut r)?;
+            let txn = db.begin_write().map_err(io_err)?;
+            let old = {
                 let mut t = txn.open_table(SM).map_err(io_err)?;
                 let (lo, hi) = (prefix(group), (group + 1).to_be_bytes());
                 t.retain_in(lo.as_slice()..hi.as_slice(), |_, _| false).map_err(io_err)?;
-                for (k, v) in &pairs {
-                    t.insert(with_prefix(group, k).as_slice(), v.as_slice()).map_err(io_err)?;
+                while let Some((k, v)) = next_pair(&mut r)? {
+                    t.insert(with_prefix(group, &k).as_slice(), v.as_slice()).map_err(io_err)?;
                 }
                 let mut m = txn.open_table(SM_META).map_err(io_err)?;
                 m.insert((group, "applied"), enc(&meta2.last_log_id)?.as_slice()).map_err(io_err)?;
                 m.insert((group, "membership"), enc(&meta2.last_membership)?.as_slice()).map_err(io_err)?;
-            }
+                point_at(&mut m, group, &path)?
+            };
             txn.commit().map_err(io_err)?;
-            write_snapshot_file(&path, &meta2, &pairs)?;
-            set_current_snapshot(&db, group, &path)
+            remove_replaced(old, &path);
+            Ok(())
         })
         .await
         .map_err(io_err)??;
@@ -275,7 +316,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
     async fn get_current_snapshot(&mut self) -> Result<Option<SnapshotOf<TypeConfig, Self::SnapshotData>>, io::Error> {
         let Some(path) = self.meta::<String>("snapshot")? else { return Ok(None) };
         let mut f = std::fs::File::open(&path)?;
-        let (meta, _) = read_snapshot(&mut BufReader::new(&mut f))?;
+        let meta = read_meta(&mut BufReader::new(&mut f))?; // the header only, not the state
         let f = std::fs::File::open(&path)?;
         Ok(Some(openraft::storage::Snapshot { meta, snapshot: f }))
     }
@@ -300,7 +341,7 @@ pub(crate) fn run_detached(kv: &dyn KvRead, run: &[u8]) -> Option<bool> {
     chimaera_core::shard::read::run(kv, id).map(|r| r.detached)
 }
 
-fn apply_batch(
+pub(crate) fn apply_batch(
     db: &Database,
     group: u32,
     shard: &ShardState,
@@ -353,88 +394,159 @@ fn snapshot_path(dir: &std::path::Path, group: u32, meta: &SnapshotMetaOf<TypeCo
 }
 
 /// Snapshot file: `[u32 len][postcard meta]` then `[u32 klen][key][u32 vlen][value]`*.
+/// Written from an iterator, so a group's state never has to fit in memory.
+/// Returns the file's size.
 fn write_snapshot_file(
-    path: &std::path::Path,
+    path: &Path,
     meta: &SnapshotMetaOf<TypeConfig>,
-    pairs: &[(Vec<u8>, Vec<u8>)],
-) -> io::Result<()> {
+    pairs: impl Iterator<Item = io::Result<(Vec<u8>, Vec<u8>)>>,
+) -> io::Result<u64> {
     let tmp = path.with_extension("tmp");
-    {
+    let size = {
         let mut w = BufWriter::new(std::fs::File::create(&tmp)?);
         let m = enc(meta)?;
         w.write_all(&(m.len() as u32).to_le_bytes())?;
         w.write_all(&m)?;
-        for (k, v) in pairs {
+        for pair in pairs {
+            let (k, v) = pair?;
             w.write_all(&(k.len() as u32).to_le_bytes())?;
-            w.write_all(k)?;
+            w.write_all(&k)?;
             w.write_all(&(v.len() as u32).to_le_bytes())?;
-            w.write_all(v)?;
+            w.write_all(&v)?;
         }
-        w.into_inner().map_err(io_err)?.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
+        let f = w.into_inner().map_err(io_err)?;
+        f.sync_all()?;
+        f.metadata()?.len()
+    };
+    std::fs::rename(&tmp, path)?;
+    Ok(size)
 }
 
-#[allow(clippy::type_complexity)]
-fn read_snapshot(r: &mut impl Read) -> io::Result<(SnapshotMetaOf<TypeConfig>, Vec<(Vec<u8>, Vec<u8>)>)> {
-    fn chunk(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
-        let mut len = [0u8; 4];
-        match r.read_exact(&mut len) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
-        r.read_exact(&mut buf)?;
-        Ok(Some(buf))
+fn chunk(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
     }
-    let meta = dec(&chunk(r)?.ok_or_else(|| io_err("empty snapshot"))?)?;
-    let mut pairs = Vec::new();
-    while let Some(k) = chunk(r)? {
-        let v = chunk(r)?.ok_or_else(|| io_err("truncated snapshot"))?;
-        pairs.push((k, v));
-    }
-    Ok((meta, pairs))
+    let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+    r.read_exact(&mut buf)?;
+    Ok(Some(buf))
 }
 
-fn set_current_snapshot(db: &Database, group: u32, path: &std::path::Path) -> io::Result<()> {
-    let txn = db.begin_write().map_err(io_err)?;
+fn read_meta(r: &mut impl Read) -> io::Result<SnapshotMetaOf<TypeConfig>> {
+    dec(&chunk(r)?.ok_or_else(|| io_err("empty snapshot"))?)
+}
+
+/// The next key and value after the header; None at the end of the file.
+fn next_pair(r: &mut impl Read) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let Some(k) = chunk(r)? else { return Ok(None) };
+    let v = chunk(r)?.ok_or_else(|| io_err("truncated snapshot"))?;
+    Ok(Some((k, v)))
+}
+
+/// Point group `group` at the snapshot in `path`; returns the file it pointed at before.
+fn point_at(
+    m: &mut Table<'_, (u32, &'static str), &'static [u8]>,
+    group: u32,
+    path: &Path,
+) -> io::Result<Option<String>> {
+    let old = m.get((group, "snapshot")).map_err(io_err)?.map(|v| dec::<String>(v.value())).transpose()?;
+    m.insert((group, "snapshot"), enc(&path.to_string_lossy().to_string())?.as_slice()).map_err(io_err)?;
+    Ok(old)
+}
+
+/// Delete the snapshot a new one replaced. A transfer still reading it keeps
+/// its open descriptor, so this never cuts one short.
+fn remove_replaced(old: Option<String>, new: &Path) {
+    if let Some(old) = old.filter(|o| Path::new(o) != new)
+        && let Err(e) = std::fs::remove_file(&old)
+        && e.kind() != io::ErrorKind::NotFound
     {
-        let mut m = txn.open_table(SM_META).map_err(io_err)?;
-        m.insert((group, "snapshot"), enc(&path.to_string_lossy().to_string())?.as_slice()).map_err(io_err)?;
+        tracing::warn!("could not delete the replaced snapshot {old}: {e}");
     }
-    txn.commit().map_err(io_err)
+}
+
+/// Delete snapshot files no group points at (left by a crash between writing
+/// one and committing the pointer, or by older peers that never deleted
+/// replaced snapshots), and unfinished transfers in `scratch`.
+pub(crate) fn prune_snapshots(db: &Database, dir: &Path, scratch: &Path) -> io::Result<()> {
+    let txn = db.begin_read().map_err(io_err)?;
+    let m = txn.open_table(SM_META).map_err(io_err)?;
+    let mut current = std::collections::HashSet::new();
+    for r in m.iter().map_err(io_err)? {
+        let (k, v) = r.map_err(io_err)?;
+        if k.value().1 == "snapshot" {
+            current.insert(PathBuf::from(dec::<String>(v.value())?));
+        }
+    }
+    let stale = |p: &Path, name: &str| {
+        (name.starts_with("group-") && !current.contains(p)) || name.ends_with(".tmp") || name.starts_with("incoming-")
+    };
+    for d in [dir, scratch] {
+        for e in std::fs::read_dir(d)?.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if (name.ends_with(".snap") || name.ends_with(".tmp")) && stale(&p, &name) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write group `group`'s committed state as a snapshot, point the group at it
+/// and delete the one it replaces. The position, membership and state come
+/// from one read transaction, so the snapshot is exactly the state at its
+/// position even while applies continue. Returns its meta, path and size.
+pub(crate) fn write_group_snapshot(
+    db: &Database,
+    group: u32,
+    dir: &Path,
+) -> io::Result<(SnapshotMetaOf<TypeConfig>, PathBuf, u64)> {
+    let txn = db.begin_read().map_err(io_err)?;
+    let meta_t = txn.open_table(SM_META).map_err(io_err)?;
+    let get = |k: &str| -> io::Result<Option<Vec<u8>>> {
+        Ok(meta_t.get((group, k)).map_err(io_err)?.map(|v| v.value().to_vec()))
+    };
+    let last_log_id: Option<LogIdOf<TypeConfig>> = get("applied")?.map(|b| dec(&b)).transpose()?.flatten();
+    let last_membership: StoredMembershipOf<TypeConfig> =
+        get("membership")?.map(|b| dec(&b)).transpose()?.unwrap_or_default();
+    let meta = SnapshotMetaOf::<TypeConfig> { last_log_id, last_membership };
+    let path = snapshot_path(dir, group, &meta);
+    let t = txn.open_table(SM).map_err(io_err)?;
+    let (lo, hi) = (prefix(group), (group + 1).to_be_bytes());
+    let pairs = t.range(lo.as_slice()..hi.as_slice()).map_err(io_err)?.map(|r| {
+        let (k, v) = r.map_err(io_err)?;
+        Ok((k.value()[4..].to_vec(), v.value().to_vec()))
+    });
+    let size = write_snapshot_file(&path, &meta, pairs)?;
+    let w = db.begin_write().map_err(io_err)?;
+    let old = point_at(&mut w.open_table(SM_META).map_err(io_err)?, group, &path)?;
+    w.commit().map_err(io_err)?;
+    remove_replaced(old, &path);
+    Ok((meta, path, size))
 }
 
 pub struct SnapshotBuilder {
     group: u32,
     db: Arc<Database>,
     dir: PathBuf,
+    due: Arc<SnapshotDue>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
     type SnapshotData = std::fs::File;
 
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<TypeConfig, std::fs::File>, io::Error> {
-        let (db, group, dir) = (self.db.clone(), self.group, self.dir.clone());
+        let (db, group, dir, due) = (self.db.clone(), self.group, self.dir.clone(), self.due.clone());
         tokio::task::spawn_blocking(move || {
             // Everything this snapshot covers becomes durable first, so logs
             // purged after it are never needed for a replay.
             StateMachine::checkpoint(&db)?;
-            let txn = db.begin_read().map_err(io_err)?;
-            let meta_t = txn.open_table(SM_META).map_err(io_err)?;
-            let get = |k: &str| -> io::Result<Option<Vec<u8>>> {
-                Ok(meta_t.get((group, k)).map_err(io_err)?.map(|v| v.value().to_vec()))
-            };
-            let last_log_id: Option<LogIdOf<TypeConfig>> = get("applied")?.map(|b| dec(&b)).transpose()?.flatten();
-            let last_membership: StoredMembershipOf<TypeConfig> =
-                get("membership")?.map(|b| dec(&b)).transpose()?.unwrap_or_default();
-            let meta = SnapshotMetaOf::<TypeConfig> { last_log_id, last_membership };
-            let t = txn.open_table(SM).map_err(io_err)?;
-            let pairs = scan(&t, group, &[], usize::MAX);
-            let path = snapshot_path(&dir, group, &meta);
-            write_snapshot_file(&path, &meta, &pairs)?;
-            set_current_snapshot(&db, group, &path)?;
+            due.log_bytes.store(0, Ordering::Relaxed);
+            let (meta, path, size) = write_group_snapshot(&db, group, &dir)?;
+            due.last_size.store(size, Ordering::Relaxed);
             Ok(openraft::storage::Snapshot { meta, snapshot: std::fs::File::open(&path)? })
         })
         .await

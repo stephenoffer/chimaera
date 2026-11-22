@@ -1,8 +1,10 @@
 """Call options: validation, scopes and precedence.
 
 Soft settings resolve in this order: the call view (``fn.options(...)``), then
-``with ch.options(...)`` scopes from innermost to outermost, then the
-decorator, then the learned profile (applied by the peer), then defaults.
+the decorator, then ``with ch.defaults(...)`` blocks from innermost to
+outermost (a block fills in only what the call and its decorator leave unset,
+and never applies to Chimaera's own internal calls), then the learned profile
+(applied by the peer), then defaults.
 
 ``effects`` is a lattice (none < idempotent < external): a view or scope can
 only make a call stricter; only the decorator can choose a weaker contract.
@@ -19,7 +21,7 @@ import functools
 import inspect
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Literal, Mapping, TypedDict, Unpack
 
 from . import _units
 from ._errors import OptionsError
@@ -37,7 +39,7 @@ class Placement:
 
 @dataclass(frozen=True)
 class State:
-    """Durable actor state: ``@ch.remote(state=ch.State())`` on a class.
+    """Durable actor state: ``@ch.remote(state=ch.durable.State())`` on a class.
 
     After every method call that returns, the instance's attributes (or what
     ``__getstate__`` returns) are committed with the call's command id before
@@ -51,7 +53,7 @@ class State:
 
 def _state(name: str, v: Any) -> State:
     if not isinstance(v, State):
-        raise ValueError(f"{name}: expected ch.State(), got {v!r}")
+        raise ValueError(f"{name}: expected ch.durable.State(), got {v!r}")
     return v
 
 
@@ -156,13 +158,59 @@ def _within(name: str, v: Any) -> Any:
     from ._reserve import Bundle
 
     if not isinstance(v, Bundle):
-        raise ValueError(f"{name}: expected a bundle of a reservation, res[i] from ch.reserve(...), got {v!r}")
+        raise ValueError(f"{name}: expected a bundle of a reservation, res[i] from ch.dist.reserve(...), got {v!r}")
     return v
+
+
+BUDGET_KEYS = ("cpu_seconds", "gpu_seconds")
+
+
+def _budget(name: str, v: Any) -> dict[str, float]:
+    """``{"cpu_seconds": 3600, "gpu_seconds": "8h"}``: numbers of seconds or durations."""
+    if not isinstance(v, Mapping) or not v:
+        raise ValueError(f"{name}: expected a mapping with {' and/or '.join(BUDGET_KEYS)}, got {v!r}")
+    unknown = [k for k in v if k not in BUDGET_KEYS]
+    if unknown:
+        raise ValueError(f"{name}: unknown {unknown[0]!r}; a budget limits {' and '.join(BUDGET_KEYS)}")
+    out = {}
+    for k, x in v.items():
+        secs = _units.parse_duration(x, f"{name}[{k!r}]") if isinstance(x, str) else x
+        out[k] = _pos_float(f"{name}[{k!r}]", secs)
+    return out
+
+
+def _budget_fields(eff: Effective) -> dict[str, Any]:
+    """The policy's budget: this call's own (it is the root), or the enclosing
+    call's, inherited with its root. Budgets do not nest."""
+    from ._context import context
+
+    ctx = context()
+    outer = ctx.policy if ctx is not None and isinstance(ctx.policy, Mapping) else {}
+    inherited = (outer.get("budget_cpu_seconds") or 0) > 0 or (outer.get("budget_gpu_seconds") or 0) > 0
+    own = eff.get("budget")
+    if own and inherited:
+        raise OptionsError(
+            "budget: this call runs inside a call that has a budget, which already covers it; budgets do not nest"
+        )
+    if own:
+        return {
+            "budget_cpu_seconds": own.get("cpu_seconds", 0.0),
+            "budget_gpu_seconds": own.get("gpu_seconds", 0.0),
+            "budget_root": b"",
+        }
+    if inherited:
+        assert ctx is not None
+        return {
+            "budget_cpu_seconds": outer.get("budget_cpu_seconds") or 0.0,
+            "budget_gpu_seconds": outer.get("budget_gpu_seconds") or 0.0,
+            "budget_root": outer.get("budget_root") or (ctx.run + ctx.task),
+        }
+    return {}
 
 
 def _placement(name: str, v: Any) -> Placement:
     if not isinstance(v, Placement):
-        raise ValueError(f"{name}: expected ch.Placement(require=..., prefer=...), got {v!r}")
+        raise ValueError(f"{name}: expected ch.dist.Placement(require=..., prefer=...), got {v!r}")
     return v
 
 
@@ -194,20 +242,18 @@ FIELDS: dict[str, tuple[Any, str]] = {
     "retry_exceptions": (_exceptions, "any"),
     "deadline": (_deadline, "any"),
     "concurrency": (_or_auto(_pos_int), "any"),
-    "prefetch": (_or_auto(_pos_int), "any"),
-    "range_size": (_or_auto(_pos_int), "any"),
     "max_in_flight": (_pos_int, "any"),
     "returns": (_pos_int, "any"),
     "priority": (_int, "any"),
+    "budget": (_budget, "any"),
     "max_in_flight_bytes": (lambda n, v: _units.parse_bytes(v, n), "any"),
     "latency": (_latency, "any"),
     "adaptive": (_choice(("on", "observe", "frozen")), "any"),
-    "splittable": (_bool, "any"),
     "deterministic": (_bool, "any"),
     "replicas": (_or_auto(_pos_int), "pool"),
     "ranks": (_or_auto(_pos_int), "any"),
-    "key": (_str, "actor"),
-    "lifetime": (_choice(("run", "detached")), "actor"),
+    "name": (_str, "actor"),
+    "detach": (_bool, "actor"),
     "restart": (_choice(("never", "fresh", "checkpoint")), "actor"),
     "max_restarts": (_pos_int, "actor"),
     "workflow": (_choice(("durable",)), "decorator"),
@@ -217,6 +263,48 @@ FIELDS: dict[str, tuple[Any, str]] = {
     "groups": (_groups, "decorator"),
 }
 
+class Options(TypedDict, total=False):
+    """Every option, for type checkers: ``fn.options(cpu=2)`` is an error in
+    an editor as it is at run time. Kept equal to ``FIELDS`` by a test."""
+
+    cpus: float | Auto | Literal["auto"]
+    memory: int | str | Auto | Literal["auto"]
+    memory_limit: int | str
+    gpus: float
+    device: str
+    resources: Mapping[str, float]
+    placement: Placement
+    within: Any  # a reservation's bundle, res[i]
+    accounting: Literal["auto", "process", "isolated"]
+    effects: Literal["none", "idempotent", "external"]
+    max_attempts: int
+    retry_exceptions: type[BaseException] | tuple[type[BaseException], ...]
+    deadline: str | float | _dt.datetime
+    concurrency: int | Auto | Literal["auto"]
+    max_in_flight: int
+    returns: int
+    priority: int
+    budget: Mapping[str, float | str]
+    max_in_flight_bytes: int | str
+    latency: str | float
+    adaptive: Literal["on", "observe", "frozen"]
+    deterministic: bool
+    replicas: int | Auto | Literal["auto"]
+    ranks: int | Auto | Literal["auto"]
+    name: str
+    detach: bool
+    restart: Literal["never", "fresh", "checkpoint"]
+    max_restarts: int
+    workflow: Literal["durable"]
+    state: State
+    command_id: str
+    batch: Any
+    groups: Mapping[str, int]
+
+
+# Options that name one actor: a block of calls cannot share them.
+IDENTITY = ("name", "detach")
+
 DEFAULTS: dict[str, Any] = {
     "effects": "none",
     "max_attempts": 3,
@@ -224,7 +312,6 @@ DEFAULTS: dict[str, Any] = {
     "adaptive": "on",
     "deterministic": True,
     "restart": "never",
-    "lifetime": "run",
 }
 
 
@@ -238,6 +325,7 @@ class Layer:
     values: Mapping[str, Any]
     source: str
     kind: str  # "view" | "scope" | "decorator"
+    internal: bool = False  # Chimaera's own decorator: `with ch.defaults` blocks do not apply
 
 
 def validate(options: Mapping[str, Any], *, kind: str, target: str, source: str) -> Layer:
@@ -247,16 +335,18 @@ def validate(options: Mapping[str, Any], *, kind: str, target: str, source: str)
         if name not in FIELDS:
             close = difflib.get_close_matches(name, FIELDS, n=1)
             hint = f"; did you mean {close[0]!r}?" if close else ""
-            raise TypeError(f"unknown option {name!r} ({source}){hint}")
+            raise OptionsError(f"unknown option {name!r} ({source}){hint}")
         check, where = FIELDS[name]
         if where == "decorator" and kind != "decorator":
-            raise TypeError(f"option {name!r} can only be set on the decorator ({source})")
+            raise OptionsError(f"option {name!r} can only be set on the decorator ({source})")
         if where == "call" and (kind != "view" or target != "function"):
-            raise TypeError(f"option {name!r} names one call; set it with .options(...) on that call ({source})")
+            raise OptionsError(f"option {name!r} names one call; set it with .options(...) on that call ({source})")
+        if name in IDENTITY and kind == "scope":
+            raise OptionsError(f"option {name!r} names one actor; set it on that actor's .options(...) ({source})")
         if where == "actor" and target not in ("actor", "pool", "scope"):
-            raise TypeError(f"option {name!r} applies to actors, not to {target}s ({source})")
+            raise OptionsError(f"option {name!r} applies to actors, not to {target}s ({source})")
         if where == "pool" and target not in ("pool", "actor", "scope"):
-            raise TypeError(f"option {name!r} applies to pools; use Class.options(replicas=...).pool(...) ({source})")
+            raise OptionsError(f"option {name!r} applies to pools; use Class.options(replicas=...).pool(...) ({source})")
         try:
             out[name] = check(name, value)
         except (ValueError, TypeError) as e:
@@ -271,13 +361,24 @@ class _Scope:
     def __init__(self, layer: Layer) -> None:
         self.layer = layer
         self.token: contextvars.Token[tuple[Layer, ...]] | None = None
+        self.entered = False
 
     def __enter__(self) -> None:
+        self.entered = True
         self.token = _scopes.set(_scopes.get() + (self.layer,))
 
     def __exit__(self, *exc: object) -> None:
         assert self.token is not None
         _scopes.reset(self.token)
+
+    def __del__(self) -> None:
+        if not self.entered:
+            import warnings
+
+            warnings.warn(
+                f"{self.layer.source} applies to nothing: use it as `with ch.defaults(...):` around the calls",
+                stacklevel=2,
+            )
 
     async def __aenter__(self) -> None:
         self.__enter__()
@@ -286,9 +387,10 @@ class _Scope:
         self.__exit__()
 
 
-def options(**opts: Any) -> _Scope:
-    """``with ch.options(...)``: defaults for calls submitted inside the block."""
-    return _Scope(validate(opts, kind="scope", target="scope", source=f"with ch.options at {_caller(2)}"))
+def defaults(**opts: Unpack[Options]) -> _Scope:
+    """``with ch.defaults(...)``: options for the calls made inside the block,
+    where neither the call nor its decorator sets them."""
+    return _Scope(validate(opts, kind="scope", target="scope", source=f"with ch.defaults at {_caller(2)}"))
 
 
 @dataclass(frozen=True)
@@ -310,7 +412,7 @@ class Effective:
 
 
 def resolve_cached(holder: Any, view: tuple[Layer, ...], decorator: Layer) -> Effective:
-    """`resolve(view, decorator)`, reused while the active ``with ch.options``
+    """`resolve(view, decorator)`, reused while the active ``with ch.defaults``
     scopes are unchanged. The result is kept on `holder._resolved`; a scope
     entered or left makes a new tuple, which misses the cache."""
     scopes = _scopes.get()
@@ -338,7 +440,8 @@ def signature_of(fn: Any) -> inspect.Signature:
 
 def resolve(view: tuple[Layer, ...], decorator: Layer) -> Effective:
     """Merge layers by precedence; `view` is ordered most specific first."""
-    layers = list(view) + list(reversed(_scopes.get())) + [decorator]
+    scopes = () if decorator.internal else tuple(reversed(_scopes.get()))
+    layers = [*view, decorator, *scopes]
     values: dict[str, Any] = {}
     sources: dict[str, str] = {}
     for layer in layers:
@@ -403,7 +506,7 @@ def policy_dict(eff: Effective) -> dict[str, Any]:
         "accounting": eff.get("accounting"),
         "adaptive": eff.get("adaptive"),
         "concurrency": int(num("concurrency")),
-        "range_size": int(num("range_size")),
+        "range_size": 0,  # unused by the peer, which learns batching itself
         "interactive": latency == "interactive",
         "deterministic": bool(eff.get("deterministic")),
         "require": dict(placement.require) if placement else {},
@@ -411,6 +514,7 @@ def policy_dict(eff: Effective) -> dict[str, Any]:
         "source": eff.sources.get("cpus", ""),
         "priority": int(eff.get("priority") or 0),
         "max_in_flight": int(eff.get("max_in_flight") or 0),
+        **_budget_fields(eff),
     }
 
 

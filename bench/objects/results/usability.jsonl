@@ -1,0 +1,8 @@
+{"runtime": "ray", "scenario": "usability", "kind": "numpy", "size": "8M", "op": "modify_array_after_get", "result": "no (assignment destination is read-only)"}
+{"runtime": "ray", "scenario": "usability", "kind": "numpy", "size": "256M", "op": "memory_after_dropping_put", "grew_mib": 0, "result": "freed"}
+{"runtime": "ray", "scenario": "usability", "kind": "numpy", "size": "2G", "op": "put_get_2GiB", "result": "ok (2048 MiB)", "seconds": 0.5532585609998932}
+{"runtime": "ray", "done": "usability", "wall_s": 1.7}
+{"runtime": "chimaera", "scenario": "usability", "kind": "numpy", "size": "8M", "op": "modify_array_after_get", "result": "yes"}
+{"runtime": "chimaera", "scenario": "usability", "kind": "numpy", "size": "256M", "op": "memory_after_dropping_put", "grew_mib": 0, "result": "freed"}
+{"runtime": "chimaera", "scenario": "usability", "kind": "numpy", "size": "2G", "op": "put_get_2GiB", "result": "ok (2048 MiB)", "seconds": 1.0567194610002844}
+{"runtime": "chimaera", "done": "usability", "wall_s": 2.4}

@@ -114,23 +114,46 @@ pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Objects copied to disk at once when memory is over its limit
+/// (`CHIMAERA_SPILL_THREADS`, default 4; Ray's `max_io_workers`).
+fn spill_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CHIMAERA_SPILL_THREADS").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(4)
+    })
+}
+
 /// Large values, one file per object under `objects/<run>/<object>`.
 #[derive(Clone)]
 pub struct ObjectStore {
     dir: PathBuf,
-    /// On disk, for objects moved out of a memory-backed store under pressure.
-    spill: Option<PathBuf>,
+    /// On disk, for objects moved out of a memory-backed store under
+    /// pressure; each spilled object goes to the next one in turn.
+    spill: Vec<PathBuf>,
+    next_spill: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ObjectStore {
     pub fn open(dir: PathBuf) -> io::Result<ObjectStore> {
         std::fs::create_dir_all(&dir)?;
-        Ok(ObjectStore { dir, spill: None })
+        Ok(ObjectStore { dir, spill: Vec::new(), next_spill: Default::default() })
     }
 
-    /// Spill to `dir` (on disk) when the store itself is in memory (tmpfs).
-    pub fn with_spill(self, dir: PathBuf) -> ObjectStore {
-        ObjectStore { spill: Some(dir), ..self }
+    /// Spill to `dirs` (on disk) when the store itself is in memory (tmpfs).
+    pub fn with_spill(self, dirs: Vec<PathBuf>) -> ObjectStore {
+        ObjectStore { spill: dirs, ..self }
+    }
+
+    /// The next spill directory, in turn (None: this store does not spill).
+    fn next_spill(&self) -> Option<&Path> {
+        let n = self.spill.len();
+        (n > 0).then(|| self.spill[self.next_spill.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n].as_path())
+    }
+
+    /// Where a copy of `object` on disk goes (a spill or a replica), when
+    /// this store spills.
+    pub fn spill_path(&self, run: &[u8], object: &[u8]) -> Option<PathBuf> {
+        self.next_spill().map(|d| d.join(hex(run)).join(hex(object)))
     }
 
     /// Move the least recently written objects to disk until `want` bytes are
@@ -138,7 +161,9 @@ impl ObjectStore {
     /// a symlink to its copy, so every reader keeps working unchanged; a
     /// reader that already mapped it keeps its pages until it is done.
     pub fn spill_oldest(&self, want: u64) -> io::Result<u64> {
-        let Some(spill) = &self.spill else { return Ok(0) };
+        if self.spill.is_empty() {
+            return Ok(0);
+        }
         let mut files = Vec::new();
         for run in std::fs::read_dir(&self.dir)?.flatten().filter(|e| !is_plane_dir(e)) {
             let Ok(entries) = std::fs::read_dir(run.path()) else { continue };
@@ -152,45 +177,80 @@ impl ObjectStore {
             }
         }
         files.sort();
-        let mut moved = 0;
+        // The oldest files that cover `want`, moved spill_threads() at a time
+        // (one copy stream is well below what the disk takes).
+        let mut picked = Vec::new();
+        let mut planned = 0;
         for (_, len, path) in files {
-            if moved >= want {
+            if planned >= want {
                 break;
             }
-            let rel = path.strip_prefix(&self.dir).expect("listed under the store");
-            let target = spill.join(rel);
-            std::fs::create_dir_all(target.parent().expect("run directory"))?;
-            std::fs::copy(&path, &target)?;
-            let link = path.with_extension("spilling");
-            let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink(&target, &link)?;
-            std::fs::rename(&link, &path)?; // atomic: readers see the file or the link
-            moved += len;
+            planned += len;
+            picked.push((len, path));
         }
-        Ok(moved)
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let moved = std::sync::atomic::AtomicU64::new(0);
+        let failed: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..spill_threads().min(picked.len()) {
+                s.spawn(|| {
+                    while let Some((len, path)) = picked.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        let spill = self.next_spill().expect("checked above");
+                        match self.spill_one(spill, path) {
+                            Ok(()) => {
+                                moved.fetch_add(*len, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                *failed.lock().expect("lock") = Some(e);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        match failed.into_inner().expect("lock") {
+            Some(e) if moved.load(std::sync::atomic::Ordering::Relaxed) == 0 => Err(e),
+            _ => Ok(moved.into_inner()),
+        }
+    }
+
+    /// Copy one in-memory object to the spill directory and make its path a
+    /// symlink to the copy.
+    fn spill_one(&self, spill: &Path, path: &Path) -> io::Result<()> {
+        let rel = path.strip_prefix(&self.dir).expect("listed under the store");
+        let target = spill.join(rel);
+        std::fs::create_dir_all(target.parent().expect("run directory"))?;
+        std::fs::copy(path, &target)?;
+        let link = path.with_extension("spilling");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link)?;
+        std::fs::rename(&link, path) // atomic: readers see the file or the link
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// The disk directory spilled objects (and replicas of other peers'
-    /// objects) live in, when the store itself is in memory.
-    pub fn spill_dir(&self) -> Option<&Path> {
-        self.spill.as_deref()
-    }
-
     pub fn path(&self, run: &[u8], object: &[u8]) -> PathBuf {
         self.dir.join(hex(run)).join(hex(object))
     }
 
-    /// Delete one object's bytes (inline objects have no file).
+    /// Delete one object's bytes (inline objects have no file), with the
+    /// parts of a result of several values (see parts).
     pub fn delete(&self, obj: &chimaera_core::pb::ObjectRef) {
         if obj.inline_data.is_empty() && !obj.run.is_empty() {
-            let _ = std::fs::remove_file(self.path(&obj.run, &obj.object_id));
-            if let Some(spill) = &self.spill {
-                let _ = std::fs::remove_file(spill.join(hex(&obj.run)).join(hex(&obj.object_id)));
+            for part in crate::parts::file_ids(&self.path(&obj.run, &obj.object_id)) {
+                self.remove(&obj.run, &part);
             }
+            self.remove(&obj.run, &obj.object_id);
+        }
+    }
+
+    fn remove(&self, run: &[u8], object: &[u8]) {
+        let _ = std::fs::remove_file(self.path(run, object));
+        for spill in &self.spill {
+            let _ = std::fs::remove_file(spill.join(hex(run)).join(hex(object)));
         }
     }
 
@@ -199,8 +259,9 @@ impl ObjectStore {
     /// Results and stream items stay until the run expires, for clients that
     /// reattach; they are named by ids that start with the run's own cell and
     /// vshard bytes, which a content digest does only by chance (it then stays
-    /// until expiry too). A task that returned a `ch.put` handle as its value
-    /// loses what it points to. Returns the bytes freed.
+    /// until expiry too). A `ch.put` made inside a call is named like a
+    /// result (chimaera-py's `_future.put`), so a call that returns its handle
+    /// keeps it readable; one made by the driver goes. Returns the bytes freed.
     pub fn delete_values(&self, run: &Id) -> u64 {
         let (dir, run_hex) = (self.dir.join(run.hex()), run.hex());
         let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
@@ -214,7 +275,7 @@ impl ObjectStore {
             }
             freed += std::fs::metadata(e.path()).map_or(0, |m| m.len());
             let _ = std::fs::remove_file(e.path());
-            if let Some(spill) = &self.spill {
+            for spill in &self.spill {
                 let _ = std::fs::remove_file(spill.join(&run_hex).join(name));
             }
         }
@@ -223,7 +284,7 @@ impl ObjectStore {
 
     pub fn delete_run(&self, run: &Id) {
         let _ = std::fs::remove_dir_all(self.dir.join(run.hex()));
-        if let Some(spill) = &self.spill {
+        for spill in &self.spill {
             let _ = std::fs::remove_dir_all(spill.join(run.hex()));
         }
     }
@@ -295,26 +356,33 @@ pub async fn read_chunks(
     len: u64,
     chunk_bytes: usize,
 ) -> io::Result<tokio::sync::mpsc::Receiver<io::Result<Chunk>>> {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut f = tokio::fs::File::open(path).await?;
-    let size = f.metadata().await?.len();
+    let p = path.to_path_buf();
+    let (f, size) = tokio::task::spawn_blocking(move || -> io::Result<(std::fs::File, u64)> {
+        let f = std::fs::File::open(&p)?;
+        let size = f.metadata()?.len();
+        Ok((f, size))
+    })
+    .await
+    .map_err(io::Error::other)??;
     if offset > size {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("offset {offset} past the end ({size})")));
     }
     let total = if len == 0 { size - offset } else { len.min(size - offset) };
-    f.seek(io::SeekFrom::Start(offset)).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(4);
-    tokio::spawn(async move {
-        let mut left = total;
-        let mut first = true;
+    // One blocking thread reads (pread: no async file wrapper and its bounce
+    // buffers) and checksums each chunk; the async side only moves it on.
+    tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        let (mut left, mut pos, mut first) = (total, offset, true);
         loop {
             let want = left.min(chunk_bytes as u64) as usize;
             let mut data = vec![0u8; want];
-            if let Err(e) = f.read_exact(&mut data).await {
-                let _ = tx.send(Err(e)).await;
+            if let Err(e) = f.read_exact_at(&mut data, pos) {
+                let _ = tx.blocking_send(Err(e));
                 return;
             }
             left -= want as u64;
+            pos += want as u64;
             let checksum = blake3::hash(&data).as_bytes()[..16].to_vec();
             let chunk = Chunk {
                 data,
@@ -323,7 +391,7 @@ pub async fn read_chunks(
                 object_size: if first { size } else { 0 },
             };
             first = false;
-            if tx.send(Ok(chunk)).await.is_err() || left == 0 {
+            if tx.blocking_send(Ok(chunk)).is_err() || left == 0 {
                 return;
             }
         }
@@ -368,8 +436,9 @@ mod tests {
     #[test]
     fn spilled_objects_stay_readable_at_their_path_and_go_with_their_run() {
         let mem = tempfile::tempdir().unwrap();
-        let disk = tempfile::tempdir().unwrap();
-        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(disk.path().to_path_buf());
+        let (disk, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let dirs = vec![disk.path().to_path_buf(), other.path().to_path_buf()];
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(dirs);
         let run = Id::derive(0, 0, &[b"run"]);
         for (i, size) in [(1u8, 3000usize), (2, 2000), (3, 1000)] {
             let path = store.path(&run.0, &[i]);
@@ -383,12 +452,19 @@ mod tests {
         assert!(store.bytes_used() < before - 4000, "spilled bytes no longer count as stored");
         assert_eq!(std::fs::read(store.path(&run.0, &[1])).unwrap(), vec![1u8; 3000], "read through the link");
         assert!(std::fs::symlink_metadata(store.path(&run.0, &[3])).unwrap().is_file(), "the newest stays");
+        let spilled =
+            |i: u8| [&disk, &other].iter().filter(|d| d.path().join(run.hex()).join(hex(&[i])).exists()).count();
+        assert_eq!((spilled(1), spilled(2)), (1, 1), "each spilled object is in one spill directory");
+        assert!(
+            [&disk, &other].iter().all(|d| d.path().join(run.hex()).exists()),
+            "the two spilled objects went to different directories"
+        );
         let obj =
             |i: u8| chimaera_core::pb::ObjectRef { run: run.0.to_vec(), object_id: vec![i], ..Default::default() };
         store.delete(&obj(1));
-        assert!(!disk.path().join(run.hex()).join("01").exists(), "deleting removes the spilled copy");
+        assert_eq!(spilled(1), 0, "deleting removes the spilled copy");
         store.delete_run(&run);
-        assert!(!disk.path().join(run.hex()).exists());
+        assert!(!disk.path().join(run.hex()).exists() && !other.path().join(run.hex()).exists());
     }
 
     #[test]
@@ -413,7 +489,7 @@ mod tests {
     #[test]
     fn plane_directories_are_neither_counted_nor_spilled() {
         let (mem, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(disk.path().to_path_buf());
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(vec![disk.path().to_path_buf()]);
         for d in [".arena/123", ".reserve"] {
             std::fs::create_dir_all(mem.path().join(d)).unwrap();
             std::fs::write(mem.path().join(d).join("21-0"), vec![0u8; 3000]).unwrap();

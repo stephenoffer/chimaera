@@ -11,7 +11,7 @@ import pytest
 import chimaera as ch
 
 
-@ch.remote(state=ch.State())
+@ch.remote(state=ch.durable.State())
 class Account:
     def __init__(self):
         self.balance = 0
@@ -43,7 +43,7 @@ def test_a_repeated_command_returns_its_first_reply_and_changes_nothing():
 def test_a_command_id_reused_with_other_arguments_is_a_conflict():
     a = Account.remote()
     assert a.deposit.options(command_id="op-1").remote(5).result(timeout=60) == 5
-    with pytest.raises(ch.CommandConflict):
+    with pytest.raises(ch.errors.CommandConflict):
         a.deposit.options(command_id="op-1").remote(9).result(timeout=60)
     assert a.get.remote().result(timeout=60) == 5
 

@@ -157,7 +157,7 @@ def test_cancel_races_commit_and_reports_the_winner():
 
 def test_gather_and_as_completed():
     futs = [sleep_then.remote(0.02 * (5 - i), i) for i in range(5)]
-    assert ch.gather(*futs, timeout=30) == [0, 1, 2, 3, 4]
+    assert ch.get(futs, timeout=30) == [0, 1, 2, 3, 4]
     futs = [sleep_then.remote(0.05 * i, i) for i in (3, 1, 2)]
     order = [f.result() for f in ch.as_completed(futs, timeout=30)]
     assert sorted(order) == [1, 2, 3]
@@ -171,7 +171,7 @@ def test_put_shares_one_copy():
     def total(xs):
         return sum(xs)
 
-    assert ch.gather(*(total.remote(ref) for _ in range(4)), timeout=60) == [sum(big)] * 4
+    assert ch.get((total.remote(ref) for _ in range(4)), timeout=60) == [sum(big)] * 4
 
 
 def test_large_arguments_and_results_round_trip():
@@ -255,7 +255,7 @@ def test_nested_submissions_and_blocking_waits_inside_tasks():
         return sum(p.result() for p in parts)
 
     # More nested waiters than cores must not deadlock: a blocked task lends its CPU.
-    outs = ch.gather(*(fan.remote(4) for _ in range(20)), timeout=120)
+    outs = ch.get((fan.remote(4) for _ in range(20)), timeout=120)
     assert outs == [6] * 20
 
 

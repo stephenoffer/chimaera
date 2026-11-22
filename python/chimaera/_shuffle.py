@@ -19,7 +19,7 @@ import pickle
 from collections.abc import Callable, Iterable
 from typing import Any
 
-from ._future import Future, put
+from ._future import Future
 from ._native import blake3_digest
 from ._remote import remote
 
@@ -27,34 +27,41 @@ from ._remote import remote
 def bucket_of(key: Any, partitions: int) -> int:
     """A stable bucket for `key`, the same in every process. Keys must pickle
     deterministically: str, bytes, numbers and tuples of them do."""
+    if type(key) is int:
+        # CPython does not randomize int hashing: hash() agrees across
+        # processes, at a fraction of the cost of pickling and digesting.
+        return hash(key) % partitions
     data = key.encode() if isinstance(key, str) else pickle.dumps(key, protocol=5)
     return int.from_bytes(blake3_digest(data)[:8], "little") % partitions
-
-
-def _merge(into: dict[Any, Any], key: Any, value: Any, combine: Callable[[Any, Any], Any] | None, grouped: bool) -> None:
-    if combine is not None:
-        into[key] = combine(into[key], value) if key in into else value
-    elif grouped:
-        into.setdefault(key, []).extend(value)
-    else:
-        into.setdefault(key, []).append(value)
 
 
 @remote
 def _scatter(pairs: Iterable[tuple[Any, Any]], partitions: int, combine: Callable[[Any, Any], Any] | None) -> tuple:
     buckets: list[dict[Any, Any]] = [{} for _ in range(partitions)]
-    for key, value in pairs:
-        _merge(buckets[bucket_of(key, partitions)], key, value, combine, grouped=False)
-    return tuple(put(list(b.items())) for b in buckets)
+    # The loops run once per pair, so they are written out in full: a helper
+    # call per pair doubled their cost.
+    if combine is None:
+        for key, value in pairs:
+            buckets[bucket_of(key, partitions)].setdefault(key, []).append(value)
+    else:
+        for key, value in pairs:
+            b = buckets[hash(key) % partitions if type(key) is int else bucket_of(key, partitions)]
+            b[key] = combine(b[key], value) if key in b else value
+    # A tuple result is stored value by value: each gather reads only its own.
+    return tuple(list(b.items()) for b in buckets)
 
 
 @remote
-def _gather(combine: Callable[[Any, Any], Any] | None, *buckets: Future[list[tuple[Any, Any]]]) -> list[tuple[Any, Any]]:
+def _gather(combine: Callable[[Any, Any], Any] | None, *buckets: list[tuple[Any, Any]]) -> list[tuple[Any, Any]]:
     out: dict[Any, Any] = {}
-    for bucket in buckets:
-        # Each bucket is the ch.put handle a scatter returned: read just this one.
-        for key, value in bucket.result():
-            _merge(out, key, value, combine, grouped=combine is None)
+    if combine is None:
+        for bucket in buckets:
+            for key, values in bucket:
+                out.setdefault(key, []).extend(values)
+    else:
+        for bucket in buckets:
+            for key, value in bucket:
+                out[key] = combine(out[key], value) if key in out else value
     return list(out.items())
 
 

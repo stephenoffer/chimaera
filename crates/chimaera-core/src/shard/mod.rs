@@ -100,7 +100,12 @@ pub enum Event {
         target_vshard: u16,
     },
     /// Outcome committed and no client pin remains; payload bytes can be freed.
-    Releasable(Tk),
+    /// Nothing can read this call's result any more: the peer frees `object`
+    /// (the record has shrunk to a tombstone).
+    Releasable {
+        task: Tk,
+        object: Option<pb::ObjectRef>,
+    },
     ActorChanged(Id),
     /// A bounded CancelRun stopped early; propose it again.
     CancelRunContinues(Id),
@@ -213,6 +218,27 @@ fn cancelled_kind(o: &pb::Outcome) -> Option<Kind> {
     }
 }
 
+/// A finished call nothing holds any more: emit its result object for the
+/// peer to free, and shrink its record to a tombstone. The spec (with inline
+/// arguments), attempts and failure history go; the outcome stays, unchanged:
+/// a small result lives inline in it, and a durable workflow's replay or an
+/// attach still reads it (a large result's file is freed, as before). Without
+/// this a long-lived run (a service's driver) keeps every record until it ends.
+fn tombstone(cx: &mut Cx, tk: Tk, rec: &pb::TaskRecord) -> pb::TaskRecord {
+    let object = match rec.outcome.as_ref().and_then(|o| o.value.as_ref()) {
+        Some(pb::outcome::Value::Ok(obj)) => Some(obj.clone()),
+        _ => None,
+    };
+    cx.events.push(Event::Releasable { task: tk, object });
+    pb::TaskRecord {
+        state: TState::Done as i32,
+        submitted_hlc: rec.submitted_hlc,
+        done_hlc: rec.done_hlc,
+        outcome: rec.outcome.clone(),
+        ..Default::default()
+    }
+}
+
 fn causal(producer: Tk, root: &pb::Outcome) -> pb::Outcome {
     let mut e = match &root.value {
         Some(pb::outcome::Value::Err(e)) => e.clone(),
@@ -220,8 +246,18 @@ fn causal(producer: Tk, root: &pb::Outcome) -> pb::Outcome {
     };
     if e.kind != Kind::Causal as i32 {
         e.message = format!("{} (in prerequisite {})", e.message, producer.task.hex());
+        // A runtime error (no user exception to rebuild) keeps its kind by
+        // name, so a call whose actor ended before it ran raises ActorDied,
+        // not an unnamed remote error.
+        if e.type_name.is_empty() && e.exc_pickle.is_empty() {
+            e.type_name = format!("chimaera:{}", e.kind().as_str_name());
+        }
     }
-    e.kind = Kind::Causal as i32;
+    // A call on an actor that ended (its constructor failed to run) fails
+    // because the actor died: callers catch that kind, not a generic cause.
+    if e.kind() != Kind::ActorDied {
+        e.kind = Kind::Causal as i32;
+    }
     e.upstream = Some(producer.pb());
     pb::Outcome { value: Some(pb::outcome::Value::Err(e)), ..Default::default() }
 }
@@ -287,6 +323,7 @@ impl ShardState {
             Body::RunFinish(r) => self.run_finish(cx, v, r),
             Body::StoreWrite(w) => reply(pb::shard_reply::Body::Store(store::write(cx, v, w))),
             Body::StoreRead(r) => reply(pb::shard_reply::Body::Store(store::read(cx.kv, v, r, cx.now))),
+            Body::Charge(c) => self.charge(cx, v, c),
             Body::AdoptVshard(_) | Body::Retire(_) | Body::OutboxAck(_) | Body::Gc(_) => unreachable!(),
         }
     }
@@ -385,6 +422,8 @@ impl ShardState {
                     keys::tasks_of_run(v, &run),
                     keys::pairs_of_run(v, keys::CHILD, &run),
                     keys::pairs_of_run(v, keys::FORWARD, &run),
+                    keys::pairs_of_run(v, keys::BUDGET, &run),
+                    keys::pairs_of_run(v, keys::DEPS_LEFT, &run),
                 ] {
                     for (k, _) in cx.kv.scan_prefix(&prefix, budget - deleted) {
                         cx.kv.delete(&k);
@@ -598,6 +637,11 @@ impl ShardState {
             }
             if rec.deps_remaining == 0 {
                 self.mark_ready(cx, tk, &mut rec, true);
+            } else {
+                cx.kv.put(keys::deps_left(v, &tk.run, &tk.task), rec.deps_remaining.to_be_bytes().to_vec());
+                if let Some(peer) = grant_to {
+                    rec.grant_on_ready = Some(peer_pb(peer));
+                }
             }
             let mut a_status = Status::Accepted;
             let mut attempt = 0;
@@ -632,6 +676,21 @@ impl ShardState {
             cx.events.push(Event::DepsSatisfied(tk));
         }
         cx.events.push(Event::Ready(tk));
+    }
+
+    /// Dependencies satisfied: grant the call to the peer its submission
+    /// asked for, in this same commit, or else make it ready for placement.
+    fn ready_or_grant(&self, cx: &mut Cx, tk: Tk, rec: &mut pb::TaskRecord) {
+        let Some(peer) = peer_of(&rec.grant_on_ready.take()) else {
+            self.mark_ready(cx, tk, rec, true);
+            return;
+        };
+        rec.set_state(TState::Ready);
+        cx.kv.put(keys::ready(tk.v(), &tk.run, &tk.task), Vec::new());
+        cx.events.push(Event::DepsSatisfied(tk));
+        if self.grant(cx, tk, rec, peer, false).is_err() {
+            cx.events.push(Event::Ready(tk)); // that peer was retired meanwhile: place it
+        }
     }
 
     fn grant(
@@ -1015,7 +1074,7 @@ impl ShardState {
             return single(ack_rec(tk, Status::Existing, &rec));
         }
         let kind = match c.reason() {
-            k @ (Kind::Deadline | Kind::ActorDied | Kind::Infeasible | Kind::Oom) => k,
+            k @ (Kind::Deadline | Kind::ActorDied | Kind::Infeasible | Kind::Oom | Kind::Budget) => k,
             _ => Kind::Cancelled,
         };
         let msg = if c.message.is_empty() { "cancelled".to_string() } else { c.message.clone() };
@@ -1034,6 +1093,35 @@ impl ShardState {
             }
         }
         single(ack_rec(tk, Status::Accepted, &rec))
+    }
+
+    /// Add usage to a budgeted call's totals. Past a limit, cancel the call
+    /// and everything it submitted (kind BUDGET, naming the budget). Charges
+    /// for a call that already finished are dropped, with its totals.
+    fn charge(&self, cx: &mut Cx, v: u16, c: &pb::Charge) -> pb::ShardReply {
+        let key = c.root.clone().unwrap_or_default();
+        let Some(tk) = Tk::parse(&key).filter(|t| t.v() == v) else { return rejected("charge for another vshard") };
+        let totals_key = keys::of_producer(v, keys::BUDGET, tk.pair());
+        if load::<pb::TaskRecord>(cx.kv, &tk.key()).is_none_or(|r| r.state() == TState::Done) {
+            cx.kv.delete(&totals_key);
+            return reply(pb::shard_reply::Body::Tasks(pb::TaskAcks { acks: vec![ack(&key, Status::Existing)] }));
+        }
+        let (mut cpu, mut gpu) = cx.kv.get(&totals_key).map_or((0.0, 0.0), |b| {
+            let at = |i: usize| f64::from_be_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+            (at(0), at(1))
+        });
+        cpu += c.cpu_seconds.max(0.0);
+        gpu += c.gpu_seconds.max(0.0);
+        cx.kv.put(totals_key, [cpu.to_be_bytes(), gpu.to_be_bytes()].concat());
+        let over = [("cpu_seconds", cpu, c.limit_cpu_seconds), ("gpu_seconds", gpu, c.limit_gpu_seconds)]
+            .into_iter()
+            .find(|&(_, used, limit)| limit > 0.0 && used > limit);
+        let Some((name, used, limit)) = over else {
+            return reply(pb::shard_reply::Body::Tasks(pb::TaskAcks { acks: vec![ack(&key, Status::Accepted)] }));
+        };
+        let message =
+            format!("budget exceeded: {name}={limit} allowed, {used:.2} used by this call and the calls it made");
+        self.cancel(cx, v, &pb::Cancel { task: Some(key), reason: Kind::Budget as i32, message })
     }
 
     /// Commit `outcome` and propagate it to dependents and subscribers.
@@ -1062,7 +1150,7 @@ impl ShardState {
         }
         p.pins -= 1;
         if p.pins == 0 && p.state() == TState::Done {
-            cx.events.push(Event::Releasable(producer));
+            p = tombstone(cx, producer, &p);
         }
         store(cx.kv, producer.key(), &p);
     }
@@ -1074,13 +1162,16 @@ impl ShardState {
             }
         }
         cx.kv.delete(&keys::ready(tk.v(), &tk.run, &tk.task));
+        cx.kv.delete(&keys::deps_left(tk.v(), &tk.run, &tk.task));
         rec.set_state(TState::Done);
         rec.outcome = Some(outcome.clone());
         rec.done_hlc = cx.now;
-        store(cx.kv, tk.key(), &rec);
         cx.events.push(Event::Done { task: tk, outcome });
         if rec.pins == 0 {
-            cx.events.push(Event::Releasable(tk));
+            let tomb = tombstone(cx, tk, &rec);
+            store(cx.kv, tk.key(), &tomb);
+        } else {
+            store(cx.kv, tk.key(), &rec);
         }
         // A completed dependent stops waiting and no longer needs its local
         // producers' results. Removing its entries keeps a later-submitted
@@ -1107,6 +1198,25 @@ impl ShardState {
                 cx.kv.delete(&dkey);
                 let (run, task) = keys::trailing_pair(&dkey);
                 let d = Tk { run, task };
+                let left_key = keys::deps_left(d.v(), &d.run, &d.task);
+                if is_ok(&o)
+                    && let Some(left) =
+                        cx.kv.get(&left_key).map(|b| u32::from_be_bytes(b[..4].try_into().expect("u32")))
+                {
+                    // Prerequisites still outstanding: only the counter moves.
+                    if left > 1 {
+                        cx.kv.put(left_key, (left - 1).to_be_bytes().to_vec());
+                        continue;
+                    }
+                    cx.kv.delete(&left_key);
+                    let Some(mut drec) = load::<pb::TaskRecord>(cx.kv, &d.key()) else { continue };
+                    if drec.state() == TState::Pending {
+                        drec.deps_remaining = 0;
+                        self.ready_or_grant(cx, d, &mut drec);
+                        store(cx.kv, d.key(), &drec);
+                    }
+                    continue;
+                }
                 let Some(mut drec) = load::<pb::TaskRecord>(cx.kv, &d.key()) else { continue };
                 if drec.state() == TState::Done {
                     continue;
@@ -1114,7 +1224,7 @@ impl ShardState {
                 if is_ok(&o) {
                     drec.deps_remaining = drec.deps_remaining.saturating_sub(1);
                     if drec.deps_remaining == 0 && drec.state() == TState::Pending {
-                        self.mark_ready(cx, d, &mut drec, true);
+                        self.ready_or_grant(cx, d, &mut drec);
                     }
                     store(cx.kv, d.key(), &drec);
                 } else {
@@ -1209,7 +1319,7 @@ impl ShardState {
             }
             rec.pins -= 1;
             if rec.pins == 0 && rec.state() == TState::Done {
-                cx.events.push(Event::Releasable(tk));
+                rec = tombstone(cx, tk, &rec);
             }
             store(cx.kv, tk.key(), &rec);
             released += 1;
@@ -1221,6 +1331,12 @@ impl ShardState {
 /// Read helpers for peers serving queries from (possibly stale) local state.
 pub mod read {
     use super::*;
+
+    /// Prerequisites a pending call still waits on (its record keeps the
+    /// count it was submitted with).
+    pub fn deps_left(kv: &dyn KvRead, tk: Tk) -> Option<u32> {
+        kv.get(&keys::deps_left(tk.v(), &tk.run, &tk.task)).map(|b| u32::from_be_bytes(b[..4].try_into().expect("u32")))
+    }
 
     pub fn task(kv: &dyn KvRead, tk: Tk) -> Option<pb::TaskRecord> {
         load(kv, &tk.key())
@@ -1236,6 +1352,17 @@ pub mod read {
 
     pub fn run(kv: &dyn KvRead, run: Id) -> Option<pb::RunRecord> {
         load(kv, &keys::run(run.vshard(), &run))
+    }
+
+    /// The run records `vshard` holds, at most `limit`.
+    pub fn runs(kv: &dyn KvRead, vshard: u16, limit: usize) -> Vec<pb::RunRecord> {
+        let mut prefix = vshard.to_be_bytes().to_vec();
+        prefix.push(keys::RUN);
+        kv.scan_prefix(&prefix, limit)
+            .into_iter()
+            .filter(|(k, _)| k.len() == 3 + 16)
+            .map(|(_, v)| pb::RunRecord::decode(v.as_slice()).expect("shard state is corrupt"))
+            .collect()
     }
 
     /// One page of a run's tasks after the task id `after` (exclusive; empty =

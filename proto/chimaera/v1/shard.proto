@@ -79,6 +79,10 @@ message TaskRecord {
   uint64 memory_hint = 15;              // raised after OOM, bytes
   repeated ErrorRecord failure_history = 16;  // bounded, newest last
   TaskKey forwarded_to = 17;            // waiting for this call's outcome (see PublishEntry.forward_to)
+  // The peer its submission asked to run it (SubmitTasks.grant_to) while it
+  // still waited on dependencies: granted there in the commit that satisfies
+  // them, instead of a placement round and a second commit.
+  PeerInc grant_on_ready = 18;
 }
 
 message RunRecord {
@@ -185,6 +189,7 @@ message ShardCmd {
     CancelRun cancel_run = 30;
     StoreWrite store_write = 31;
     StoreRead store_read = 32;
+    Charge charge = 33;
   }
 }
 
@@ -250,6 +255,18 @@ message Cancel {
   TaskKey task = 1;
   ErrorRecord.Kind reason = 2;  // CANCELLED or DEADLINE
   string message = 3;
+}
+
+// Usage charged to a budgeted call (the root) by the peers running it or
+// calls made inside it. Past a limit the shard cancels the root and
+// everything it submitted, with kind BUDGET. The limits travel with each
+// charge, so the shard never reads the opaque policy.
+message Charge {
+  TaskKey root = 1;
+  double cpu_seconds = 2;
+  double gpu_seconds = 3;
+  double limit_cpu_seconds = 4;   // 0 = no limit
+  double limit_gpu_seconds = 5;
 }
 
 message CancelRun {

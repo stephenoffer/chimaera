@@ -124,6 +124,7 @@ def up(dist: str, env: dict[str, str]) -> None:
     seeds = ",".join(f"{n['NodeManagerAddress']}:{PORT}" for n in ns)
     PeerHost = _host_class(ray)
     hosts = [
+        # Ray's actor option (not Chimaera's): the host outlives this launcher.
         PeerHost.options(name=f"peer-{n['NodeID']}", lifetime="detached", get_if_exists=True,
                          scheduling_strategy=NodeAffinitySchedulingStrategy(n["NodeID"], soft=False)
                          ).remote(files, seeds, env)

@@ -49,6 +49,10 @@ spec:
   replicas: 3
   # OrderedReady would deadlock formation: pod 0 is not ready until the other founders exist.
   podManagementPolicy: Parallel
+  # Peers of two peer levels refuse each other, so a release that raises the
+  # level replaces every pod together (docs/deploy.md, "Upgrading").
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       app.kubernetes.io/name: chimaera

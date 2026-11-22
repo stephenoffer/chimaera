@@ -27,7 +27,7 @@ def inc(x):
 
 
 def calls_in_run() -> int:
-    return sum(ch.current_run().status().values())
+    return sum(ch.runs.current_run().status().values())
 
 
 def test_fast_items_share_calls_and_keep_their_own_errors():

@@ -1,4 +1,4 @@
-"""``ray.util.queue``: Ray's blocking queue API over ``ch.Queue``."""
+"""``ray.util.queue``: Ray's blocking queue API over ``ch.coord.Queue``."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ class Queue:
         if actor_options:
             raise unsupported("Queue(actor_options=...)", why="the queue's host actor is managed by Chimaera")
         self.maxsize = maxsize
-        self._q: ch.Queue[Any] = ch.Queue(maxsize)
+        self._q: ch.coord.Queue[Any] = ch.coord.Queue(maxsize)
 
     def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
         try:

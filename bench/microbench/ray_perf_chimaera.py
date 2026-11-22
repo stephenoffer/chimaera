@@ -110,7 +110,7 @@ class Actor:
         return b"ok"
 
     def small_value_batch(self, n):
-        ch.gather(*[small_value.remote() for _ in range(n)])
+        ch.get([small_value.remote() for _ in range(n)])
 
 
 @ch.remote(concurrency=1000)
@@ -133,14 +133,14 @@ class Client:
         results = []
         for s in self.servers:
             results.extend([s.small_value.remote() for _ in range(n)])
-        ch.gather(*results)
+        ch.get(results)
 
     def small_value_batch_arg(self, n):
         x = ch.put(0)
         results = []
         for s in self.servers:
             results.extend([s.small_value_arg.remote(x) for _ in range(n)])
-        ch.gather(*results)
+        ch.get(results)
 
 
 @ch.remote
@@ -180,7 +180,7 @@ def main():
         ch.put(0)
 
     def put_multi_small():
-        ch.gather(*[do_put_small.remote() for _ in range(10)])
+        ch.get([do_put_small.remote() for _ in range(10)])
 
     arr = np.zeros(100 * 1024 * 1024, dtype=np.int64)
 
@@ -195,13 +195,13 @@ def main():
 
     def small_value_batch():
         submitted = [small_value.remote() for _ in range(1000)]
-        ch.gather(*submitted)
+        ch.get(submitted)
         return 0
 
     timeit("single client tasks and get batch", small_value_batch)
 
     def put_multi():
-        ch.gather(*[do_put.remote() for _ in range(10)])
+        ch.get([do_put.remote() for _ in range(10)])
 
     timeit("multi client put gigabytes", put_multi, 10 * 8 * 0.1)
 
@@ -232,7 +232,7 @@ def main():
     timeit("single client tasks sync", small_task)
 
     def small_task_async():
-        ch.gather(*[small_value.remote() for _ in range(1000)])
+        ch.get([small_value.remote() for _ in range(1000)])
 
     timeit("single client tasks async", small_task_async, 1000)
 
@@ -242,7 +242,7 @@ def main():
 
     def multi_task():
         submitted = [a.small_value_batch.remote(n) for a in actors]
-        ch.gather(*submitted)
+        ch.get(submitted)
 
     timeit("multi client tasks async", multi_task, n * m)
 
@@ -256,14 +256,14 @@ def main():
     a = Actor.remote()
 
     def actor_async():
-        ch.gather(*[a.small_value.remote() for _ in range(1000)])
+        ch.get([a.small_value.remote() for _ in range(1000)])
 
     timeit("1:1 actor calls async", actor_async, 1000)
 
     a = Actor.options(concurrency=16).remote()
 
     def actor_concurrent():
-        ch.gather(*[a.small_value.remote() for _ in range(1000)])
+        ch.get([a.small_value.remote() for _ in range(1000)])
 
     timeit("1:1 actor calls concurrent", actor_concurrent, 1000)
 
@@ -282,10 +282,10 @@ def main():
 
     @ch.remote
     def work(actors):
-        ch.gather(*[actors[i % n_cpu].small_value.remote() for i in range(n)])
+        ch.get([actors[i % n_cpu].small_value.remote() for i in range(n)])
 
     def actor_multi2():
-        ch.gather(*[work.remote(a) for _ in range(m)])
+        ch.get([work.remote(a) for _ in range(m)])
 
     timeit("n:n actor calls async", actor_multi2, m * n)
 
@@ -294,7 +294,7 @@ def main():
     clients = [Client.remote(a) for a in actors]
 
     def actor_multi2_direct_arg():
-        ch.gather(*[c.small_value_batch_arg.remote(n) for c in clients])
+        ch.get([c.small_value_batch_arg.remote(n) for c in clients])
 
     timeit("n:n actor calls with arg async", actor_multi2_direct_arg, n * len(clients))
 
@@ -308,14 +308,14 @@ def main():
     a = AsyncActor.remote()
 
     def async_actor():
-        ch.gather(*[a.small_value.remote() for _ in range(1000)])
+        ch.get([a.small_value.remote() for _ in range(1000)])
 
     timeit("1:1 async-actor calls async", async_actor, 1000)
 
     a = AsyncActor.remote()
 
     def async_actor():
-        ch.gather(*[a.small_value_with_arg.remote(i) for i in range(1000)])
+        ch.get([a.small_value_with_arg.remote(i) for i in range(1000)])
 
     timeit("1:1 async-actor calls with args async", async_actor, 1000)
 
@@ -336,10 +336,10 @@ def main():
 
     @ch.remote
     def async_actor_work(actors):
-        ch.gather(*[actors[i % n_cpu].small_value.remote() for i in range(n)])
+        ch.get([actors[i % n_cpu].small_value.remote() for i in range(n)])
 
     def async_actor_multi():
-        ch.gather(*[async_actor_work.remote(a) for _ in range(m)])
+        ch.get([async_actor_work.remote(a) for _ in range(m)])
 
     timeit("n:n async-actor calls async", async_actor_multi, m * n)
 
@@ -356,27 +356,27 @@ def main():
 def client_main():
     """Runs in a child process whose driver connects over TCP ($CHIMAERA_ADDRESS)."""
     ch.init()
-    assert ch.Runtime.get().remote
+    assert ch._runtime.Runtime.get().remote
 
     value = ch.put(0)
     timeit("client: get calls", lambda: value.result())
 
     def small_value_batch():
-        ch.gather(*[small_value.remote() for _ in range(1000)])
+        ch.get([small_value.remote() for _ in range(1000)])
         return 0
 
     timeit("client: tasks and get batch", small_value_batch)
     timeit("client: put calls", lambda: ch.put(0))
-    timeit("client: tasks and put batch", lambda: ch.gather(*[do_put_small.remote() for _ in range(10)]), 1000)
+    timeit("client: tasks and put batch", lambda: ch.get([do_put_small.remote() for _ in range(10)]), 1000)
 
     arr = np.zeros(100 * 1024 * 1024, dtype=np.int64)
     timeit("client: put gigabytes", lambda: ch.put(arr), 8 * 0.1)
 
     a = Actor.remote()
     timeit("client: 1:1 actor calls sync", lambda: a.small_value.remote().result())
-    timeit("client: 1:1 actor calls async", lambda: ch.gather(*[a.small_value.remote() for _ in range(1000)]), 1000)
+    timeit("client: 1:1 actor calls async", lambda: ch.get([a.small_value.remote() for _ in range(1000)]), 1000)
     a = Actor.options(concurrency=16).remote()
-    timeit("client: 1:1 actor calls concurrent", lambda: ch.gather(*[a.small_value.remote() for _ in range(1000)]), 1000)
+    timeit("client: 1:1 actor calls concurrent", lambda: ch.get([a.small_value.remote() for _ in range(1000)]), 1000)
 
 
 def _peer_bin() -> str:

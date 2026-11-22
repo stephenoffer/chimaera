@@ -3,7 +3,7 @@
     CHIMAERA_ADDRESS=host:7710 CHIMAERA_TOKEN=... \\
         python -m chimaera.provisioner --k8s-statefulset chimaera --min 1 --max 8
 
-It is an ordinary remote driver: it reads ``ch.cluster().nodes()`` and keeps
+It is an ordinary remote driver: it reads ``ch.runs.cluster().nodes()`` and keeps
 no state of its own, so you can restart it at any time, and losing it stops
 scaling, never work. It sits outside the peers, so user code never runs next
 to the credentials that scale the cluster. Each change is printed as one
@@ -66,7 +66,7 @@ class Memory:
 
 
 def decide(nodes: list[Any], replicas: int, rules: Rules, memory: Memory, now: float) -> tuple[int, str]:
-    """The replica count to ask for, and why. `nodes` are ``ch.cluster().nodes()``."""
+    """The replica count to ask for, and why. `nodes` are ``ch.runs.cluster().nodes()``."""
     live = [n for n in nodes if n.alive]
     stuck = False
     if len(live) < replicas:
@@ -153,7 +153,7 @@ class StatefulSet:
 
 def _seeds() -> tuple[str, str]:
     """The live peers' addresses (seeds for a joining peer) and their port."""
-    live = sorted(n.address for n in ch.cluster().nodes() if n.alive and n.address)
+    live = sorted(n.address for n in ch.runs.cluster().nodes() if n.alive and n.address)
     if not live:
         raise RuntimeError("no live peer has a network address (a local peer?): spares have nothing to join")
     return ",".join(live), live[0].rsplit(":", 1)[1]
@@ -220,7 +220,7 @@ class SkySpares:
         if not os.environ.get("CHIMAERA_CLUSTER_TOKEN"):
             raise SystemExit("--sky needs CHIMAERA_CLUSTER_TOKEN set: spares join the cluster with it")
         self.base, self.launch_args, self.drain_s = base, launch_args, drain_s
-        self._store = ch.Store("provisioner/sky")
+        self._store = ch.coord.Store("provisioner/sky")
         self._children: list[subprocess.Popen[bytes]] = []
 
     def _names(self) -> list[str]:
@@ -255,7 +255,7 @@ class SkySpares:
 
 def run(pool: Any, rules: Rules, interval: float, out: Any = sys.stdout) -> None:
     memory = Memory()
-    view = ch.cluster()
+    view = ch.runs.cluster()
     while True:
         try:
             nodes, replicas = view.nodes(), pool.replicas()

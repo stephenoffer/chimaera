@@ -33,7 +33,7 @@ def main() -> None:
     cores = rt.info["usable_cores"]
     wave = max(1, int(cores * 0.5))
     # Warm up: start enough executors for the wave.
-    ch.gather(*(noop.remote(i) for i in range(wave * 4)), timeout=120)
+    ch.get((noop.remote(i) for i in range(wave * 4)), timeout=120)
 
     rtt = []
     for _ in range(300):
@@ -44,7 +44,7 @@ def main() -> None:
     wave_lat = []
     for _ in range(100):
         t = time.perf_counter()
-        ch.gather(*(noop.remote(i) for i in range(wave)), timeout=30)
+        ch.get((noop.remote(i) for i in range(wave)), timeout=30)
         wave_lat.append((time.perf_counter() - t) * 1e6)
 
     n = 20_000

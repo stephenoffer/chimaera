@@ -54,7 +54,7 @@ def test_a_lone_call_waits_at_most_max_wait():
 
 def test_async_batched_methods():
     e = Embedder.remote()
-    assert ch.gather(*(e.shout.remote(w) for w in ["a", "b", "c"]), timeout=60) == ["A", "B", "C"]
+    assert ch.get((e.shout.remote(w) for w in ["a", "b", "c"]), timeout=60) == ["A", "B", "C"]
 
 
 def test_errors_reach_every_call_in_the_batch():
@@ -62,7 +62,7 @@ def test_errors_reach_every_call_in_the_batch():
     with pytest.raises(ValueError, match="bad batch"):
         e.broken.remote("boom").result(timeout=60)
     with pytest.raises(ValueError, match="1 results for a batch of 2|0 results for a batch of 1"):
-        ch.gather(*(e.broken.remote(x) for x in ["a", "b"]), timeout=60)
+        ch.get((e.broken.remote(x) for x in ["a", "b"]), timeout=60)
     with pytest.raises(TypeError):
         e.embed.remote("a", "b")  # the method takes one list: the caller's binding rejects two
     with pytest.raises(TypeError, match="call it with one argument"):

@@ -18,11 +18,11 @@ class Where:
     def node(self):
         return ch.context().node
 
-peers = [n.peer for n in ch.cluster().nodes()]
+peers = [n.peer for n in ch.runs.cluster().nodes()]
 placed = []
 for _ in range(3):
     for target in peers:
-        a = Where.options(placement=ch.Placement(require={"node": target})).remote()
+        a = Where.options(placement=ch.dist.Placement(require={"node": target})).remote()
         placed.append(a.node.remote().result(timeout=60) == target)
         a.close()
 print(sum(placed), len(placed))

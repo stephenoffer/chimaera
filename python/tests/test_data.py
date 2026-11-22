@@ -1,4 +1,4 @@
-"""Partitioned data: ch.partitions, reduce_by_key (the shuffle contract) and sinks."""
+"""Partitioned data: ch.data.partitions, reduce_by_key (the shuffle contract) and sinks."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ def count_words(partition):
 
 
 def test_word_count_matches_a_serial_count():
-    totals = count_words.map(ch.partitions(LINES, n=7)).reduce_by_key(operator.add, partitions=3)
-    assert isinstance(totals, ch.Partitioned) and len(totals) == 3
+    totals = count_words.map(ch.data.partitions(LINES, n=7)).reduce_by_key(operator.add, partitions=3)
+    assert isinstance(totals, ch.data.Partitioned) and len(totals) == 3
     parts = list(totals)  # one list of (key, value) pairs per partition
     assert len(parts) == 3 and sum(len(p) for p in parts) == len(totals.to_dict())
     assert totals.to_dict() == collections.Counter(w for line in LINES for w in line.split())
@@ -88,20 +88,20 @@ def test_file_sources_project_and_filter():
                 f.write(json.dumps({"name": f"p{i}{j}", "age": 20 + 10 * j, "city": "x"}) + "\n")
     with open(os.path.join(d, "more.csv"), "w") as f:
         f.write("name,age\nc1,50\nc2,10\n")
-    parts = ch.partitions(os.path.join(d, "*.jsonl"), columns=["name"], filter=[("age", ">=", 40)])
+    parts = ch.data.partitions(os.path.join(d, "*.jsonl"), columns=["name"], filter=[("age", ">=", 40)])
     assert len(parts) == 3
     assert sorted(n for ns in names.map(parts) for n in ns) == ["p02", "p03", "p12", "p13", "p22", "p23"]
-    rows = list(ch.partitions(os.path.join(d, "*.jsonl"), columns=["name", "age"])[0].rows())
+    rows = list(ch.data.partitions(os.path.join(d, "*.jsonl"), columns=["name", "age"])[0].rows())
     assert rows[0] == {"name": "p00", "age": 20}
-    young = ch.partitions(os.path.join(d, "*.csv"), filter=lambda r: int(r["age"]) < 30)
+    young = ch.data.partitions(os.path.join(d, "*.csv"), filter=lambda r: int(r["age"]) < 30)
     assert list(names.map(young)) == [["c2"]]
     with pytest.raises(FileNotFoundError):
-        ch.partitions(os.path.join(d, "*.nothing"))
+        ch.data.partitions(os.path.join(d, "*.nothing"))
 
 
 def test_file_sink_writes_parts_and_a_manifest_and_rewrites_cleanly():
     out = tempfile.mkdtemp()
-    totals = count_words.map(ch.partitions(LINES, n=4)).reduce_by_key(operator.add, partitions=2)
+    totals = count_words.map(ch.data.partitions(LINES, n=4)).reduce_by_key(operator.add, partitions=2)
     manifest = totals.write(ext.FileSink(out)).result()
     assert manifest["rows"] == len(totals.to_dict()) and len(manifest["parts"]) == 2
     on_disk = {}
@@ -138,7 +138,7 @@ def total(partition):
 
 
 def test_custom_sources_and_sinks_plug_in():
-    parts = ch.partitions(Squares(35))
+    parts = ch.data.partitions(Squares(35))
     assert len(parts) == 4
     committed = total.map(parts).write(Collect()).result()
     assert sum(committed.values()) == sum(x * x for x in range(40)) and sorted(committed) == [0, 1, 2, 3]
@@ -165,3 +165,21 @@ def test_register_serializer_round_trips():
     assert b"point_loads" in data  # the custom form, not Point's __dict__
     p = pickle.loads(data)
     assert (p.x, p.y) == (3, 4)
+
+
+def test_shuffle_buckets_agree_across_processes_whatever_their_hash_seed():
+    # Scatters run in different executors: a key must land in the same bucket
+    # in all of them, including the fast path for ints.
+    import subprocess
+    import sys
+
+    code = (
+        "from chimaera._shuffle import bucket_of; "
+        "print([bucket_of(k, 64) for k in (0, 1, -1, -2, 2**61, 2**70, 123456789012, 'a', b'b', (1, 'x'), 2.5)])"
+    )
+    env = {k: v for k, v in __import__("os").environ.items() if k != "PYTHONHASHSEED"}
+    outs = {
+        subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env={**env, "PYTHONHASHSEED": s}, check=True).stdout
+        for s in ("0", "1", "random", "4242")
+    }
+    assert len(outs) == 1, outs

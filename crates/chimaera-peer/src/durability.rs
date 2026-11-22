@@ -7,8 +7,12 @@
 //! that comes back from a crash having forgotten its vote could vote twice in
 //! one term. So a peer whose logs were not synced, and whose machine rebooted
 //! without a clean shutdown, discards its raft identity and joins again as a
-//! new member (the cluster replaces the old one like any dead voter). What is
-//! left at risk is a majority of one group's machines failing at once.
+//! new member (the cluster replaces the old one like any dead voter), but only
+//! while the rest of the cluster still leads every group it held. When a
+//! majority of a group's machines went down together nobody leads it, and
+//! discarding would lose the group for good: the peer keeps its state then,
+//! and the group comes back with whatever its voters' disks kept (possibly
+//! missing its last moments of commits).
 //!
 //! The choice: `CHIMAERA_RAFT_SYNC` (`fsync`, `full`, `none`), else measured:
 //! keep `fsync` where it is cheap (local SSDs), skip it where a sync costs a
@@ -121,19 +125,31 @@ fn trusted(prev: Option<&Marker>, boot: Option<&str>) -> bool {
 }
 
 /// Run before the peer loads its identity (holding the directory lock):
-/// discard raft state the machine may have lost, then record this process.
-pub fn guard(dir: &Path, durability: DiskDurability) -> io::Result<()> {
+/// discard raft state the machine may have lost, if `others_lead` (given the
+/// raft directory) says the rest of the cluster leads every group it held,
+/// then record this process.
+pub fn guard(dir: &Path, durability: DiskDurability, others_lead: impl FnOnce(&Path) -> bool) -> io::Result<()> {
     let boot = boot_id();
     let prev = std::fs::read_to_string(dir.join(MARKER)).ok().and_then(|s| Marker::parse(&s));
-    if !trusted(prev.as_ref(), boot.as_deref()) && dir.join("raft").exists() {
-        tracing::warn!(
-            "{}: raft logs were not synced and the machine restarted without a clean shutdown; \
-             joining again as a new member",
-            dir.display()
-        );
-        std::fs::remove_dir_all(dir.join("raft"))?;
-        let _ = std::fs::remove_file(dir.join("peer-id"));
-        let _ = std::fs::remove_file(dir.join("hosted-groups"));
+    let raft = dir.join("raft");
+    if !trusted(prev.as_ref(), boot.as_deref()) && raft.exists() {
+        if others_lead(&raft) {
+            tracing::warn!(
+                "{}: raft logs were not synced and the machine restarted without a clean shutdown; \
+                 joining again as a new member",
+                dir.display()
+            );
+            std::fs::remove_dir_all(&raft)?;
+            let _ = std::fs::remove_file(dir.join("peer-id"));
+            let _ = std::fs::remove_file(dir.join("hosted-groups"));
+        } else {
+            tracing::error!(
+                "{}: raft logs were not synced and the machine restarted without a clean shutdown, but no \
+                 other voter leads this peer's groups: keeping its state so they can recover (their last \
+                 commits may be missing)",
+                dir.display()
+            );
+        }
     }
     let now = Marker {
         boot: boot.unwrap_or_else(|| "unknown".into()),
@@ -239,14 +255,32 @@ mod tests {
         std::fs::write(d.path().join("hosted-groups"), b"3\n").unwrap();
         // The previous process ran unsynced in another boot and never stopped cleanly.
         std::fs::write(d.path().join(MARKER), marker("another-boot", true, false).encode()).unwrap();
-        guard(d.path(), DiskDurability::Process).unwrap();
+        guard(d.path(), DiskDurability::Process, |_| true).unwrap();
         assert!(!d.path().join("raft").exists() && !d.path().join("peer-id").exists());
         assert!(!d.path().join("hosted-groups").exists(), "the old identity's groups are not rejoined");
         // A clean stop syncs and marks it: the next start keeps its state.
         std::fs::create_dir_all(d.path().join("raft")).unwrap();
         mark_clean(d.path()).unwrap();
         std::fs::write(d.path().join("peer-id"), b"new").unwrap();
-        guard(d.path(), DiskDurability::Process).unwrap();
+        guard(d.path(), DiskDurability::Process, |_| panic!("a clean stop needs no probe")).unwrap();
         assert!(d.path().join("raft").exists() && d.path().join("peer-id").exists());
+    }
+
+    #[test]
+    fn guard_keeps_raft_state_when_no_other_voter_leads_its_groups() {
+        // A whole group rebooted at once: discarding every copy would lose it.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("raft")).unwrap();
+        std::fs::write(d.path().join("peer-id"), b"old").unwrap();
+        std::fs::write(d.path().join(MARKER), marker("another-boot", true, false).encode()).unwrap();
+        let mut asked = None;
+        guard(d.path(), DiskDurability::Process, |raft| {
+            asked = Some(raft.to_path_buf());
+            false
+        })
+        .unwrap();
+        assert_eq!(asked.as_deref(), Some(d.path().join("raft").as_path()));
+        assert!(d.path().join("raft").exists(), "state kept");
+        assert_eq!(std::fs::read(d.path().join("peer-id")).unwrap(), b"old", "identity kept");
     }
 }

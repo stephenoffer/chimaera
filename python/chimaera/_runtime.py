@@ -9,6 +9,7 @@ events into resolved futures; waiting never holds the GIL in Rust.
 from __future__ import annotations
 
 import atexit
+import collections
 import fnmatch
 import inspect
 import itertools
@@ -26,7 +27,7 @@ import weakref
 from typing import Any, Callable
 
 from . import _cluster, _context, _objects, _project, _serde, _values
-from ._errors import ChimaeraError, DataLost, Infeasible, SerializationError, WorkflowDivergence
+from ._errors import ChimaeraError, DataLost, Infeasible, QuorumLost, SerializationError, WorkflowDivergence
 from ._native import Client, blake3_digest, child_id, socket_path
 
 VERSION = "0.1.0"
@@ -43,18 +44,36 @@ def default_home() -> str:
     return os.environ.get("CHIMAERA_HOME") or os.path.join(os.path.expanduser("~"), ".chimaera", "local")
 
 
-def _peer_binary() -> str:
-    candidates = [os.environ.get("CHIMAERA_BIN", "")]
+def _peer_binary(*, skip: str = "") -> str:
+    """The `chimaera` peer binary: $CHIMAERA_BIN, the one a wheel installs
+    with this package, a development checkout's build, then PATH. `skip` is a
+    path to pass over (the `chimaera` command's launcher, which would run
+    itself)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(here, "_bin", "chimaera"))
-    candidates.append(shutil.which("chimaera") or "")
-    # Development checkout: <repo>/python/chimaera -> <repo>/target/{release,debug}/chimaera
-    repo = os.path.dirname(os.path.dirname(here))
-    candidates += [os.path.join(repo, "target", "release", "chimaera"), os.path.join(repo, "target", "debug", "chimaera")]
+    repo = os.path.dirname(os.path.dirname(here))  # <repo>/python/chimaera
+    candidates = [
+        os.environ.get("CHIMAERA_BIN", ""),
+        os.path.join(here, "_bin", "chimaera"),
+        os.path.join(repo, "target", "release", "chimaera"),
+        os.path.join(repo, "target", "debug", "chimaera"),
+        shutil.which("chimaera") or "",
+    ]
     for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK) and not (skip and _same_file(c, skip)):
             return c
-    raise ChimaeraError("cannot find the `chimaera` peer binary; set CHIMAERA_BIN or reinstall the package")
+    raise ChimaeraError(
+        "cannot find the `chimaera` peer binary (looked for "
+        + ", ".join(c for c in candidates if c)
+        + "). A wheel built with `make wheel` includes it; in a source checkout, build it with "
+        "`cargo build --release -p chimaera-peer`, or set CHIMAERA_BIN to its path."
+    )
+
+
+def _same_file(a: str, b: str) -> bool:
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def peer_socket(home: str) -> str:
@@ -89,12 +108,42 @@ def _check_peer_binary(home: str) -> None:
         )
 
 
+def _check_cluster_version(name: str, version: str) -> None:
+    """Warn (CH116) when a remote cluster runs another Chimaera version: the
+    wire version matched on connect, but behavior may not."""
+    if version and version != VERSION:
+        warnings.warn(
+            f"CH116: cluster {name!r} runs Chimaera {version}, this program {VERSION}. The protocol matches, but "
+            "behavior may differ; install the cluster's version here (or upgrade the cluster) if calls misbehave.",
+            stacklevel=4,
+        )
+
+
+# What a local peer, and so every executor it starts, takes from the driver
+# that happens to start it: where programs and the user's files are, and
+# Chimaera's own settings. Nothing else, or that driver's variables would reach
+# the calls of every later run on the peer (see run_env for what a run ships).
+PEER_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG")
+# A local peer's log past this size is rotated when the next peer starts.
+PEER_LOG_MAX = 16 << 20
+
+
+def _peer_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k in PEER_ENV or k.startswith(("LC_", "CHIMAERA_"))}
+
+
 def _ensure_local_peer(home: str) -> None:
     sock = peer_socket(home)
     if os.path.exists(sock):
         _check_peer_binary(home)
         return
-    with open(os.path.join(home, "peer.log"), "ab") as log:
+    log_path = os.path.join(home, "peer.log")
+    try:
+        if os.path.getsize(log_path) > PEER_LOG_MAX:
+            os.replace(log_path, log_path + ".1")  # keep one previous log, not every one
+    except OSError:
+        pass
+    with open(log_path, "ab") as log:
         subprocess.Popen(
             [_peer_binary(), "--dir", home, "peer", "start", "--idle-timeout", "600"],
             stdin=subprocess.DEVNULL,
@@ -102,6 +151,7 @@ def _ensure_local_peer(home: str) -> None:
             stderr=log,
             start_new_session=True,
             close_fds=True,
+            env=_peer_env(),
         )
     deadline = time.monotonic() + 20
     while not os.path.exists(sock):
@@ -182,9 +232,34 @@ def _connect_remote(target: _cluster.Target, client_name: str) -> Client:
     raise ChimaeraError(f"cannot reach cluster {target.name!r}: " + "; ".join(errors))
 
 
+class _ForkedClient:
+    """The client in a process forked from one using Chimaera: the threads
+    that drive the connection were not copied, so a call through it would
+    wait forever (as ray.get does in a forked DataLoader worker)."""
+
+    def __getattr__(self, name: str) -> Any:
+        raise ChimaeraError(
+            "CH113: this process was forked from one using Chimaera, so it cannot submit, wait or fetch through "
+            "its parent's connection. Start it with multiprocessing.get_context('spawn') or 'forkserver', or "
+            "make the work a Chimaera call instead of a child process."
+        )
+
+
+def _after_fork_in_child() -> None:
+    rt = Runtime._instance
+    if rt is not None:
+        rt.forked = True  # its values belong to the parent: dropping them here frees nothing
+        rt.client = _ForkedClient()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
 class Runtime:
     _instance: Runtime | None = None
     _lock = threading.Lock()
+    forked = False
 
     @classmethod
     def get(cls) -> Runtime:
@@ -218,7 +293,18 @@ class Runtime:
         else:
             self.client = self._connect_local(client_name)
         self.info = self.client.info
+        # Executors get their run's tenant in its environment; a driver
+        # credential names its own.
+        self.tenant: str = (
+            tenant
+            or os.environ.get("CHIMAERA_TENANT")
+            or _cluster.tenant_of(target.token if target is not None else None)
+            or "default"
+        )
+        self.client.set_tenant(self.tenant)
         self.inline_limit: int = self.info["inline_limit"]
+        if target is not None:
+            _check_cluster_version(target.name, self.info.get("version", ""))
         if self.remote:
             # The peer's store is on another machine: values are uploaded as
             # blobs and fetched into a local cache to be read.
@@ -231,6 +317,10 @@ class Runtime:
         # A blob another peer stored is fetched into this peer's store on read.
         _serde.localize_hook = self.localize
         self._futures: weakref.WeakValueDictionary[bytes, Any] = weakref.WeakValueDictionary()
+        # Call key -> the ch.put futures and arena links it reads, held until the call has an
+        # outcome (its own future may be dropped first): a value is never
+        # released under a reader still running.
+        self._reads: dict[bytes, list[Any]] = {}
         self._streams: weakref.WeakValueDictionary[bytes, Any] = weakref.WeakValueDictionary()
         self.cond = threading.Condition()
         self._code: dict[int, tuple[Any, bytes]] = {}
@@ -241,6 +331,14 @@ class Runtime:
         # Driver backpressure (wait_for_room): arguments of unfinished calls.
         self._pending_bytes = 0
         self._pending_calls = 0
+        # Held until their outcome arrives, even if the caller dropped them,
+        # so exit can wait for them; maps not yet read to the end; generator
+        # calls (nobody reads those after exit).
+        self._unfinished: dict[bytes, Any] = {}
+        # Call key -> the function's name, for labelling what calls print.
+        self._names: collections.OrderedDict[bytes, str] = collections.OrderedDict()
+        self._open_maps: set[Any] = set()
+        self._stream_keys: set[bytes] = set()
         self._room_warned: set[str | None] = set()
         self._releases: list[bytes] = []
         self.run: bytes | None = None
@@ -252,22 +350,31 @@ class Runtime:
                 "CHIMAERA_CODE_FINGERPRINT": code_fingerprint(),
                 # Executors log at the driver's level (stderr reaches the driver).
                 "CHIMAERA_LOG_LEVEL": logging.getLevelName(logging.getLogger().getEffectiveLevel()),
+                # A remote peer's workers run its own Python: they name a mismatch
+                # when the program's functions will not load (CH115).
+                "CHIMAERA_DRIVER_PYTHON": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "CHIMAERA_TENANT": self.tenant,
             }
             sys_path = [p or os.getcwd() for p in sys.path]
             # A remote peer has no copy of the project's own modules: ship them.
             project = _project.pack(sys_path) if self.remote else None
             if project is not None:
                 ship[_project.ENV] = project[0].hex()
-            self.run, self.detached = self.client.create_run(
-                tenant or os.environ.get("CHIMAERA_TENANT") or "default",
-                "",
-                want_detached,
-                sys.executable,
-                os.getcwd(),
-                sys_path,
-                ship,
-                " ".join(sys.argv)[:200],
-            )
+            try:
+                self.run, self.detached = self.client.create_run(
+                    self.tenant,
+                    "",
+                    want_detached,
+                    sys.executable,
+                    os.getcwd(),
+                    sys_path,
+                    ship,
+                    " ".join(sys.argv)[:200],
+                )
+            except ConnectionError as e:
+                if str(e).startswith("quorum lost"):
+                    raise QuorumLost(str(e)) from None
+                raise
             _project.ship(self.blob_sink, self.run, project)
             self.client.attach(self.run)
             atexit.register(self._finish)
@@ -333,12 +440,18 @@ class Runtime:
         else:
             self.client.localize(run, obj)
 
-    def pack(self, key: bytes, value: Any, site: str | None = None) -> dict[str, Any]:
+    def pack(self, key: bytes, value: Any, site: str | None = None, holds: list[Any] | None = None) -> dict[str, Any]:
         """Encode a call frame by size: inline when small, else a file for this
         call; large buffers and arguments become blobs shared by every call
-        that passes the same bytes (see _values)."""
+        that passes the same bytes (see _values). Arena arrays linked for the
+        call go into `holds`; without it they stay for the run."""
         run = key[:16]
-        enc = _values.encode_frame(value, run, self.blob_sink)
+        enc = _values.encode_frame(value, run, self.blob_sink, None if self.in_executor else self._release_values)
+        for hold in enc.holds:
+            if holds is None:
+                hold.keep()
+            else:
+                holds.append(hold)
         _values.repeats.note(site, enc)
         packed = {
             "args_size": enc.size,
@@ -359,6 +472,10 @@ class Runtime:
         _serde.write_file(_serde.object_path(self.object_dir, run, obj), enc.parts)
         return {**packed, "args_inline": None, "args_object": obj}
 
+    def _release_values(self, run: bytes, object_ids: list[bytes]) -> None:
+        """Free stored values nothing refers to any more, on every peer."""
+        self.client.release_objects(run, object_ids)
+
     def release_later(self, key: bytes) -> None:
         """A future was dropped: unpin its result (sent in batches)."""
         self._releases.append(key)
@@ -371,16 +488,23 @@ class Runtime:
         for s, f in zip(specs, futures):
             self._futures[s["key"]] = f
             if not self.in_executor:
+                name = s["policy"].get("fn_name", "")
+                self._names[s["key"]] = ".".join(name.split(".")[-2:]) if s.get("method") else name.rsplit(".", 1)[-1]
+                if len(self._names) > 65536:
+                    self._names.popitem(last=False)
                 with self.cond:
                     self._pending_bytes += f._arg_bytes
                     self._pending_calls += 1
-                f.add_done_callback(self._release_room)
+                    self._unfinished[s["key"]] = f
+                f._on_done(self._release_room)
         self.client.submit(specs)
 
     def _release_room(self, f: Any) -> None:
         with self.cond:
             self._pending_bytes -= f._arg_bytes
             self._pending_calls -= 1
+            self._unfinished.pop(f.key, None)
+            self._stream_keys.discard(f.key)
             self.cond.notify_all()
 
     def wait_for_room(self, nbytes: int, site: str | None) -> None:
@@ -441,12 +565,15 @@ class Runtime:
             for ev in events:
                 tag = ev[0]
                 if tag == "outcome":
+                    self._reads.pop(ev[1], None)
                     f = self._futures.get(ev[1])
                     if f is not None:
                         f._set(ev[2])
                         changed = True
                 elif tag == "acks":
                     for key, status, reason, outcome in ev[2]:
+                        if status == "Rejected" or outcome is not None:
+                            self._reads.pop(key, None)
                         f = self._futures.get(key) if key else None
                         if f is None:
                             continue
@@ -455,6 +582,8 @@ class Runtime:
                                 exc: ChimaeraError = Infeasible(reason)
                             elif reason.startswith("workflow divergence"):
                                 exc = WorkflowDivergence(reason)
+                            elif reason.startswith("quorum lost"):
+                                exc = QuorumLost(reason)
                             else:
                                 exc = ChimaeraError(reason)
                             f._set_exception(exc)
@@ -468,10 +597,12 @@ class Runtime:
                         s._add(ev[3], ev[4])
                         changed = True
                 elif tag == "log":
-                    _, _key, stream, text, pid = ev
+                    _, key, stream, text, pid = ev
                     out = sys.stderr if stream == "stderr" else sys.stdout
+                    name = self._names.get(key)
+                    label = f"({name} pid={pid})" if name else f"(pid={pid})"
                     for line in text.splitlines():
-                        out.write(f"(pid={pid}) {line}\n")
+                        out.write(f"{label} {line}\n")
                     out.flush()
                 elif tag in ("actor", "error"):
                     box = self._waiters.pop(ev[1], None)
@@ -490,9 +621,11 @@ class Runtime:
             return _serde.loads(inline, _serde.run_dir(self.object_dir, run))
         return read_object(self.object_dir, run, obj)
 
-    def _finish(self) -> None:
+    def _finish(self, cancel: bool = False) -> None:
         try:
             if not self.detached:
+                if not cancel:
+                    self._wait_for_work()
                 self.client.finish_run()
             else:
                 self.client.flush()
@@ -501,6 +634,54 @@ class Runtime:
             self.client.close()
         except Exception as e:  # interpreter is exiting; report, do not raise
             sys.stderr.write(f"chimaera: could not finish run {self.run_id} cleanly: {e}\n")
+
+    def shutdown(self, cancel: bool) -> None:
+        """Finish now what exit would (see _finish), and stop being the
+        process's runtime: the next call connects again."""
+        atexit.unregister(self._finish)
+        self._finish(cancel)
+
+    def _wait_for_work(self) -> None:
+        """At exit, finish the script's work, as concurrent.futures waits for
+        its pool: calls it never waited on, and maps it did not read to the
+        end. Generator calls are stopped (nobody reads their items now). A
+        script that failed or was interrupted cancels instead, and Ctrl-C
+        during the wait cancels what is left; finish_run then cancels it."""
+        for key in list(self._stream_keys):
+            if key in self._unfinished:
+                self.client.cancel(key, False)
+        maps = list(self._open_maps)
+        calls = sum(1 for k in self._unfinished if k not in self._stream_keys)
+        if not calls and not maps:
+            return
+        what = " and ".join(
+            p for p in (f"{calls} unfinished call{'s' * (calls != 1)}" if calls else "",
+                        f"{len(maps)} unread map{'s' * (len(maps) != 1)}" if maps else "") if p
+        )
+        failed = getattr(sys, "last_exc", None) or getattr(sys, "last_value", None)
+        if failed is not None:
+            why = "was interrupted" if isinstance(failed, KeyboardInterrupt) else "failed"
+            sys.stderr.write(f"chimaera: cancelling {what}: the script {why}\n")
+            return
+        sys.stderr.write(
+            f"chimaera: waiting for {what} before exiting (Ctrl-C cancels them; "
+            "ch.init(detach=True) lets work outlive the script)\n"
+        )
+        try:
+            failures, first = 0, None
+            for m in maps:
+                for item in m.outcomes():
+                    if item.error is not None:
+                        failures += 1
+                        first = first or item.error
+            self.client.flush()
+            with self.cond:
+                while any(k not in self._stream_keys for k in self._unfinished):
+                    self.cond.wait(1.0)
+            if failures:
+                sys.stderr.write(f"chimaera: {failures} map item{'s' * (failures != 1)} you did not read failed; the first: {first!r}\n")
+        except KeyboardInterrupt:
+            sys.stderr.write("chimaera: cancelling the rest\n")
 
 
 def preflight_captures(obj: Any) -> None:

@@ -21,11 +21,11 @@
 >    and `chimaera inspect` works after the script exits.
 > 5. **Pools:** `Class.options(replicas="auto").pool(*ctor_args)`, and `pool.method.map(items)` instead of a
 >    method name string.
-> 6. **Durable state:** schema on the decorator (`state=ch.State(codec=..., checkpoint_every=...)`), identity via
->    `.options(key=...)`; 1 MiB inline limit.
+> 6. **Durable state:** schema on the decorator (`state=ch.durable.State(codec=..., checkpoint_every=...)`), identity via
+>    `.options(name=...)`; 1 MiB inline limit.
 > 7. **§5 worked example:** 2 GiB + 3 × 896 MiB = 4,736 MiB fits under 5 GiB, so "clamp to 2" requires two stated
 >    rules: depths move on a power-of-two ladder, and the guard keeps 10% headroom. A regression test pins it.
-> 8. **Deadlines** in `ch.options(deadline="30s")` are relative and resolved per submission; children inherit the
+> 8. **Deadlines** in `ch.defaults(deadline="30s")` are relative and resolved per submission; children inherit the
 >    earliest absolute deadline; a `datetime` is absolute.
 > 9. **Decorator-only fields:** `workflow=`, `state=` and `batch=`. `workflow="durable"` requires `async def`;
 >    replay pins `PYTHONHASHSEED`.
@@ -177,22 +177,22 @@ def summarize(partition):
     return partition.summary()
 
 large = summarize.options(cpus=8, memory="32 GiB")
-with ch.options(accounting="isolated"):
+with ch.defaults(accounting="isolated"):
     result = large.remote(partition)
 ```
 
 | Control | Proposed surface | What Chimaera enforces or explains |
 |---|---|---|
 | Reservation and isolation | `cpus=8`, `memory="32 GiB"`, `accounting="isolated"` | Reserve eight core equivalents at admission. Apply the advertised memory ceiling to the isolated subtree. Show actual CPU time, throttling, charged peak, shared charges, and scope independently. |
-| Topology and affinity | `placement=ch.Placement(require={"fabric": "rdma"}, prefer=("input_local", "same_numa"))` | Hard predicates filter candidates. Preferences rank feasible peers. An unmet requirement reports the requested shape, candidate count, constraint, and available alternatives. |
+| Topology and affinity | `placement=ch.dist.Placement(require={"fabric": "rdma"}, prefer=("input_local", "same_numa"))` | Hard predicates filter candidates. Preferences rank feasible peers. An unmet requirement reports the requested shape, candidate count, constraint, and available alternatives. |
 | Recovery and effects | `effects="none"` (default) / `"idempotent"` / `"external"`, `max_attempts=3`, a participating sink’s `idempotency_key` | Retry infrastructure losses only within the declared effect contract, deadline, and attempt budget (three attempts include the original; user exceptions are never retried unless listed in `retry_exceptions`). `"external"` gets an at-most-once start and `OutcomeUnknown`. Scopes and `.options()` may only make effects stricter. |
-| Bulk throughput and latency | `fn.map(items, ordered=False)`, `ch.options(max_in_flight_bytes="2 GiB")` | Bound retained and admitted bytes. Shrink credits under pressure. Honor ordered output when requested. A single input exceeding a hard cap gets a size error or an eligible streaming path. |
+| Bulk throughput and latency | `fn.map(items, ordered=False)`, `ch.defaults(max_in_flight_bytes="2 GiB")` | Bound retained and admitted bytes. Shrink credits under pressure. Honor ordered output when requested. A single input exceeding a hard cap gets a size error or an eligible streaming path. |
 | Observability and tuning | `accounting="isolated"`, `adaptive="observe"`, `adaptive="frozen"` | Observe records proposed changes. Frozen pins heuristic settings and retains hard admission guards. A decision record shows the effective setting, source, evidence, and rollback. |
-| Deadlines and quotas | `ch.options(deadline="30s")` (relative, resolved per submission; a `datetime` is absolute) plus operator CPU-second/GPU-second envelopes | Child deadlines inherit the earliest ancestor deadline. Spend reservations require a known price basis and account for unavoidable in-flight spend. Show deadline expiry, wait timeout, and cancellation separately. |
+| Deadlines and quotas | `ch.defaults(deadline="30s")` (relative, resolved per submission; a `datetime` is absolute) plus operator CPU-second/GPU-second envelopes | Child deadlines inherit the earliest ancestor deadline. Spend reservations require a known price basis and account for unavoidable in-flight spend. Show deadline expiry, wait timeout, and cancellation separately. |
 
 For soft settings the order is explicit call view, innermost submission scope, decorator defaults, learned profile, then framework defaults. Hard node, tenant, parent, and job limits intersect. A call can narrow those limits. An empty intersection or contradictory hard request fails with the field names and policy sources. An adaptive change can operate only inside the resulting envelope. A generic override cannot promote an arbitrary side effect to replay-safe work. The frozen effective policy is attached to each attempt.
 
-**Large inputs and large results.** A Python generator that reads a local file is produced by that Python process. Chimaera consumes it under credit and documents which prefix was accepted before disconnection. A fleet-sized run instead passes `chimaera.partitions(manifest_uri)`, an immutable, sharded index of input ranges that peers read independently. A partitioned sink writes results directly from peers and returns a small manifest. A notebook can iterate a sample. Calling `list(...)` remains an explicit decision to bring the entire result into client memory.
+**Large inputs and large results.** A Python generator that reads a local file is produced by that Python process. Chimaera consumes it under credit and documents which prefix was accepted before disconnection. A fleet-sized run instead passes `chimaera.data.partitions(manifest_uri)`, an immutable, sharded index of input ranges that peers read independently. A partitioned sink writes results directly from peers and returns a small manifest. A notebook can iterate a sample. Calling `list(...)` remains an explicit decision to bring the entire result into client memory.
 
 **Packaging and error behavior.** Local scripts run with their current environment. A wheel-provided supervisor launches the local executor entry point directly, so process spawning does not execute the user’s top-level script a second time. Remote preflight captures an importable module, a lock or image digest, Python ABI, declared files, and required device libraries. Small notebook functions can be snapshotted within an authenticated project. Captured file handles, live sockets, and oversized closures fail before submission with the captured variable name and a repair example. Replicas fetch the same content-addressed environment through cell caches. A mismatched CUDA driver is a placement error. A Python exception keeps its original type when safely reconstructable, traceback, input index, attempt ID, and cause chain. Otherwise a `RemoteError` retains that information. Unknown effects have their own exception. Type stubs use `ParamSpec` and generic futures so editor completion remains useful.
 
@@ -372,7 +372,7 @@ Every started invocation has a logical task ID and an attempt ID. The agent writ
 
 [Linux cgroup v2 counters and memory ownership][cgroup] · [NVIDIA process and job statistics][dcgmproc] · [NVIDIA profiling fields][dcgmprof] · [MIG measurement support][mig]
 
-**Automatic and isolated accounting.** The default obtains exact exclusive-process CPU deltas when the execution boundary supports them. It routes a small number of naturally arriving calls from a new code/input profile to isolated processes, and repeats that measurement when memory risk or profile drift increases. It never duplicates an ordinary call to profile it. Compatible high-rate work uses a warm pool with a provenance label on every reported field. `with chimaera.options(accounting="isolated")` requests a dedicated accounting boundary and per-attempt enforcement. A Linux peer must advertise the required controllers and kernel features. Unsupported hard requirements fail preflight. On a laptop without delegation, report process-level measurements. Strict GPU attribution also requires compatible hardware and an exclusive or instrumented execution interval. The scheduler explicitly prices the startup and utilization cost of isolation. A prewarmed dedicated process must retain its own cgroup and disclose its starting baseline.
+**Automatic and isolated accounting.** The default obtains exact exclusive-process CPU deltas when the execution boundary supports them. It routes a small number of naturally arriving calls from a new code/input profile to isolated processes, and repeats that measurement when memory risk or profile drift increases. It never duplicates an ordinary call to profile it. Compatible high-rate work uses a warm pool with a provenance label on every reported field. `with chimaera.defaults(accounting="isolated")` requests a dedicated accounting boundary and per-attempt enforcement. A Linux peer must advertise the required controllers and kernel features. Unsupported hard requirements fail preflight. On a laptop without delegation, report process-level measurements. Strict GPU attribution also requires compatible hardware and an exclusive or instrumented execution interval. The scheduler explicitly prices the startup and utilization cost of isolation. A prewarmed dedicated process must retain its own cgroup and disclose its starting baseline.
 
 **A measurement from the local machine.** In two separate Python interpreters, bodies with about 0.3 seconds of wall time consumed **0.995 mean CPU cores** for a busy loop and **0.007** for a sleep plus a short allocation. A third interpreter allocated and released 8, 64, and 8 MiB sequentially. Its lifetime RSS peaks were **27.05, 83.11, and 83.11 MiB**. Reporting that last value as the third item’s own allocation would misdiagnose it by a wide margin. These were process-clock and `getrusage` readings. The local runner did not expose a delegated cgroup or a GPU. The same probe is included for repetition on another host.
 
@@ -411,7 +411,7 @@ def counts_by_region(partition):
     counts = Counter(row["region"] for row in partition.rows())
     return list(counts.items())
 
-batches = counts_by_region.map(ch.partitions(input_manifest))
+batches = counts_by_region.map(ch.data.partitions(input_manifest))
 totals = batches.reduce_by_key(sum_counts)
 output_manifest = totals.write_parquet(output_uri).result()
 ```
@@ -475,7 +475,7 @@ Ray already offers configurable task retries and actor restarts. Chimaera’s pr
 | A rank dies during checkpoint or collective | Abort the incomplete generation, fence device bindings, and form a fresh group. Restore the most recent complete compatible checkpoint. | A checkpoint ID, restored input cursor, lost-work interval, and first successful post-recovery training step. |
 | A routing or telemetry partition isolates an otherwise healthy cell | Jobs with valid local authority drain granted work. Freeze unsafe ownership transfers or unsupported tuning changes. | Unrelated authority groups continue. Progress reports distinguish unavailable measurements, blocked quorum decisions, and running work. |
 
-Power users can request keyed durable identity on the same decorated class: declare the schema on the class with `@ch.remote(state=ch.State(codec=CartV1, checkpoint_every=128))` and select the instance with `Cart.options(key="cart/42").remote()`. Durable state is limited to 1 MiB inline per command; larger state uses replicated checkpoint references. The codec defines snapshot/restore and schema migration. A method operates on tentative state until its state/receipt transaction commits. Multiple handles for the same tenant and key resolve to the same fenced actor. Reusing a command ID with a different payload is rejected by checking its request fingerprint. An incompatible constructor or schema fails preflight. The ordinary `Cart.remote()` has ephemeral process state. Arbitrary external writes still require application-level idempotency or a transactional outbox with a participating sink.
+Power users can request keyed durable identity on the same decorated class: declare the schema on the class with `@ch.remote(state=ch.durable.State(codec=CartV1, checkpoint_every=128))` and select the instance with `Cart.options(name="cart/42").remote()`. Durable state is limited to 1 MiB inline per command; larger state uses replicated checkpoint references. The codec defines snapshot/restore and schema migration. A method operates on tentative state until its state/receipt transaction commits. Multiple handles for the same tenant and key resolve to the same fenced actor. Reusing a command ID with a different payload is rejected by checking its request fingerprint. An incompatible constructor or schema fails preflight. The ordinary `Cart.remote()` has ephemeral process state. Arbitrary external writes still require application-level idempotency or a transactional outbox with a participating sink.
 
 **Recovery time has components.** Report detection, election/fencing, scheduler replay, available capacity, checkpoint read, and time to the next useful result separately. Initial targets with a healthy majority and warm spare capacity are p99 reattachment and resumed grants within 10 seconds of a single owner loss, and zero lost acknowledged durable outputs in the declared fault domain. For durable workflows, inject loss immediately before and after child acceptance and verify the same child ID, branch, and committed result on replay. Publish checkpoint size and restore bandwidth for training. These are qualification targets. A lost majority, opaque side effect, or unavailable storage system has its own terminal or waiting state.
 

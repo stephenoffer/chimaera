@@ -155,6 +155,10 @@ spec:
   replicas: {replicas}
   # OrderedReady would deadlock formation: pod 0 is not ready until the other founders exist.
   podManagementPolicy: Parallel
+  # Peers of two peer levels refuse each other, so a release that raises the
+  # level replaces every pod together (docs/deploy.md, "Upgrading").
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
 {l6}
@@ -399,6 +403,7 @@ mod tests {
         let y = render(&s).unwrap();
         for want in [
             "podManagementPolicy: Parallel",
+            "updateStrategy:\n    type: OnDelete",
             "publishNotReadyAddresses: true",
             "automountServiceAccountToken: false",
             "terminationGracePeriodSeconds: 45",

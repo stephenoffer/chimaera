@@ -45,21 +45,33 @@ def test_option_in_the_wrong_place_is_rejected():
         f.options(workflow="durable")
 
 
-def test_precedence_view_over_scope_over_decorator():
+def test_precedence_view_over_decorator_over_scope():
     @ch.remote(cpus=1, memory="1 GiB")
     def f():
         pass
 
-    with ch.options(cpus=2, memory="2 GiB"):
-        with ch.options(cpus=3):
+    with ch.defaults(cpus=2, deadline="30s"):
+        with ch.defaults(cpus=3, priority=5):
             eff = f.options(cpus=4).policy()
             assert eff.get("cpus") == 4
             assert ".options at" in eff.sources["cpus"]
             eff = f.policy()
-            assert eff.get("cpus") == 3
-            assert eff.get("memory") == 2 << 30
-            assert "with ch.options" in eff.sources["memory"]
-    assert f.policy().get("cpus") == 1
+            assert eff.get("cpus") == 1, "a block fills in only what the decorator leaves unset"
+            assert eff.get("memory") == 1 << 30
+            assert eff.get("priority") == 5 and "with ch.defaults" in eff.sources["priority"]
+            assert eff.get("deadline") is not None
+    assert f.policy().get("priority") is None
+
+
+def test_a_block_never_reaches_chimaeras_own_helpers_nor_names_actors():
+    from chimaera._coord import _QueueHost
+
+    with ch.defaults(cpus=8, max_attempts=5):
+        assert _QueueHost.policy().get("cpus") != 8
+    with pytest.raises(ch.OptionsError, match="names one actor"):
+        ch.defaults(name="shared")
+    with pytest.warns(UserWarning, match="applies to nothing"):
+        ch.defaults(deadline="1s")  # not used with `with`
 
 
 def test_resolved_options_follow_scopes_entered_after_an_earlier_call():
@@ -80,11 +92,11 @@ def test_resolved_options_follow_scopes_entered_after_an_earlier_call():
     handle = Actor(None, b"a" * 16, b"c" * 16, A._cls, A.policy())  # type: ignore[arg-type]
     assert f.policy().get("cpus") == 1
     assert handle.m._policy().get("deadline") is None
-    with ch.options(cpus=5, deadline="30s"):
-        assert f.policy().get("cpus") == 5
+    with ch.defaults(priority=5, deadline="30s"):
+        assert f.policy().get("priority") == 5
         assert handle.m._policy().get("deadline") is not None
         assert handle.m._policy().get("priority") == 2
-    assert f.policy().get("cpus") == 1
+    assert f.policy().get("priority") is None
     assert handle.m._policy().get("deadline") is None
     assert f.policy() is f.policy(), "unchanged scopes reuse the resolved options"
 
@@ -97,7 +109,7 @@ def test_scopes_do_not_leak_across_threads():
         pass
 
     seen = []
-    with ch.options(cpus=7):
+    with ch.defaults(cpus=7):
         t = threading.Thread(target=lambda: seen.append(f.policy().get("cpus")))
         t.start()
         t.join()
@@ -129,3 +141,9 @@ def test_validate_names_the_source():
         validate({"cpus": -1}, kind="view", target="function", source="here")
     eff = resolve((), Layer({}, "d", "decorator"))
     assert eff.get("max_attempts") == 3 and eff.sources["max_attempts"] == "default"
+
+
+def test_the_options_type_names_every_option():
+    from chimaera._options import FIELDS, Options
+
+    assert set(Options.__annotations__) == set(FIELDS)
