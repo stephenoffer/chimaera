@@ -1,13 +1,13 @@
 # See what your program is doing
 
-Every call leaves a record on the peer: its output, its attempts, what it
-measured and why it waited. This guide shows where to read each of them, from
-Python and from the `chimaera` command, and what the `CHnnn` warnings mean.
+Every call leaves a record on the peer: what it printed, each attempt, what
+it measured and why it waited. Here is how to read it from Python or the
+`chimaera` command, and what the `CHnnn` warnings mean.
 
 ## Read what your calls print
 
-Anything a call prints, and anything it logs with `logging`, shows up in your
-script's terminal, labeled with the function and the worker's process id:
+Whatever a call prints or logs with `logging` shows up in your script's
+terminal, labeled with the function and the worker's process id:
 
 ```python run
 import logging
@@ -36,16 +36,15 @@ What the script printed:
 (tokenize pid=61338) INFO etl: got 19 chars
 ```
 
-Workers log at your script's level. The script ships the level of its root
-logger with the run, and a worker that has no logging handlers of its own
-calls `logging.basicConfig` at that level. So `logging.basicConfig(level=logging.INFO)`
-in the script is enough to see `log.info` from inside calls; at the default
-`WARNING` level those records are dropped.
+Workers log at your script's level, so
+`logging.basicConfig(level=logging.INFO)` in the script shows `log.info`
+from inside calls. At the default `WARNING` level those records are
+dropped. (The run carries your root logger's level, and a worker with no
+logging handlers of its own calls `logging.basicConfig` at that level.)
 
-The peer also keeps the output, so you can read it after the script has
-exited. `run.logs()` yields it line by line as `<task> <stream>| <text>`, where
-`<task>` is the first 12 hex digits of the call's task id (the second half of
-`future.id`):
+The peer keeps the output, so you can read it after the script exits.
+`run.logs()` yields lines of `<task> <stream>| <text>`, where `<task>` is
+the first 12 hex digits of the task id (the second half of `future.id`):
 
 ```python run
 lines = list(run.logs())
@@ -53,8 +52,8 @@ assert any(line.endswith("stdout| tokenizing 19 chars") for line in lines)
 assert any(line.endswith("stderr| INFO etl: got 19 chars") for line in lines)
 ```
 
-`run.logs(follow=True)` keeps waiting for more output; break out of the loop
-to stop. From a shell, `chimaera logs RUN` prints the same lines and
+`run.logs(follow=True)` keeps waiting until you break out of the loop. In
+a shell, `chimaera logs RUN` prints the same lines, and
 `chimaera logs RUN --follow` waits for more (Ctrl-C to stop):
 
 ```bash
@@ -66,14 +65,14 @@ chimaera logs 0000027da0522d95e30e656fd7268a93
 0000027d12b9 stderr| INFO etl: got 19 chars
 ```
 
-Each peer keeps the output of the calls it ran, up to 64 MiB per run, in
-`logs/runs/<run>.log` under its data directory. On a cluster, output from
-calls on other peers also reaches your terminal as it is printed.
+Each peer stores its calls' output in `logs/runs/<run>.log` under its data
+directory, up to 64 MiB per run. On a cluster, output from calls on other
+peers reaches your terminal as it is printed.
 
 ## Ask a call what happened
 
-`future.explain()` returns a dict with the call's state, why it is waiting,
-and one entry per attempt:
+`future.explain()` returns a dict with the call's state, why it is
+waiting, and one entry per attempt:
 
 ```python run
 info = words.explain()
@@ -116,12 +115,12 @@ assert later.explain()["pending_reason"] == "waiting on 1 prerequisite(s)"
 assert later.result() == 2
 ```
 
-You don't always have to ask. When `result()` has waited 60 seconds on a
-call that hasn't started, the script prints the reason once to stderr, as
+You don't always have to ask. After `result()` waits 60 seconds on a call
+that hasn't started, the script prints the reason once to stderr:
 `chimaera: waited 60 s on call <id>: <reason>`. `CHIMAERA_STALL_NOTICE_S`
 changes the 60.
 
-A call that raised shows `user_error` as its end reason:
+A call that raised ends with `user_error`:
 
 ```python run
 @ch.remote(max_attempts=1)
@@ -137,9 +136,9 @@ except ValueError:
 assert bad.explain()["attempts"][0]["end_reason"] == "user_error"
 ```
 
-The same view from a shell is `chimaera explain RUN --task TASK`, where `TASK`
-is the second half of `future.id` (the id is the run id followed by the task
-id, 32 hex digits each). `chimaera inspect RUN` counts a run's calls by state:
+In a shell, run `chimaera explain RUN --task TASK`. `TASK` is the second
+half of `future.id`, which is the run id and then the task id, 32 hex digits
+each. `chimaera inspect RUN` counts a run's calls by state:
 
 ```text
 $ chimaera inspect 0000027da0522d95e30e656fd7268a93
@@ -153,14 +152,14 @@ task Done
   attempt 1 · user_error · wall 0.001 s [attempt] · cpu 0.001 s [process] · mean cores 0.782 [process] · rss peak 23.7 MiB [process_lifetime]
 ```
 
-Add `--json` to `inspect` or `explain` for the full record. `chimaera explain
-RUN --decisions` lists the tuning decisions the peer made while the run was
-active (which controller changed which setting, from what to what, and why);
-it prints nothing when the peer made none.
+Add `--json` to `inspect` or `explain` for the full record.
+`chimaera explain RUN --decisions` lists the tuning decisions the peer made
+while the run was active: which controller changed which setting, from what
+to what, and why. It prints nothing if there were none.
 
 ## Report progress from inside a call
 
-A long call can publish progress with `ch.context().report(...)`, and whoever
+A long call publishes progress with `ch.context().report(...)`. Whoever
 holds its future reads it with `future.metrics()`:
 
 ```python run
@@ -176,13 +175,13 @@ assert job.result() == "done"
 assert [m["epoch"] for m in job.metrics()] == [0, 1, 2]
 ```
 
-Each report is one write to the replicated store, so report per epoch or per
-thousand steps, not per sample. Reports expire a day after they are written.
-[tasks.md](tasks.md) covers the rest of the call's context.
+Each report is one write to the replicated store, so report per epoch or
+per thousand steps, not per sample. Reports expire after a day. The rest of
+the call's context is in [tasks.md](tasks.md).
 
 ## Look at the whole cluster
 
-`ch.runs.cluster()` shows what the peer your script is connected to knows:
+`ch.runs.cluster()` shows the cluster as your script's peer knows it:
 
 ```python run
 nodes = ch.runs.cluster().nodes()
@@ -196,11 +195,11 @@ Each node is a named tuple: `peer`, `address`, `cpus`, `memory_bytes`, `gpus`,
 `object_bytes` and `draining`. `resources()` sums the live ones into `nodes`,
 `cpus`, `cpus_in_use`, `memory_bytes` and `gpus`.
 
-`events()` streams what the cluster does. The kinds are `member` (peers
-joining and leaving), `actor` (actors starting, restarting and dying),
-`task_failed` (calls that failed for good), `decision` and `drain`. By default
-it starts at what happens next and keeps waiting; `start="earliest"` begins
-at the oldest event the peer still holds (it keeps the latest 10,000), and
+`events()` streams what the cluster does: `member` (peers joining and
+leaving), `actor` (actors starting, restarting and dying), `task_failed`
+(calls that failed for good), `decision` and `drain`. By default it starts
+with the next event and keeps waiting. `start="earliest"` begins at the
+oldest event the peer still holds (it keeps the latest 10,000), and
 `follow=False` stops at the newest:
 
 ```python run
@@ -209,14 +208,14 @@ assert any(e.task == bad.id and "bad row 17" in e.message for e in failed)
 ```
 
 Events come from the connected peer: member events for the whole cluster,
-call and actor events for the shards that peer leads. They are notifications.
-For the durable record, read `run.outcomes()` or the actor itself.
+call and actor events for the shards it leads. They are notifications. The
+durable record is `run.outcomes()` or the actor itself.
 
 ## Check a peer from the shell
 
-`chimaera status` is the first thing to run when work is slow or stuck. It
-shows the peer's CPUs, workers, queue, memory pool and the settings it chose
-by itself:
+When work is slow or stuck, run `chimaera status` first. It shows the
+peer's CPUs, workers, queue, memory pool and the settings it chose by
+itself:
 
 ```bash
 chimaera status
@@ -231,9 +230,8 @@ peer 0000000024e6 (incarnation 1) · 0.00/12.00 CPU in use · 16 executors (0 bu
   automatic: 23 learned function profile(s), saved in .../profiles.pb
 ```
 
-On a cluster peer it also lists every peer (with `unreachable` next to the
-ones it can't reach) and each Raft group's leader and voters. The other
-commands:
+On a cluster it also lists every peer, marking the ones it can't reach
+`unreachable`, and each Raft group's leader and voters. The other commands:
 
 | Command | Shows |
 |---|---|
@@ -247,7 +245,7 @@ commands:
 | `chimaera objects` | What the object store holds; see [data.md](data.md) |
 | `chimaera doctor` | What this host supports: cgroups, NUMA, GPUs, fsync speed |
 
-`status`, `runs`, `inspect`, `explain`, `logs`, `actors` and `cancel` accept
+`status`, `runs`, `inspect`, `explain`, `logs`, `actors` and `cancel` take
 `--cluster NAME` to ask a cluster instead of the local peer
 ([clusters.md](clusters.md)). `profiles` and `objects` read the local data
 directory. Most commands take `--json`. Every flag is in [../cli.md](../cli.md).
@@ -259,11 +257,10 @@ RUN                               STATE       AGE  COMMAND
 0000027da0522d95e30e656fd7268a93  finished     6s  etl.py
 ```
 
-`chimaera profiles` reads the profiles the peer saves every 30 seconds while
-they change and when it stops, so right after a first run it may say none
-are saved yet. `calls` counts the samples kept, at most 64 per function, and
-the same name can appear more than once because profiles are kept per code
-digest:
+`chimaera profiles` reads what the peer saves every 30 seconds while
+profiles change, and when it stops. Right after a first run, it may say
+none are saved yet. `calls` counts the samples kept, at most 64 per
+function. A name can repeat, because profiles are kept per code digest:
 
 ```text
 $ chimaera profiles --fn __main__
@@ -283,10 +280,10 @@ isolated accounting: unavailable: accounting="isolated" fails preflight here; me
 fsync p50 39 µs in .../homes/observability (cluster peers pay this per commit)
 ```
 
-When a peer itself misbehaves, read its log: `peer.log` in its data
-directory (`~/.chimaera/local/peer.log` for the local peer). Each worker
-writes `logs/executor-<n>.log` there too. `CHIMAERA_LOG` sets the peer's log
-filter, in the `tracing` crate's syntax; the default is
+If the peer itself misbehaves, read `peer.log` in its data directory
+(`~/.chimaera/local/peer.log` for the local peer). Each worker writes
+`logs/executor-<n>.log` there too. `CHIMAERA_LOG` sets the log filter in
+the `tracing` crate's syntax; the default is
 `chimaera=info,chimaera_peer=info,warn`.
 
 ## Scrape metrics with Prometheus
@@ -318,28 +315,25 @@ chimaera_cluster_nodes{state="alive"} 1
 chimaera_cluster_nodes{state="dead"} 0
 ```
 
-The gauges cover calls queued and running, CPUs in use, workers, object and
-memory bytes, connected drivers, proposals in flight and dispatch latency
-(p50 and p99). Counters since the peer started cover proposals and proposals
-no leader accepted, peers declared dead, worker deaths, OOM kills, workers
-killed for a cancelled call and failed object replicas. Cluster peers add
-`chimaera_groups_without_leader`, and per group they hold
-`chimaera_group_leading{group="N"}` and, on the leader,
-`chimaera_group_max_lag_entries{group="N"}`. Every other path answers 404.
+- Gauges: calls queued and running, CPUs in use, workers, object and memory bytes, connected drivers, proposals in flight, and dispatch latency (p50 and p99).
+- Counters since the peer started: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a cancelled call, and failed object replicas.
+- On cluster peers, `chimaera_groups_without_leader`, and for each group they hold, `chimaera_group_leading{group="N"}` plus, on the leader, `chimaera_group_max_lag_entries{group="N"}`.
 
-The endpoint has no token, and it serves counts only, never run names or
-values. Bind it where only your scraper can reach it. A local peer that your
-script starts inherits the script's `CHIMAERA_*` variables, so
-`CHIMAERA_METRICS_LISTEN` works for it too. `chimaera k8s render` turns the
-endpoint on and adds the `prometheus.io/scrape` annotations
-([../deploy.md](../deploy.md)).
+Every other path answers 404. The endpoint has no token. It serves counts
+only, never run names or values, but bind it where only your scraper can
+reach it.
+
+A local peer that your script starts inherits the script's `CHIMAERA_*`
+variables, so `CHIMAERA_METRICS_LISTEN` works for it too.
+`chimaera k8s render` turns the endpoint on and adds the
+`prometheus.io/scrape` annotations ([../deploy.md](../deploy.md)).
 
 ## Understand the CHnnn warnings
 
-When Chimaera sees a pattern that is slow or will fail, it warns with a code.
-Most are Python warnings (`UserWarning`, shown once per line by default); a
-few are errors. Here is CH101, from waiting on each call before submitting
-the next:
+When Chimaera sees a pattern that is slow or will fail, it warns with a
+code. Most are Python warnings (`UserWarning`, shown once per line by
+default); a few are errors. Here is CH101, from waiting on each call before
+submitting the next:
 
 ```python run
 import warnings

@@ -6,6 +6,10 @@ local ones.
 
 ## Swap in for a process pool
 
+`ch.Executor` is a `concurrent.futures.Executor`. Code written against
+`ProcessPoolExecutor` needs only the constructor changed, and then runs on one
+machine or a whole cluster.
+
 ```python run
 import concurrent.futures
 
@@ -24,17 +28,14 @@ with ch.Executor() as ex:
     assert ex.submit(lambda x: x + offset, 1).result() == 11   # lambdas and closures work
 ```
 
-`ch.Executor` is a `concurrent.futures.Executor`. Code written against
-`ProcessPoolExecutor` needs only the constructor changed, and then runs on one
-machine or a whole cluster. `submit` returns a standard
-`concurrent.futures.Future`, which `concurrent.futures.wait`, `as_completed`,
-`add_done_callback` and `asyncio.wrap_future` all accept. Done-callbacks run
-on a thread of their own, so a slow one never holds up other results. Lambdas
-and closures work too, since Chimaera serializes them with cloudpickle.
+`submit` returns a standard `concurrent.futures.Future`, which
+`concurrent.futures.wait`, `as_completed`, `add_done_callback` and
+`asyncio.wrap_future` all accept. Done-callbacks run on a thread of their own,
+so a slow one never holds up other results.
 
-The constructor takes call options, the same keywords as `@ch.remote(...)`,
-and applies them to every call. It does not take `max_workers`: how many calls
-run at once depends on the capacity of the cluster, not on a pool size.
+The constructor takes the same call options as `@ch.remote(...)` and applies
+them to every call. It does not take `max_workers`: the cluster's capacity,
+not a pool size, decides how many calls run at once.
 
 ```python run
 ex = ch.Executor(cpus=0.5, max_attempts=1)
@@ -47,27 +48,29 @@ except ch.OptionsError as e:
     assert "unknown option 'max_workers'" in str(e)
 ```
 
-A few more rules:
+Good to know:
 
 - A function already decorated with `@ch.remote` keeps its options; the
-  executor's options override the ones with the same name.
+  executor's override the ones with the same name.
 - A class passed to `submit` is called like a function and its instance comes
-  back. It never becomes an actor ([actors.md](actors.md) covers those).
+  back. It never becomes an actor ([actors.md](actors.md)).
 - A generator function raises `TypeError`. Stream it with
   `ch.remote(fn).remote(...)` instead ([tasks.md](tasks.md)).
 - `future.cancel()` cancels the Chimaera call and returns `True` if it had not
   finished. `shutdown(cancel_futures=True)` cancels everything still pending.
 
-Two rough edges remain. `shutdown(wait=False)` also stops the thread that
-completes futures, so any still pending never complete; use the `with` block
-or a plain `shutdown()`. And a future you cancel just before the executor
-shuts down can print
-`chimaera: done-callback raised RuntimeError('cannot schedule new futures after shutdown')`
-on stderr. Ignore it. The future is already canceled.
+Two rough edges remain:
+
+- `shutdown(wait=False)` also stops the thread that completes futures, so any
+  still pending never complete. Use the `with` block or a plain `shutdown()`.
+- A future you cancel just before the executor shuts down can print
+  `chimaera: done-callback raised RuntimeError('cannot schedule new futures after shutdown')`
+  on stderr. Ignore it; the future is already canceled.
 
 ## Run joblib's Parallel on Chimaera
 
-This needs joblib (`pip install joblib`):
+Importing `chimaera.joblib` registers a backend named `"chimaera"`. It needs
+joblib (`pip install joblib`) and raises `ImportError` without it.
 
 ```python
 import chimaera.joblib  # registers the "chimaera" backend
@@ -81,10 +84,7 @@ with parallel_config(backend="chimaera", n_jobs=4):
 assert squares == [i * i for i in range(100)]
 ```
 
-Importing `chimaera.joblib` registers a backend named `"chimaera"`. Without
-joblib installed, the import raises `ImportError`.
-
-Each batch joblib dispatches becomes one Chimaera call. joblib sizes its
+Each batch joblib dispatches becomes one Chimaera call, and joblib sizes its
 batches by how long they take, so many small tasks share a call. `n_jobs` is
 the number of batches in flight: by default, and with `-1`, the CPU count of
 the machine your script runs on. Chimaera places the batches on whichever
@@ -92,6 +92,9 @@ peers have room. When a task raises, `Parallel` raises that error and the
 batches still running are canceled. `return_as="generator"` works too.
 
 ## Use it from asyncio
+
+Every Chimaera future is awaitable from any event loop without blocking it,
+so `asyncio.gather` and `asyncio.wait_for` take futures directly.
 
 ```python run
 import asyncio
@@ -109,16 +112,13 @@ async def main() -> list[int]:
 assert asyncio.run(main()) == [3, 2, 4, 0, 2, 4]
 ```
 
-Every Chimaera future is awaitable from any event loop, and awaiting it
-doesn't block the loop, so `asyncio.gather` and `asyncio.wait_for` take
-futures directly. Inside a coroutine, use `await` rather than `.result()`,
-which blocks the loop until the call finishes. A timeout from
-`asyncio.wait_for`, or canceling the task that awaits, ends your wait but not
-the call. To stop the call, call `.cancel()` on the future.
+Inside a coroutine, use `await` rather than `.result()`, which blocks the loop
+until the call finishes. A timeout from `asyncio.wait_for`, or canceling the
+task that awaits, ends your wait but not the call; call `.cancel()` on the
+future to stop it.
 
-Anything that yields many results also works with `async for`: a map, a
-generator's stream, and `ch.as_completed`. `with ch.defaults(...)` has an
-`async with` form.
+A map, a generator's stream and `ch.as_completed` all work with `async for`,
+and `with ch.defaults(...)` has an `async with` form.
 
 ```python run
 async def collect() -> tuple[list[int], list[int]]:
@@ -141,9 +141,8 @@ async def add_then_double(x: int) -> int:
 assert add_then_double.remote(3).result() == 8
 ```
 
-An `async def` function decorated with `@ch.remote` returns a future of the
-value its coroutine produces. Each call runs its coroutine to the end on a new
-event loop in the worker, and inside it you can await other calls. An
+Each call to an `async def` remote function runs its coroutine to the end on a
+new event loop in the worker, and its future holds the coroutine's value. An
 `async def` generator streams its items like a plain generator.
 
 ### Async actor methods
@@ -159,10 +158,10 @@ fetcher = Fetcher.options(concurrency=4).remote()
 assert ch.get([fetcher.get.remote(i) for i in range(4)]) == [0, 1, 2, 3]
 ```
 
-An actor's async methods run on one event loop in the actor's process. Making
-a method `async` doesn't change how many calls run at once: still one at a
-time, unless you set `concurrency`. With `concurrency=4`, up to four calls
-overlap at their `await` points. [actors.md](actors.md) has the rest.
+An actor's async methods run on one event loop in the actor's process.
+`async` alone doesn't change how many calls run at once: still one, unless you
+set `concurrency`. With `concurrency=4`, up to four calls overlap at their
+`await` points. [actors.md](actors.md) has the rest.
 
 ## Check types with mypy
 
@@ -183,9 +182,9 @@ or to `pyproject.toml`:
 plugins = ["chimaera.mypy"]
 ```
 
-With the plugin, `Counter.remote(...)` is checked against `__init__` and
-returns `Actor[Counter]`, and `handle.method.remote(...)` is checked against
-the method and returns a `Future` of its return type. Take this file:
+The plugin checks `Counter.remote(...)` against `__init__` and types it
+`Actor[Counter]`. It checks `handle.method.remote(...)` against the method and
+types it as a `Future` of the method's return type. Take this file:
 
 ```python
 import chimaera as ch
@@ -227,11 +226,11 @@ Found 4 errors in 1 file (checked 1 source file)
 
 Without the plugin, mypy reports `"type[Counter]" has no attribute "remote"`
 instead, and the handle's calls go unchecked (their type is `Any`). The errors
-on `add` show up either way, since functions and `.options(...)` are typed
-without the plugin. The plugin's own notes say Pyright needs no plugin: it
-types handles as `Actor[Counter]`, and their methods accept any arguments.
+on `add` appear either way, since functions and `.options(...)` are typed
+without it. The plugin's own notes say Pyright needs no plugin: it types
+handles as `Actor[Counter]`, and their methods accept any arguments.
 
-Some gaps remain:
+Known gaps:
 
 - `.remote(...)` takes the function's own parameter types. Passing a future
   where the function expects its value works at run time, but mypy calls it
@@ -272,11 +271,11 @@ assert bump(Tally.remote()).result() == 1
 
 ## Run a Ray program
 
+`python -m chimaera.compat.ray app.py` runs an unmodified Ray script.
 `import chimaera.compat.ray as ray` maps Ray Core's API (`remote`, `get`,
 `put`, `wait`, `cancel`, `kill`, named and detached actors, `ActorPool`) onto
-Chimaera, and `python -m chimaera.compat.ray app.py` runs an unmodified Ray
-script. Anything that doesn't map raises `Unsupported` and names the Chimaera
-alternative. [from-ray.md](from-ray.md) walks through a port, and
+Chimaera, and anything that doesn't map raises `Unsupported` naming the
+Chimaera alternative. [from-ray.md](from-ray.md) walks through a port, and
 [../compat-ray.md](../compat-ray.md) has the full table.
 
 Next: run all of this on several machines with [clusters.md](clusters.md).

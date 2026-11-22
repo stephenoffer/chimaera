@@ -1,13 +1,11 @@
 # Coming from Ray
 
-Most Ray Core programs port to Chimaera line by line. Use the table to find each
-Ray name's counterpart, read the differences that change behavior, or run your
-Ray program unchanged through the compatibility shim.
+Most Ray Core programs port to Chimaera line by line: `@ray.remote` becomes
+`@ch.remote` and `ray.get(ref)` becomes `future.result()`. Not ready to port?
+The [compatibility shim](#run-a-ray-program-unchanged) runs your Ray program
+unchanged, with no Ray installed.
 
 ## Map Ray names to Chimaera
-
-The left column is Ray Core; the right is the native Chimaera API. The shim's
-own translation of every option is in [../compat-ray.md](../compat-ray.md).
 
 | Ray | Chimaera |
 |---|---|
@@ -53,8 +51,8 @@ own translation of every option is in [../compat-ray.md](../compat-ray.md).
 
 ## Port a program
 
-Here is a small Ray program: tokenize documents in parallel, count words in an
-actor.
+Here's a small Ray program that tokenizes documents in parallel and counts words
+in an actor:
 
 ```python
 import ray
@@ -121,18 +119,16 @@ ch.get([vocab.add.remote(f) for f in futures])
 assert vocab.top.remote(2).result() == [("cat", 2), ("sat", 2)]
 ```
 
-There's no `init` to call, `ray.get(x)` becomes `x.result()` or `ch.get(xs)`,
-and the decorator options take Chimaera's names. The result is the same because
-the three `add` calls go through one handle, so they run in the order they were
-made.
+The output matches Ray's because the three `add` calls go through one handle,
+so they run in the order they were made.
 
 ## Know the differences that change behavior
 
 ### There is no head node
 
 Every machine runs the same `chimaera` peer, and the state that matters is
-replicated with Raft across peers. There is no head node to size or to lose. On
-a laptop your script starts a local peer the first time it needs one. To use a
+replicated across peers with Raft. There's no head node to size or to lose. On a
+laptop your script starts a local peer the first time it needs one; to use a
 cluster, point the script at it ([clusters.md](clusters.md)).
 
 ### Options are checked where you write them
@@ -147,18 +143,18 @@ except ch.OptionsError as e:
     assert "did you mean 'cpus'?" in str(e)
 ```
 
-`max_retries` gets the suggestion `max_restarts`, which is the actor option. For
-a function you want `max_attempts`. Options that conflict with each other, such
-as `effects="external"` with `max_attempts=3`, raise when you make the call.
+One trap: `max_retries` suggests `max_restarts`, the actor option, but for a
+function you want `max_attempts`. Conflicting options, such as
+`effects="external"` with `max_attempts=3`, raise when you make the call.
 `cpus` must be above zero, so Ray's `num_cpus=0` has no direct equivalent; an
 actor holds no CPU unless you ask ([actors.md](actors.md)).
 
 ### Your exceptions are not retried
 
 As in Ray, an exception your code raises fails the call at once. Only lost
-workers and peers are retried, up to `max_attempts` (default 3 attempts in all,
-where Ray's default `max_retries=3` gives 4). List the exceptions worth retrying
-as types: `retry_exceptions=True` is rejected.
+workers and peers are retried, up to `max_attempts` (default 3 attempts in all;
+Ray's default `max_retries=3` gives 4). Name the exceptions worth retrying as
+types, because `retry_exceptions=True` is rejected.
 
 ```python run
 import os
@@ -176,10 +172,10 @@ assert flaky.remote(tempfile.mktemp()).result() == "ok"     # retried once
 
 ### Declare calls with side effects
 
-Ray retries a task whose worker died, whatever the task did. Chimaera asks you to
-say what a call does to the outside world. `effects="external"` (charging a
-card, sending an email) means the call starts at most once. If its worker dies
-mid-call, you get `ch.OutcomeUnknown` instead of a silent second attempt.
+Ray retries a task whose worker died, whatever the task did. Chimaera asks what
+a call does to the outside world. Mark it `effects="external"` (charging a card,
+sending an email) and it starts at most once: if its worker dies mid-call, you
+get `ch.OutcomeUnknown` instead of a silent second attempt.
 
 ```python run
 import signal
@@ -194,8 +190,8 @@ except ch.OutcomeUnknown as e:
     assert "may have started" in str(e)
 ```
 
-`effects="idempotent"` says a repeat is harmless. See
-[failures.md](failures.md) for what each level allows.
+`effects="idempotent"` says a repeat is harmless. [failures.md](failures.md)
+covers what each level allows.
 
 ### Arrays arrive writable
 
@@ -216,24 +212,24 @@ assert bump.remote(zeros).result() == 1.0
 assert bump.remote(zeros).result() == 1.0     # the stored array is unchanged
 ```
 
-On a host that refuses private writable mappings (strict memory overcommit) the
-array falls back to read-only. [data.md](data.md) has the details.
+On a host that refuses private writable mappings (strict memory overcommit),
+the array falls back to read-only. [data.md](data.md) has the details.
 
 ### Memory is measured, not declared
 
 You rarely need `memory=`. The peer measures each function's memory peak and
 reserves that for its later calls, so calls wait for memory instead of
-overcommitting a machine. Values you set still win, and `memory_limit=`
-enforces a cap. `chimaera profiles` shows what was learned. See
-[resources.md](resources.md).
+overcommitting a machine. Values you set still win, `memory_limit=` enforces a
+cap, and `chimaera profiles` shows what was learned
+([resources.md](resources.md)).
 
 ### Futures inside lists arrive as values
 
 Ray resolves only refs passed directly as arguments; refs inside a list stay
 refs for the task to `ray.get`. Chimaera resolves futures directly in the
-arguments and one level inside a list, tuple or dict value, and the call starts
-once they're ready. Wrap the argument in `ch.handles(...)` to pass the futures
-themselves.
+arguments and one level inside a list, tuple or dict value, and starts the call
+once they're ready. To pass the futures themselves, wrap the argument in
+`ch.handles(...)`.
 
 ```python run
 @ch.remote
@@ -252,14 +248,13 @@ assert first_done.remote(ch.handles(futures)).result() in (["cat", "sat"], ["cat
 ### Actors live as long as their run
 
 A Ray actor dies when its last handle goes away. A Chimaera actor lives until
-you call `close()` or its run ends, whether or not any handle remains, so
+you call `close()` or its run ends, handle or no handle, so
 `Vocabulary.remote().add.remote(["x"])` works. Close actors you're done with to
 give back the CPUs they hold.
 
 ### Calls through one actor handle run in order, async ones too
 
-Calls through one handle start in the order you made them, one at a time. Ray
-runs an async actor's calls concurrently (up to 1,000 by default). Here an
+Ray runs an async actor's calls concurrently (up to 1,000 by default). Here an
 `async def` method still runs one call at a time until you set `concurrency=`
 on the class. Ray's `allow_out_of_order_execution` has no equivalent.
 
@@ -268,16 +263,16 @@ on the class. Ray's `allow_out_of_order_execution` has no equivalent.
 `.options(name=...)` returns the existing actor if there is one, where Ray's
 default raises. A name covers your whole tenant on the cluster, not one job's
 namespace, so put the namespace in the name (`"ns/name"`). `ch.actor(name)`
-raises `ch.NotFound`, a `LookupError`, where `ray.get_actor` raises
-`ValueError`. A name also stays taken after its actor ends
+raises `ch.NotFound` (a `LookupError`) where `ray.get_actor` raises
+`ValueError`, and a name stays taken after its actor ends
 ([actors.md](actors.md#find-an-actor-by-name)).
 
 ### `ch.wait` waits for everything by default
 
 `ray.wait` returns after one ref and caps the ready list at `num_returns`.
-`ch.wait` waits for all futures unless you pass `num_returns`, and its `done`
-list holds every finished future, which can be more than `num_returns`. It
-doesn't fetch values unless you pass `fetch_local=True`.
+`ch.wait` waits for all futures unless you pass `num_returns`, and even then its
+`done` list holds every finished future, which can be more than `num_returns`.
+It fetches values only if you pass `fetch_local=True`.
 
 ```python run
 done, pending = ch.wait(futures, num_returns=1, timeout=10)
@@ -287,7 +282,7 @@ assert len(done) >= 1 and len(done) + len(pending) == 3
 ### A decorated function still runs locally
 
 Calling a decorated function without `.remote` runs it in your process, where
-Ray raises `TypeError`. That's handy in unit tests.
+Ray raises `TypeError`. Handy in unit tests.
 
 ```python run
 assert tokenize("The cat", {"the"}) == ["cat"]
@@ -295,7 +290,7 @@ assert tokenize("The cat", {"the"}) == ["cat"]
 
 ## Run a Ray program unchanged
 
-The shim in `chimaera.compat.ray` maps Ray Core's API onto Chimaera, and needs no
+The shim in `chimaera.compat.ray` maps Ray Core's API onto Chimaera and needs no
 Ray installation. Run a whole program with `-m`, which installs the shim as
 `ray` (with `ray.exceptions`, `ray.util` and their submodules) before your
 script starts. Here it is on the Ray program above, saved as `app.py`:
@@ -310,7 +305,7 @@ python -m chimaera.compat.ray app.py
 
 `chimaera run -- python -m chimaera.compat.ray app.py` works too, and with
 `--cluster lab` the program's `ray.init()` connects to that cluster profile.
-`ray.init(address=...)` itself is refused by the shim.
+The shim refuses `ray.init(address=...)` itself.
 
 In your own code, import the shim under the name `ray`:
 
@@ -346,7 +341,7 @@ except KeyError as e:                               # also a ray.exceptions.RayT
     assert isinstance(e, ray.exceptions.RayTaskError)
 ```
 
-What the shim does and doesn't do:
+What to expect from the shim:
 
 - It covers Ray Core only. `ray.data`, `ray.train`, `ray.tune`, `ray.serve` and
   the other libraries raise `Unsupported`.

@@ -59,9 +59,9 @@ returned exactly once, in 9.6 s. Ray took 18.5 s.
 ### It sizes your calls for you
 
 You don't have to guess `num_cpus` or `memory`. The peer measures each
-function's memory peak, and after three calls later ones reserve what was
-seen, so calls wait for memory instead of being OOM-killed. A call killed for
-memory comes back with 1.5x what it reached. Fast calls get batched, and
+function's peak memory. After three calls it reserves what it saw, so later
+calls wait for memory instead of getting OOM-killed. A call killed for memory
+comes back with 1.5x what it reached. Fast calls get batched, and
 OpenMP and BLAS thread pools are sized to the CPUs a call was given.
 `future.explain()` tells you what was reserved and why. Set `cpus=` or
 `memory=` yourself and your value wins.

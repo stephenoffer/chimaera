@@ -1,10 +1,10 @@
 # CLI reference
 
 Every command and flag of `chimaera`, the one binary that is both the peer
-and the command-line tool. The command summaries and flag descriptions are
-taken from `chimaera --help` and `chimaera <command> --help` of
-`chimaera 0.1.0 (peer level 1)` (`chimaera --version`). Where the help text
-is empty or silent, the table says what the code does.
+and the command-line tool. Summaries and flag descriptions come from
+`chimaera --help` and `chimaera <command> --help` of
+`chimaera 0.1.0 (peer level 1)` (`chimaera --version`). Where the help is
+empty or silent, the table says what the code does.
 
 For a walkthrough, see [guides/clusters.md](guides/clusters.md) and
 [guides/observability.md](guides/observability.md).
@@ -28,23 +28,22 @@ binary installed with the package. A failing command prints
 ## Which peer a command asks
 
 `status`, `runs`, `actors`, `cancel`, `logs`, `inspect` and `explain` take
-`--cluster <CLUSTER>`:
+`--cluster <CLUSTER>`: a cluster profile in ~/.config/chimaera/clusters.toml,
+or tcp://host:port. The first of these that applies picks the peer:
 
-> A cluster profile in ~/.config/chimaera/clusters.toml, or tcp://host:port.
-> Default, as for a driver: $CHIMAERA_CLUSTER, $CHIMAERA_ADDRESS, then the
-> profile file's default; the local peer when --dir or $CHIMAERA_HOME is set,
-> or when none of those is
+1. `--cluster`.
+2. `--dir` or `CHIMAERA_HOME`: the local peer.
+3. As for a driver: `CHIMAERA_CLUSTER`, then `CHIMAERA_ADDRESS` (with
+   `CHIMAERA_TOKEN` or `CHIMAERA_TOKEN_FILE`, and `CHIMAERA_CA`), then the
+   profile file's `default`.
+4. The local peer.
 
-In practice: `--cluster` wins. Without it, `--dir` or `CHIMAERA_HOME` means
-the local peer. Otherwise the command uses `CHIMAERA_CLUSTER`, then
-`CHIMAERA_ADDRESS` (with `CHIMAERA_TOKEN` or `CHIMAERA_TOKEN_FILE`, and
-`CHIMAERA_CA`), then the profile file's `default`, then the local peer.
 [guides/clusters.md](guides/clusters.md#point-a-script-at-the-cluster)
 describes profiles.
 
 `objects`, `profiles`, `stop`, `doctor` and `cluster recover` always use the
-local data directory. `objects --cluster` is a plain switch with a different
-meaning (every live peer's store).
+local data directory. `objects --cluster` is a plain switch with another
+meaning: every live peer's store.
 
 ## Run programs
 
@@ -63,17 +62,18 @@ chimaera run [OPTIONS] <COMMAND>...
 | `--detach` | Keep the program's run going after the program exits |
 | `--cluster <CLUSTER>` | A cluster profile or tcp://host:port, passed to the program as $CHIMAERA_CLUSTER |
 
-The program gets `CHIMAERA_DETACH` (`1` with `--detach`, else `0`) and either
-`CHIMAERA_CLUSTER` or, without `--cluster`, `CHIMAERA_HOME` set to the data
-directory. `chimaera run` exits with the program's exit status. A program
-that calls `ch.init()` itself ignores `--detach` (its `detach` argument
-defaults to `False`); use `ch.init(detach=True)` there.
+`chimaera run` exits with the program's exit status. The program gets
+`CHIMAERA_DETACH` (`1` with `--detach`, else `0`), plus `CHIMAERA_CLUSTER`
+or, without `--cluster`, `CHIMAERA_HOME` set to the data directory.
+
+A program that calls `ch.init()` itself ignores `--detach`, since `detach`
+defaults to `False`. Use `ch.init(detach=True)` there.
 
 ### `chimaera submit`
 
-Run a program on the cluster: it runs on a peer as the one call of a
-detached run, with this directory shipped as its project; this prints the
-run's id and returns (`chimaera logs RUN`, `chimaera cancel RUN`).
+Run a program on the cluster. It runs on a peer as the one call of a
+detached run, with this directory shipped as its project. `submit` prints
+the run's id and returns (`chimaera logs RUN`, `chimaera cancel RUN`).
 
 ```text
 chimaera submit [OPTIONS] <COMMAND>...
@@ -84,12 +84,13 @@ chimaera submit [OPTIONS] <COMMAND>...
 | `<COMMAND>...` | The program and its arguments, after `--` |
 | `--cluster <CLUSTER>` | A cluster profile or tcp://host:port (default: as for a driver) |
 
-`submit` runs `$CHIMAERA_PYTHON -m chimaera._submit` (default `python3`) on
-this machine, so that interpreter needs Chimaera installed. The program runs
-at most once, and `python` or `python3` at the start of the command becomes
-the peer's own interpreter. `submit` fails if the cluster has not taken the
-program within 60 seconds. The run stays active after the program exits
-until `chimaera cancel RUN` ends it.
+The program runs at most once. A leading `python` or `python3` in the
+command becomes the peer's own interpreter. If the cluster has not taken the
+program within 60 seconds, `submit` fails. The run stays active after the
+program exits, until `chimaera cancel RUN` ends it.
+
+`submit` itself runs `$CHIMAERA_PYTHON -m chimaera._submit` (default
+`python3`) on this machine, so that interpreter needs Chimaera installed.
 
 ## Inspect
 
@@ -104,10 +105,10 @@ chimaera status [OPTIONS]
 | Flag | Description |
 |---|---|
 | `--json` | Print the status as JSON |
-| `--cluster <CLUSTER>` | Which peer to ask; see [Which peer a command asks](#which-peer-a-command-asks) |
+| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
-On a cluster peer the output also lists every peer (marking unreachable
-ones) and each Raft group this peer holds, with its leader and voters.
+On a cluster peer, the output adds every peer (unreachable ones marked) and
+each Raft group this peer holds, with its leader and voters.
 
 ### `chimaera runs`
 
@@ -122,7 +123,7 @@ chimaera runs [OPTIONS]
 |---|---|
 | `--limit <LIMIT>` | Show at most this many (0: all) [default: 20] |
 | `--json` | Print the runs as JSON |
-| `--cluster <CLUSTER>` | Which peer to ask; see [Which peer a command asks](#which-peer-a-command-asks) |
+| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera actors`
 
@@ -136,7 +137,7 @@ chimaera actors [OPTIONS]
 |---|---|
 | `--prefix <PREFIX>` | Only names starting with this [default: ""] |
 | `--json` | Print the actors as JSON |
-| `--cluster <CLUSTER>` | Which peer to ask; see [Which peer a command asks](#which-peer-a-command-asks) |
+| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera inspect`
 
@@ -150,7 +151,7 @@ chimaera inspect [OPTIONS] <RUN>
 |---|---|
 | `<RUN>` | The run id, 32 hex digits |
 | `--json` | Print the run's state, whether it is detached, and its counts as JSON |
-| `--cluster <CLUSTER>` | Which peer to ask; see [Which peer a command asks](#which-peer-a-command-asks) |
+| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera explain`
 
@@ -167,7 +168,7 @@ chimaera explain [OPTIONS] <RUN>
 | `--task <TASK>` | Task id (hex) to explain: the second half of a future's `id` |
 | `--decisions` | Show tuning decisions |
 | `--json` | Print the attempts, decisions, waiting reason and task state as JSON |
-| `--cluster <CLUSTER>` | Which peer to ask; see [Which peer a command asks](#which-peer-a-command-asks) |
+| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera logs`
 
@@ -181,7 +182,7 @@ chimaera logs [OPTIONS] <RUN>
 |---|---|
 | `<RUN>` | The run id, 32 hex digits |
 | `-f, --follow` | Keep waiting for more output (Ctrl-C to stop) |
-| `--cluster <CLUSTER>` | Which peer to ask; see [Which peer a command asks](#which-peer-a-command-asks) |
+| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 Each line reads `<task> <stream>| <text>`, where `<task>` is the first 12 hex
 digits of the call's task id.
@@ -200,8 +201,8 @@ chimaera profiles [OPTIONS]
 | `--fn <NAME>` | Only functions whose name contains this |
 | `--json` | Print the profiles as JSON |
 
-It reads `profiles.pb` in the data directory, which the peer writes every 30
-seconds while profiles change and when it stops.
+It reads `profiles.pb` in the data directory. The peer writes that file
+every 30 seconds while profiles change, and when it stops.
 
 ### `chimaera objects`
 
@@ -226,8 +227,8 @@ chimaera doctor [OPTIONS]
 ```
 
 No flags beyond `--dir`. It prints the OS, CPUs and memory, NUMA nodes and
-GPUs, whether isolated accounting works, and the fsync latency of the data
-directory.
+GPUs, whether isolated accounting works, and the data directory's fsync
+latency.
 
 ## Control
 
@@ -236,13 +237,15 @@ directory.
 Cancel a run: its unfinished calls are cancelled and its actors stopped.
 
 ```text
-chimaera cancel [OPTIONS] <RUN>
+chimaera cancel [OPTIONS] [RUNS]...
 ```
 
 | Flag | Description |
 |---|---|
-| `<RUN>` | The run id, 32 hex digits |
-| `--cluster <CLUSTER>` | Which peer to ask; see [Which peer a command asks](#which-peer-a-command-asks) |
+| `[RUNS]...` | Runs to cancel, ids as `chimaera runs` prints them |
+| `--match <PATTERN>` | Instead of ids: the active runs whose command contains this text |
+| `--yes` | With `--match`, cancel them. Without it, `--match` only lists what would be cancelled |
+| `--cluster <CLUSTER>` | [Which peer to ask](#which-peer-a-command-asks) |
 
 ### `chimaera stop`
 
@@ -282,12 +285,16 @@ chimaera peer start [OPTIONS]
 | `--tls-dir <TLS_DIR>` | Directory with this peer's mutual-TLS files (`chimaera cluster cert`) |
 | `--client-listen <CLIENT_LISTEN>` | Also accept drivers on other machines at this address (host:port). They must present the cluster token, and use TLS when --tls-dir is set |
 
-Rules the code enforces: `--seeds` needs `--listen` and the reverse (for the
-static provider); `--client-port` is refused under the local and static
-providers (use `--client-listen`); a token shorter than 16 characters is
-refused. Give `--dir` an absolute path. SIGTERM and SIGUSR1 drain the peer
-for up to `CHIMAERA_DRAIN_SECONDS`; Ctrl-C stops it at once. Environment
-variables that tune a peer are in [configuration.md](configuration.md).
+The code refuses:
+
+- `--seeds` without `--listen`, or the reverse (static provider).
+- `--client-port` under the local and static providers; use
+  `--client-listen` there.
+- A token shorter than 16 characters.
+
+Give `--dir` an absolute path. SIGTERM and SIGUSR1 drain the peer for up to
+`CHIMAERA_DRAIN_SECONDS`; Ctrl-C stops it at once. The environment variables
+that tune a peer are in [configuration.md](configuration.md).
 
 ### `chimaera cluster token`
 
@@ -328,7 +335,7 @@ chimaera cluster cert [OPTIONS] --ca <CA> --name <NAME> --out <OUT>
 
 ### `chimaera cluster credential`
 
-Print a driver credential for TENANT: drivers presenting it (as
+Print a driver credential for TENANT. Drivers presenting it (as
 $CHIMAERA_TOKEN, or a profile's token file) reach only that tenant's runs,
 actors, store and logs, and cannot stop peers. Changing the cluster token
 revokes every credential.
@@ -342,16 +349,15 @@ chimaera cluster credential [OPTIONS] --tenant <TENANT>
 | `--tenant <TENANT>` | The tenant: 1 to 64 letters, digits, `-` or `_` |
 | `--token-file <TOKEN_FILE>` | The cluster token's file (default: $CHIMAERA_CLUSTER_TOKEN) |
 
-`CHIMAERA_TOKEN_FILE` pointing at a file that holds the credential works
-too.
+`CHIMAERA_TOKEN_FILE`, naming a file that holds the credential, works too.
 
 ### `chimaera cluster recover`
 
-Rebuild group GROUP around this stopped peer when its other voters are gone
-for good: this peer becomes the group's only voter, keeping the commits it
-holds (ones it never received are lost), and the cluster adds voters back
-once it runs. Use the surviving replica that holds the most of the group's
-log.
+Rebuild group GROUP around this stopped peer when the group's other voters
+are gone for good. This peer becomes the group's only voter and keeps the
+commits it holds; commits it never received are lost. Once it runs, the
+cluster adds voters back. Use the surviving replica that holds the most of
+the group's log.
 
 ```text
 chimaera cluster recover [OPTIONS] --group <GROUP>
@@ -393,8 +399,8 @@ chimaera k8s render [OPTIONS] --image <IMAGE>
 | `--token-secret <TOKEN_SECRET>` | Secret holding the cluster token under the key `token` (default: NAME-token) |
 | `--provisioner <MAX>` | Also run the provisioner in the cluster, growing the pool from --replicas up to MAX peers under load (a Deployment whose Role may only read this StatefulSet and change its scale). Needs --namespace |
 
-With fewer than 3 founders it prints a warning to stderr: losing one peer
-can then stop the cluster's groups until it returns.
+With fewer than 3 founders it warns on stderr: losing one peer can then
+stop the cluster's groups until it returns.
 
 ### `chimaera slurm-launch`
 
@@ -413,7 +419,7 @@ chimaera slurm-launch [OPTIONS] <COMMAND>...
 It fails outside an allocation (`SLURM_JOB_ID` unset). The data directory
 defaults to `$TMPDIR/chimaera-$SLURM_JOB_ID` (`/tmp` when `TMPDIR` is unset)
 and must be node-local. The job makes its own cluster token unless
-`CHIMAERA_CLUSTER_TOKEN` is set, and the client port is the peer port + 1000
+`CHIMAERA_CLUSTER_TOKEN` is set. The client port is the peer port + 1000
 unless `CHIMAERA_CLIENT_PORT` is set.
 
 ### `chimaera up`
@@ -429,9 +435,9 @@ chimaera up [OPTIONS] <NAME>
 | `<NAME>` | A profile with `provider = "ssh"` |
 
 The profile lists `hosts` (SSH destinations) and `peers` (client
-addresses); optional keys are `dir` (default `~/.chimaera/peers/NAME`),
+addresses). Optional keys: `dir` (default `~/.chimaera/peers/NAME`),
 `port` (7700), `client_port` (port + 10), `ssh_user`, `remote_bin` and
-`token_file` (default `~/.chimaera/clusters/NAME/token`). It uses the
+`token_file` (default `~/.chimaera/clusters/NAME/token`). It runs the
 system `ssh` and `scp`, so `~/.ssh/config` applies.
 
 ### `chimaera down`
@@ -482,5 +488,5 @@ usage: python -m chimaera.provisioner [-h] (--k8s-statefulset NAME | --slurm |
 | `--start-grace SECONDS` | No help text; default 300 |
 | `--interval SECONDS` | No help text; default 5 |
 
-How it decides to grow and shrink is in
-[deploy.md](deploy.md#autoscaling-kubernetes).
+[deploy.md](deploy.md#autoscaling-kubernetes) explains when it grows and
+shrinks the pool.
