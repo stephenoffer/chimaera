@@ -1,244 +1,222 @@
 # Getting started
 
-This walks through a first program, then the parts you will use most. Every
-example runs on your machine as written, and unchanged on a cluster
-(`ch.init(cluster="lab")`, or `chimaera run --cluster lab -- python app.py`).
-Install with `pip install dist/chimaera-*.whl` from `make wheel`, or from
-source as the README says.
+Ten minutes from here, you'll have run functions in parallel, chained them
+without waiting, kept state in an actor and looked at what the runtime did.
+Every example runs on a laptop as written, and the same code runs on a
+cluster without changes.
 
-A few words used below:
+You need Chimaera installed: build it from source as the
+[README](../README.md#install) shows, or `pip install` a wheel from
+`make wheel`.
 
-| Word | Meaning |
-|---|---|
-| script (driver) | your program: the process that calls `.remote()` |
-| peer | the `chimaera` process on each machine that schedules work and stores values; one starts on your machine on demand |
-| worker | a Python process a peer starts to run calls |
-| call | one `.remote(...)`; it runs in a worker |
-| future | what `.remote()` returns: `.result()` waits for the value |
-| actor | an instance of a `@ch.remote` class living in one worker; its methods run there in order |
-| run | everything one script submitted; its id lets you inspect it (`chimaera runs`) or reattach (`ch.runs.attach`) |
+## Your first remote function
 
-When your script exits, it waits for calls it started but never waited on
-(Ctrl-C cancels them; `ch.init(detach=True)` leaves them running).
-
-## 1. Your first remote function
-
-```python
+```python run
 import chimaera as ch
 
 @ch.remote
 def square(x: int) -> int:
     return x * x
 
-print(square(4))                   # 16, runs here like any function
-print(square.remote(4).result())   # 16, runs in a worker process
+assert square(4) == 16                     # a plain call runs right here
+assert square.remote(4).result() == 16     # .remote() runs it in a worker
 ```
 
-Save it as `first.py` and run `python first.py`. The first `.remote()` call
-starts a local peer if none is running. Your script runs once: workers receive
-the function itself, so top-level code is not executed again.
+Save that as `first.py` and run `python first.py`. The first `.remote()` call
+starts a local peer in the background (its files live in `~/.chimaera/local`),
+and the peer stops by itself after ten idle minutes. Your script runs once:
+workers receive the function, so your top-level code doesn't run again in
+them.
 
-## 2. Connect calls without waiting
+`.remote()` returns a `Future` straight away. `.result()` waits for the value,
+and `.result(timeout=5)` gives up after five seconds with `TimeoutError` while
+the call keeps running. You can also `await` a future.
 
-Pass a future into another call. The second call starts when the first one
-finishes, and the value moves between workers without coming back to your
-script.
+## Chain calls without waiting
 
-```python
+Pass a future into another call. The second call starts when its inputs are
+ready, and the value moves between workers without coming back to you.
+
+```python run
 @ch.remote
 def add(a: int, b: int) -> int:
     return a + b
 
 total = add.remote(square.remote(3), square.remote(4))
-print(total.result())              # 25
+assert total.result() == 25
 ```
 
-If a call fails, everything that depends on it fails with that error and never
-runs.
+That works for a future inside a list, tuple or dict argument too, one level
+deep. If a call fails, everything that depends on it fails with the same
+error and never runs.
 
-## 3. Many items
+## Run many items
 
-```python
-for y in square.map(range(10)):
-    print(y)
+`fn.map(items)` streams results back in order. Only a bounded number of items
+are in flight at once, so a slow loop slows the producer down instead of
+filling memory, and fast items are batched for you.
 
-results = square.map(range(1000), ordered=False)   # completion order
-with square.map(huge_iterable) as stream:           # stop early safely
+```python run
+assert list(square.map(range(5))) == [0, 1, 4, 9, 16]
+
+with square.map(range(1000), ordered=False) as stream:   # completion order
     for y in stream:
         if y > 100:
-            break
+            break                                         # leaving the block cancels the rest
 ```
 
-The runtime keeps a bounded number of items in flight and batches fast items
-for you. Leaving the `with` block cancels whatever is still running.
+For a handful of futures, `ch.get(futures)` returns their values in order and
+`ch.as_completed(futures)` yields them as they finish.
 
-To wait on a handful of futures, use `ch.get(futures)` (values in order) or
-`ch.as_completed(futures)` (futures as they finish).
+```python run
+futures = [square.remote(n) for n in range(4)]
+assert ch.get(futures) == [0, 1, 4, 9]
+assert sorted(f.result() for f in ch.as_completed(futures)) == [0, 1, 4, 9]
+```
 
-A generator function streams its items back as it yields them:
+A generator function sends its items back as it yields them:
 
-```python
+```python run
+import os
+import tempfile
+
+log = os.path.join(tempfile.mkdtemp(), "app.log")
+with open(log, "w") as f:
+    f.write("ok\nerror: disk\nok\nerror: net\n")
+
 @ch.remote
-def lines(path):
+def errors(path: str):
     with open(path) as f:
-        yield from f
+        for line in f:
+            if line.startswith("error"):
+                yield line.strip()
 
-for line in lines.remote("big.log"):
-    ...
+assert list(errors.remote(log)) == ["error: disk", "error: net"]
 ```
 
-The generator stays at most 64 items ahead of your loop
-(`.options(max_in_flight=8)` changes that). `async for` works too, and
-`.close()` stops it early. If its worker dies, the generator runs again and
-you get the remaining items once each, so it should yield the same items
-every time it runs.
+## Keep state in an actor
 
-## 4. State in an actor
+Put the decorator on a class and each instance lives in its own worker.
+Calls through one handle run in the order you made them.
 
-```python
+```python run
 @ch.remote
 class Tally:
     def __init__(self):
         self.seen = []
 
-    def add(self, item):
+    def add(self, item: str) -> int:
         self.seen.append(item)
         return len(self.seen)
 
-    def items(self):
+    def items(self) -> list[str]:
         return self.seen
 
 t = Tally.remote()
 for word in ["a", "b", "c"]:
     t.add.remote(word)
-print(t.items.remote().result())   # ['a', 'b', 'c'], in the order you called
+assert t.items.remote().result() == ["a", "b", "c"]
 t.close()
 ```
 
-`async def` methods are ordered too. If you want calls to overlap,
-say so: `@ch.remote(concurrency=4)`.
+A method that raises leaves the actor usable. `Tally.options(name="tally")`
+gets or creates a named actor any process can find, and
+`Tally.options(replicas=4).pool()` gives you interchangeable replicas.
+[Actors](guides/actors.md) covers all of it, including actors whose state
+survives a crash.
 
-An actor's state normally lives only in its process. Give the class
-`state=ch.durable.State()` and every call that returns commits the instance's
-attributes before its reply goes out:
+## Let the runtime size your calls
 
-```python
-@ch.remote(state=ch.durable.State())
-class Account:
-    def __init__(self):
-        self.balance = 0
+You usually don't need to say how much CPU or memory a call takes. The peer
+measures each function, and after a few calls it reserves what they were seen
+to use, so calls wait for memory rather than run out of it. When you do know,
+say so:
 
-    def deposit(self, amount):
-        self.balance += amount
-        return self.balance
+```python run
+@ch.remote(cpus=2, memory="512 MiB")
+def heavy(x: int) -> int:
+    return x + 1
 
-a = Account.options(name="account/42").remote()
-a.deposit.options(command_id="order-17").remote(5).result()   # 5
-a.deposit.options(command_id="order-17").remote(5).result()   # 5 again: not deposited twice
+assert heavy.options(cpus=1).remote(5).result() == 6      # override for one call
+with ch.defaults(deadline="30s"):                          # or for a block
+    assert heavy.remote(6).result() == 7
 ```
 
-If its process or its peer dies, the actor comes back with the last
-committed state, without running `__init__` again. A call that raises
-commits nothing. Reusing a `command_id` with different arguments raises
-`ch.errors.CommandConflict`. The state is stored inline, so keep it under 1 MiB
-pickled, and a durable actor runs one call at a time.
+Sizes need a unit: `"512 MiB"` or `"2 GB"`, and each means what it says. A
+misspelled option fails on the line where you wrote it. GPUs, memory limits
+and the tuning you can watch are in
+[Resources and GPUs](guides/resources.md).
 
-## 5. Ask for resources
+## When something fails
 
-```python
-@ch.remote(cpus=2, memory="2 GiB", memory_limit="3 GiB")
-def train_step(batch): ...
+```python run
+@ch.remote
+def parse(text: str) -> int:
+    return int(text)
+
+try:
+    parse.remote("not a number").result()
+except ValueError as e:                  # your exception, with the remote traceback attached
+    assert "not a number" in str(e)
 ```
-
-`cpus` and `memory` reserve capacity. `memory_limit` is enforced: a call that
-goes over it is stopped and retried twice more (for now under that limit, not a
-larger one), then fails with `ch.OutOfMemory` and the peak it reached.
-
-Sizes need a unit: `"512 MiB"`, `"2 GB"`. Both kinds are accepted and mean
-what they say: `"2 GB"` is 2,000,000,000 bytes and `"2 GiB"` is 2 × 1024³
-(about 7% more). Library thread pools (OpenMP, BLAS) are sized to the CPUs
-you asked for.
-
-You usually do not need either. Without them, the peer measures each
-function's calls: after three, later calls reserve the memory they were seen
-to use (more for larger inputs when memory tracks input size), and calls wait
-for memory rather than run out of it. A function whose calls mostly wait gets
-a smaller CPU share once a trial shows that is faster per core.
-`future.explain()["attempts"][-1]["reservation"]` says what a call reserved
-and why, and `chimaera explain RUN --decisions` lists every change. Set
-`cpus`/`memory` to fix a value, `ch.auto(min=..., max=...)` to bound it, or
-`adaptive="frozen"` to turn learning off.
-
-## 6. When something goes wrong
 
 | You see | It means |
 |---|---|
-| Your own exception, with a remote traceback note | Your code raised it; it ran once |
-| `ch.InfrastructureFailure` | Workers kept dying; three attempts were used |
-| `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died |
-| `ch.Infeasible` | Nothing can ever run this request; the message says why |
-| `ch.Cancelled` / `ch.DeadlineExceeded` | The call was stopped |
-| `TimeoutError` | Your wait ended; the call is still running |
+| Your own exception | Your code raised it. It ran once, unless you listed it in `retry_exceptions`. |
+| `ch.InfrastructureFailure` | Workers kept dying; all three attempts were used. |
+| `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died. |
+| `ch.Infeasible` | No machine could ever run this request; the message says why. |
+| `ch.Cancelled`, `ch.DeadlineExceeded` | The call was stopped. |
+| `TimeoutError` | Your wait ended; the call is still running. |
 
-`future.explain()` returns the state, the reason it is waiting, and each
-attempt's measurements.
+When your script exits, it waits for the calls it started and never waited
+on. Ctrl-C cancels them, and `ch.init(detach=True)` leaves them running so
+you can come back later with `ch.runs.attach(run_id)`.
+[Failures](guides/failures.md) explains retries, effects and recovery.
 
-## 7. Come back to a run
+## See what happened
 
-Every script gets a run id (`ch.init()` returns it). Another process can
-reattach and read the results, even after the local peer restarted:
+Every call can explain itself:
 
-```python
-run = ch.runs.attach("0000...")         # the run id
-run.wait()
-for task_id, value, error in run.outcomes():
-    ...
+```python run
+f = square.remote(7)
+f.result()
+info = f.explain()
+assert info["state"] == "Done" and info["attempts"]
 ```
 
-Start a run with `ch.init(detach=True)` (or `chimaera run --detach -- python app.py`)
-to keep its work going after your script exits.
-
-A long sequence of steps can survive its own worker dying. Mark it a durable
-workflow:
-
-```python
-@ch.remote(workflow="durable")
-async def nightly(day):
-    raw = await extract.remote(day)
-    clean = await transform.remote(raw)
-    started = await ch.durable.now()
-    return await load.remote(clean, started)
-```
-
-If its worker dies, the workflow runs again from the top, and each call it
-already made is answered from the run's record instead of running twice. So
-it must make the same calls, in the same order, every time: anything that
-varies (the time, random numbers, an API response) goes through
-`await ch.durable.now()`, `ch.durable.random()` or `ch.durable.record(fn, ...)`.
-A replay that asks for something different at a step raises
-`ch.errors.WorkflowDivergence`.
-
-## 8. Environment variables
-
-Workers do not see your shell's environment. A run carries only locale
-settings and `PYTHONHASHSEED`, plus what you name:
-
-```python
-ch.init(env={"MODEL_DIR": "/data/models"})
-```
-
-or, from the shell, `CHIMAERA_ENV_PASSTHROUGH=MODEL_*,MY_FLAG`. Never pass
-secrets this way: the run's variables are stored with the run. Put secrets
-(cloud credentials, tokens) in the environment of the peer itself.
-
-## 9. See what happened
+And the `chimaera` command shows the rest:
 
 ```bash
-chimaera status
-chimaera runs                # recent runs: their ids, state and the command that started them
-chimaera logs RUN
-chimaera inspect RUN
-chimaera explain RUN --task TASK
-chimaera explain RUN --decisions
-chimaera profiles            # per function: calls, time, cores, and what the next call reserves
+chimaera status                  # CPU in use, the queue, why work is waiting
+chimaera runs                    # recent runs: ids, state, the command that started them
+chimaera logs RUN                # what a run's calls printed
+chimaera explain RUN --decisions # what the runtime tuned, and why
+chimaera profiles                # per function: calls, time, cores, what the next call reserves
 ```
+
+## Take it to a cluster
+
+Start a `chimaera` peer on each machine, then point your script at them:
+
+```python
+ch.init(cluster="lab")           # a profile in ~/.config/chimaera/clusters.toml
+```
+
+or run it unchanged with `chimaera run --cluster lab -- python app.py`.
+[Run on a cluster](guides/clusters.md) walks through it.
+
+## A few words
+
+| Word | Meaning |
+|---|---|
+| script | your program, the process that calls `.remote()` (also called the driver) |
+| peer | the `chimaera` process on each machine; it schedules work and stores values |
+| worker | a Python process a peer starts to run calls |
+| call | one `.remote(...)`; it runs in a worker |
+| future | what `.remote()` returns; `.result()` waits for the value |
+| actor | an instance of a `@ch.remote` class, living in one worker |
+| run | everything one script submitted; its id lets you inspect it or reattach |
+
+Next: [Tasks and futures](guides/tasks.md), then the rest of the
+[guides](README.md).

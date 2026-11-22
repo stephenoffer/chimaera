@@ -77,7 +77,9 @@ assert first_done.remote(ch.handles(parts)).result() in (2, 3)
 `fn.map(items)` applies a function to every item and streams results back in
 order (`ordered=False` gives completion order). Only a bounded number of items
 are in flight, so a slow consumer slows the producer instead of filling
-memory. Leaving a `with` block cancels whatever is still running. **Runs today:**
+memory. Leaving a `with` block cancels whatever is still running. A map starts
+when it is first read, or as soon as the script submits or waits on anything
+else, or at exit, whichever comes first. **Runs today:**
 
 ```python run
 assert list(word_count.map(["a", "a b", "a b c"])) == [1, 2, 3]
@@ -86,7 +88,7 @@ with word_count.map(["x"] * 1000, ordered=False) as stream:
 ```
 
 The decorator works on a class. Calls through one handle run in the order you
-made them. **Runs today:**
+made them, including after the actor restarts on another peer. **Runs today:**
 
 ```python run
 @ch.remote
@@ -166,7 +168,7 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 | `name`, `detach`, `restart`, `max_restarts` | Actor identity and recovery. |
 | `replicas` | Pool size, or `ch.auto(...)` (P4 controller). |
 | `latency="interactive"` | Never batch these calls. |
-| `adaptive` | `"on"`, `"observe"` (record proposals only) or `"frozen"`. Accepted today; the live controllers that read it arrive in P4. |
+| `adaptive` | `"on"` (default: learned reservations apply), `"observe"` (record proposals only) or `"frozen"` (no learning). See [resources](guides/resources.md). |
 
 ### Waiting on many futures
 
@@ -549,7 +551,8 @@ partition per file; `.jsonl`, `.csv`, `.parquet` or lines), or any
 `ext.Source`. `columns=` and `filter=` are pushed down where the format
 allows. `reduce_by_key` regroups `(key, value)` results by key between calls,
 so the data moves between workers, not through the driver. Its result is a
-`ch.data.Partitioned`: iterate it for each partition's pairs, or call `to_dict()`.
+`ch.data.Partitioned`: iterate it for each partition's dict (key to value; to
+the list of values without a combine), or call `to_dict()`.
 `write` stores each partition from the worker that holds it, then commits once. **Runs today:**
 
 ```python run
@@ -567,22 +570,29 @@ def count_words(lines) -> list[tuple[str, int]]:
     return list(counts.items())
 
 lines = ["the cat", "the dog", "a cat"] * 10
+# A map nothing has read yet runs its function inside reduce_by_key's scatter
+# calls: the pairs it returns are never stored in between.
 totals = count_words.map(ch.data.partitions(lines, n=3)).reduce_by_key(operator.add, partitions=2)
 assert totals.to_dict()["cat"] == 20
 manifest = totals.write(ext.FileSink(tempfile.mkdtemp())).result()   # one file per partition
 assert manifest["rows"] == 4 and len(manifest["parts"]) == 2
 ```
 
-### Coming in P3 and P4
+### Durable state, workflows and placement
+
+Durable actors, durable workflows and placement on peer labels work today;
+[actors](guides/actors.md), [failures](guides/failures.md) and
+[resources](guides/resources.md) run them. A per-call environment is still
+planned.
 
 ```python
-# Durable actors (main session, landed): state survives the process; a
-# repeated command id returns the stored reply.
+# Durable actors: state survives the process; a repeated command id returns
+# the stored reply.
 @ch.remote(state=ch.durable.State(), restart="checkpoint")
 class Cart: ...
 cart = Cart.options(name="cart/42").remote()
 
-# Durable workflows (P3): replayed from history after any process dies.
+# Durable workflows: replayed from the run's record after any process dies.
 @ch.remote(workflow="durable")
 async def checkout(order):
     payment = await charge.remote(order)
@@ -590,13 +600,13 @@ async def checkout(order):
         await notify.remote(order, "declined")
     return await ship.remote(order)
 
-# Per-call environment (P3).
+# Placement: hard requirements and preferences on peer labels.
+@ch.remote(placement=ch.dist.Placement(require={"zone": "us-east1-b"}, prefer=("rack=r7",)))
+def shard(i): ...
+
+# Per-call environment (planned).
 @ch.remote(env=ch.Env(pip=["pandas==2.2.3"]))
 def report(df): ...
-
-# Placement (P3): hard requirements, preferences, affinity and spreading.
-@ch.remote(placement=ch.dist.Placement(require={"zone": "us-east1-b"}, spread="rack"))
-def shard(i): ...
 ```
 
 ## Tier 3: accelerators, gangs and fast paths

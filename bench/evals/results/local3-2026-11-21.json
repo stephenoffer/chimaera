@@ -50,7 +50,7 @@
     },
     "broadcast": {
       "ray": {
-        "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_privat"
+        "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_privat"
       },
       "chimaera": {
         "seconds": 0.409,
@@ -92,7 +92,7 @@
         "runs": 3
       },
       "chimaera": {
-        "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/b"
+        "error": "Traceback (most recent call last):\n  File \"bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"b"
       }
     }
   },
@@ -161,7 +161,7 @@
     {
       "runtime": "ray",
       "workload": "broadcast",
-      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
+      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
       "wall_s": 1.7,
       "round": 0
     },
@@ -231,7 +231,7 @@
     {
       "runtime": "chimaera",
       "workload": "shuffle",
-      "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
+      "error": "Traceback (most recent call last):\n  File \"bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
       "wall_s": 0.5,
       "round": 0
     },
@@ -310,7 +310,7 @@
     {
       "runtime": "ray",
       "workload": "broadcast",
-      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
+      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
       "wall_s": 1.5,
       "round": 1
     },
@@ -359,7 +359,7 @@
     {
       "runtime": "chimaera",
       "workload": "shuffle",
-      "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
+      "error": "Traceback (most recent call last):\n  File \"bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
       "wall_s": 0.1,
       "round": 1
     },
@@ -437,7 +437,7 @@
     {
       "runtime": "ray",
       "workload": "broadcast",
-      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \"/Users/stephen.offer/Desktop/chimaera/.venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
+      "error": "line 235, in run_workload\n    ref = ray.put(np.ones(size // 8))\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/auto_init_hook.py\", line 22, in auto_init_wrapper\n    return fn(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/client_mode_hook.py\", line 134, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 3084, in put\n    object_ref = worker.put_object(\n                 ^^^^^^^^^^^^^^^^^^\n  File \".venv-bench/lib/python3.12/site-packages/ray/_private/worker.py\", line 891, in put_object\n    ret = self.core_worker.put_object(\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"python/ray/_raylet.pyx\", line 3668, in ray._raylet.CoreWorker.put_object\n  File \"python/ray/_raylet.pyx\", line 3699, in ray._raylet.CoreWorker.put_serialized_object_and_increment_local_ref\n  File \"python/ray/includes/common.pxi\", line 101, in ray._raylet.check_status\nray.exceptions.OutOfDiskError: Local disk is full\nThe object cannot be created because the local object store is full and the local disk's utilization is over capacity (95% by default).Tip: Use `df` on this node to check disk usage and `ray memory` to check object store memory usage.\n",
       "wall_s": 1.6,
       "round": 2
     },
@@ -507,7 +507,7 @@
     {
       "runtime": "chimaera",
       "workload": "shuffle",
-      "error": "Traceback (most recent call last):\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"/Users/stephen.offer/Desktop/chimaera/bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
+      "error": "Traceback (most recent call last):\n  File \"bench/evals/multi_node.py\", line 433, in <module>\n    main()\n    ~~~~^^\n  File \"bench/evals/multi_node.py\", line 384, in main\n    res = run_workload(a.runtime, a.workload)\n  File \"bench/evals/multi_node.py\", line 325, in run_workload\n    total = sum(v for part in result for _, v in part)\n                              ^^^^^^\nTypeError: 'Partitioned' object is not iterable\n",
       "wall_s": 0.2,
       "round": 2
     }

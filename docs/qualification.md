@@ -100,8 +100,7 @@ been tested.
 
 One Anyscale node, c7i.16xlarge (64 vCPU, 124 GiB, Linux 6.8 x86_64), Ray
 2.59.0 from the image against Chimaera built from source on the same node,
-Python 3.11, full workload sizes (`EVAL_SCALE=1`). Job
-`prodjob_db31rrxdh7at2a428g9vcvvcmb`, one run per workload: these are single
+Python 3.11, full workload sizes (`EVAL_SCALE=1`). One run per workload: these are single
 samples, not distributions. Multi-node scalability is unverified until the
 multi-peer gates run.
 
@@ -133,7 +132,7 @@ Dev-container numbers (4 vCPU, a tenth of the sizes) are smoke runs only.
 Four Anyscale nodes, c7i.4xlarge (16 vCPU each, 64 in all), Ray from the
 image against one Chimaera peer per node started through Ray
 (`bench/evals/multi_node.py`, `deploy/anyscale/eval-4node.job.yaml`), full
-sizes. Job `prodjob_khqvpua1iltd1zzu58dnna5vew`, working tree diff
+sizes. Working tree diff
 `c2efc4b541130ba9` on top of `22cbcd2`. One run per workload: single samples.
 
 | Workload | Ray | Chimaera | Better |
@@ -156,8 +155,7 @@ listener the caller supplies), so raft replies waited out delayed ACKs, about
 160 ms per 64-call submission commit, and the ingress commits one session's
 submissions one at a time. Both are fixed (accepted sockets set nodelay; the
 client keeps 2 submissions in flight and coalesces up to 4,096 calls
-meanwhile). Rerun with both fixes (job `prodjob_3vat62mbqmvbbwb3rcwch8sydb`,
-tree diff `e6e2bad21fbdee8d`), same machines and sizes:
+meanwhile). Rerun with both fixes (tree diff `e6e2bad21fbdee8d`), same machines and sizes:
 
 | Workload | Ray | Chimaera | Better |
 |---|---:|---:|---|
@@ -175,8 +173,7 @@ tree diff `e6e2bad21fbdee8d`), same machines and sizes:
 Per-call throughput rose 6–10x but is still behind Ray across machines. A
 3.5 ms fsync injected on three laptop peers does not reproduce the gap (they
 still run 8–13k calls/s), so the next run recorded per-peer CPU and repeated
-tasks and actor calls with raft fsync off (job
-`prodjob_hrjyprp6y491c2sct9lmq7455f`, same machines, single samples):
+tasks and actor calls with raft fsync off (same machines, single samples):
 
 | Workload | Ray | Chimaera, fsync per commit | Chimaera, replicas only |
 |---|---:|---:|---:|
@@ -204,12 +201,9 @@ address).
 Same method as the runs below: c7i.4xlarge machines, one Chimaera peer per
 machine started through Ray, at least 60 s of repetitions per workload (45 s
 at 64 nodes), median shown; node loss runs once. Built from the shared tree
-at 06:46 (the commit that adds this section). Jobs: `prodjob_4r74rqcjethh63hv8ya5rt6r47` (1 node),
-`prodjob_anu85pvalld4281rw44s6ih3tb` (4), `prodjob_faziqk8kv3bvpnc2r6pwqwjqrp`
-(16), `prodjob_25a4b9dnd8y3mx3e1vmcg6f6ye` (64). The 64-node job reached its
+at 06:46 (the commit that adds this section). The 64-node job reached its
 hour before Ray's actor, nested, shuffle and node-loss passes; those Ray
-figures (marked *) are from `prodjob_q368a693wi5f13xxsj14ube8wa` (actors) and
-`prodjob_knugq6wg8kwlahg9kby44ssf6c` (nested, shuffle, node loss), on the same
+figures (marked *) are from two separate runs (actors; nested, shuffle and node loss) on the same
 machine type and Ray.
 
 | Workload | 1 node Ray | 1 node Chimaera | 4 Ray | 4 Chimaera | 16 Ray | 16 Chimaera | 64 Ray | 64 Chimaera |
@@ -248,9 +242,7 @@ in tasks and nested at 16 and 64 nodes; with it on, the busiest used 1.0 to
 2.2. The shuffle submits too slowly to spread (the rate rule keeps it in one
 group), so its difference is noise.
 
-An earlier round the same night (`prodjob_gmuwv5rzyzv6d7v2tg1ahwnebb`,
-`prodjob_1rcmm8gnhv9m19daxwn1w21ppp`, `prodjob_axrducgtnkpleepca53u4pbfa1`,
-`prodjob_q368a693wi5f13xxsj14ube8wa`) ran a tree with two faults, both fixed
+An earlier round the same night ran a tree with two faults, both fixed
 in the tree above: a peer whose core was slow to answer a ping was taken for
 one shutting down and lost its voter seats under load, and a large result's
 buffers were freed only with its run (follow-input filled one node's memory
@@ -263,8 +255,7 @@ c7i.4xlarge machines (16 vCPU each), Ray from the image against one Chimaera
 peer per machine started through Ray (`bench/evals/multi_node.py`). Each
 workload ran for at least 60 s after an uncounted warm-up; the median of the
 repetitions is shown. Peers chose raft sync themselves (replicas only on this
-volume: fsync p50 3.9 ms). Jobs `prodjob_18yra1pp6t3udi8ufteexn5vsv` (1 node)
-and `prodjob_sk36myi9natg8ailnndgnxmzap` (16 nodes), tree diff `4805bb8acb567ec2`
+volume: fsync p50 3.9 ms). Tree diff `4805bb8acb567ec2`
 on `b6c71a5`.
 
 | Workload | 1 node: Ray | 1 node: Chimaera | 16 nodes: Ray | 16 nodes: Chimaera |
@@ -285,8 +276,7 @@ Where Ray is ahead: tasks on one machine (1.3x), shuffle on both (2.2x and
 Chimaera put all 128 actors on one host (Ray: 16), which these trivial
 methods did not mind but CPU-heavy ones would.
 
-Fixed since the earlier 16-node run (`prodjob_y95uyvfdg61kqayqwerrjyyqq4`,
-where broadcast took 6.39 s and the large argument 0.389 s): values a driver
+Fixed since the earlier 16-node run (where broadcast took 6.39 s and the large argument 0.389 s): values a driver
 uploaded now carry their holder, so placement keeps quick readers there; tuple
 results are stored value by value so a split value decodes alone; a cluster
 of one grants at submission; local-first grants for calls made inside tasks.
@@ -297,7 +287,7 @@ spilling began and retired the driver's peer after a 2 s stall; both fixed
 
 ## Ray comparison (cluster, 64 nodes)
 
-64 x c7i.4xlarge (1,024 vCPU), job `prodjob_knugq6wg8kwlahg9kby44ssf6c`, same
+64 x c7i.4xlarge (1,024 vCPU), same
 method with at least 45 s of repetitions per workload, tree diff
 `40e2fe4826e0cf5b` on `b6c71a5`.
 
@@ -359,6 +349,8 @@ was shared with other builds and test runs during these measurements.
 | Under a pod's task limit, calls wait for workers instead of failing | pass (unit; Linux container) | `pids.max` counts every thread. Starting more workers than fit failed with EAGAIN, and the calls were lost as "3 attempts lost to infrastructure failures; last: executor process exited". The peer now reads the tightest limit up its cgroup chain (`topology::pids_room`) and starts a worker only if it has room for it (4 tasks plus its threads; measured 3). Otherwise calls wait with a reason naming the limit, and `chimaera status` lists it. `topology.rs` unit test; `test_defaults.py::test_under_a_task_limit_calls_wait_for_workers_instead_of_failing` starts a peer in a cgroup with room for two workers: 2/2 pass, and 2/2 fail with the old behavior. Manual: `docker run --pids-limit=24`, 32 calls in 6.7 s |
 | More lints: large Python collections, hidden GPUs, functions defined per call | pass (local; Linux container for the first) | CH118: a list, dict, set or tuple that pickles to 8 MiB or more, passed to calls or stored with `ch.put`, warns once per site that every reader unpickles a copy, unlike a NumPy array or Arrow table (`test_values.py`). CH119: a CUDA "no device" error in a call that asked for no GPU, on a machine with GPUs, gets a note saying how to ask for one (`test_defaults.py`, simulated). CH120: the same code sent as 100 distinct functions warns once to define it once; the digest cache is bounded at 1,024 functions (`test_defaults.py`). Also fixed: a `ch.put` handle returned by a call was forwarded like a call's future and never resolved; it is now stored as the value (`test_values.py`, which failed every time before) |
 | A result's separately stored buffers are freed, placed by and fetched with it | pass (Linux container) | On Linux a call's large arrays are linked from the arena into files of their own, and the outcome named only the frame (often a few inline bytes). Releasing a result freed nothing: a 1-node cloud run looping over fresh 256 MiB results filled the pool and killed the peer. Placement saw no large input either, so follow-input, large arguments and broadcast slowed at 16 and 64 nodes. Outcomes now list those files (`ObjectRef.blobs`, with sizes, the writer named as holder). Release deletes them here and on peers that copied them; placement counts them; a peer fetches them before the call; output sizes are learned with them. `test_values.py::test_large_results_released_mid_run_free_their_files` (eight 32 MiB results; "8 results still stored" when release skips them). `test_locality.py` result-locality test: 3/3, flaky before |
+| A worker returning large bytes or str keeps none of them | pass (unit; Linux container) | `_serde` pickled a large top-level bytes or str through a class made per call. A class sits in a reference cycle, so each value stayed alive until the next full garbage collection, which an idle worker rarely runs: on Linux an arena file per call. A loop making a fresh 256 MiB bytes result filled a 4 GiB /dev/shm within a minute; in the cloud, follow-input's median ran 12–65% behind its best reps. Now one plain class, freed when pickling ends. The same loop for 60 s: 137 reps, p50 0.335 s, p90 0.425 s, no worker restarts, /dev/shm flat. `test_values.py::test_pickling_large_bytes_or_str_leaves_nothing_holding_them` (one extra reference with the old code) and `::test_a_worker_returning_large_bytes_keeps_none_of_them` (the old code kept all 24 values, 1,536 MiB, in one worker's arena) |
+| An async actor's awaiting calls hold no threads | pass (local) | An async method in a lane (actor `concurrency` > 1) used to block a lane thread on the coroutine's result, one OS thread per awaiting call. Now its arguments are read in a lane thread, the coroutine runs on the actor's event loop, and the outcome is encoded and sent from a lane thread (`Executor.start_async`, `Executor.finish`). Starting and finishing run on 4 threads, not the lane's pool, which a burst grew toward its size. 500 calls awaiting 3 s: 505 threads before; 1,500 calls: 9 threads after. `test_defaults.py::test_an_async_actors_awaiting_calls_hold_no_threads` (205 threads with the old dispatch); actors, admission, compat, gang and workflow modules pass (95) |
 | In-memory objects spill before their filesystem fills | pass (Linux container) | Objects also move to disk when their tmpfs has under a fifth free, not only past 80% of the pool (/dev/shm defaults to half of RAM, smaller than the pool). 3 peers, objects on a 700 MiB tmpfs, 25 rounds of a 64 MiB `ch.put` read by 24 calls: failed within 4–17 rounds before, 25 of 25 in three runs after (arena on and off) |
 | A full disk is named in the error | pass (local, unit) | `test_values.py::test_a_full_disk_is_named_in_the_error`; objects are now written natively (`chimaera-py/src/objects.rs`), which owns removing a partial file on failure |
 | A memory or CPU limit on a parent cgroup is honored | pass (unit) | `topology.rs::chain_tests`: the pool, CPU capacity and available memory take the tightest limit from the process's cgroup up to the root (systemd slices and some runtimes leave the process's own cgroup unlimited) |

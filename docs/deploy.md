@@ -228,9 +228,13 @@ would otherwise go with it: groups it leads move to another voter, the
 groups' leaders replace it as a voter with a live peer that is not one (if
 there is such a peer), and once its calls are done it copies every value it
 stores to the peer readers ask next. The log says how many values were
-copied and how many were left behind at the deadline. Actors it hosts are not
-moved: they restart elsewhere as on a lost peer, counting against their
-restart limit. Kubernetes' grace period uses SIGTERM;
+copied and how many were left behind at the deadline. Actors it hosts that may
+restart (`restart="fresh"` or `"checkpoint"`, or durable) move: each finishes
+the calls it is running, stops, and starts on another peer without counting
+against `max_restarts`. Calls waiting for it go to its new host, and every
+handle keeps its order. A fresh actor starts over there; a durable one resumes
+its committed state. Actors with `restart="never"` stay until the peer stops,
+and then end. Kubernetes' grace period uses SIGTERM;
 Slurm jobs use SIGUSR1, because `srun` forwards it to the peers and turns
 SIGTERM into a kill (`--signal=B:USR1@120` in the job script).
 
@@ -492,7 +496,7 @@ with 4 NVIDIA A10Gs, running `bench/evals/gpu_check.py`. That script checks:
 It also copies the node's driver files to `OUT/fixture`, a real tree to
 replace the hand-written CUDA ones.
 
-It ran on 2026-11-21 (job `prodjob_hallzt4lkuhdbrgazpxhrrepv9`):
+It ran on 2026-11-21:
 - **Passed (7 of 8):**
   - each `gpus=1` call saw exactly one GPU by UUID (torch counted 1, `ch.dist.device()` was `cuda:0`);
   - four concurrent calls got four different GPUs;
@@ -524,7 +528,10 @@ the image check or the built lock exists yet.
 profile) ships its project's own modules. These are the `sys.path`
 directories that aren't the interpreter's, a virtualenv's or Chimaera's, as
 one archive named by its content, at most `CHIMAERA_PROJECT_MAX_BYTES`
-(100 MiB). Each peer unpacks it once and puts it on the workers' `sys.path`.
+(100 MiB). Inside a git work tree it holds only what git would track, so
+files your `.gitignore` excludes (data, checkpoints, `.env`) stay home; a
+directory git ignores as a whole still ships when it is the project itself.
+Each peer unpacks it once and puts it on the workers' `sys.path`.
 When the project has a `uv.lock`, each peer also installs the locked packages
 once, with its own Python (`uv sync --frozen`), and the workers put them
 ahead of the peer's own. An install that takes longer than

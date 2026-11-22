@@ -16,8 +16,10 @@ import pytest
 from conftest import REPO, run_script
 
 DOCS = pathlib.Path(REPO, "docs")
-# The API docs this suite owns; other docs belong to other work and aren't policed here.
-OWN = [DOCS / name for name in ("api.md", "deploy.md", "compat-ray.md") if (DOCS / name).exists()]
+# The API docs, the getting-started page and the user guides; design docs aren't policed here.
+OWN = [
+    DOCS / name for name in ("api.md", "deploy.md", "compat-ray.md", "getting-started.md") if (DOCS / name).exists()
+] + sorted((DOCS / "guides").glob("*.md"))
 FENCE = re.compile(r"^```python( run)?\n(.*?)^```", re.M | re.S)
 
 
