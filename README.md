@@ -9,7 +9,7 @@
 
 <p align="center">
   <strong>Distributed Python with one decorator.</strong><br>
-  A Rust runtime with no head node, which measures your code and sizes it for you.
+  A Rust runtime with no head node that learns what your code needs.
 </p>
 
 <p align="center">
@@ -50,21 +50,19 @@ the same file runs unchanged.
 ### No head node
 
 Every machine runs the same `chimaera` peer, and none of them is in charge.
-The record of which calls exist, which finished and what they returned is
-replicated with Raft, so there's no head process to size, babysit or lose.
-When a machine dies, its calls run somewhere else. In a 64-machine test,
-one machine was killed under a load of one-second tasks: every task still
-returned exactly once, in 9.6 s. Ray took 18.5 s.
+Which calls exist, which finished and what they returned is replicated with
+Raft, so there's no head process to size, babysit or lose. Kill a machine
+mid-run and its calls run elsewhere. In a 64-machine test under a load of
+one-second tasks, every task still returned exactly once, in 9.6 s. Ray took
+18.5 s.
 
 ### It sizes your calls for you
 
-You don't have to guess `num_cpus` or `memory`. The peer measures each
-function's peak memory. After three calls it reserves what it saw, so later
-calls wait for memory instead of getting OOM-killed. A call killed for memory
-comes back with 1.5x what it reached. Fast calls get batched, and
-OpenMP and BLAS thread pools are sized to the CPUs a call was given.
-`future.explain()` tells you what was reserved and why. Set `cpus=` or
-`memory=` yourself and your value wins.
+No more guessing `num_cpus` or `memory`. After three calls the peer reserves
+the memory peak it measured, so later calls wait for room instead of getting
+OOM-killed, and a call killed for memory retries with 1.5x what it reached.
+Tiny calls batch themselves. `future.explain()` shows what was reserved and
+why, and a `cpus=` or `memory=` you set always wins.
 
 ### Failures you can reason about
 
@@ -94,12 +92,11 @@ and caveats, is in [qualification.md](docs/qualification.md).
 
 ### Runs where your machines are
 
-A laptop, a few SSH hosts, Kubernetes or Slurm, from one binary:
-`chimaera up` over SSH, `chimaera k8s render --image IMG | kubectl apply -f -`, or
-`chimaera slurm-launch` inside an allocation. Then
-`chimaera submit --cluster NAME -- python app.py` ships this directory and
-starts the program on the cluster in the background. You get its run id back. See
-[clusters](docs/guides/clusters.md) and [deploy.md](docs/deploy.md).
+One binary covers a laptop, a few SSH hosts, Kubernetes and Slurm:
+`chimaera up` over SSH, `chimaera k8s render --image IMG | kubectl apply -f -`,
+or `chimaera slurm-launch` inside an allocation. Then
+`chimaera run --cluster NAME -- python app.py` runs your script against it.
+See [clusters](docs/guides/clusters.md) and [deploy.md](docs/deploy.md).
 
 ## Install
 

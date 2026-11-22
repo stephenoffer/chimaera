@@ -1,6 +1,6 @@
 # Data: large values, pipelines and shared state
 
-You'll pass large values to calls without copying them, run partitioned pipelines that shuffle by key and write to a sink, stream items from generators, and share state through queues, topics and a replicated store.
+Pass a large NumPy array to a thousand calls and it's stored once. This page covers that, then pipelines that regroup data by key and write it out, and the queues and stores that let calls share state.
 
 ## Pass a large value to many calls
 
