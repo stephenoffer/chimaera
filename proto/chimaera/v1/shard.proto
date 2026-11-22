@@ -85,6 +85,14 @@ message TaskRecord {
   PeerInc grant_on_ready = 18;
 }
 
+// A TaskRecord's state and outcome alone: the same field numbers, so a
+// stored record decodes as this while skipping its spec, arguments and
+// attempts (reading a dependency's outcome happens once per edge).
+message TaskRecordOutcome {
+  TaskRecord.State state = 2;
+  Outcome outcome = 10;
+}
+
 message RunRecord {
   enum State {
     ACTIVE = 0;

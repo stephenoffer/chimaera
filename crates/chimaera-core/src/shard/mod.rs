@@ -705,7 +705,7 @@ impl ShardState {
     /// received cross-vshard notification).
     fn known_outcome(&self, kv: &dyn KvRead, v: u16, d: Tk) -> Option<pb::Outcome> {
         if d.v() == v {
-            load::<pb::TaskRecord>(kv, &d.key()).and_then(|r| r.outcome)
+            load::<pb::TaskRecordOutcome>(kv, &d.key()).and_then(|r| r.outcome)
         } else {
             load::<pb::Outcome>(kv, &keys::notified(v, d.pair()))
         }
@@ -1490,7 +1490,7 @@ pub mod read {
     /// Outcome of `producer` as seen from a dependent in `vshard`: its own
     /// record when the same group holds it, else the copy a DepNotify left.
     pub fn dep_outcome(kv: &dyn KvRead, vshard: u16, producer: Tk) -> Option<pb::Outcome> {
-        task(kv, producer)
+        load::<pb::TaskRecordOutcome>(kv, &producer.key())
             .and_then(|r| r.outcome)
             .or_else(|| load(kv, &keys::notified(vshard, (&producer.run, &producer.task))))
     }

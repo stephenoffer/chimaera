@@ -2105,14 +2105,14 @@ impl Core {
     }
 
     fn dep_outcomes(&self, tk: Tk, spec: &pb::TaskSpec) -> Vec<pb::Outcome> {
-        spec.deps
-            .iter()
-            .map(|d| {
-                Tk::parse(d)
-                    .and_then(|dep| self.router.read(tk.v(), |kv| read::dep_outcome(kv, tk.v(), dep)).flatten())
-                    .unwrap_or_default()
-            })
-            .collect()
+        // One read for all of them: a gather may have hundreds.
+        let read_all = |kv: &dyn chimaera_core::kv::KvRead| {
+            spec.deps
+                .iter()
+                .map(|d| Tk::parse(d).and_then(|dep| read::dep_outcome(kv, tk.v(), dep)).unwrap_or_default())
+                .collect()
+        };
+        self.router.read(tk.v(), read_all).unwrap_or_else(|| vec![pb::Outcome::default(); spec.deps.len()])
     }
 
     /// Whether an attempt's outcome may reach its callers before it is
