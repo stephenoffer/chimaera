@@ -26,6 +26,23 @@ _ALTERNATIVES = {
 }
 
 
+def list_named_actors(all_namespaces: bool = False) -> list[Any]:
+    """Live named actors: names in this job's namespace, or with
+    ``all_namespaces=True`` a ``{"name", "namespace"}`` dict each, as in Ray."""
+    import chimaera as ch
+
+    from .._remote import _default_namespace
+
+    if not all_namespaces:
+        prefix = f"{_default_namespace()}/"
+        return [a.name[len(prefix) :] for a in ch.runs.actors(prefix)]
+    out = []
+    for a in ch.runs.actors():
+        namespace, _, name = a.name.partition("/")
+        out.append({"name": name, "namespace": namespace})
+    return out
+
+
 def __getattr__(name: str) -> Any:
     if name.startswith("__"):
         raise AttributeError(name)
@@ -40,6 +57,7 @@ __all__ = [
     "collective",
     "get_current_placement_group",
     "get_placement_group",
+    "list_named_actors",
     "multiprocessing",
     "placement_group",
     "placement_group_table",

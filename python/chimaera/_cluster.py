@@ -141,6 +141,9 @@ class Node(NamedTuple):
     queued: int
     this_peer: bool
     labels: dict[str, str]
+    actors: int = 0  # actor instances it hosts
+    object_bytes: int = 0  # bytes of values it stores
+    draining: bool = False  # stopping: it takes no new work
 
 
 class Event(NamedTuple):
@@ -225,18 +228,24 @@ class ClusterView:
 
         return [Node(**n) for n in Runtime.get().client.nodes()]
 
-    def events(self, kinds: list[str] | None = None, since: int | None = None, *, follow: bool = True) -> EventStream:
+    def events(
+        self, kinds: list[str] | None = None, *, start: str | int = "latest", follow: bool = True
+    ) -> EventStream:
         """Cluster events, oldest first: members joining and leaving, actors
         starting, restarting and dying, calls failing for good, controller
-        decisions and drains. `kinds` narrows them; `since=0` starts at the
-        oldest the peer still holds (it keeps the latest 10,000), the default
-        at what happens next. With ``follow=False`` iteration stops at the newest.
+        decisions and drains. `kinds` narrows them. `start` is ``"latest"``
+        (what happens next), ``"earliest"`` (the oldest the peer still holds;
+        it keeps the latest 10,000) or a sequence number. With
+        ``follow=False`` iteration stops at the newest.
 
         Events come from the peer this process is connected to: member events
         from the whole cluster, call and actor events for the shards it leads.
         They are notifications, not records: ``Run.outcomes()`` and
         ``ch.actor(key)`` are the durable answers."""
-        return EventStream(kinds or [], since, follow)
+        from . import _units
+
+        start = _units.start_position(start)
+        return EventStream(kinds or [], None if start == "latest" else 0 if start == "earliest" else start, follow)
 
     def resources(self) -> dict[str, float]:
         """Capacity of the live nodes, and how much CPU they report in use."""

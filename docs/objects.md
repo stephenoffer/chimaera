@@ -75,6 +75,10 @@ that is still exact:
   `SIGBUS`.
 - **Top-level `bytes`** go out of band, which avoids pickle's copy into its
   stream: from the arena they are linked, otherwise copied once.
+- **Top-level `str`** of 1 MiB or more is encoded to UTF-8 once and goes out
+  of band the same way (the encoded bytes are an arena block, so they are
+  linked), instead of being encoded into pickle's stream and copied again.
+  Reading decodes it once, as pickle would.
 - **Small values** (up to 256 KiB for `ch.put`, 64 KiB for results) travel
   inside the handle; no file is written.
 - **Large plain containers** (dicts, lists and tuples of str, int, float,
@@ -160,10 +164,21 @@ and any blobs it names) to this host before returning, as Ray's
   turn. The writer waits for the successor to confirm each copy
   (`ReplicateRequest.wait`), so a failed copy is logged as a warning and
   counted (`replication_failures_total` in `/metrics`), not lost silently.
-  `CHIMAERA_OBJECT_REPLICAS=0` turns replicas off.
+  `CHIMAERA_OBJECT_REPLICAS=N` keeps N copies, on the next N peers round
+  the ring (default 1; a peer that fetched the object counts as one); 0
+  turns replicas off.
 - **Finding a copy.** A reader whose holder is gone tries the holders'
   successors, then a few other live peers (at most eight peers in all),
   before reporting `DataLost`.
+- **Draining.** A peer that drains (stopped with SIGTERM, or scaled down)
+  first copies every object it holds to its ring successor, the next live
+  peer that is not draining, where readers look once it is gone. It waits
+  for each copy, eight at a time, within the drain's grace, and logs how
+  many it copied and how many it left (`objplane::hand_off`, called from
+  the drain once running calls finish).
+- **Results returned as handles.** A `ch.put` made inside a call is named
+  like the call's results, so when the run ends and its other values are
+  deleted, a result that is a handle to that put still reads.
 - **Dead processes.** A process that dies leaves its arena behind; the peer
   sweeps it every 10 s. Stored objects keep their own links, so sweeping
   never loses one.
@@ -178,7 +193,7 @@ and any blobs it names) to this host before returning, as Ray's
 | `CHIMAERA_SPILL_DIR` | the peer's `spill/` | where objects go past the memory limit: one directory or several, colon-separated |
 | `CHIMAERA_SPILL_THRESHOLD` | `0.8` | share of the memory pool past which the oldest objects move to disk |
 | `CHIMAERA_SPILL_THREADS` | `4` | objects copied to disk at once |
-| `CHIMAERA_OBJECT_REPLICAS` | `1` | `0`: no replicas |
+| `CHIMAERA_OBJECT_REPLICAS` | `1` | copies of each object on other peers; `0`: none |
 
 ## Compared with Ray's object store
 
@@ -227,4 +242,7 @@ Not matched yet:
   after any fork.
 - Replicas cost one extra network transfer per object that no other peer
   read. A peer that dies within about a second of writing an object can
-  lose that object.
+  lose that object, and so can losing a peer together with every peer
+  holding a copy (one by default: `CHIMAERA_OBJECT_REPLICAS`).
+  Replicas are made on Linux only (the replicator watches the store with
+  inotify).

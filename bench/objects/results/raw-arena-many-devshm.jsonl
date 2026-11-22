@@ -1,0 +1,7 @@
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1K", "op": "put", "per_object_s": 8.005498199963768e-06, "n": 10000}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1K", "op": "get", "per_object_s": 6.20748139999705e-06, "n": 10000, "call_s": 0.14187612299974717}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "64K", "op": "put", "per_object_s": 5.273820909997085e-05, "n": 10000}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "64K", "op": "get", "per_object_s": 3.8127400099983786e-05, "n": 10000, "call_s": 2.001954024999577}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1M", "op": "put", "per_object_s": 4.0915241211081366e-05, "n": 2048}
+{"runtime": "chimaera", "scenario": "many", "kind": "bytes", "size": "1M", "op": "get", "per_object_s": 0.0005221778618165196, "n": 2048, "call_s": 1.2678086569994775}
+{"runtime": "chimaera", "done": "many", "wall_s": 4.3}

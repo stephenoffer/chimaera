@@ -208,8 +208,9 @@ fn outcome_py<'py>(py: Python<'py>, o: &pb::Outcome) -> PyResult<Bound<'py, PyTu
     }
 }
 
-/// Build an Outcome from Python: ("ok", run, object_id, size, inline|None, oob)
-/// or ("err", kind, type_name, message, exc_pickle, traceback, detail_json).
+/// Build an Outcome from Python: ("ok", run, object_id, size, inline|None, oob
+/// [, [(blob_id, size), ...]]) or ("err", kind, type_name, message, exc_pickle,
+/// traceback, detail_json). The blobs are files the frame refers to.
 fn outcome_from(t: &Bound<'_, PyTuple>) -> PyResult<pb::Outcome> {
     let tag: String = t.get_item(0)?.extract()?;
     let value = if tag == "ok" {
@@ -218,12 +219,22 @@ fn outcome_from(t: &Bound<'_, PyTuple>) -> PyResult<pb::Outcome> {
         let size: u64 = t.get_item(3)?.extract()?;
         let inline: Option<Vec<u8>> = t.get_item(4)?.extract()?;
         let oob: u32 = t.get_item(5)?.extract()?;
+        let blobs: Vec<(Vec<u8>, u64)> = if t.len() > 6 {
+            t.get_item(6)?.extract::<Option<Vec<(Vec<u8>, u64)>>>()?.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let blobs = blobs
+            .into_iter()
+            .map(|(object_id, size)| pb::ObjectRef { object_id, size, run: run.clone(), ..Default::default() })
+            .collect();
         pb::outcome::Value::Ok(pb::ObjectRef {
             object_id,
             size,
             inline_data: inline.unwrap_or_default(),
             run,
             oob_buffers: oob,
+            blobs,
             ..Default::default()
         })
     } else {
@@ -633,7 +644,7 @@ impl Client {
         sys_path: Vec<String>,
         env: BTreeMap<String, String>,
         description: String,
-    ) -> PyResult<(Py<PyBytes>, bool)> {
+    ) -> PyResult<(Py<PyBytes>, bool, Vec<u32>)> {
         let mut peer = self.peer.clone();
         let rec = py.detach(|| {
             runtime().block_on(async move {
@@ -654,7 +665,7 @@ impl Client {
                 .map_err(rpc_err)
             })
         })?;
-        Ok((PyBytes::new(py, &rec.run).unbind(), rec.detached))
+        Ok((PyBytes::new(py, &rec.run).unbind(), rec.detached, rec.spread))
     }
 
     /// Bind this session to a run (outcomes, logs and run lifetime).
@@ -754,7 +765,7 @@ impl Client {
 
     /// Create an actor; returns the seq whose ("actor", ...) event answers it.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (actor, ctor, tenant, key, class_digest, restart, max_restarts, detached, durable=false))]
+    #[pyo3(signature = (actor, ctor, tenant, key, class_digest, restart, max_restarts, detached, durable=false, nonce=Vec::new()))]
     fn create_actor(
         &self,
         py: Python<'_>,
@@ -767,9 +778,11 @@ impl Client {
         max_restarts: u32,
         detached: bool,
         durable: bool,
+        nonce: Vec<u8>,
     ) -> PyResult<u64> {
         let ctor = ctor.into_spec(py)?;
         let spec = pb::ActorSpec {
+            nonce,
             actor,
             ctor: ctor.key.clone(),
             tenant,
@@ -859,6 +872,9 @@ impl Client {
                 d.set_item("queued", n.queued)?;
                 d.set_item("this_peer", n.this_peer)?;
                 d.set_item("labels", n.labels.clone())?;
+                d.set_item("actors", n.actors)?;
+                d.set_item("object_bytes", n.object_bytes)?;
+                d.set_item("draining", n.draining)?;
                 Ok(d)
             })
             .collect()
@@ -885,6 +901,31 @@ impl Client {
             Err(e) if e.code() == tonic::Code::NotFound => Ok(None),
             Err(e) => Err(rpc_err(e)),
         }
+    }
+
+    /// Live named actors whose name starts with `prefix`, that this client
+    /// may see: (tenant, name, state, actor id) each.
+    fn list_actors<'py>(&self, py: Python<'py>, prefix: String) -> PyResult<Vec<Bound<'py, PyTuple>>> {
+        let mut peer = self.peer.clone();
+        let r = py
+            .detach(|| runtime().block_on(async move { peer.list_actors(pb::ListActorsRequest { prefix }).await }))
+            .map_err(rpc_err)?
+            .into_inner();
+        r.actors
+            .iter()
+            .map(|a| {
+                let spec = a.spec.clone().unwrap_or_default();
+                PyTuple::new(
+                    py,
+                    [
+                        spec.tenant.into_pyobject(py)?.into_any(),
+                        spec.key.into_pyobject(py)?.into_any(),
+                        format!("{:?}", a.state()).into_pyobject(py)?.into_any(),
+                        PyBytes::new(py, &spec.actor).into_any(),
+                    ],
+                )
+            })
+            .collect()
     }
 
     /// A ch.Store write in `namespace`; returns the reply as a dict.

@@ -13,9 +13,13 @@
 >    `OutcomeUnknown` after a possible start). Scopes and `.options()` may only make a call stricter. User
 >    exceptions are never retried unless listed in `retry_exceptions`; a second identical exception fingerprint stops.
 > 2. **Raft:** openraft 0.10 with redb storage, cross-group group commit, AppendEntries batched per target peer.
-> 3. **Shard key:** dynamic calls go to the run's home vshard (ids embed `cell | vshard | hash`, so any peer routes
->    them); stages spread across vshards only above a measured commit rate. Hashing every call scattered small
->    runs and turned each chain into a cross-group notification.
+> 3. **Shard key:** a run's calls go to a few vshards it names, not to a hash of each call (ids embed
+>    `cell | vshard | hash`, so any peer routes them). Hashing every call scattered small runs and turned each
+>    chain into a cross-group notification. In a cluster a run is spread over up to 16 vshards in groups led
+>    by other peers (`CHIMAERA_RUN_SPREAD`), because one group leader commits roughly 10,000 calls a second.
+>    A driver's call goes to the vshard its inputs share, to the run's own vshard when they span several, and
+>    otherwise round robin. A call's children stay in its vshard, and actor and generator calls stay in the
+>    run's own.
 > 4. **Local mode** spawns a local peer process (the same binary, single-voter groups) on first submission. It
 >    is not embedded in the driver: user code never shares a process with control-plane state, `fork` stays safe,
 >    and `chimaera inspect` works after the script exits.

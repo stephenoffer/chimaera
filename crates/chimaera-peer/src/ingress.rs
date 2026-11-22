@@ -32,11 +32,26 @@ pub struct Ingress {
     next_session: AtomicU64,
     isolated_available: bool,
     /// Each run's and actor's tenant, as read from its group: neither changes.
-    owners: std::sync::Mutex<HashMap<Id, String>>,
+    /// Keyed by (id, is an actor): a run and an actor may share an id.
+    owners: std::sync::Mutex<HashMap<(Id, bool), String>>,
 }
 
 /// Owners kept before the cache starts over.
 const OWNERS_CACHED: usize = 100_000;
+/// Vshards a run's calls are spread over, its own included: each in another
+/// data group, led by another peer where leaders are known. One group leader
+/// commits roughly 10,000 calls a second; a large run's nested calls and
+/// stages are shared by this many. `CHIMAERA_RUN_SPREAD` sets it (1: every
+/// run stays in one vshard).
+fn spread_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("CHIMAERA_RUN_SPREAD").ok().and_then(|v| v.parse().ok()).unwrap_or(16).clamp(1, 64)
+    })
+}
+/// How long creating a run waits for each copy; a group that does not answer
+/// is left out of the spread.
+const COPY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Ingress {
     pub fn new(
@@ -348,6 +363,17 @@ fn ev(seq: u64, event: pb::session_event::Event) -> pb::SessionEvent {
 #[derive(Clone)]
 pub struct Service(pub Arc<Ingress>);
 
+/// The vshards holding a run's calls, ascending (task ids sort the same way).
+fn spread_list(rec: &pb::RunRecord, run: Id) -> Vec<u16> {
+    let mut v: Vec<u16> = rec.spread.iter().map(|v| *v as u16).collect();
+    if v.is_empty() {
+        v.push(run.vshard());
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 #[tonic::async_trait]
 impl pb::peer_server::Peer for Service {
     async fn hello(&self, req: Request<pb::ClientHello>) -> Result<Response<pb::PeerInfo>, Status> {
@@ -397,7 +423,9 @@ impl pb::peer_server::Peer for Service {
             vshard = owned[(vshard as usize) % owned.len()] as u16;
         }
         let run = Id::derive(0, vshard, &[tenant.as_bytes(), key.as_bytes()]);
-        let record = pb::RunRecord {
+        // A keyed run must be the same record from any peer: it stays in one vshard.
+        let spread = if r.submission_key.is_empty() { self.0.spread_for(vshard) } else { Vec::new() };
+        let mut record = pb::RunRecord {
             run: run.to_vec(),
             tenant,
             submission_key: key,
@@ -413,8 +441,13 @@ impl pb::peer_server::Peer for Service {
                 env: r.env.clone(),
             }),
             home: Some(self.0.router.identity.pb()),
+            spread: spread.iter().map(|v| u32::from(*v)).collect(),
             ..Default::default()
         };
+        // The copies first, so no call is routed to a vshard that would refuse it.
+        if !spread.is_empty() {
+            record.spread = self.0.create_copies(&record, vshard, &spread).await;
+        }
         // Patient like a submission: a leader election is not a lost majority.
         let reply = self
             .0
@@ -434,7 +467,7 @@ impl pb::peer_server::Peer for Service {
         };
         let env = ExecEnv { python: r.python, cwd: r.cwd, sys_path: r.sys_path, env: r.env.into_iter().collect() };
         let run_id = Id::from_slice(&rec.run).map_err(|e| Status::internal(e.to_string()))?;
-        self.0.owners.lock().expect("lock").insert(run_id, rec.tenant.clone());
+        self.0.owners.lock().expect("lock").insert((run_id, false), rec.tenant.clone());
         let _ = self.0.core.send(CoreMsg::RegisterRun { run: run_id, env, detached: rec.detached }).await;
         Ok(Response::new(rec))
     }
@@ -569,20 +602,20 @@ impl pb::peer_server::Peer for Service {
             Some(Id::from_slice(&r.after_task).map_err(|e| Status::invalid_argument(e.to_string()))?)
         };
         let limit = (r.limit as usize).clamp(1, 10_000);
-        let page = match self.0.router.read(run.vshard(), |kv| read::tasks_page(kv, run, after, limit)) {
-            Some(page) => page,
-            None => {
-                let req = pb::ReadRequest {
-                    run: run.to_vec(),
-                    after_task: r.after_task.clone(),
-                    limit: limit as u32,
-                    linearizable: true,
-                    ..Default::default()
-                };
-                let reply = self.0.remote_read(run.vshard(), req).await?;
-                reply.page_keys.iter().filter_map(Tk::parse).zip(reply.tasks).collect()
+        // Task ids lead with their vshard, so the run's vshards in order, each
+        // in id order, list its tasks in id order.
+        let spread = self.0.spread_of(run).await?;
+        let mut cursor = after.unwrap_or_else(|| read::page_start(run, spread[0]));
+        let (mut page, first) = (Vec::new(), cursor.vshard());
+        for &v in spread.iter().filter(|v| **v >= first) {
+            if v != cursor.vshard() {
+                cursor = read::page_start(run, v);
             }
-        };
+            page.extend(self.0.tasks_page(run, cursor, limit - page.len()).await?);
+            if page.len() == limit {
+                break;
+            }
+        }
         let next_after = if page.len() == limit {
             page.last().map(|(tk, _)| tk.task.to_vec()).unwrap_or_default()
         } else {
@@ -602,13 +635,14 @@ impl pb::peer_server::Peer for Service {
         let router = &self.0.router;
         let mut reply = pb::ListRunsReply::default();
         for group in router.data_groups() {
-            let runs = match (router.runs_of(group), &router.mesh) {
-                (Some(runs), _) => Some(runs),
-                (None, Some(mesh)) => {
-                    let req = pb::ReadRequest { list_runs_group: group, ..Default::default() };
-                    mesh.read_group(group, req).await.ok().map(|r| r.runs)
+            // From the leader, which has applied every commit; a replica here
+            // that may lag is the fallback when no leader answers.
+            let runs = match &router.mesh {
+                Some(mesh) if !router.leads(group) => {
+                    let req = pb::ReadRequest { list_runs_group: group, linearizable: true, ..Default::default() };
+                    mesh.read_group(group, req).await.ok().map(|r| r.runs).or_else(|| router.runs_of(group))
                 }
-                (None, None) => None,
+                _ => router.runs_of(group),
             };
             match runs {
                 Some(runs) => reply.runs.extend(runs.into_iter().filter(|r| caller.may(&r.tenant))),
@@ -619,6 +653,35 @@ impl pb::peer_server::Peer for Service {
         if limit > 0 {
             reply.runs.truncate(limit as usize);
         }
+        Ok(Response::new(reply))
+    }
+
+    async fn list_actors(&self, req: Request<pb::ListActorsRequest>) -> Result<Response<pb::ListActorsReply>, Status> {
+        let caller = Caller::of(&req);
+        let prefix = req.into_inner().prefix;
+        let router = &self.0.router;
+        let mut reply = pb::ListActorsReply::default();
+        for group in router.data_groups() {
+            let actors = match &router.mesh {
+                Some(mesh) if !router.leads(group) => {
+                    let req = pb::ReadRequest { list_actors_group: group, linearizable: true, ..Default::default() };
+                    mesh.read_group(group, req).await.ok().map(|r| r.actors).or_else(|| router.actors_of(group))
+                }
+                _ => router.actors_of(group),
+            };
+            let Some(actors) = actors else {
+                reply.unavailable.push(group);
+                continue;
+            };
+            reply.actors.extend(actors.into_iter().filter(|a| {
+                a.state() != pb::actor_record::State::Dead
+                    && a.spec
+                        .as_ref()
+                        .is_some_and(|s| !s.key.is_empty() && s.key.starts_with(&prefix) && caller.may(&s.tenant))
+            }));
+        }
+        let name = |a: &pb::ActorRecord| a.spec.as_ref().map(|s| (s.tenant.clone(), s.key.clone())).unwrap_or_default();
+        reply.actors.sort_by_key(name);
         Ok(Response::new(reply))
     }
 
@@ -644,6 +707,15 @@ impl pb::peer_server::Peer for Service {
         let caller = Caller::of(&req);
         let req = req.into_inner();
         self.0.may_run(&caller, &req.run).await?;
+        if let Some(task) = &req.task {
+            self.0.may_run(&caller, &task.run).await?;
+        }
+        // Decisions are the peer's, about every tenant's functions.
+        if req.decisions && caller != Caller::Admin {
+            return Err(Status::permission_denied(
+                "the peer's decisions cover every tenant: they take the cluster token",
+            ));
+        }
         let (reply, rx) = oneshot::channel();
         self.0
             .core
@@ -652,23 +724,24 @@ impl pb::peer_server::Peer for Service {
             .map_err(|_| Status::unavailable("peer is stopping"))?;
         let mut out = rx.await.map_err(|_| Status::unavailable("peer is stopping"))?;
         // The core reads only the groups this peer hosts: read another group's run from a replica of it.
-        if let Ok(run) = Id::from_slice(&req.run)
-            && out.run.is_none()
-            && !self.0.router.hosts(run.vshard())
-        {
-            let read = pb::ReadRequest { run: run.to_vec(), linearizable: true, ..Default::default() };
-            out.run = self.0.remote_read(run.vshard(), read).await?.run;
-            let mut after = Vec::new();
-            while out.run.is_some() && req.task.is_none() {
-                let page =
-                    pb::ReadRequest { run: run.to_vec(), after_task: after, limit: 10_000, ..Default::default() };
-                let reply = self.0.remote_read(run.vshard(), page).await?;
-                for t in &reply.tasks {
-                    *out.counts.entry(crate::core::count_key(t)).or_default() += 1;
-                }
-                match reply.page_keys.last() {
-                    Some(k) if reply.tasks.len() == 10_000 => after = k.task.clone(),
-                    _ => break,
+        if let Ok(run) = Id::from_slice(&req.run) {
+            if out.run.is_none() && !self.0.router.hosts(run.vshard()) {
+                let read = pb::ReadRequest { run: run.to_vec(), linearizable: true, ..Default::default() };
+                out.run = self.0.remote_read(run.vshard(), read).await?.run;
+            }
+            if let Some(rec) = out.run.as_ref().filter(|_| req.task.is_none()) {
+                for v in spread_list(rec, run) {
+                    let mut cursor = read::page_start(run, v);
+                    loop {
+                        let page = self.0.tasks_page(run, cursor, 10_000).await?;
+                        for (_, t) in &page {
+                            *out.counts.entry(crate::core::count_key(t)).or_default() += 1;
+                        }
+                        match page.last() {
+                            Some((tk, _)) if page.len() == 10_000 => cursor = tk.task,
+                            _ => break,
+                        }
+                    }
                 }
             }
         }
@@ -683,7 +756,9 @@ impl pb::peer_server::Peer for Service {
         let caller = Caller::of(&req);
         let want_objects = req.into_inner().objects;
         if want_objects && caller != Caller::Admin {
-            return Err(Status::permission_denied("every peer's object store lists every tenant's runs: it takes the cluster token"));
+            return Err(Status::permission_denied(
+                "every peer's object store lists every tenant's runs: it takes the cluster token",
+            ));
         }
         let (reply, rx) = oneshot::channel();
         self.0.core.send(CoreMsg::Status { reply }).await.map_err(|_| Status::unavailable("peer is stopping"))?;
@@ -833,16 +908,30 @@ impl pb::peer_server::Peer for Service {
             rx.await.unwrap_or_default()
         };
         let next = events.last().map_or(r.since, |e| e.seq + 1);
-        // A tenant sees the cluster's own events and those of its runs and actors.
-        let mut mine = Vec::with_capacity(events.len());
-        for e in events {
-            let ok = (e.run.is_empty() || self.0.may_run(&caller, &e.run).await.is_ok())
-                && (e.actor.is_empty() || self.0.may_actor(&caller, &e.actor).await.is_ok());
-            if ok {
-                mine.push(e);
+        // A tenant sees membership and drains, and its own runs' and actors'
+        // events. Those come from the groups this peer leads, so the check
+        // reads them here; decisions (about every tenant's functions) are left out.
+        let events = match caller.tenant() {
+            None => events,
+            Some(tenant) => {
+                let owner = |id: &[u8], actor: bool| {
+                    let id = Id::from_slice(id).ok()?;
+                    self.0.router.read(id.vshard(), |kv| match actor {
+                        true => read::actor(kv, id).and_then(|r| r.spec).map(|s| s.tenant),
+                        false => read::run(kv, id).map(|r| r.tenant),
+                    })?
+                };
+                events
+                    .into_iter()
+                    .filter(|e| match (e.kind.as_str(), e.run.is_empty(), e.actor.is_empty()) {
+                        ("decision", ..) => false,
+                        (_, true, true) => true,
+                        (_, false, _) => owner(&e.run, false).as_deref() == Some(tenant),
+                        (_, true, false) => owner(&e.actor, true).as_deref() == Some(tenant),
+                    })
+                    .collect()
             }
-        }
-        let events = mine;
+        };
         Ok(Response::new(pb::EventsReply {
             events,
             next,
@@ -862,12 +951,18 @@ impl pb::peer_server::Peer for Service {
         if let Some(mesh) = &self.0.router.mesh
             && let Ok(run) = Id::from_slice(&r.run)
         {
-            let rec = match self.0.router.read(run.vshard(), |kv| read::run(kv, run)) {
-                Some(rec) => rec,
-                None => self.0.remote_read(run.vshard(), pb::ReadRequest { run: run.to_vec(), ..Default::default() }).await?.run,
+            // A replica here may lag (or be one this peer is leaving): without
+            // the record here, ask the group.
+            let rec = match self.0.router.read(run.vshard(), |kv| read::run(kv, run)).flatten() {
+                Some(rec) => Some(rec),
+                None => {
+                    let req = pb::ReadRequest { run: run.to_vec(), linearizable: true, ..Default::default() };
+                    self.0.remote_read(run.vshard(), req).await.ok().and_then(|r| r.run)
+                }
             };
             let home = rec.and_then(|r| r.home).filter(|h| h.peer != self.0.router.identity.peer.to_vec());
-            if let Some(node) = home.and_then(|h| mesh.member_by_peer(&h.peer)).filter(|p| !p.dead).map(|p| p.member.node_id)
+            if let Some(node) =
+                home.and_then(|h| mesh.member_by_peer(&h.peer)).filter(|p| !p.dead).map(|p| p.member.node_id)
                 && let Ok(reply) = mesh.logs(node, r.clone()).await
             {
                 return Ok(Response::new(reply));
@@ -940,7 +1035,7 @@ impl pb::peer_server::Peer for Service {
 impl Ingress {
     /// The tenant owning run or actor `id` (`actor`: which), or None when there is none.
     async fn owner(&self, id: Id, actor: bool) -> Result<Option<String>, Status> {
-        if let Some(t) = self.owners.lock().expect("lock").get(&id) {
+        if let Some(t) = self.owners.lock().expect("lock").get(&(id, actor)) {
             return Ok(Some(t.clone()));
         }
         let local = |kv: &dyn chimaera_core::kv::KvRead| match actor {
@@ -949,14 +1044,20 @@ impl Ingress {
         };
         // A replica here may not have applied a record just created: only a
         // linearizable read may say that there is none.
-        let tenant = match self.router.hosted(self.router.group_of(id.vshard())) {
+        let group_id = self.router.group_of(id.vshard());
+        let here = match self.router.hosted(group_id) {
             Some(group) => match group.read(local).map_err(|e| Status::internal(e.to_string()))? {
-                Some(t) => Some(t),
-                None => {
+                Some(t) => Some(Some(t)),
+                None if self.router.leads(group_id) => {
                     group.linearizable().await.map_err(|e| Status::unavailable(e.to_string()))?;
-                    group.read(local).map_err(|e| Status::internal(e.to_string()))?
+                    Some(group.read(local).map_err(|e| Status::internal(e.to_string()))?)
                 }
+                None => None, // a follower: ask the leader
             },
+            None => None,
+        };
+        let tenant = match here {
+            Some(t) => t,
             None => {
                 let mut req = pb::ReadRequest { linearizable: true, ..Default::default() };
                 if actor {
@@ -973,7 +1074,7 @@ impl Ingress {
             if owners.len() >= OWNERS_CACHED {
                 owners.clear();
             }
-            owners.insert(id, t.clone());
+            owners.insert((id, actor), t.clone());
         }
         Ok(tenant)
     }
@@ -1047,13 +1148,6 @@ impl Ingress {
                         spec.tenant
                     )));
                 }
-                // A named actor's id is derived from its name: one of another
-                // tenant's must not be found (and handed out) this way.
-                if let Ok(id) = Id::from_slice(&spec.actor)
-                    && self.owner(id, true).await?.is_some_and(|owner| !caller.may(&owner))
-                {
-                    return Err(Status::not_found(format!("tenant {} has no actor {}", spec.tenant, id.hex())));
-                }
                 return match &a.ctor {
                     Some(ctor) => self.may_runs_of(caller, ctor).await,
                     None => Ok(()),
@@ -1066,6 +1160,83 @@ impl Ingress {
             self.may_run(caller, run).await?;
         }
         Ok(())
+    }
+
+    /// Vshards for a new run whose own is `home`: `home`, then one in each of
+    /// up to spread_limit() - 1 other data groups, preferring groups led by distinct
+    /// other peers. Empty (only `home`) on a single peer or when this peer
+    /// leads every group.
+    fn spread_for(&self, home: u16) -> Vec<u16> {
+        let router = &self.router;
+        if !router.is_cluster() {
+            return Vec::new();
+        }
+        let home_group = router.group_of(home);
+        let mut leaders = BTreeSet::new();
+        let mut picked = vec![home];
+        for g in router.data_groups() {
+            if picked.len() >= spread_limit() {
+                break;
+            }
+            if g == home_group || router.leads(g) {
+                continue;
+            }
+            // A leader already chosen adds no committing capacity.
+            if let Some(leader) = router.leader_hint(g)
+                && (leader == router.node_id() || !leaders.insert(leader))
+            {
+                continue;
+            }
+            let owned = router.vshards_of(g);
+            if let Some(v) = owned.get(home as usize % owned.len().max(1)) {
+                picked.push(*v as u16);
+            }
+        }
+        if picked.len() == 1 { Vec::new() } else { picked }
+    }
+
+    /// Create the run's copy in every vshard of `spread` but its own; the
+    /// spread to record: those that took it.
+    async fn create_copies(&self, record: &pb::RunRecord, home: u16, spread: &[u16]) -> Vec<u32> {
+        let copies = spread.iter().filter(|v| **v != home).map(|&v| {
+            let body = pb::shard_cmd::Body::RunCreate(pb::RunCreate { run: Some(record.clone()) });
+            async move {
+                let took = tokio::time::timeout(COPY_PATIENCE, self.router.propose(v, body)).await;
+                let ok = matches!(took, Ok(Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Run(_)), .. })));
+                ok.then_some(u32::from(v))
+            }
+        });
+        let took = futures_util::future::join_all(copies).await;
+        std::iter::once(u32::from(home)).chain(took.into_iter().flatten()).collect()
+    }
+
+    /// The vshards holding `run`'s calls, in id order.
+    async fn spread_of(&self, run: Id) -> Result<Vec<u16>, Status> {
+        let rec = match self.router.read(run.vshard(), |kv| read::run(kv, run)) {
+            Some(rec) => rec,
+            None => {
+                let req = pb::ReadRequest { run: run.to_vec(), linearizable: true, ..Default::default() };
+                self.remote_read(run.vshard(), req).await?.run
+            }
+        };
+        Ok(rec.map_or_else(|| vec![run.vshard()], |r| spread_list(&r, run)))
+    }
+
+    /// One page of `run`'s tasks after `after` in `after`'s vshard (see
+    /// `read::tasks_page`), from a replica here or the group's.
+    async fn tasks_page(&self, run: Id, after: Id, limit: usize) -> Result<Vec<(Tk, pb::TaskRecord)>, Status> {
+        if let Some(page) = self.router.read(after.vshard(), |kv| read::tasks_page(kv, run, Some(after), limit)) {
+            return Ok(page);
+        }
+        let req = pb::ReadRequest {
+            run: run.to_vec(),
+            after_task: after.to_vec(),
+            limit: limit as u32,
+            linearizable: true,
+            ..Default::default()
+        };
+        let reply = self.remote_read(after.vshard(), req).await?;
+        Ok(reply.page_keys.iter().filter_map(Tk::parse).zip(reply.tasks).collect())
     }
 
     /// Read from a replica on another peer (this one does not host the group).
@@ -1085,6 +1256,31 @@ impl Ingress {
         let Ok(actor) = Id::from_slice(&spec.actor) else {
             return pb::session_event::Event::Error("malformed actor id".into());
         };
+        // The constructor builds this actor and is the one its record names
+        // (a restart replays it); a named actor's id is its tenant's.
+        if ctor.kind() != pb::CallKind::CallActorCtor
+            || ctor.actor != spec.actor
+            || spec.ctor.as_ref() != ctor.key.as_ref()
+        {
+            return pb::session_event::Event::Error(
+                "an actor's constructor must be its own CALL_ACTOR_CTOR call".into(),
+            );
+        }
+        // An actor's id is derived, never chosen: from its tenant and name, or
+        // from its creating run and a nonce. Nobody can create one at an id
+        // that is (or will be) another tenant's.
+        let derived = if spec.key.is_empty() {
+            let run = ctor.key.as_ref().and_then(|k| Id::from_slice(&k.run).ok());
+            run.filter(|_| spec.nonce.len() == 16).map(|r| r.child(&[b"actor", &spec.nonce]))
+        } else {
+            Some(keyed_actor_id(&spec.tenant, &spec.key))
+        };
+        if derived != Some(actor) {
+            return pb::session_event::Event::Error(
+                "an actor's id must be derived from its tenant and name, or from its run and nonce".into(),
+            );
+        }
+        let tenant = spec.tenant.clone();
         // Create (or find) the actor first: for keyed actors a second creator
         // gets the existing one and must not submit a second constructor.
         let created = self
@@ -1096,6 +1292,9 @@ impl Ingress {
             Ok(other) => return pb::session_event::Event::Error(format!("actor create rejected: {other:?}")),
             Err(e) => return pb::session_event::Event::Error(e.to_string()),
         };
+        if ack.record.as_ref().and_then(|r| r.spec.as_ref()).is_some_and(|s| s.tenant != tenant) {
+            return pb::session_event::Event::Error(format!("tenant {tenant} has no actor {}", actor.hex()));
+        }
         if ack.status() == pb::actor_ack::Status::Ok {
             let acks = self.submit(pb::SubmitTasks { tasks: vec![ctor], grant_to: None }).await;
             if let Some(a) = acks.acks.first()
@@ -1106,6 +1305,14 @@ impl Ingress {
         }
         pb::session_event::Event::Actor(ack)
     }
+}
+
+/// The id of `tenant`'s actor named `key` (python/chimaera/_remote.py
+/// `_keyed_actor_id`): named actors of two tenants never share an id.
+fn keyed_actor_id(tenant: &str, key: &str) -> Id {
+    let h = blake3::hash(format!("{tenant}\0{key}").as_bytes());
+    let vshard = u16::from_le_bytes([h.as_bytes()[0], h.as_bytes()[1]]) % VSHARDS;
+    Id::derive(0, vshard, &[b"actor", tenant.as_bytes(), key.as_bytes()])
 }
 
 /// Whether an uploaded value (PutObject) should be written: it must match its
@@ -1125,7 +1332,14 @@ fn object_upload(data: &[u8], checksum: &[u8], existing: Option<&[u8]>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::object_upload;
+    use super::{keyed_actor_id, object_upload};
+
+    #[test]
+    fn a_named_actors_id_is_the_one_the_client_derives() {
+        // python -c "from chimaera._remote import _keyed_actor_id; print(_keyed_actor_id('alice','counter').hex())"
+        assert_eq!(keyed_actor_id("alice", "counter").hex(), "000000ed8f8e6f7dfdd825d528086d96");
+        assert_ne!(keyed_actor_id("bob", "counter"), keyed_actor_id("alice", "counter"));
+    }
 
     #[test]
     fn an_uploaded_value_must_match_its_checksum_and_never_replaces_another() {

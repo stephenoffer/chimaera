@@ -82,6 +82,57 @@ def test_the_same_array_passed_many_times_is_stored_once():
     assert len(_inodes(new)) == 1, f"one stored copy of the bytes, not one per call: {len(_inodes(new))} files"
 
 
+def _stored_since(before: set[str], min_bytes: int = 2 << 20) -> int:
+    """Distinct files of at least `min_bytes` the run stored since `before`."""
+    inodes = set()
+    for n in _files() - before:
+        try:
+            st = os.stat(os.path.join(_run_dir(), n))
+        except OSError:
+            continue  # removed meanwhile
+        if st.st_size >= min_bytes:
+            inodes.add(st.st_ino)
+    return len(inodes)
+
+
+def test_large_results_released_mid_run_free_their_files():
+    """A result's large buffers may be stored apart from its frame (on Linux
+    an arena array is linked, not copied, and the frame may be a few inline
+    bytes). Releasing the result frees them too, so a loop over fresh large
+    results stays flat; kept until the run ended, they filled the memory pool
+    and killed the peer in a 1-node cloud run."""
+    before = _files()
+    for _ in range(8):
+        f = ones.remote(1 << 22)  # 32 MiB
+        assert f.result(timeout=60)[0] == 1.0
+        del f
+        gc.collect()
+    deadline = time.monotonic() + 15
+    while _stored_since(before, 16 << 20) > 1 and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert _stored_since(before, 16 << 20) <= 1, f"{_stored_since(before, 16 << 20)} results still stored"
+
+
+def test_a_calls_inputs_stay_while_its_result_is_held():
+    """A lost result is made again by running its call, which reads the same
+    inputs (lineage): an array passed to a call stays stored while the call's
+    future lives, even once the array is gone, and goes with the future."""
+    before = _files()
+    a = np.full(1 << 19, 9.0)  # 4 MiB
+    f = total.remote(a)
+    assert f.result(timeout=60) == 9.0 * a.size
+    del a
+    gc.collect()
+    time.sleep(0.5)
+    assert _stored_since(before) == 1, "the input went while its call's result was still held"
+    del f
+    gc.collect()
+    deadline = time.monotonic() + 10
+    while _stored_since(before) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert _stored_since(before) == 0, "the input stayed after its call's future was dropped"
+
+
 def test_fresh_values_per_iteration_do_not_pile_up(monkeypatch):
     """A long-lived loop that passes new bytes each time keeps a bounded number
     of copies stored, not one per iteration: an array's blob (stored by
@@ -93,15 +144,7 @@ def test_fresh_values_per_iteration_do_not_pile_up(monkeypatch):
     before = _files()
 
     def stored() -> int:
-        sizes = set()
-        for n in _files() - before:
-            try:
-                st = os.stat(os.path.join(_run_dir(), n))
-            except OSError:
-                continue  # removed meanwhile
-            if st.st_size >= 2 << 20:
-                sizes.add(st.st_ino)
-        return len(sizes)
+        return _stored_since(before)
 
     def settled() -> int:
         deadline = time.monotonic() + 10
@@ -182,6 +225,21 @@ def test_cpu_tensors_travel_out_of_band():
     before = _files()
     assert total.remote(t).result(timeout=60) == float(t.sum())
     assert _files() - before == {_blob_name(t.numpy())}
+
+
+def test_a_large_python_collection_shared_with_calls_warns_once_per_site(monkeypatch):
+    # Every reader unpickles its own copy of a list; an array is mapped.
+    monkeypatch.setattr(_values, "collection_lint", _values.CollectionLint())
+    xs = [float(i) for i in range(1_200_000)]  # pickles to about 11 MiB
+    arr = np.arange(1_200_000, dtype=np.float64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert [length.remote(xs).result(timeout=60) for _ in range(2)] == [len(xs)] * 2
+        assert length.remote(arr).result(timeout=60) == len(arr)
+        assert len(ch.put(xs).result()) == len(xs)
+    warned = [str(w.message) for w in caught if "CH118" in str(w.message)]
+    assert len(warned) == 2, warned  # the call site once, the put once; the array never
+    assert all("NumPy array or an Arrow table" in m and "list" in m for m in warned), warned
 
 
 def test_a_gather_that_outgrows_the_machine_warns_once(monkeypatch):

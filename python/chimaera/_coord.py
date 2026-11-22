@@ -4,7 +4,8 @@ Each is hosted by an actor, so it lives as long as its run (or, with
 ``detach=True``, until closed), is shared by ``name=``, and works from
 the driver and from inside calls alike. They are not replicated: if the
 hosting process dies, its contents are lost and further calls raise
-``ch.ActorDied`` (durable queues arrive with ``ch.coord.Store``).
+``ch.ActorDied``. ``ch.coord.WorkQueue`` is the replicated one: it lives
+in ``ch.coord.Store``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from typing import Any, Generic, TypeVar
 
 from . import _units
 from ._errors import Closed
-from ._future import Future, put
+from ._future import Future
 from ._remote import method, remote
 
 T = TypeVar("T")
@@ -105,10 +106,7 @@ class Queue(Generic[T]):
     everyone who names it; the first creator's ``maxsize`` applies.
     """
 
-    def __new__(cls, maxsize: int = 0, *, name: str | None = None, detach: bool = False, durable: bool = False) -> Any:
-        return super().__new__(DurableQueue if durable and cls is Queue else cls)
-
-    def __init__(self, maxsize: int = 0, *, name: str | None = None, detach: bool = False, durable: bool = False) -> None:
+    def __init__(self, maxsize: int = 0, *, name: str | None = None, detach: bool = False) -> None:
         if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 0:
             raise ValueError(f"maxsize: expected an integer >= 0, got {maxsize!r}")
         opts: dict[str, Any] = {"detach": detach}
@@ -148,32 +146,37 @@ class Queue(Generic[T]):
                 return
 
 
-class DurableQueue(Queue[T]):
-    """``ch.coord.Queue(name=..., durable=True)``: a queue kept in a ``ch.coord.Store``.
+class WorkQueue(Generic[T]):
+    """``ch.coord.WorkQueue(name)``: a queue of work items kept in a ``ch.coord.Store``.
 
     It survives the loss of any process and a minority of peers, and lives
     until closed. Items are delivered first-in, first-out to consumers that
     ``claim`` them: a claim holds the item under a lease, and the item is
     removed when the ``with`` block exits normally. If the block raises, or
     its process dies and the lease lapses, the item is delivered again.
-    ``get()`` claims and removes in one step. The work happens in the call;
-    the futures ``put`` and ``get`` return are already done.
+    ``get()`` claims and removes in one step.
+
+    Unlike ``Queue``, its methods are synchronous: ``put`` returns once the
+    item is stored and ``get`` returns the item.
     """
 
     _POLL_MAX = 0.25
 
-    def __init__(self, maxsize: int = 0, *, name: str | None = None, detach: bool = False, durable: bool = True) -> None:
+    def __init__(self, name: str, *, maxsize: int = 0) -> None:
         from ._store import Store
 
         if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 0:
             raise ValueError(f"maxsize: expected an integer >= 0, got {maxsize!r}")
-        if name is None:
-            raise ValueError("a durable queue is found by its name: give it name=")
+        if not isinstance(name, str) or not name:
+            raise ValueError("a work queue is found by its name: WorkQueue(name)")
         self._store = Store(f"queue/{name}")
         self._maxsize = maxsize
 
+    def __repr__(self) -> str:
+        return f"<WorkQueue {self._store.namespace[len('queue/') :]!r}>"
+
     def __reduce__(self) -> tuple[Any, ...]:
-        return (_durable_queue, (self._store.namespace[len("queue/") :], self._maxsize))
+        return (_work_queue, (self._store.namespace[len("queue/") :], self._maxsize))
 
     def _resize(self, delta: int, *, timeout: float | None = None) -> None:
         """Add `delta` to the stored size atomically, waiting for room when growing."""
@@ -197,38 +200,49 @@ class DurableQueue(Queue[T]):
             except VersionConflict:
                 continue
 
-    def put(self, item: T, *, timeout: float | None = None) -> Future[None]:
+    def put(self, item: T, *, timeout: float | None = None) -> None:
+        """Store `item`, waiting up to `timeout` seconds for room (``queue.Full``
+        after that); ``ch.errors.Closed`` after ``close()``."""
         if self._store.get("closed", False):
             raise Closed("put on a closed queue")
         self._resize(1, timeout=timeout)
         seq = self._store.counter("tail").add(1)
         self._store.put(f"item/{seq:020d}", item)
-        return put(None)
 
     def claim(self, *, lease: float | str = "30s", timeout: float | None = None) -> Claim[T]:
         """``with q.claim() as item: ...``: the item is removed when the block
         finishes, and delivered again if it raises or its process dies."""
         return Claim(self, lease, timeout)
 
-    def get(self, *, timeout: float | None = None) -> Future[T]:
+    def get(self, *, timeout: float | None = None) -> T:
+        """Claim the next item and remove it (``queue.Empty`` after `timeout`
+        seconds; ``ch.errors.Closed`` once closed and empty)."""
         with self.claim(timeout=timeout) as item:
-            return put(item)
+            return item
 
     def close(self) -> None:
+        """No more puts; consumers drain what is left, then get ``ch.errors.Closed``."""
         self._store.put("closed", True)
 
     def qsize(self) -> int:
         return self._store.get("size", 0)
 
+    def __iter__(self) -> Iterator[T]:
+        while True:
+            try:
+                yield self.get()
+            except Closed:
+                return
 
-def _durable_queue(name: str, maxsize: int) -> DurableQueue[Any]:
-    return DurableQueue(maxsize, name=name)
+
+def _work_queue(name: str, maxsize: int) -> WorkQueue[Any]:
+    return WorkQueue(name, maxsize=maxsize)
 
 
 class Claim(Generic[T]):
-    """One claimed item of a durable queue (see ``DurableQueue.claim``)."""
+    """One claimed item of a work queue (see ``WorkQueue.claim``)."""
 
-    def __init__(self, q: DurableQueue[T], lease: float | str, timeout: float | None) -> None:
+    def __init__(self, q: WorkQueue[T], lease: float | str, timeout: float | None) -> None:
         self._q, self._ttl, self._timeout = q, lease, timeout
         self.key: str | None = None
         self.lease: Any = None
@@ -257,7 +271,7 @@ class Claim(Generic[T]):
                 raise _stdqueue.Empty(f"the queue stayed empty for {self._timeout} s")
             with waiting():
                 time.sleep(pause)
-            pause = min(pause * 2, DurableQueue._POLL_MAX)
+            pause = min(pause * 2, WorkQueue._POLL_MAX)
 
     def __exit__(self, exc_type: Any, *exc: object) -> None:
         store, lease = self._q._store, self.lease
@@ -353,15 +367,12 @@ class Topic(Generic[T]):
     def subscribe(self, start: str | int = "latest") -> Subscription[T]:
         """Items from `start`: ``"latest"`` (published from now on),
         ``"earliest"`` (everything retained) or an offset."""
+        start = _units.start_position(start)
         if start == "latest":
             # Fixed now, not at the first read: an item published in between is seen.
             offset = self._host.end.remote().result()
-        elif start == "earliest":
-            offset = 0
-        elif isinstance(start, int) and not isinstance(start, bool) and start >= 0:
-            offset = start
         else:
-            raise ValueError(f"start: expected 'latest', 'earliest' or an offset >= 0, got {start!r}")
+            offset = 0 if start == "earliest" else start
         return Subscription(self._host, offset)
 
     def close(self) -> None:

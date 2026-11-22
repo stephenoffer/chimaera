@@ -60,6 +60,16 @@ enum Cmd {
         #[command(flatten)]
         at: At,
     },
+    /// The cluster's live named actors: tenant, name, state.
+    Actors {
+        /// Only names starting with this.
+        #[arg(long, default_value = "")]
+        prefix: String,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        at: At,
+    },
     /// Cancel a run: its unfinished calls are cancelled and its actors stopped.
     Cancel {
         run: String,
@@ -360,6 +370,7 @@ fn main() -> ExitCode {
             Cmd::Status { json, at } => status(connect(&dir, local, &at).await?, json).await,
             Cmd::Runs { limit, json, at } => runs(connect(&dir, local, &at).await?, limit, json).await,
             Cmd::Cancel { run, at } => cancel(connect(&dir, local, &at).await?, &run).await,
+            Cmd::Actors { prefix, json, at } => actors(connect(&dir, local, &at).await?, prefix, json).await,
             Cmd::Objects { json, cluster } => objects(&dir, json, cluster).await,
             Cmd::Logs { run, follow, at } => logs(connect(&dir, local, &at).await?, &run, follow).await,
             Cmd::Inspect { run, json, at } => inspect(connect(&dir, local, &at).await?, &run, json).await,
@@ -411,6 +422,13 @@ fn main() -> ExitCode {
             Cmd::Doctor => Ok(doctor(&dir)),
             Cmd::K8s { action: K8sCmd::Render(spec) } => {
                 print!("{}", launch::k8s::render(&spec)?);
+                let founders = spec.founders.unwrap_or(spec.replicas.min(3));
+                if founders < 3 {
+                    eprintln!(
+                        "chimaera: warning: {founders} founder(s): the cluster's groups have fewer than 3 voters, so \
+                         losing one peer can stop them until it returns; use --replicas 3 or more"
+                    );
+                }
                 Ok(0)
             }
             Cmd::SlurmLaunch { port, command } => launch::slurm::launch(dir_flag, port, &command).await,
@@ -469,7 +487,12 @@ async fn connect(dir: &std::path::Path, local: bool, at: &At) -> Result<Client, 
     let text = std::fs::read_to_string(&path).ok();
     let shown = path.display().to_string();
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()));
-    match chimaera_peer::target::resolve(at.cluster.as_deref(), &env, text.as_deref().map(|t| (shown.as_str(), t)), &home)? {
+    match chimaera_peer::target::resolve(
+        at.cluster.as_deref(),
+        &env,
+        text.as_deref().map(|t| (shown.as_str(), t)),
+        &home,
+    )? {
         Some(t) => chimaera_peer::target::connect(&t).await,
         None => connect_local(dir).await,
     }
@@ -479,17 +502,19 @@ fn parse_run(run: &str) -> Result<Id, String> {
     Id::parse_hex(run.trim_start_matches("r-")).ok_or_else(|| format!("{run:?} is not a run id (32 hex digits)"))
 }
 
-async fn run_program(dir: &std::path::Path, detach: bool, cluster: Option<&str>, command: &[String]) -> Result<u8, String> {
+async fn run_program(
+    dir: &std::path::Path,
+    detach: bool,
+    cluster: Option<&str>,
+    command: &[String],
+) -> Result<u8, String> {
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.args(&command[1..]).env("CHIMAERA_DETACH", if detach { "1" } else { "0" });
     match cluster {
         Some(c) => cmd.env("CHIMAERA_CLUSTER", c),
         None => cmd.env("CHIMAERA_HOME", dir),
     };
-    let status = cmd
-        .status()
-        .await
-        .map_err(|e| format!("cannot run {}: {e}", command[0]))?;
+    let status = cmd.status().await.map_err(|e| format!("cannot run {}: {e}", command[0]))?;
     Ok(status.code().map_or(1, |c| c.clamp(0, 255) as u8))
 }
 
@@ -743,6 +768,36 @@ async fn runs(mut c: Client, limit: u32, json: bool) -> Result<u8, String> {
     Ok(0)
 }
 
+async fn actors(mut c: Client, prefix: String, json: bool) -> Result<u8, String> {
+    let r = c.list_actors(pb::ListActorsRequest { prefix }).await.map_err(|e| e.message().to_string())?.into_inner();
+    let rows: Vec<(String, String, String, String)> = r
+        .actors
+        .iter()
+        .map(|a| {
+            let s = a.spec.clone().unwrap_or_default();
+            let id = Id::from_slice(&s.actor).map(|i| i.hex()).unwrap_or_default();
+            (s.tenant, s.key, format!("{:?}", a.state()).to_lowercase(), id)
+        })
+        .collect();
+    if json {
+        let list: Vec<_> = rows
+            .iter()
+            .map(|(tenant, name, state, id)| serde_json::json!({"tenant": tenant, "name": name, "state": state, "actor": id}))
+            .collect();
+        println!("{}", serde_json::json!({"actors": list, "unavailable_groups": r.unavailable}));
+    } else {
+        println!("{:<16}  {:<10}  NAME", "TENANT", "STATE");
+        for (tenant, name, state, _) in &rows {
+            println!("{tenant:<16}  {state:<10}  {name}");
+        }
+    }
+    if !r.unavailable.is_empty() {
+        let groups: Vec<String> = r.unavailable.iter().map(u32::to_string).collect();
+        eprintln!("no replica of group {} answered: their actors are missing above", groups.join(", "));
+    }
+    Ok(0)
+}
+
 async fn cancel(mut c: Client, run: &str) -> Result<u8, String> {
     let run = parse_run(run)?;
     let state = |r: pb::ExplainReply| r.run.map(|rec| rec.state());
@@ -755,10 +810,19 @@ async fn cancel(mut c: Client, run: &str) -> Result<u8, String> {
             return Ok(0);
         }
     }
-    let end = pb::ClientMsg { msg: Some(pb::client_msg::Msg::EndRun(pb::EndRun { run: run.to_vec(), cancel: true })), ..Default::default() };
-    c.session(tokio_stream::iter([end])).await.map_err(|e| e.message().to_string())?;
+    let end = pb::ClientMsg {
+        msg: Some(pb::client_msg::Msg::EndRun(pb::EndRun { run: run.to_vec(), cancel: true })),
+        ..Default::default()
+    };
+    // The cancel is a proposal another peer may not take at once (a leader
+    // election, a busy group): sent again until the run has ended.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut resend = std::time::Instant::now();
     while std::time::Instant::now() < deadline {
+        if std::time::Instant::now() >= resend {
+            c.session(tokio_stream::iter([end.clone()])).await.map_err(|e| e.message().to_string())?;
+            resend = std::time::Instant::now() + Duration::from_secs(3);
+        }
         let reply = c.explain(explain.clone()).await.map_err(|e| e.message().to_string())?.into_inner();
         if let Some(s) = state(reply).filter(|s| *s != pb::run_record::State::Active) {
             println!("run {} {}", run.hex(), state_name(s));
@@ -902,6 +966,7 @@ fn profiles(dir: &std::path::Path, filter: Option<&str>, json: bool) -> u8 {
                     "memory_bytes": mem.as_ref().map(|m| m.bytes),
                     "memory_evidence": mem.map(|m| m.evidence),
                     "peak_p95_bytes": s.peak_p95,
+                    "out_p90_bytes": s.out_p90,
                     "killed_for_memory_at": s.oom_bounds.iter().map(|b| b.1).max(),
                 })
             })

@@ -212,3 +212,55 @@ def test_a_call_to_an_actor_closed_before_it_started_fails_instead_of_waiting():
     finally:
         subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=30)
     assert "FAILED the actor ended before it started" in out.stdout, out.stdout + out.stderr
+
+
+@ch.remote
+class Named:
+    def ping(self):
+        return "pong"
+
+
+def test_named_actors_are_listed_by_name_and_prefix():
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]
+    made = [Named.options(name=f"list-{tag}/{n}").remote() for n in ("b", "a")]
+    assert [m.ping.remote().result(timeout=60) for m in made] == ["pong", "pong"]
+    listed = ch.runs.actors(f"list-{tag}/")
+    assert [a.name for a in listed] == [f"list-{tag}/a", f"list-{tag}/b"], listed
+    assert all(a.state in ("Alive", "Pending") and len(a.id) == 32 for a in listed)
+    assert ch.actor(listed[0].name).ping.remote().result(timeout=60) == "pong"
+    for m in made:
+        m.close()
+    deadline = time.monotonic() + 30
+    while ch.runs.actors(f"list-{tag}/") and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert ch.runs.actors(f"list-{tag}/") == [], "closed actors are dead, and the dead are not listed"
+
+
+@ch.remote
+class Quitter:
+    def ping(self):
+        return "pong"
+
+    def quit(self):
+        ch.context().exit_actor()
+
+
+def test_an_actor_can_end_itself():
+    q = Quitter.remote()
+    assert q.ping.remote().result(timeout=60) == "pong"
+    with pytest.raises(ch.ActorDied, match="exit_actor"):
+        q.quit.remote().result(timeout=60)
+    with pytest.raises(ch.ActorDied):
+        q.ping.remote().result(timeout=60)  # closed: not restarted
+
+
+def test_exit_actor_outside_an_actor_says_where_it_belongs():
+    @ch.remote
+    def not_an_actor():
+        ch.context().exit_actor()
+
+    with pytest.raises(RuntimeError, match="inside one of the actor's methods"):
+        not_an_actor.remote().result(timeout=60)
+

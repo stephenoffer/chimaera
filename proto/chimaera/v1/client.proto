@@ -22,6 +22,8 @@ service Peer {
   rpc ListTasks(ListTasksRequest) returns (ListTasksReply);
   // Every run the cluster holds, newest first (`chimaera runs`).
   rpc ListRuns(ListRunsRequest) returns (ListRunsReply);
+  // The cluster's live named actors (`ch.runs.actors()`, `chimaera actors`).
+  rpc ListActors(ListActorsRequest) returns (ListActorsReply);
   rpc Status(StatusRequest) returns (StatusReply);
   rpc Shutdown(ShutdownRequest) returns (ShutdownReply);
   // Bring an object produced on another peer into this peer's store.
@@ -380,6 +382,9 @@ message ClusterNode {
   bool this_peer = 9;      // the peer that answered
   map<string, string> labels = 10;
   repeated uint32 leading = 11;  // raft groups it leads (others: from their last load report)
+  uint32 actors = 12;            // actor instances it hosts
+  uint64 object_bytes = 13;      // bytes of values it stores
+  bool draining = 14;            // stopping: it takes no new work
 }
 
 message ShutdownRequest {}
@@ -391,6 +396,15 @@ message LocalizeRequest {
 }
 
 message LocalizeReply {}
+
+message ListActorsRequest {
+  string prefix = 1;               // names starting with this; empty = all
+}
+
+message ListActorsReply {
+  repeated ActorRecord actors = 1; // named and not dead, by tenant then name
+  repeated uint32 unavailable = 2; // groups no replica answered for
+}
 
 message ListRunsRequest {
   uint32 limit = 1;   // 0 = all

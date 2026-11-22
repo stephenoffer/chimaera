@@ -446,13 +446,15 @@ the current value of every key and continues; it may repeat a change, but it
 never misses one. Anyone who holds the cluster token can write values that
 readers unpickle, the same trust that running calls requires.
 
-`ch.coord.Queue(name=..., durable=True)` keeps a queue in a store, so it outlives any
+`ch.coord.WorkQueue(name)` keeps a queue of work items in a store, so it outlives any
 process. A consumer `claim`s an item: the item is removed when the block
-finishes, and delivered again if the block raises or the consumer dies.
+finishes, and delivered again if the block raises or the consumer dies. Its
+methods are synchronous (`put` returns once the item is stored, `get` returns
+the item), unlike `Queue`'s futures.
 **Runs today:**
 
 ```python run
-jobs = ch.coord.Queue(name="docs/jobs", durable=True)
+jobs = ch.coord.WorkQueue("docs/jobs")
 jobs.put("resize image 7")
 with jobs.claim(lease="30s") as job:
     assert job == "resize image 7"
@@ -470,11 +472,12 @@ assert nodes and all(n.cpus > 0 for n in nodes)
 assert ch.runs.cluster().resources()["cpus"] >= 1
 ```
 
-`ch.runs.cluster().events(kinds, since=)` streams what the cluster does: members
+`ch.runs.cluster().events(kinds, start=)` streams what the cluster does: members
 joining and leaving (`member`), actors starting, restarting and dying
 (`actor`), calls failing for good (`task_failed`), controller `decision`s and
 `drain`s. By default it starts at what happens next and waits for more;
-`since=0` begins at the oldest the peer still holds, and `follow=False` stops
+`start="earliest"` begins at the oldest the peer still holds (or pass a
+sequence number), and `follow=False` stops
 at the newest. Events are notifications; `Run.outcomes()` and `ch.actor(name)`
 are the durable record. **Runs today:**
 

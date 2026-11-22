@@ -138,6 +138,34 @@ def test_chimaera_profiles_lists_what_was_learned(home):
     assert "hold: 4 calls" in text and "next call gets" in text, text
 
 
+def test_a_large_array_result_is_learned_at_its_full_size(home):
+    # On Linux an array a call returns is linked into a file of its own and
+    # the result's frame is a few bytes: its output size counts that file.
+    learn = run_script(
+        """
+        import numpy as np
+        import chimaera as ch
+
+        @ch.remote
+        def make(i):
+            return np.ones(1 << 20)  # 8 MiB
+
+        for i in range(4):
+            assert make.remote(i).result(timeout=60)[0] == 1.0
+        """,
+        home=home,
+    )
+    assert learn.returncode == 0, learn.stderr
+    subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, text=True, timeout=60)
+    deadline = time.monotonic() + 15  # a stopping peer saves its profiles first
+    while not os.path.exists(os.path.join(home, "profiles.pb")) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    listed = subprocess.run([BIN, "--dir", home, "profiles", "--fn", "make", "--json"], capture_output=True, text=True, timeout=60)
+    assert listed.returncode == 0, listed.stderr
+    [row] = json.loads(listed.stdout)
+    assert row["out_p90_bytes"] >= 8 << 20, row
+
+
 def test_an_edited_module_is_used_by_the_next_run(home, tmp_path):
     mod = tmp_path / "helper.py"
     script = """

@@ -518,6 +518,9 @@ def put(value: T) -> Future[T]:
     prefix = run[:4] if ctx is not None else b""
     object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, max(rt.inline_limit, PUT_INLINE), prefix)
     f = _resolved_future(run, object_id, inline, size)
+    if type(value) in _values._COLLECTIONS:
+        caller = sys._getframe(1)
+        _values.collection_lint.note(f"{caller.f_code.co_filename}:{caller.f_lineno}", type(value).__name__, size, 3)
     if owned:
         f._escaped, f._owned = False, owned
     return f

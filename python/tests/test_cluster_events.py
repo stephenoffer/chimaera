@@ -46,6 +46,6 @@ def test_history_without_follow_stops_at_the_newest():
     f = doomed.remote()
     with pytest.raises(ValueError):
         f.result(timeout=60)
-    history = list(ch.runs.cluster().events(["task_failed"], since=0, follow=False))
+    history = list(ch.runs.cluster().events(["task_failed"], start="earliest", follow=False))
     assert f.id in [e.task for e in history]
     assert all(e.kind == "task_failed" for e in history)

@@ -15,6 +15,7 @@ pub const TASK: u8 = b'T';
 pub const DEPENDENT: u8 = b'D'; // producer -> dependent in this vshard
 pub const FORWARD: u8 = b'F'; // producer -> task that forwarded to it, in this vshard
 pub const CHILD: u8 = b'P'; // parent -> child submitted from inside it, in this vshard
+pub const REMOTE_CHILD: u8 = b'c'; // parent in another vshard -> child here; alone: the parent's cancellation
 pub const STORE: u8 = b'S'; // ch.Store entry: namespace, key
 pub const STORE_REV: u8 = b'Y'; // ch.Store namespace revision
 pub const STORE_LEASE: u8 = b'L'; // ch.Store lock
@@ -23,6 +24,8 @@ pub const STORE_LOG: u8 = b'J'; // ch.Store change log: namespace, revision
 pub const STORE_LOG_META: u8 = b'U'; // ch.Store change log bounds
 pub const SUBSCRIBER: u8 = b'B'; // producer -> remote subscriber vshard
 pub const NOTIFIED: u8 = b'N'; // remote producer outcome received
+pub const HELD: u8 = b'h'; // producer -> remote subscriber vshard holding it: the hold's generation
+pub const REMOTE_PINS: u8 = b'r'; // remote producer -> calls here still reading it, and the hold's generation
 pub const GRANT: u8 = b'G'; // live attempt by peer incarnation
 pub const READY: u8 = b'Q';
 pub const ACTOR: u8 = b'A';
@@ -103,6 +106,12 @@ pub fn of_producer(v: u16, tag: u8, producer: (&Id, &Id)) -> Vec<u8> {
 
 pub fn subscriber(v: u16, producer: (&Id, &Id), sub_vshard: u16) -> Vec<u8> {
     let mut k = of_producer(v, SUBSCRIBER, producer);
+    k.extend_from_slice(&sub_vshard.to_be_bytes());
+    k
+}
+
+pub fn held(v: u16, producer: (&Id, &Id), sub_vshard: u16) -> Vec<u8> {
+    let mut k = of_producer(v, HELD, producer);
     k.extend_from_slice(&sub_vshard.to_be_bytes());
     k
 }

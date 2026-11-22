@@ -156,11 +156,13 @@ class Store:
             if not r["more"]:
                 return
 
-    def watch(self, prefix: str = "", *, from_version: int | None = None) -> Watch:
-        """Changes to keys starting with `prefix`, in order: those after
-        `from_version`, or from now on when it is None."""
-        start = from_version if from_version is not None else self._read("get", "")["revision"]
-        return Watch(self, prefix, start)
+    def watch(self, prefix: str = "", *, start: str | int = "latest") -> Watch:
+        """Changes to keys starting with `prefix`, in order, from `start`:
+        ``"latest"`` (from now on), ``"earliest"`` (every change the namespace
+        still holds) or after a revision."""
+        start = _units.start_position(start)
+        after = self._read("get", "")["revision"] if start == "latest" else 0 if start == "earliest" else start
+        return Watch(self, prefix, after)
 
     # ---- coordination ------------------------------------------------------------
 

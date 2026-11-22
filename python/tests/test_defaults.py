@@ -4,13 +4,66 @@ and log records from tasks reach the driver at its level."""
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 import sys
+import time
 
-from conftest import run_script
+import pytest
+from conftest import BIN, run_script
 
 from chimaera._executor import python_mismatch
 
 PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def test_a_function_wrapped_anew_for_every_call_warns_once():
+    # ch.remote(lambda ...) inside a loop sends a new function each time, each
+    # pickled and hashed again (6x slower than a function defined once).
+    r = run_script(
+        """
+        import warnings
+        import chimaera as ch
+
+        warnings.simplefilter("always")
+        assert ch.get([ch.remote(lambda x: x).remote(i) for i in range(150)], timeout=120) == list(range(150))
+        once = ch.remote(lambda x: 2 * x)
+        assert ch.get([once.remote(i) for i in range(150)], timeout=120) == [2 * i for i in range(150)]
+        """,
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stderr.count("CH120") == 1 and "Define the remote function once" in r.stderr, r.stderr[-2000:]
+
+
+def test_a_cuda_error_in_a_call_given_no_gpu_says_how_to_ask_for_one():
+    # The peer hides GPUs (CUDA_VISIBLE_DEVICES empty) from calls that did not
+    # ask for one, on machines that have them; torch then raises an error that
+    # never says why. Simulated here: no GPU on the test machine.
+    r = run_script(
+        """
+        import os
+        import chimaera as ch
+
+        @ch.remote
+        def cuda(hidden):
+            if hidden:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            else:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            raise RuntimeError("No CUDA GPUs are available")
+
+        for hidden in (True, False):
+            try:
+                cuda.remote(hidden).result(timeout=60)
+            except Exception as e:
+                notes = " ".join(getattr(e, "__notes__", []))
+                print("HINT" if "CH119" in notes and "gpus=1" in notes else "PLAIN", hidden)
+        """
+    )
+    assert r.returncode == 0, r.stderr
+    assert "HINT True" in r.stdout and "PLAIN False" in r.stdout, r.stdout + r.stderr[-1500:]
 
 
 def test_a_function_that_will_not_load_on_another_python_says_so(monkeypatch):
@@ -217,3 +270,99 @@ def test_work_waiting_on_cpu_that_actors_hold_says_so():
         assert "held by 1 actor(s)" in r.stdout and "cpus=" in r.stdout, r.stdout
     finally:
         subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+
+
+def _pids_cgroup() -> str | None:
+    """A fresh cgroup with the pids controller, or None: not Linux, no
+    writable cgroup v2, or pids not delegated outside a container (moving a
+    host's processes around is not a test's business)."""
+    root = "/sys/fs/cgroup"
+    control = os.path.join(root, "cgroup.subtree_control")
+    if sys.platform != "linux" or not os.access(control, os.W_OK):
+        return None
+    try:
+        with open(control) as f:
+            delegated = "pids" in f.read().split()
+        if not delegated:
+            if not os.path.exists("/.dockerenv"):
+                return None
+            # A cgroup holding processes cannot give its children controllers
+            # (cgroup v2): move this container's processes into a leaf first,
+            # as the peer does for isolated attempts.
+            leaf = os.path.join(root, "init")
+            os.makedirs(leaf, exist_ok=True)
+            with open(os.path.join(root, "cgroup.procs")) as f:
+                pids = f.read().split()
+            for pid in pids:
+                try:
+                    with open(os.path.join(leaf, "cgroup.procs"), "w") as f:
+                        f.write(pid)
+                except OSError:
+                    pass  # exited meanwhile
+            with open(control, "w") as f:
+                f.write("+pids")
+        path = os.path.join(root, f"chimaera-pids-{os.getpid()}")
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return None
+    return path if os.path.exists(os.path.join(path, "pids.max")) else None
+
+
+def test_under_a_task_limit_calls_wait_for_workers_instead_of_failing(tmp_path):
+    # A pod's pids.max counts every thread. Starting more workers than fit
+    # failed with EAGAIN ("executor process exited") and lost the calls; now
+    # the peer starts only what fits, calls wait, and status names the limit.
+    cg = _pids_cgroup()
+    if cg is None:
+        pytest.skip("needs a writable cgroup v2 with the pids controller (the Linux dev container)")
+    home = str(tmp_path / "home")
+
+    def enter() -> None:
+        with open(os.path.join(cg, "cgroup.procs"), "w") as f:
+            f.write(str(os.getpid()))
+
+    peer = subprocess.Popen(
+        [BIN, "--dir", home, "peer", "start", "--cpus", "4"],
+        preexec_fn=enter,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not os.path.exists(os.path.join(home, "peer.sock")) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        time.sleep(1)
+        with open(os.path.join(cg, "pids.current")) as f:
+            idle = int(f.read())
+        with open(os.path.join(cg, "pids.max"), "w") as f:
+            f.write(str(idle + 10))  # room for two one-thread workers (3 tasks each), not the four it wants
+        r = run_script(
+            """
+            import time
+            import chimaera as ch
+
+            @ch.remote
+            def work(i):
+                time.sleep(0.2)
+                return i
+
+            print("DONE", sum(ch.get([work.remote(i) for i in range(16)], timeout=120)))
+            """,
+            env={"CHIMAERA_HOME": home},
+            timeout=180,
+        )
+        assert r.returncode == 0, r.stderr[-2000:]
+        assert r.stdout.split()[-1] == str(sum(range(16))), r.stdout
+        status = subprocess.run([BIN, "--dir", home, "status", "--json"], capture_output=True, text=True, timeout=30)
+        assert any("task limit" in a for a in json.loads(status.stdout)["automatic"]), status.stdout
+    finally:
+        peer.terminate()
+        try:
+            peer.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            peer.kill()
+            peer.wait(timeout=30)
+        try:
+            os.rmdir(cg)
+        except OSError:
+            pass  # a worker still exiting: the cgroup goes with the container

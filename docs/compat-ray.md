@@ -80,7 +80,8 @@ Chimaera API work on them too.
 | `max_retries` | `max_attempts = max_retries + 1`. Unset means 4 attempts, Ray's default. `-1` becomes 100 attempts (CHR003) |
 | `retry_exceptions` | `retry_exceptions`. `True` means `(Exception,)` |
 | `num_returns=n` | `returns=n`; `.remote()` returns a list of `n` refs, one per value, as in Ray |
-| `num_returns="streaming"` / `"dynamic"`, generator tasks | `Unsupported` until streaming generators (M1) |
+| Generator tasks and methods, `num_returns="streaming"` | Supported: `.remote()` gives an `ObjectRefGenerator` with one resolved ref per item; an error raised mid-stream comes out as the next ref. Tasks stream as they yield; a generator method's items arrive once it returns |
+| `num_returns="dynamic"` | `Unsupported`: use `num_returns="streaming"` |
 | `scheduling_strategy="SPREAD"` | CHR002: not enforced until P3 |
 | `NodeAffinitySchedulingStrategy(node_id, soft=False)` | `ch.dist.Placement(require={"node": node_id})`. A node id is a peer id, as `ray.nodes()` reports it. If no live peer has it, `ray.get` raises `ch.Infeasible` naming the labels on offer; Ray would leave the task pending |
 | `NodeAffinitySchedulingStrategy(node_id, soft=True)` | `ch.dist.Placement(prefer=["node=<node_id>"])` |

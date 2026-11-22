@@ -74,6 +74,9 @@ const LOCALITY_MIN_BYTES: u64 = 1 << 20;
 const DEFAULT_BANDWIDTH: f64 = 200e6;
 const FLUSH_AT: usize = 256;
 const ATTEMPT_LOG_CAP: usize = 200_000;
+/// Tasks (threads) a new executor takes beyond its granted threads: the
+/// interpreter, the client's two I/O threads and one spare (measured: 3).
+const EXEC_TASKS: u64 = 4;
 /// ...and at most this many encoded bytes of them, about 25k recent attempts.
 /// A record takes about nine times its encoded size in memory (3 KB: policy,
 /// measures, reasons), so the count alone let explain()'s log hold 700 MB,
@@ -89,6 +92,9 @@ const PRESTART: usize = 4;
 const ACTOR_BATCH: usize = 64;
 /// Inputs of one call fetched from other peers at once.
 const INPUT_FETCHES: usize = 16;
+/// Times one attempt's lost inputs are rebuilt (each rebuild may itself
+/// rebuild its own lost inputs) before the attempt fails.
+const MAX_REBUILDS: u32 = 3;
 /// Publish proposals this peer keeps in flight per vshard. Results finishing
 /// meanwhile wait and go in the next one, so under load each commit carries
 /// many results instead of one or two (a lone result still goes at once).
@@ -190,6 +196,25 @@ pub enum CoreMsg {
         work: Box<Work>,
         error: Option<String>,
     },
+    /// An input of `consumer` was lost with every peer that held it: run the
+    /// call that made it again here (lineage), then retry `consumer`.
+    Rebuild {
+        consumer: Box<Work>,
+        producer: Tk,
+        attempt: u32,
+        spec: Box<pb::TaskSpec>,
+        deps: Vec<pb::Outcome>,
+    },
+    /// This peer stopped serving `group` (no longer a member): what it
+    /// watched there is watched on the group's members instead.
+    GroupDropped {
+        group: u32,
+    },
+    /// A call run again by `Rebuild` finished here.
+    Rebuilt {
+        work: Box<Work>,
+        outcome: Option<pb::Outcome>,
+    },
     /// An outcome reported by another peer's replica (remote watch).
     Outcome {
         task: Tk,
@@ -285,6 +310,58 @@ pub struct Work {
     read_bytes: u64,
     /// Spillback was refused for this attempt: it runs here.
     stays: bool,
+    /// Lost inputs rebuilt for this attempt so far (see `MAX_REBUILDS`).
+    rebuilds: u32,
+}
+
+/// The call that made `object`, a lost input of `w`, as running it again
+/// needs it: its task, the attempt that made the value (the same attempt
+/// writes the same object id), its spec and its own inputs' outcomes. Only a
+/// plain function or map item without external effects runs again; the
+/// error says why another cannot.
+async fn rebuild_plan(
+    router: &Router,
+    mesh: &crate::mesh::MeshClient,
+    w: &Work,
+    object: &[u8],
+) -> Result<(Tk, u32, pb::TaskSpec, Vec<pb::Outcome>), String> {
+    let made = |o: &pb::Outcome| matches!(&o.value, Some(pb::outcome::Value::Ok(obj)) if obj.object_id == object);
+    let Some(key) = w.spec.deps.iter().zip(&w.deps).find(|(_, o)| made(o)).map(|(k, _)| k) else {
+        return Err("it is a value the program stored (ch.put, or an argument), not one a call returned".into());
+    };
+    let producer = Tk::parse(key).ok_or("malformed task key")?;
+    let record = task_record(router, mesh, producer).await?.ok_or("its call's record is gone (its run ended)")?;
+    let spec = record.spec.ok_or("its call's record holds no spec")?;
+    if !matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem) {
+        return Err("an actor method made it, and such a call does not run again apart from its actor".into());
+    }
+    if spec.effects() == pb::Effects::External {
+        return Err("its call has external effects, which run at most once".into());
+    }
+    let Some(outcome) = record.outcome.filter(|o| made(o)) else {
+        return Err("its call's recorded outcome is another value".into());
+    };
+    let mut deps = Vec::with_capacity(spec.deps.len());
+    for d in &spec.deps {
+        let dep = Tk::parse(d).ok_or("malformed task key")?;
+        let rec = task_record(router, mesh, dep).await?.ok_or("an input of its call has no record")?;
+        deps.push(rec.outcome.ok_or("an input of its call has no outcome")?);
+    }
+    Ok((producer, outcome.attempt, spec, deps))
+}
+
+/// `tk`'s record, from this peer's replica of its group or another's.
+async fn task_record(
+    router: &Router,
+    mesh: &crate::mesh::MeshClient,
+    tk: Tk,
+) -> Result<Option<pb::TaskRecord>, String> {
+    if let Some(rec) = router.read(tk.v(), |kv| read::task(kv, tk)) {
+        return Ok(rec);
+    }
+    let req = pb::ReadRequest { tasks: vec![tk.pb()], ..Default::default() };
+    let reply = mesh.read_group(router.group_of(tk.v()), req).await.map_err(|e| format!("reading its record: {e}"))?;
+    Ok(reply.tasks.into_iter().next().filter(|r| r.spec.is_some()))
 }
 
 /// Whether the shard took a give-back (spillback) of an unstarted attempt, so
@@ -320,6 +397,7 @@ impl Work {
             arm: None,
             read_bytes: 0,
             stays: false,
+            rebuilds: 0,
         }
     }
 
@@ -375,6 +453,33 @@ impl Work {
 
 /// The profile a call's measurements belong to: for a map chunk, the function
 /// it runs over its items; otherwise the code it was submitted with.
+/// `obj` and the files its frame refers to (`blobs`, a result's large buffers
+/// stored apart), each naming where it is: a blob without locations is where
+/// its object is.
+fn with_blobs(obj: &pb::ObjectRef) -> Vec<pb::ObjectRef> {
+    let mut all = Vec::with_capacity(1 + obj.blobs.len());
+    for b in &obj.blobs {
+        let mut b = b.clone();
+        if b.locations.is_empty() {
+            b.locations = obj.locations.clone();
+        }
+        all.push(b);
+    }
+    let mut head = obj.clone();
+    head.blobs.clear();
+    all.insert(0, head);
+    all
+}
+
+/// Why no more workers start: the task limit (a pod's pids.max) is reached.
+fn pids_full(current: u64, max: u64) -> String {
+    let at = if max > 0 { format!(" (cgroup pids.max {max}, {current} in use)") } else { String::new() };
+    format!(
+        "the task limit{at} has no room for another worker, so calls wait for one to finish; raise it \
+         (docker --pids-limit, Kubernetes podPidsLimit) or give calls fewer CPUs (each thread counts)"
+    )
+}
+
 fn profile_key(spec: &pb::TaskSpec, policy: &pb::Policy) -> FnKey {
     let digest = if policy.profile_digest.is_empty() { &spec.fn_digest } else { &policy.profile_digest };
     FnKey::new(digest, &spec.method)
@@ -468,6 +573,9 @@ struct Exec {
 struct Running {
     exec: u32,
     items: Vec<Work>,
+    /// Which of `items` the executor reported finished (the batch stays
+    /// until the last one does).
+    finished: Vec<bool>,
     remaining: usize,
     cpus: f64,
     blocked: bool,
@@ -532,6 +640,9 @@ pub struct Core {
     capacity: f64,
     cpu_used: f64,
     queue: crate::keyed_queue::KeyedQueue<Work, Tk>,
+    /// Items still running per task, so a finished call heard of (most ran
+    /// elsewhere, or already finished here) costs a lookup, not a scan.
+    unfinished: HashMap<Tk, u32>,
     execs: HashMap<u32, Exec>,
     running: Vec<Running>,
     /// Calls told to stop while running: (executor, call, when).
@@ -547,6 +658,9 @@ pub struct Core {
     attempts: HashMap<Tk, Vec<pb::AttemptRecord>>,
     /// Encoded size of everything in `attempts`.
     attempt_bytes: usize,
+    /// Why no more executors start: the cgroup task limit is reached (see
+    /// topology::pids_room). Shown as the wait reason; cleared by a start.
+    pids_note: Option<String>,
     attempt_order: VecDeque<Tk>,
     profiles: Profiles,
     profiles_path: PathBuf,
@@ -593,6 +707,9 @@ pub struct Core {
     pending_dispatch: BTreeMap<u64, Vec<pb::RemoteWork>>,
     /// Attempts waiting for their objects to be fetched.
     localizing: HashSet<(Tk, u32)>,
+    /// Calls being run again here because a value they made was lost, and
+    /// the attempts waiting for that value.
+    rebuilding: HashMap<Tk, Vec<Work>>,
     /// Tasks watched through another peer's replica.
     remote_watched: HashSet<Tk>,
     /// Hosts of actors whose records live in groups not hosted here.
@@ -644,6 +761,9 @@ enum ActorPlacement {
 /// own load numbers include them.
 const ACTOR_HOLD_TTL: Duration = Duration::from_secs(3);
 /// How long a placement counts toward a host's load (until reports show it).
+/// How long a remote watch may stay silent before it is placed again: a
+/// replica that lost its seat keeps the stream open but applies nothing.
+const WATCH_QUIET: Duration = Duration::from_secs(5);
 const ACTOR_RECENT_TTL: Duration = Duration::from_secs(10);
 
 impl Core {
@@ -683,6 +803,7 @@ impl Core {
             capacity,
             cpu_used: 0.0,
             queue: crate::keyed_queue::KeyedQueue::new(|w: &Work| w.tk),
+            unfinished: HashMap::new(),
             execs: HashMap::new(),
             running: Vec::new(),
             cancelling: Vec::new(),
@@ -695,6 +816,7 @@ impl Core {
             publishing: BTreeMap::new(),
             attempts: HashMap::new(),
             attempt_bytes: 0,
+            pids_note: None,
             attempt_order: VecDeque::new(),
             profiles,
             profiles_path,
@@ -723,6 +845,7 @@ impl Core {
             actor_seen: HashMap::new(),
             pending_dispatch: BTreeMap::new(),
             localizing: HashSet::new(),
+            rebuilding: HashMap::new(),
             remote_watched: HashSet::new(),
             actor_hosts: HashMap::new(),
             waiting_actor: HashMap::new(),
@@ -899,6 +1022,9 @@ impl Core {
                     for tk in gone {
                         self.unplace(tk);
                     }
+                    if self.router.hosted(group).is_none() {
+                        self.watch_elsewhere(group);
+                    }
                 }
             }
             CoreMsg::Remote { work, actors, actor_env } => {
@@ -929,14 +1055,56 @@ impl Core {
                     None => self.enqueue(*work),
                     Some(why) => {
                         let why = self.released_input(&work).unwrap_or(why);
-                        self.fail_attempt(&work, pb::record_failure::Kind::Infra, &why)
+                        self.give_up(&work, &why)
                     }
+                }
+                self.dispatch();
+            }
+            CoreMsg::Rebuilt { work, outcome } => {
+                self.rebuilt(&work, outcome.as_ref());
+                self.dispatch();
+            }
+            CoreMsg::Rebuild { consumer, producer, attempt, spec, deps } => {
+                self.localizing.remove(&(consumer.tk, consumer.attempt));
+                let mut consumer = *consumer;
+                consumer.rebuilds += 1;
+                let depth = consumer.rebuilds;
+                let waiting = self.rebuilding.entry(producer).or_default();
+                waiting.push(consumer);
+                if waiting.len() == 1 {
+                    tracing::info!(
+                        task = %producer.task.hex(),
+                        "an input was lost with every peer that held it: running the call that made it again"
+                    );
+                    let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
+                    let mut work = Work::new(producer, attempt, *spec, policy, deps);
+                    // Its outcome is committed: this run only remakes the value, under
+                    // the same id (the same attempt), and has nothing to start or publish.
+                    work.publish = false;
+                    work.start_consumed = true;
+                    work.rebuilds = depth;
+                    self.reserve(&mut work, 0, 0.0, 0);
+                    self.admit(work);
                 }
                 self.dispatch();
             }
             CoreMsg::Outcome { task, outcome } => {
                 self.remote_watched.remove(&task);
                 self.notify_watchers(task, &outcome);
+            }
+            CoreMsg::GroupDropped { group } => {
+                let router = &self.router;
+                let tasks: Vec<Tk> = self
+                    .watchers
+                    .keys()
+                    .filter(|tk| router.group_of(tk.v()) == group && !self.remote_watched.contains(tk))
+                    .copied()
+                    .collect();
+                for tk in tasks {
+                    for s in self.watchers.remove(&tk).unwrap_or_default() {
+                        self.watch(s, vec![tk]);
+                    }
+                }
             }
             CoreMsg::WatchLost { tasks } => {
                 for tk in tasks {
@@ -992,6 +1160,7 @@ impl Core {
                     running: self.running.len() as u32,
                     actors: self.execs.values().filter(|e| e.actor.is_some()).count() as u32,
                     draining: self.draining,
+                    stopping: self.draining,
                     memory_pool: self.budget.pool,
                     memory_used: self.memory_used(),
                     memory_available: self.available.unwrap_or(0),
@@ -1096,14 +1265,15 @@ impl Core {
             Event::Ready(_) | Event::Granted { .. } | Event::DepsSatisfied(_) => {}
             Event::Done { task, outcome } => self.on_done(task, outcome, leader),
             // Idempotent at the producer, so every replica may send it.
-            Event::Subscribe { producer, subscriber_vshard } => self.propose(
+            Event::Subscribe { producer, subscriber_vshard, hold } => self.propose(
                 producer.v(),
                 pb::shard_cmd::Body::Subscribe(pb::Subscribe {
                     producer: Some(producer.pb()),
                     subscriber_vshard: subscriber_vshard as u32,
+                    hold,
                 }),
             ),
-            Event::Outbox { seq, target_vshard } if leader => self.deliver_outbox(group, seq, target_vshard),
+            Event::Outbox { seq, .. } if leader => self.deliver_outbox(group, seq),
             Event::Outbox { .. } => {}
             Event::Releasable { object: Some(obj), .. } if leader => self.drop_object(obj),
             Event::Releasable { .. } => {}
@@ -1118,11 +1288,14 @@ impl Core {
                     }
                 }
             }
-            Event::CancelRunContinues(run) if leader => self.propose(
-                run.vshard(),
+            Event::CancelRunContinues { run, v } if leader => self.propose(
+                v,
                 pb::shard_cmd::Body::CancelRun(pb::CancelRun { run: run.to_vec(), message: String::new() }),
             ),
-            Event::CancelRunContinues(_) => {}
+            Event::CancelRunContinues { .. } => {}
+            // The copies a run keeps in its spread end and expire with it; the
+            // run's own group does the run-wide work, once.
+            Event::RunExpired(_) | Event::RunEnded(_) if !self.is_run_home(group, &e) => {}
             Event::RunExpired(run) => {
                 self.objects.delete_run(&run);
                 self.run_logs.remove(&self.code, &run.0);
@@ -1137,6 +1310,7 @@ impl Core {
             }
             Event::RunEnded(run) => {
                 if leader {
+                    self.end_spread(run);
                     self.end_run_actors(run);
                     self.drop_run_values(run);
                     self.broadcast_forget(pb::ForgetRequest {
@@ -1146,6 +1320,28 @@ impl Core {
                     });
                 }
             }
+        }
+    }
+
+    fn is_run_home(&self, group: u32, e: &Event) -> bool {
+        match e {
+            Event::RunExpired(run) | Event::RunEnded(run) => self.router.group_of(run.vshard()) == group,
+            _ => true,
+        }
+    }
+
+    /// End the copies of an ended run in the other vshards of its spread, in
+    /// the same state, so their calls are cancelled and they expire with it.
+    fn end_spread(&mut self, run: Id) {
+        let Some(Some(rec)) = self.router.read(run.vshard(), |kv| read::run(kv, run)) else { return };
+        let cancelled = rec.state() == pb::run_record::State::Cancelled;
+        for v in rec.spread.iter().map(|v| *v as u16).filter(|v| *v != run.vshard()) {
+            let body = if cancelled {
+                pb::shard_cmd::Body::CancelRun(pb::CancelRun { run: run.to_vec(), message: String::new() })
+            } else {
+                pb::shard_cmd::Body::RunFinish(pb::RunFinish { run: run.to_vec(), state: 0 })
+            };
+            self.propose(v, body);
         }
     }
 
@@ -1202,19 +1398,23 @@ impl Core {
 
     /// Delete an object's bytes here, or ask the peers holding it to.
     fn drop_object(&self, obj: pb::ObjectRef) {
-        let Some(mesh) = self.router.mesh.clone() else {
-            self.objects.delete(&obj);
-            return;
-        };
-        let holders = mesh.holders(&obj);
-        if holders.is_empty() || holders.contains(&mesh.me.node_id) {
-            self.objects.delete(&obj);
-        }
-        for node in holders.into_iter().filter(|n| *n != mesh.me.node_id) {
-            let (mesh, obj) = (mesh.clone(), obj.clone());
-            tokio::spawn(async move {
-                let _ = mesh.forget(node, pb::ForgetRequest { objects: vec![obj], ..Default::default() }).await;
-            });
+        // The files the frame refers to go with it: an inline frame of a few
+        // bytes may name hundreds of MiB.
+        for obj in with_blobs(&obj) {
+            let Some(mesh) = self.router.mesh.clone() else {
+                self.objects.delete(&obj);
+                continue;
+            };
+            let holders = mesh.holders(&obj);
+            if holders.is_empty() || holders.contains(&mesh.me.node_id) {
+                self.objects.delete(&obj);
+            }
+            for node in holders.into_iter().filter(|n| *n != mesh.me.node_id) {
+                let (mesh, obj) = (mesh.clone(), obj.clone());
+                tokio::spawn(async move {
+                    let _ = mesh.forget(node, pb::ForgetRequest { objects: vec![obj], ..Default::default() }).await;
+                });
+            }
         }
     }
 
@@ -1262,9 +1462,7 @@ impl Core {
             }
         }
         for e in g.read(|kv| read::outbox(kv, usize::MAX)).unwrap_or_default() {
-            if let Some(n) = e.notify {
-                self.deliver_outbox_entry(group, e.seq, e.target_vshard as u16, n);
-            }
+            self.deliver_outbox_entry(group, e);
         }
         // Peers this one already considers dead may have died while the
         // group had no leader to retire them: fence them here now.
@@ -1282,20 +1480,26 @@ impl Core {
         }
     }
 
-    fn deliver_outbox(&self, group: u32, seq: u64, target: u16) {
+    fn deliver_outbox(&self, group: u32, seq: u64) {
         let Some(g) = self.router.hosted(group) else { return };
-        let entries = g.read(|kv| read::outbox(kv, usize::MAX)).unwrap_or_default();
-        let Some(entry) = entries.into_iter().find(|e| e.seq == seq) else { return };
-        let Some(notify) = entry.notify else { return };
-        self.deliver_outbox_entry(group, seq, target, notify);
+        if let Some(entry) = g.read(|kv| read::outbox_entry(kv, seq)).ok().flatten() {
+            self.deliver_outbox_entry(group, entry);
+        }
     }
 
-    fn deliver_outbox_entry(&self, group: u32, seq: u64, target: u16, notify: pb::DepNotify) {
+    fn deliver_outbox_entry(&self, group: u32, entry: pb::OutboxEntry) {
+        let (seq, target) = (entry.seq, entry.target_vshard as u16);
+        let body = match (entry.notify, entry.unsubscribe, entry.cancel_children) {
+            (Some(n), _, _) => pb::shard_cmd::Body::DepNotify(n),
+            (None, Some(u), _) => pb::shard_cmd::Body::Unsubscribe(u),
+            (None, None, Some(c)) => pb::shard_cmd::Body::CancelChildren(c),
+            (None, None, None) => return,
+        };
         let p = self.router.clone();
         // The ack goes to the group holding the outbox (any vshard it owns).
         let home = p.vshards_of(group).first().copied().unwrap_or(0) as u16;
         tokio::spawn(async move {
-            if p.propose(target, pb::shard_cmd::Body::DepNotify(notify)).await.is_ok() {
+            if p.propose(target, body).await.is_ok() {
                 let _ = p.propose(home, pb::shard_cmd::Body::OutboxAck(pb::OutboxAck { seqs: vec![seq] })).await;
             }
         });
@@ -1458,9 +1662,10 @@ impl Core {
     fn place_cost(&self, tk: Tk, spec: &pb::TaskSpec, policy: &pb::Policy, hint: u64, mesh: &MeshClient) -> PlaceCost {
         let deps = self.dep_outcomes(tk, spec);
         let dep_objects = deps.iter().filter_map(|o| match &o.value {
-            Some(pb::outcome::Value::Ok(obj)) => Some(obj.clone()),
+            Some(pb::outcome::Value::Ok(obj)) => Some(with_blobs(obj)),
             _ => None,
         });
+        let dep_objects = dep_objects.flatten();
         let inputs: Vec<pb::ObjectRef> = spec
             .args
             .iter()
@@ -1562,7 +1767,7 @@ impl Core {
                 tracing::warn!("granted to unknown peer {}", peer.0.hex());
                 return;
             };
-            let run = self.router.read(tk.v(), |kv| read::run(kv, tk.run)).flatten();
+            let run = self.router.read(tk.v(), |kv| read::run_in(kv, tk.v(), tk.run)).flatten();
             let key = profile_key(&spec, &pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default());
             let reads = spec.args.as_ref().map_or(0, |a| a.size) + spec.blobs.iter().map(|b| b.size).sum::<u64>();
             let memory = self.profiles.memory_estimate(&key, reads).map_or(0, |m| m.bytes).max(rec.memory_hint);
@@ -1584,6 +1789,7 @@ impl Core {
         let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
         let mut work = Work::new(tk, attempt, spec, policy, deps);
         self.reserve(&mut work, rec.memory_hint, 0.0, 0);
+        self.learn_run(tk);
         if self.env_of(&tk.run).is_none() {
             self.fail_infeasible(&work, "the run has no executor environment on record");
             return;
@@ -1663,11 +1869,16 @@ impl Core {
         };
         let mut missing: Vec<pb::ObjectRef> = Vec::new();
         let args = w.spec.args.iter().chain(w.spec.blobs.iter());
-        let deps = w.deps.iter().filter_map(|o| match &o.value {
-            Some(pb::outcome::Value::Ok(obj)) => Some(obj),
-            _ => None,
-        });
-        for obj in args.chain(deps) {
+        let deps: Vec<pb::ObjectRef> = w
+            .deps
+            .iter()
+            .filter_map(|o| match &o.value {
+                Some(pb::outcome::Value::Ok(obj)) => Some(with_blobs(obj)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for obj in args.chain(deps.iter()) {
             if obj.inline_data.is_empty()
                 && !obj.run.is_empty()
                 && !self.objects.path(&obj.run, &obj.object_id).exists()
@@ -1683,8 +1894,10 @@ impl Core {
         }
         self.localizing.insert((w.tk, w.attempt));
         let (tx, store, code) = (self.me_tx.clone(), self.objects.clone(), self.code.clone());
+        let router = self.router.clone();
         tokio::spawn(async move {
             let mut error = None;
+            let mut lost = None;
             if need_code && let Err(e) = mesh.localize_code(&code, &digest).await {
                 error = Some(format!("cannot fetch the function's code {}: {e}", hex(&digest)));
             }
@@ -1699,18 +1912,35 @@ impl Core {
                         let (mesh, store) = (mesh.clone(), store.clone());
                         async move {
                             let holders = mesh.holders(&obj);
-                            mesh.localize(&store, &obj.run, &obj.object_id, obj.size, &holders)
-                                .await
-                                .map_err(|e| format!("cannot fetch input object {}: {e}", hex(&obj.object_id)))
+                            mesh.localize(&store, &obj.run, &obj.object_id, obj.size, &holders).await.map_err(|e| {
+                                (
+                                    obj.object_id.clone(),
+                                    format!("cannot fetch input object {}: {e}", hex(&obj.object_id)),
+                                )
+                            })
                         }
                     })
                     .collect();
                 let mut fetches = futures_util::stream::iter(fetches).buffer_unordered(INPUT_FETCHES);
                 while let Some(r) = fetches.next().await {
-                    if let Err(e) = r {
+                    if let Err((object, e)) = r {
                         error = Some(e);
+                        lost = Some(object);
                         break;
                     }
+                }
+            }
+            if let (Some(object), Some(why)) = (lost, error.as_mut())
+                && w.rebuilds < MAX_REBUILDS
+            {
+                match rebuild_plan(&router, &mesh, &w, &object).await {
+                    Ok((producer, attempt, spec, deps)) => {
+                        let consumer = Box::new(w);
+                        let msg = CoreMsg::Rebuild { consumer, producer, attempt, spec: Box::new(spec), deps };
+                        let _ = tx.send(msg).await;
+                        return;
+                    }
+                    Err(cannot) => why.push_str(&format!("; it cannot be made again: {cannot}")),
                 }
             }
             let _ = tx.send(CoreMsg::Localized { work: Box::new(w), error }).await;
@@ -1820,6 +2050,36 @@ impl Core {
         true
     }
 
+    /// An attempt cannot run here: report it (the shard retries it), or, for
+    /// a call being run again to remake a lost value, fail what waits for it.
+    fn give_up(&mut self, w: &Work, why: &str) {
+        if w.publish {
+            self.fail_attempt(w, pb::record_failure::Kind::Infra, why);
+        } else if let Some(waiting) = self.rebuilding.remove(&w.tk) {
+            let why = format!("an input was lost with its peer, and running the call that made it again failed: {why}");
+            for c in waiting {
+                self.give_up(&c, &why);
+            }
+        }
+    }
+
+    /// A call run again to remake a lost value finished: the attempts waiting
+    /// for that value go on (it is in this peer's store now), or fail with it.
+    fn rebuilt(&mut self, w: &Work, outcome: Option<&pb::Outcome>) {
+        let Some(waiting) = self.rebuilding.remove(&w.tk) else { return };
+        match outcome.and_then(|o| o.value.as_ref()) {
+            Some(pb::outcome::Value::Ok(_)) => waiting.into_iter().for_each(|c| self.admit(c)),
+            other => {
+                let why = match other {
+                    Some(pb::outcome::Value::Err(e)) => format!("it raised {}: {}", e.type_name, e.message),
+                    _ => "it produced no value".to_string(),
+                };
+                self.rebuilding.insert(w.tk, waiting);
+                self.give_up(w, &why);
+            }
+        }
+    }
+
     /// Report an attempt that could not run here; the shard retries it.
     fn fail_attempt(&mut self, w: &Work, kind: pb::record_failure::Kind, why: &str) {
         if !w.publish {
@@ -1888,14 +2148,31 @@ impl Core {
         if self.queue.contains_key(&tk) {
             self.queue.retain(|w| w.tk != tk);
         }
-        let running_on: Vec<u32> =
-            self.running.iter().filter(|r| r.items.iter().any(|w| w.tk == tk)).map(|r| r.exec).collect();
+        if !self.unfinished.contains_key(&tk) {
+            return;
+        }
+        let running_on: Vec<u32> = self
+            .running
+            .iter()
+            .filter(|r| r.items.iter().zip(&r.finished).any(|(w, f)| w.tk == tk && !f))
+            .map(|r| r.exec)
+            .collect();
         for exec in running_on {
             self.sup.send(
                 exec,
                 pb::PeerToExec { msg: Some(pb::peer_to_exec::Msg::Cancel(pb::ExecCancel { task: Some(tk.pb()) })) },
             );
             self.cancelling.push((exec, tk, Instant::now()));
+        }
+    }
+
+    /// One running item of `tk` finished or was lost with its executor.
+    fn item_ended(&mut self, tk: Tk) {
+        if let Some(n) = self.unfinished.get_mut(&tk) {
+            *n -= 1;
+            if *n == 0 {
+                self.unfinished.remove(&tk);
+            }
         }
     }
 
@@ -2025,14 +2302,34 @@ impl Core {
         }
     }
 
+    /// This peer dropped its replica of `group`: what its sessions watched
+    /// there is followed through a peer that still holds one.
+    fn watch_elsewhere(&mut self, group: u32) {
+        let moved: Vec<Tk> = self
+            .watchers
+            .keys()
+            .filter(|t| self.router.group_of(t.v()) == group && !self.remote_watched.contains(t))
+            .copied()
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        self.remote_watched.extend(moved.iter().copied());
+        self.remote_watch(group, moved);
+    }
+
     /// Follow outcomes of tasks whose group this peer does not host, through
-    /// a peer that does; another replica takes over if that one goes away.
+    /// a peer that does; another replica takes over if that one goes away or
+    /// goes quiet.
     fn remote_watch(&self, group: u32, tasks: Vec<Tk>) {
         let Some(mesh) = self.router.mesh.clone() else { return };
         let (tx, router) = (self.me_tx.clone(), self.router.clone());
         tokio::spawn(async move {
             let mut left: BTreeSet<Tk> = tasks.into_iter().collect();
-            for round in 0..20 {
+            // Rounds in which no replica took the watch; a watch that was
+            // taken and went quiet is not a failure, it is placed again.
+            let mut failed = 0u64;
+            while !left.is_empty() && failed < 20 {
                 // The known leader first, then live voters; voters liveness
                 // has given up on last (a peer that hosts no replica of the
                 // group keeps the plan's voter list, which can name the dead).
@@ -2042,16 +2339,15 @@ impl Core {
                     let gone = mesh.member(*n).is_none_or(|p| p.dead || p.suspect);
                     (gone, Some(*n) != hint)
                 });
-                for node in nodes {
-                    if left.is_empty() {
-                        return;
-                    }
-                    if node == mesh.me.node_id {
-                        continue;
-                    }
+                let mut taken = false;
+                for node in nodes.into_iter().filter(|n| *n != mesh.me.node_id) {
                     let keys = left.iter().map(|t| t.pb()).collect();
                     let Ok(mut stream) = mesh.watch(node, keys).await else { continue };
-                    while let Ok(Some(ev)) = stream.message().await {
+                    taken = true;
+                    // A peer whose seat in the group moved away keeps the
+                    // stream open and stops applying the group: a stream that
+                    // stays quiet is placed again, on the leader as known then.
+                    while let Ok(Ok(Some(ev))) = tokio::time::timeout(WATCH_QUIET, stream.message()).await {
                         let Some(tk) = ev.task.as_ref().and_then(Tk::parse) else { continue };
                         if left.remove(&tk) {
                             let outcome = ev.outcome.unwrap_or_default();
@@ -2060,13 +2356,16 @@ impl Core {
                             }
                         }
                     }
+                    break;
                 }
-                if left.is_empty() {
-                    return;
+                if !taken {
+                    failed += 1;
+                    tokio::time::sleep(Duration::from_millis(100 * failed)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(100 * (round + 1))).await;
             }
-            let _ = tx.send(CoreMsg::WatchLost { tasks: left.into_iter().collect() }).await;
+            if !left.is_empty() {
+                let _ = tx.send(CoreMsg::WatchLost { tasks: left.into_iter().collect() }).await;
+            }
         });
     }
 
@@ -2173,12 +2472,7 @@ impl Core {
     /// the same fenced path as an executor's (a stale attempt is refused there). A
     /// call the other cell never ran, or lost, comes back to this peer's queue: it
     /// was granted here, and running it twice is harmless (`effects="none"`).
-    fn on_delegated(
-        &mut self,
-        work: Work,
-        cell: &str,
-        result: crate::fleet::Delegated,
-    ) {
+    fn on_delegated(&mut self, work: Work, cell: &str, result: crate::fleet::Delegated) {
         let (tk, attempt) = (work.tk, work.attempt);
         if let Some(f) = self.fleet.as_mut() {
             f.done(cell, work.cpus);
@@ -2195,6 +2489,10 @@ impl Core {
                     });
                     obj.run = tk.run.0.to_vec();
                     obj.locations = vec![self.router.identity.pb()];
+                    for b in &mut obj.blobs {
+                        b.run = tk.run.0.to_vec();
+                        b.locations.clear(); // here, with the value (see with_blobs)
+                    }
                     written.map(|()| outcome).map_err(|e| format!("could not store its result here: {e}"))
                 }
                 _ => Ok(outcome),
@@ -2241,6 +2539,21 @@ impl Core {
     fn tenant_of(&mut self, run: Id) -> String {
         let router = self.router.clone();
         self.quotas.tenant(run, || router.read(run.vshard(), |kv| read::run(kv, run)).flatten().map(|r| r.tenant))
+    }
+
+    /// Remember the run of a call granted here from the copy of its record in
+    /// the call's own vshard: this peer may lead that group without hosting
+    /// the run's own.
+    fn learn_run(&mut self, tk: Tk) {
+        if self.runs.contains_key(&tk.run) {
+            return;
+        }
+        let Some(Some(rec)) = self.router.read(tk.v(), |kv| read::run_in(kv, tk.v(), tk.run)) else { return };
+        self.quotas.tenant(tk.run, || Some(rec.tenant.clone()));
+        if let Some(spec) = rec.exec_env {
+            let env = ExecEnv::from_spec(spec);
+            self.runs.insert(tk.run, RunInfo { env, detached: rec.detached, sessions: BTreeSet::new() });
+        }
     }
 
     fn env_of(&mut self, run: &Id) -> Option<ExecEnv> {
@@ -2558,7 +2871,9 @@ impl Core {
                 self.capacity
             );
         }
-        self.memory_wait(w).unwrap_or_else(|| "waiting for an executor to start".into())
+        self.memory_wait(w)
+            .or_else(|| self.pids_note.clone())
+            .unwrap_or_else(|| "waiting for an executor to start".into())
     }
 
     fn consume_start(&self, w: Work) {
@@ -2694,6 +3009,16 @@ impl Core {
     }
 
     fn spawn_exec(&mut self, env: &ExecEnv, threads: u32, key: &str, actor: Option<Id>) -> Option<u32> {
+        // Under a task limit (a pod's pids.max), starting a worker that cannot
+        // fit fails with EAGAIN and loses the attempt: wait for one to exit
+        // instead. The first worker is always tried, or nothing could run.
+        if !self.execs.is_empty()
+            && let Some((current, max)) = crate::topology::pids_room()
+            && current + EXEC_TASKS + u64::from(threads) > max
+        {
+            self.pids_note = Some(pids_full(current, max));
+            return None;
+        }
         let mut extra = vec![("CHIMAERA_PEER_SOCKET", Some(self.peer_socket.clone()))];
         extra.extend(self.devices.env_for_key(key));
         match self.sup.spawn(env, threads, &extra, None) {
@@ -2718,10 +3043,19 @@ impl Core {
                         leak: LeakWatch::default(),
                     },
                 );
+                self.pids_note = None;
                 Some(id)
             }
             Err(e) => {
-                tracing::error!("cannot start executor with {}: {e}", env.python);
+                if e.raw_os_error() == Some(libc::EAGAIN) {
+                    let (current, max) = crate::topology::pids_room().unwrap_or((0, 0));
+                    self.pids_note = Some(pids_full(current, max));
+                }
+                tracing::error!(
+                    "cannot start executor with {}: {e}{}",
+                    env.python,
+                    self.pids_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
+                );
                 None
             }
         }
@@ -2825,8 +3159,12 @@ impl Core {
         // Charged from the start: calls admitted on a live floor read 0
         // until their first sample, and one pass may admit many.
         let mem = items.iter().map(|w| self.need(w)).max().unwrap_or(0);
+        for w in &items {
+            *self.unfinished.entry(w.tk).or_default() += 1;
+        }
         self.running.push(Running {
             exec,
+            finished: vec![false; items.len()],
             items,
             remaining,
             cpus,
@@ -2943,7 +3281,7 @@ impl Core {
         // The run's driver may be on another peer: send the output there too.
         let (router, mesh) = (self.router.clone(), self.router.mesh.clone());
         let home = self.log_ship.home(tk.run, || {
-            let home = router.read(tk.v(), |kv| read::run(kv, tk.run)).flatten()?.home?;
+            let home = router.read(tk.v(), |kv| read::run_in(kv, tk.v(), tk.run)).flatten()?.home?;
             if home.peer == router.identity.peer.to_vec() {
                 return None;
             }
@@ -2992,8 +3330,19 @@ impl Core {
             return;
         };
         let run = &mut self.running[idx];
-        let work = run.items.iter().find(|w| w.tk == tk && w.attempt == done.attempt).cloned().expect("found above");
+        let i = run.items.iter().position(|w| w.tk == tk && w.attempt == done.attempt).expect("found above");
+        let work = run.items[i].clone();
+        let first_report = !std::mem::replace(&mut run.finished[i], true);
         run.remaining = run.remaining.saturating_sub(1);
+        if first_report {
+            self.item_ended(tk);
+        }
+        let run = &mut self.running[idx];
+        if !work.publish && self.rebuilding.contains_key(&tk) {
+            // After this call's bookkeeping: the waiting attempts change the queue.
+            let (tx, work, outcome) = (self.me_tx.clone(), Box::new(work.clone()), done.outcome.clone());
+            tokio::spawn(async move { tx.send(CoreMsg::Rebuilt { work, outcome }).await });
+        }
         let finished = run.remaining == 0;
         let batch_len = run.items.len();
         // A durable actor's constructor commits the first state (version 1),
@@ -3004,12 +3353,16 @@ impl Core {
                 && self.actors.get(a).is_some_and(|h| h.durable)
         });
         let mut done = done;
-        if let Some(pb::Outcome { value: Some(pb::outcome::Value::Ok(obj)), .. }) = done.outcome.as_mut()
-            && obj.inline_data.is_empty()
-            && obj.locations.is_empty()
-        {
-            // Other peers fetch the bytes from here.
-            obj.locations.push(self.router.identity.pb());
+        if let Some(pb::Outcome { value: Some(pb::outcome::Value::Ok(obj)), .. }) = done.outcome.as_mut() {
+            // Other peers fetch the bytes from here: the result's file, and the
+            // files its frame refers to (an inline frame has only those).
+            let me = self.router.identity.pb();
+            if obj.inline_data.is_empty() && obj.locations.is_empty() {
+                obj.locations.push(me.clone());
+            }
+            for b in obj.blobs.iter_mut().filter(|b| b.locations.is_empty()) {
+                b.locations.push(me.clone());
+            }
         }
         if durable_actor.is_none()
             && work.publish
@@ -3386,7 +3739,9 @@ impl Core {
     /// as are failures (they stop early).
     fn learn(&mut self, w: &Work, done: &pb::ExecDone, cores: Option<f64>, peak: u64) {
         let out_bytes = match done.outcome.as_ref().and_then(|o| o.value.as_ref()) {
-            Some(pb::outcome::Value::Ok(obj)) => obj.size,
+            // The files the frame refers to are output too (the frame alone may
+            // be a few bytes for hundreds of MiB of arrays).
+            Some(pb::outcome::Value::Ok(obj)) => obj.size + obj.blobs.iter().map(|b| b.size).sum::<u64>(),
             _ => return,
         };
         if peak > 0 && !w.in_actor() {
@@ -3539,6 +3894,9 @@ impl Core {
             crate::counters::OOM_KILLS.add(1);
         }
         for r in lost {
+            for (w, _) in r.items.iter().zip(&r.finished).filter(|(_, f)| !**f) {
+                self.item_ended(w.tk);
+            }
             if !r.blocked {
                 self.cpu_used -= r.cpus;
             }
@@ -3546,6 +3904,9 @@ impl Core {
                 self.quotas.give((w.tk.run, w.tk.task));
             }
             let actor_exec = info.as_ref().and_then(|e| e.actor).is_some();
+            for w in r.items.iter().filter(|w| !w.publish) {
+                self.give_up(w, "its worker died");
+            }
             for w in r.items.iter().filter(|w| w.publish) {
                 let reason = match (oom, signal) {
                     (Some(_), _) if note.is_some() => note.clone().unwrap_or_default(),
@@ -4384,14 +4745,9 @@ impl Core {
     fn explain(&self, req: pb::ExplainRequest) -> pb::ExplainReply {
         let mut reply = pb::ExplainReply::default();
         if let Ok(run) = Id::from_slice(&req.run) {
+            // Task counts come from every vshard of the run's spread, which
+            // ingress reads (most are in groups this peer does not host).
             reply.run = self.router.read(run.vshard(), |kv| read::run(kv, run)).flatten();
-            if req.task.is_none() {
-                let tasks =
-                    self.router.read(run.vshard(), |kv| read::tasks_of_run(kv, run, 1_000_000)).unwrap_or_default();
-                for t in tasks {
-                    *reply.counts.entry(count_key(&t)).or_default() += 1;
-                }
-            }
         }
         if let Some(tk) = req.task.as_ref().and_then(Tk::parse) {
             let rec = self.router.read(tk.v(), |kv| read::task(kv, tk)).flatten();
@@ -4470,6 +4826,9 @@ impl Core {
             queued: self.queue.len() as u64,
             this_peer: true,
             leading: self.router.leading(),
+            actors: self.execs.values().filter(|e| e.actor.is_some()).count() as u32,
+            object_bytes: self.objects.bytes_used(),
+            draining: self.draining,
             ..Default::default()
         };
         let Some(mesh) = self.router.mesh.as_ref() else {
@@ -4499,6 +4858,9 @@ impl Core {
                     this_peer: false,
                     labels: v.member.labels.clone(),
                     leading: v.load.as_ref().map(|l| l.leading.clone()).unwrap_or_default(),
+                    actors: v.load.as_ref().map_or(0, |l| l.actors),
+                    object_bytes: v.load.as_ref().map_or(0, |l| l.object_bytes),
+                    draining: v.load.as_ref().is_some_and(|l| l.stopping),
                 }
             })
             .collect()
@@ -4562,6 +4924,10 @@ impl Core {
             automatic: vec![
                 self.budget.describe(),
                 format!("cpu capacity {:.2}", self.capacity),
+                crate::topology::pids_room().map_or_else(
+                    || "no task limit (cgroup pids.max)".into(),
+                    |(current, max)| format!("task limit {max} (cgroup pids.max), {current} in use"),
+                ),
                 format!(
                     "{} learned function profile(s), saved in {}",
                     self.profiles.len(),

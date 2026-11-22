@@ -1,8 +1,25 @@
 # Getting started
 
 This walks through a first program, then the parts you will use most. Every
-example runs on one machine today. The code is meant to run unchanged on a
-cluster once multi-peer support lands.
+example runs on your machine as written, and unchanged on a cluster
+(`ch.init(cluster="lab")`, or `chimaera run --cluster lab -- python app.py`).
+Install with `pip install dist/chimaera-*.whl` from `make wheel`, or from
+source as the README says.
+
+A few words used below:
+
+| Word | Meaning |
+|---|---|
+| script (driver) | your program: the process that calls `.remote()` |
+| peer | the `chimaera` process on each machine that schedules work and stores values; one starts on your machine on demand |
+| worker | a Python process a peer starts to run calls |
+| call | one `.remote(...)`; it runs in a worker |
+| future | what `.remote()` returns: `.result()` waits for the value |
+| actor | an instance of a `@ch.remote` class living in one worker; its methods run there in order |
+| run | everything one script submitted; its id lets you inspect it (`chimaera runs`) or reattach (`ch.runs.attach`) |
+
+When your script exits, it waits for calls it started but never waited on
+(Ctrl-C cancels them; `ch.init(detach=True)` leaves them running).
 
 ## 1. Your first remote function
 
@@ -137,8 +154,10 @@ def train_step(batch): ...
 goes over it is stopped and retried twice more (for now under that limit, not a
 larger one), then fails with `ch.OutOfMemory` and the peak it reached.
 
-Sizes need a unit: `"512 MiB"`, `"2 GB"`. Library thread pools (OpenMP, BLAS)
-are sized to the CPUs you asked for.
+Sizes need a unit: `"512 MiB"`, `"2 GB"`. Both kinds are accepted and mean
+what they say: `"2 GB"` is 2,000,000,000 bytes and `"2 GiB"` is 2 × 1024³
+(about 7% more). Library thread pools (OpenMP, BLAS) are sized to the CPUs
+you asked for.
 
 You usually do not need either. Without them, the peer measures each
 function's calls: after three, later calls reserve the memory they were seen

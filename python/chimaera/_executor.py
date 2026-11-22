@@ -29,6 +29,7 @@ from typing import Any
 import cloudpickle
 
 from . import _batch, _context, _future, _objects, _project, _serde
+from ._errors import ActorDied
 from ._native import ExecConn, blake3_digest, child_id
 from ._serde import Dep
 
@@ -197,6 +198,22 @@ def _unread(fd: int) -> int:
     return int.from_bytes(buf, sys.byteorder)
 
 
+# What CUDA libraries raise when they are shown no GPU (torch, CuPy, JAX).
+_NO_CUDA = ("no cuda gpus are available", "no cuda-capable device", "cudaerrornodevice", "unable to initialize backend 'cuda'")
+
+
+def _gpu_hint(exc: BaseException) -> None:
+    """CH119: a call that asked for no GPU, on a machine that has them, is
+    shown none (the peer sets CUDA_VISIBLE_DEVICES empty only where GPUs
+    exist), and CUDA's error never says why: add the reason and the fix."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != "" or not any(p in str(exc).lower() for p in _NO_CUDA):
+        return
+    exc.add_note(
+        "CH119: this call asked for no GPU, so CUDA shows it none, although this machine has GPUs; "
+        "ask for one with @ch.remote(gpus=1) or fn.options(gpus=1)"
+    )
+
+
 def python_mismatch(e: Exception) -> RuntimeError | None:
     """Why a call's function would not load, when the program runs another
     Python than this worker (a remote peer's workers run the peer's own):
@@ -241,6 +258,8 @@ class Executor:
         # The call whose own code runs on the main thread, if any: the only
         # one a signal can interrupt (see interrupt).
         self.main_call: _context.TaskContext | None = None
+        # exit_actor() ran in this worker's actor: later calls fail at once.
+        self.exited = False
         self.stdout: _Stdout | None = None  # set by main()
         self.running: dict[bytes, _context.TaskContext] = {}
         self.inbox: queue.SimpleQueue[tuple[Any, ...] | None] = queue.SimpleQueue()
@@ -399,11 +418,21 @@ class Executor:
     def ok_object(self, run: bytes, obj: bytes, value: Any) -> tuple[Any, ...]:
         """Store `value` as object `obj` of `run` (inline when small). Arena
         arrays in it are linked, not copied (see _objects); their blobs carry
-        the run's prefix, so they live as long as the result itself."""
+        the run's prefix, so they live as long as the result itself, and the
+        outcome names them (with their sizes): the peer places calls by them,
+        fetches them before a call reads them, and frees them with the result
+        (the frame alone may be a few inline bytes)."""
         rdir = _serde.run_dir(self.object_dir, run)
+        blobs: list[tuple[bytes, int]] = []
 
         def claim(view: memoryview) -> tuple[bytes, int] | None:
-            return _objects.claim(view, rdir, run[:4]) if view.nbytes >= _objects.ARENA_MIN else None
+            got = _objects.claim(view, rdir, run[:4]) if view.nbytes >= _objects.ARENA_MIN else None
+            if got is not None:
+                try:
+                    blobs.append((got[0], os.stat(os.path.join(rdir, got[0].hex())).st_size))
+                except OSError:
+                    blobs.append((got[0], view.nbytes))
+            return got
 
         if type(value) is tuple and 2 <= len(value) <= SEQ_MAX:
             # Possibly several values (returns=N): each readable on its own.
@@ -423,17 +452,18 @@ class Executor:
             parts, size, oob = _serde.pack_seq(encoded, ids)
             if ids is not None and any(ids):  # never inline: the peer frees and finds parts through this file
                 _serde.write_file(_serde.object_path(self.object_dir, run, obj), parts)
-                return ("ok", run, obj, size, None, oob)
+                return ("ok", run, obj, size, None, oob, blobs)
         else:
             parts, size, oob = _serde.dumps_parts(value, external=claim)
         if size <= self.inline_limit:
             data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts)
-            return ("ok", run, obj, size, data, oob)
+            return ("ok", run, obj, size, data, oob, blobs)
         _serde.write_file(_serde.object_path(self.object_dir, run, obj), parts)
-        return ("ok", run, obj, size, None, oob)
+        return ("ok", run, obj, size, None, oob, blobs)
 
     @staticmethod
     def err(exc: BaseException) -> tuple[Any, ...]:
+        _gpu_hint(exc)
         try:
             blob = pickle.dumps(exc)
         except Exception:
@@ -468,13 +498,16 @@ class Executor:
             if on_main:
                 self.main_call = ctx
             try:
+                if self.exited:  # exit_actor() ran; the close that ends this process is on its way
+                    raise ActorDied("the actor ended itself with ch.context().exit_actor()")
                 result = self.invoke(msg, args_ref, deps)
             finally:
                 if on_main:
                     self.main_call = None
-            if isinstance(result, _future.Future):
+            if isinstance(result, _future.Future) and result._put is None:
                 # Returning a future forwards it: this call resolves to that
-                # call's outcome, and this worker is free meanwhile.
+                # call's outcome, and this worker is free meanwhile. A ch.put
+                # handle is no call to forward to: it is stored as the value.
                 result._escaped = True  # the shard now pins it for the run
                 result._rt.client.flush()
                 outcome = ("forward", result.key)
@@ -497,6 +530,12 @@ class Executor:
             self.running.pop(key, None)
         self.trimmer((time.time_ns() - entry) / 1e9)
         self.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
+        if ctx.exiting and not self.exited:
+            # After this call's outcome went out: closing the actor ends this process.
+            from ._runtime import Runtime
+
+            self.exited = True
+            Runtime.get().client.close_actor(ctx.actor)
 
     def invoke(self, msg: dict[str, Any], args_ref: tuple[Any, ...], deps: list[tuple[Any, ...]]) -> Any:
         kind = msg["kind"]

@@ -13,8 +13,9 @@ import sys
 import threading
 import time
 import warnings
+import weakref
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
-from typing import TYPE_CHECKING, Any, Generic, ParamSpec, Protocol, TypeVar, Unpack, overload
+from typing import TYPE_CHECKING, Any, Generic, NamedTuple, ParamSpec, Protocol, TypeVar, Unpack, overload
 
 from . import _context, _serde, _values
 from ._errors import ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
@@ -166,12 +167,15 @@ def build_call(
                 pin(x)  # the call reads the stored file
                 stored[object_id] = size
                 return _values.BlobRef(object_id, size)
+            if reads is not None:
+                reads.append(x)  # lineage: its call's inputs stay while this call may need it rebuilt
             return Dep(dep(x.key))
         return x
 
     _values.fetched.check(site, args, kwargs)
     frame = (tuple(sub(a) for a in args), {k: sub(v) for k, v in kwargs.items()})
-    key = key or rt.new_key()
+    spread = kind in (CALL_FUNCTION, CALL_MAP_ITEM) and not stream
+    key = key or rt.new_key(spread, deps + list(extra_deps))
     holds: list[_values.ClaimHold] = []
     try:
         packed = rt.pack(key, frame, site, holds)
@@ -268,6 +272,12 @@ def check_call(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any], *, bound:
         raise TypeError(f"{getattr(fn, '__qualname__', fn)}(): {e}") from None
 
 
+def _release_reads(held: list[Any]) -> None:
+    """A call's future was collected: let go of the inputs it kept (a copy of
+    its reads; rt._reads keeps its own until the call's outcome)."""
+    held.clear()
+
+
 def submit_call(rt: Runtime, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any], **kw: Any) -> Future[Any]:
     site = kw.pop("site", None)
     future_cls = kw.pop("future_cls", Future)
@@ -277,6 +287,11 @@ def submit_call(rt: Runtime, target: Any, args: tuple[Any, ...], kwargs: dict[st
         rt._reads[key] = reads
     rt.wait_for_room(spec["read_bytes"], site)
     fut: Future[Any] = future_cls(rt, key, site)
+    if reads:
+        # Lineage: a lost result is made again by running its call, which reads
+        # the same inputs, so they stay while its future does (as well as until
+        # the call's outcome, through rt._reads).
+        weakref.finalize(fut, _release_reads, list(reads)).atexit = False
     ctx = _context.current_task()
     if ctx is not None and ctx.workflow:
         fut._escaped = True  # a durable workflow's replay reads this step again: never release it
@@ -497,10 +512,9 @@ def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, 
     run = ctx.run if ctx is not None else rt.run
     if run is None:
         raise ChimaeraError("no run: create actors from a driver or inside a task")
-    if name:
-        actor = _keyed_actor_id(tenant, name)
-    else:
-        actor = child_id(run, [b"actor", os.urandom(16)])
+    # The peer checks the id is derived: from tenant and name, or from the run and this nonce.
+    nonce = b"" if name else os.urandom(16)
+    actor = _keyed_actor_id(tenant, name) if name else child_id(run, [b"actor", nonce])
     lanes = sum(_lane_limits(cls).values())
     if lanes:
         # Concurrency groups and per-method lanes run beside the default lane,
@@ -523,6 +537,7 @@ def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, 
         int(eff.get("max_restarts") or 0),
         bool(eff.get("detach")),
         durable,
+        nonce,
     )
     ev = rt.wait_actor(seq)
     if ev[0] == "error":
@@ -553,6 +568,22 @@ def _lane_limits(cls: type[Any]) -> dict[str, int]:
         elif "batch" in declared:
             limits[f"method:{name}"] = declared["batch"].lane
     return limits
+
+
+class NamedActor(NamedTuple):
+    """A live actor created with ``name=`` (see ``ch.runs.actors``)."""
+
+    name: str
+    state: str  # Pending, Alive or Restarting
+    id: str
+
+
+def actors(prefix: str = "") -> list[NamedActor]:
+    """This tenant's live named actors whose name starts with `prefix`, by
+    name, from every group of the cluster. ``ch.actor(name)`` gets a handle."""
+    rt = Runtime.get()
+    found = rt.client.list_actors(prefix)
+    return [NamedActor(name, state, actor_id.hex()) for tenant, name, state, actor_id in found if tenant == rt.tenant]
 
 
 def actor(name: str) -> Actor[Any]:

@@ -397,6 +397,24 @@ impl Group {
         }
     }
 
+    /// How long since this replica last heard from a leader; None if it never
+    /// has, or leads. A voter swapped out of the group stops hearing from it
+    /// (openraft does not send it the configuration that removed it).
+    pub fn since_leader_contact(&self) -> Option<std::time::Duration> {
+        use openraft::Instant as _;
+        use openraft::async_runtime::WatchReceiver;
+        let contact = self.raft.metrics().borrow_watched().last_leader_contact?;
+        Some(contact.elapsed())
+    }
+
+    /// The node ids in this replica's latest membership, voters and learners.
+    pub fn members(&self) -> Vec<NodeId> {
+        use openraft::async_runtime::WatchReceiver;
+        let rx = self.raft.metrics();
+        let m = rx.borrow_watched();
+        m.membership_config.membership().nodes().map(|(id, _)| *id).collect()
+    }
+
     /// Changes to leadership or membership: `changed` waits for the next one.
     pub fn watch(&self) -> GroupWatch {
         GroupWatch { rx: self.raft.metrics() }

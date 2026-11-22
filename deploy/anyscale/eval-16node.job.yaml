@@ -18,8 +18,11 @@ working_dir: .
 excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
 entrypoint: bash deploy/anyscale/run_eval_multi.sh
 # Peers choose raft sync from their disk's measured fsync latency (the
-# forced-fsync comparison is in the 4-node job).
+# forced-fsync comparison is in docs/qualification.md).
 env_vars:
+  # A pass with run spreading off, on the same machines, for the calls it changes.
+  EVAL_CHIMAERA_VARIANTS: "CHIMAERA_RUN_SPREAD=1"
+  EVAL_VARIANT_WORKLOADS: "tasks,nested,shuffle,actors"
   # Timed repetitions per workload after a warm-up (the job's hour bounds it).
   EVAL_MIN_SECONDS: "60"
 max_retries: 0

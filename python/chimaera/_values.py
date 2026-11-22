@@ -32,6 +32,10 @@ from ._native import blake3_buffer
 
 # Out-of-band buffers and top-level arguments at least this large become blobs.
 PROMOTE_BYTES = 1 << 20
+# CH118: a Python collection that pickles to at least this much, read by
+# calls: every reader unpickles a full copy of it.
+COLLECTION_WARN_BYTES = 8 << 20
+_COLLECTIONS = (list, dict, set, frozenset, tuple)
 # CH107: the same blob from one call site this many times...
 REPEAT_WARN_CALLS = 20
 # ...after this much time spent hashing and pickling it.
@@ -129,7 +133,7 @@ class InlineRef:
 class Encoded:
     """An encoded call frame and the blobs it reads."""
 
-    __slots__ = ("parts", "size", "oob", "blobs", "seconds", "holds")
+    __slots__ = ("parts", "size", "oob", "blobs", "seconds", "holds", "collection")
 
     def __init__(
         self,
@@ -142,6 +146,8 @@ class Encoded:
     ):
         self.parts, self.size, self.oob, self.blobs, self.seconds = parts, size, oob, blobs, seconds
         self.holds = holds or []
+        # The largest Python collection stored for the call: (type name, bytes).
+        self.collection: tuple[str, int] | None = None
 
     @property
     def total_bytes(self) -> int:
@@ -403,9 +409,13 @@ def encode_frame(
         # Large without buffers (big dicts, lists, objects): store each large
         # top-level argument once and pass a reference that loads it.
         args, kwargs = frame
-        promote = _promoter(run, sink, external, blobs, holds, release)
+        collections: list[tuple[str, int]] = []
+        promote = _promoter(run, sink, external, blobs, holds, release, collections)
         frame = (tuple(promote(a) for a in args), {k: promote(v) for k, v in kwargs.items()})
         parts, size, oob = _serde.dumps_parts(frame, external=external)
+        enc = Encoded(parts, size, oob, blobs, time.perf_counter() - t0, holds)
+        enc.collection = max(collections, key=lambda c: c[1], default=None)
+        return enc
     return Encoded(parts, size, oob, blobs, time.perf_counter() - t0, holds)
 
 
@@ -416,6 +426,7 @@ def _promoter(
     blobs: dict[bytes, int],
     holds: list[ClaimHold],
     release: Callable[[bytes, list[bytes]], None] | None,
+    collections: list[tuple[str, int]],
 ) -> Callable[[Any], Any]:
     def promote(x: Any) -> Any:
         if isinstance(x, (_serde.Dep, BlobRef, InlineRef)) or type(x).__name__ in ("Future", "ObjectRef"):
@@ -424,6 +435,8 @@ def _promoter(
         if size < PROMOTE_BYTES:
             return x
         data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts)
+        if type(x) in _COLLECTIONS:
+            collections.append((type(x).__name__, len(data)))
         bid = blake3_buffer(data)[:16]
         hold = _hold_blob(run, bid, data, sink, release)
         if hold is not None:
@@ -433,6 +446,30 @@ def _promoter(
         return BlobRef(bid, len(data))
 
     return promote
+
+
+class CollectionLint:
+    """CH118: a large list, dict, set or tuple shared with calls. It is stored
+    once, but every call that reads it unpickles a full copy, where a NumPy
+    array or an Arrow table is mapped: one copy for every reader on a machine.
+    Warns once per call site."""
+
+    def __init__(self) -> None:
+        self._warned: set[str | None] = set()
+
+    def note(self, site: str | None, kind: str, nbytes: int, stacklevel: int = 4) -> None:
+        if nbytes < COLLECTION_WARN_BYTES or site in self._warned:
+            return
+        self._warned.add(site)
+        warnings.warn(
+            f"CH118: {site or 'this call'} shares a {kind} that pickles to {nbytes >> 20} MiB; every call that "
+            f"reads it unpickles a full copy. A NumPy array or an Arrow table is mapped instead: one copy, "
+            f"shared by every reader on a machine.",
+            stacklevel=stacklevel,
+        )
+
+
+collection_lint = CollectionLint()
 
 
 class RepeatTracker:

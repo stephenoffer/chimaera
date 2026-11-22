@@ -55,7 +55,7 @@ def test_resource_options_translate():
 @pytest.mark.parametrize(
     ("opts", "names"),
     [
-        ({"num_returns": "streaming"}, "generator"),
+        ({"num_returns": "dynamic"}, "streaming"),
         ({"accelerator_type": "Ascend910B"}, "no device plugin"),
         ({"runtime_env": {"pip": ["x"]}}, "ch.Env"),
         ({"label_selector": {"zone": "!a"}}, "Placement"),
@@ -93,6 +93,80 @@ def test_node_affinity_and_labels_become_placement():
     assert both["placement"] == ch.dist.Placement(require={"zone": "a", "rack": "r7"}, prefer=("disk=ssd",))
     with pytest.raises(ray.Unsupported, match="exact label values"):
         _options.translate({"scheduling_strategy": NodeLabelSchedulingStrategy(hard={"rack": NotIn("r7")})}, _options.TASK)
+
+
+@ray.remote
+def countdown(n, fail_at=None):
+    for i in range(n, 0, -1):
+        if i == fail_at:
+            raise ValueError(f"stopped at {i}")
+        yield i
+
+
+@ray.remote
+class Ticker:
+    def ticks(self, n):
+        yield from range(n)
+
+
+def test_generator_tasks_and_methods_give_an_object_ref_generator():
+    ray.init(ignore_reinit_error=True)
+    try:
+        gen = countdown.remote(3)
+        assert isinstance(gen, ray.ObjectRefGenerator)
+        refs = list(gen)
+        assert all(isinstance(r, ray.ObjectRef) for r in refs) and ray.get(refs) == [3, 2, 1]
+        assert ray.get(countdown.options(num_returns="streaming").remote(2).completed()) is None
+        # The error comes out as the next ref, raised by ray.get, as in Ray.
+        failing = list(countdown.remote(4, fail_at=2))
+        assert ray.get(failing[:2]) == [4, 3] and len(failing) == 3
+        with pytest.raises(ValueError, match="stopped at 2"):
+            ray.get(failing[2])
+        t = Ticker.remote()
+        assert [ray.get(r) for r in t.ticks.remote(3)] == [0, 1, 2]
+
+        @ray.remote
+        def twice(x):
+            return 2 * x
+
+        assert ray.get(twice.remote(next(countdown.remote(5)))) == 10, "an item ref passes to another task as its value"
+    finally:
+        ray.shutdown()
+
+
+@ray.remote
+class Holder:
+    def ping(self):
+        return 1
+
+
+@ray.remote
+class Leaver:
+    def leave(self):
+        ray.actor.exit_actor()
+
+
+def test_exit_actor_ends_the_actor_as_in_ray():
+    ray.init(ignore_reinit_error=True)
+    try:
+        with pytest.raises(ray.exceptions.RayActorError):
+            ray.get(Leaver.remote().leave.remote(), timeout=60)
+        with pytest.raises(TypeError, match="non-actor worker"):
+            ray.actor.exit_actor()
+    finally:
+        ray.shutdown()
+
+
+def test_list_named_actors_in_this_namespace_and_all():
+    ray.init(ignore_reinit_error=True, namespace="listing")
+    try:
+        h = Holder.options(name="first", lifetime="detached").remote()
+        assert ray.get(h.ping.remote(), timeout=60) == 1
+        assert "first" in ray.util.list_named_actors()
+        assert {"name": "first", "namespace": "listing"} in ray.util.list_named_actors(all_namespaces=True)
+        ray.kill(h)
+    finally:
+        ray.shutdown()
 
 
 @ray.remote

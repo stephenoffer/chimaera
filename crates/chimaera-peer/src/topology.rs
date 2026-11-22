@@ -46,6 +46,26 @@ pub fn own_cgroup_chain() -> Vec<PathBuf> {
     own_cgroup_dir().map_or_else(Vec::new, |dir| cgroup_chain(&dir, Path::new("/sys/fs/cgroup")))
 }
 
+/// The cgroup task limit closest to running out for this process: (tasks
+/// counted against it now, the limit), from `pids.current` and `pids.max`
+/// along its cgroup chain. Every thread counts. None without a limit or
+/// outside cgroup v2. Pods often set a low one (Kubernetes podPidsLimit,
+/// docker --pids-limit), and starting a worker then fails with EAGAIN.
+pub fn pids_room() -> Option<(u64, u64)> {
+    pids_room_in(&own_cgroup_chain())
+}
+
+fn pids_room_in(chain: &[PathBuf]) -> Option<(u64, u64)> {
+    chain
+        .iter()
+        .filter_map(|d| {
+            let max = read(d.join("pids.max"))?.trim().parse::<u64>().ok()?; // "max": no limit
+            let current = read(d.join("pids.current"))?.trim().parse::<u64>().ok()?;
+            Some((current, max))
+        })
+        .min_by_key(|(current, max)| max.saturating_sub(*current))
+}
+
 /// `dir` and its ancestors below `root` (`root` itself only when `dir` is
 /// it, as inside a container's cgroup namespace).
 fn cgroup_chain(dir: &Path, root: &Path) -> Vec<PathBuf> {
@@ -210,5 +230,21 @@ mod chain_tests {
             [root.to_path_buf()],
             "inside a container its cgroup is the namespace root"
         );
+    }
+
+    #[test]
+    fn the_task_limit_closest_to_running_out_is_reported() {
+        let dir = std::env::temp_dir().join(format!("chimaera-pids-{}", std::process::id()));
+        let (own, parent) = (dir.join("pod/app"), dir.join("pod"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("pids.max"), "max\n").unwrap(); // no limit of its own
+        std::fs::write(own.join("pids.current"), "5\n").unwrap();
+        std::fs::write(parent.join("pids.max"), "100\n").unwrap();
+        std::fs::write(parent.join("pids.current"), "90\n").unwrap();
+        assert_eq!(pids_room_in(&[own.clone(), parent.clone()]), Some((90, 100)), "the pod's limit applies");
+        std::fs::write(own.join("pids.max"), "8\n").unwrap();
+        assert_eq!(pids_room_in(&[own, parent]), Some((5, 8)), "3 left beats 10 left");
+        assert_eq!(pids_room_in(&[]), None, "no cgroup: no limit");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

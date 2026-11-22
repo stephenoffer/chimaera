@@ -630,3 +630,39 @@ async fn a_group_reports_its_leader_voters_and_follower_lag() {
     }
     assert_eq!(group(1).stats().max_lag, Some(5), "{:?}", group(1).stats());
 }
+
+/// A voter swapped out of a group is never sent the change that removed it;
+/// it stops hearing from the leader, whose membership no longer lists it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_swapped_out_voter_stops_hearing_from_the_leader_that_dropped_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    let ids = [1u64, 2, 3];
+    let mut hosts = Vec::new();
+    for id in ids {
+        let (host, rx) =
+            RaftHost::open(&dir.path().join(format!("n{id}")), id, net.clone(), DiskDurability::Os).unwrap();
+        std::mem::forget(rx);
+        let g = host.start_group(0, members(&ids), id == 1).await.unwrap();
+        net.nodes.lock().unwrap().insert(id, g);
+        hosts.push(host);
+    }
+    let group = |id: NodeId| net.nodes.lock().unwrap().get(&id).cloned().unwrap();
+    wait_leader(&group(1)).await;
+    setup_run(&group(1), 9).await;
+    let (h4, rx) = RaftHost::open(&dir.path().join("n4"), 4, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let g4 = h4.start_group(0, BTreeMap::new(), false).await.unwrap();
+    net.nodes.lock().unwrap().insert(4, g4);
+    tokio::time::timeout(Duration::from_secs(20), group(1).add_learner(4, "node-4")).await.unwrap().unwrap();
+    group(1).change_voters([1, 2, 4].into()).await.unwrap();
+    let mut leader = group(1).members();
+    leader.sort();
+    assert_eq!(leader, vec![1, 2, 4], "the leader lists the new members only");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let gone = group(3).since_leader_contact().expect("it heard from the leader before");
+    let kept = group(2).since_leader_contact().expect("a follower hears from the leader");
+    assert!(gone > Duration::from_secs(1) && kept < Duration::from_secs(1), "removed {gone:?}, kept {kept:?}");
+    assert_eq!(group(1).since_leader_contact(), None, "the leader does not count contact with itself");
+    drop(h4);
+}

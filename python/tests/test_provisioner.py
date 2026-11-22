@@ -8,7 +8,7 @@ import pytest
 
 import chimaera as ch
 from chimaera._cluster import Node
-from chimaera.provisioner import Memory, Rules, decide
+from chimaera.provisioner import Memory, Rules, StatefulSet, decide
 
 
 def node(cpus=4.0, used=0.0, queued=0, alive=True, address="a:1"):
@@ -68,6 +68,25 @@ def test_work_that_needs_every_peer_keeps_them():
     m = Memory()
     assert decide([node(used=3), node(used=3)], 2, RULES, m, now=0) == (2, "steady")
     assert decide([node(used=3), node(used=3)], 2, RULES, m, now=999) == (2, "steady")
+
+
+def test_it_shrinks_only_once_the_peer_that_would_go_holds_nothing():
+    m = Memory()
+    keep = node(used=1)
+    last = Node("p", "chimaera-2.peers.ml.svc:7700", 4.0, 1 << 30, [], True, 0.0, 0, False, {}, actors=1, object_bytes=5)
+    quiet = [keep, node(), last]
+    assert decide(quiet, 3, RULES, m, now=0, victim=last)[0] == 3
+    want, why = decide(quiet, 3, RULES, m, now=60, victim=last)
+    assert want == 3 and why.endswith("holds 1 actors, 5 bytes of stored values"), why
+    emptied = last._replace(actors=0, object_bytes=0)
+    assert decide([keep, node(), emptied], 3, RULES, m, now=61, victim=emptied)[0] == 2, "quiet long enough already"
+
+
+def test_a_statefulsets_victim_is_its_highest_pod():
+    pods = [node(address=f"chimaera-{i}.peers.ml.svc:7700") for i in range(3)]
+    sts = StatefulSet("chimaera", "ml", sa_dir="/nonexistent")
+    assert sts.victim(pods, 3) is pods[2] and sts.victim(pods, 2) is pods[1]
+    assert sts.victim(pods[:2], 3) is None, "a pod that never started holds nothing"
 
 
 def test_in_cluster_it_calls_the_api_server_with_the_pods_service_account(tmp_path, monkeypatch):

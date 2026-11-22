@@ -32,17 +32,20 @@ This is early software. What works today and what does not:
 
 | Area | State |
 |---|---|
-| Functions, futures as dependencies, `map`, actors, pools | Working, on one machine |
+| Functions, futures as dependencies, `map`, actors, pools | Working, on one machine and across peers |
 | Retries, `OutcomeUnknown` for external effects, memory limits, cancellation, deadlines | Working |
 | Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |
 | Restarting the peer mid-run and reattaching with `ch.runs.attach(run_id)` | Working |
 | Several peers: replicated shard groups, placement across peers, objects fetched between peers, failover, dead voters replaced | Working on localhost clusters and on 4 cloud machines (Ray comparison in [qualification](docs/qualification.md)); per-call throughput across machines still trails Ray |
-| Peer authentication: cluster token, mutual TLS | Working on localhost clusters |
+| Peer authentication: cluster token, mutual TLS (opt-in, `--tls-dir`) | Working on localhost clusters |
+| Tenants: driver credentials bound to a tenant (`chimaera cluster credential`), per-tenant CPU quotas | Working on localhost clusters; a credential scopes the API and is not a sandbox (docs/deploy.md) |
+| Operating a cluster: `chimaera status` (peers, groups, leaders), `runs`, `logs`, `cancel`, `inspect` with `--cluster`, Prometheus metrics | Working |
 | Durable actors (`state=ch.durable.State()`): committed state, idempotent command ids, restart from the committed state | Working |
 | Learned reservations, memory-aware admission, large values stored once ([details](#what-chimaera-does-for-you)) | Working on one machine; placement across peers weighs input locality and memory |
 | Streaming generator calls (`ch.typing.Stream`, bounded ahead of the consumer, replayed after a worker dies) | Working |
 | Durable workflows (`workflow="durable"`): replay answered from the run's record, divergence detected | Working |
-| GPU gangs, shuffles | Not yet |
+| Gangs (`ch.dist.group`, `fn.options(ranks=n).gang()`): rendezvous env, collectives on small objects, device meshes, elastic size, restart as a new generation | Working on one machine and localhost clusters; GPU process groups are not tested here |
+| Shuffles (reduce by key across partitions) | Not yet: `ch.data.partitions` splits data, nothing regroups it |
 
 The design and the plan are in [docs/design.md](docs/design.md). What has been
 measured so far is in [docs/qualification.md](docs/qualification.md).
@@ -57,6 +60,11 @@ cargo build --release -p chimaera-peer          # the `chimaera` binary
 python -m venv .venv && . .venv/bin/activate
 pip install maturin && maturin develop --release
 ```
+
+To install on machines without Rust, build a wheel once: `make wheel` puts
+one in `dist/` with the peer binary inside, and `pip install dist/chimaera-*.whl`
+gives `import chimaera` and the `chimaera` command (same OS and CPU
+architecture as the build). `make wheel-smoke` checks it in a fresh venv.
 
 The first `.remote()` call starts a local peer in the background
 (`~/.chimaera/local`) if one is not running. It stops after ten idle minutes.
@@ -76,23 +84,34 @@ replaces a founder that dies.
 
 ```bash
 chimaera --dir /var/lib/chimaera peer start \
-    --listen 10.0.0.1:7100 --seeds 10.0.0.1:7100,10.0.0.2:7100,10.0.0.3:7100 \
+    --listen 10.0.0.1:7700 --seeds 10.0.0.1:7700,10.0.0.2:7700,10.0.0.3:7700 \
     --token-file ca/token --tls-dir host1-tls/
 ```
 
 Peers refuse calls without the token and connections from certificates
-another CA signed. `--insecure` skips the token; leaving out `--tls-dir`
+another CA signed. Give drivers a credential for their tenant rather than the
+token (`chimaera cluster credential --tenant T`, see docs/deploy.md). `--insecure` skips the token; leaving out `--tls-dir`
 sends peer traffic in plain text.
 
 Point a program at the peer on its machine with `CHIMAERA_HOME=/var/lib/chimaera`.
 Work spreads over every peer; any peer can attach to any run. A peer that
-stops answering for three seconds is retired and its work runs elsewhere.
-`SIGTERM` drains a peer: it takes no new work and stops once its running
-calls finish (up to `CHIMAERA_DRAIN_SECONDS`, default 30).
+stops answering is declared dead after its suspicion timeout (at least six
+seconds) and retired, and its work runs elsewhere.
+`SIGTERM` drains a peer: it takes no new work, hands the groups it leads,
+its voter seats and the values it stores to other peers, and stops once its
+running calls finish (up to `CHIMAERA_DRAIN_SECONDS`, default 30).
 
-Programs reach their peer through a local socket only it and its user can
-open; there is no network client endpoint yet. Results stored on a peer that
-dies are lost with it; their tasks are not re-run to rebuild them.
+Programs on a peer's machine reach it through a local socket only it and its
+user can open; programs elsewhere connect to a peer's client port
+(`--client-listen`) with the token or a driver credential.
+
+A peer that dies takes the values it stored with it, except where they were
+copied. On Linux each value is copied to one other peer about a second after
+it is written. A call whose input was lost with every peer that held it runs
+the call that made it again (a function or map item without external
+effects, inputs first), so a pipeline goes on. Not remade: values your
+program stored (`ch.put`, large arguments), actor results, and a result your
+script reads directly; losing one of those fails the read.
 
 ## A short tour
 
@@ -154,7 +173,7 @@ with ch.defaults(deadline="30s"):
 
 ### Failures
 
-A plain function is retried up to three times if its
+A plain function runs up to three times (two retries) if its
 worker or machine dies; your own exceptions are never retried unless you list
 them in `retry_exceptions`. Errors come back with their original type and the
 remote traceback attached. A function that touches the outside world can say

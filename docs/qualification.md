@@ -199,6 +199,64 @@ also caught a starting peer being declared dead while its core was not yet
 answering pings, and a dead identity kept alive by a new one answering at its
 address).
 
+## Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22)
+
+Same method as the runs below: c7i.4xlarge machines, one Chimaera peer per
+machine started through Ray, at least 60 s of repetitions per workload (45 s
+at 64 nodes), median shown; node loss runs once. Built from the shared tree
+at 06:46 (the commit that adds this section). Jobs: `prodjob_4r74rqcjethh63hv8ya5rt6r47` (1 node),
+`prodjob_anu85pvalld4281rw44s6ih3tb` (4), `prodjob_faziqk8kv3bvpnc2r6pwqwjqrp`
+(16), `prodjob_25a4b9dnd8y3mx3e1vmcg6f6ye` (64). The 64-node job reached its
+hour before Ray's actor, nested, shuffle and node-loss passes; those Ray
+figures (marked *) are from `prodjob_q368a693wi5f13xxsj14ube8wa` (actors) and
+`prodjob_knugq6wg8kwlahg9kby44ssf6c` (nested, shuffle, node loss), on the same
+machine type and Ray.
+
+| Workload | 1 node Ray | 1 node Chimaera | 4 Ray | 4 Chimaera | 16 Ray | 16 Chimaera | 64 Ray | 64 Chimaera |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Independent no-op tasks (/s) | 6,432 | 13,548 | 6,763 | 16,450 | 5,805 | 15,373 | 5,188 | 14,203 |
+| CPU scaling efficiency | 0.704 | 0.693 | 0.719 | 0.735 | 0.698 | 0.710 | 0.656 | 0.605 |
+| Map of tiny items, naive (/s) | 6,489 | 2,031,911 | 6,723 | 905,159 | 5,676 | 820,232 | 5,171 | 774,908 |
+| 512 MiB value to 2 x CPUs readers (s) | 0.010 | 0.009 | 0.025 | 0.032 | 0.106 | 0.110 | 0.407 | 0.375 |
+| 32 MiB array passed straight to 2 x CPUs calls (s) | 0.058 | 0.009 | 0.214 | 0.043 | 0.928 | 0.208 | 3.507 | 0.713 |
+| 10 calls on a 256 MiB value just made (s) | 0.227 | 0.310 | 0.229 | 0.270 | 0.233 | 0.262 | 0.228 | 0.376 |
+| Actor calls (/s) | 7,528 | 14,073 | 8,809 | 14,433 | 7,947 | 14,339 | 9,482* | 10,973 |
+| Nested tasks, 4 x CPUs parents of 8 (s) | 0.176 | 0.058 | 0.319 | 0.223 | 0.486 | 0.395 | 1.29* | 0.824 |
+| Shuffle, 3.2M pairs (s) | 0.235 | 0.441 | 0.145 | 0.449 | 0.141 | 0.472 | 0.135* | 0.842 |
+| A node killed under 4 x CPUs one-second tasks (s) | 8.22 | 5.62 | 18.59 | 11.62 | 18.25 | 8.23 | 18.5* | 9.58 |
+
+Where Ray is still ahead: the shuffle at every size (1.9x on one node, about
+3x at 4 and 16, 6x at 64); calls on a value just made at every size (12% to
+65%); CPU scaling on one node (2%) and at 64 (8%); broadcast at 4 nodes and,
+within 4%, at 16. Chimaera is ahead on everything else, including tasks on
+one machine, which went from 4,787/s to 13,548/s: a finished call no longer
+scans every running batch on its peer, nor sends a cancel to the executor of
+each batched call that had already finished.
+
+Run spreading, same machines and pass order, with `CHIMAERA_RUN_SPREAD=1` (off)
+against the default:
+
+| Workload | 4 off | 4 on | 16 off | 16 on | 64 off | 64 on |
+|---|---:|---:|---:|---:|---:|---:|
+| Tasks (/s) | 15,012 | 16,450 | 13,500 | 15,373 | 10,770 | 14,203 |
+| Nested (s) | 0.216 | 0.223 | 0.898 | 0.395 | 4.328 | 0.824 |
+| Shuffle (s) | 0.442 | 0.449 | 0.548 | 0.472 | 0.790 | 0.842 |
+| Actor calls (/s) | 12,897 | 14,433 | 13,433 | 14,339 | timed out | 10,973 |
+
+With spreading off, the peer leading the run's group used 2.3 to 3.1 cores
+in tasks and nested at 16 and 64 nodes; with it on, the busiest used 1.0 to
+2.2. The shuffle submits too slowly to spread (the rate rule keeps it in one
+group), so its difference is noise.
+
+An earlier round the same night (`prodjob_gmuwv5rzyzv6d7v2tg1ahwnebb`,
+`prodjob_1rcmm8gnhv9m19daxwn1w21ppp`, `prodjob_axrducgtnkpleepca53u4pbfa1`,
+`prodjob_q368a693wi5f13xxsj14ube8wa`) ran a tree with two faults, both fixed
+in the tree above: a peer whose core was slow to answer a ping was taken for
+one shutting down and lost its voter seats under load, and a large result's
+buffers were freed only with its run (follow-input filled one node's memory
+and hung). Its Chimaera numbers are not used here; its Ray actor-call figure
+at 64 nodes is (Ray was not affected).
+
 ## Ray comparison (cluster, 1 and 16 nodes)
 
 c7i.4xlarge machines (16 vCPU each), Ray from the image against one Chimaera
@@ -296,8 +354,11 @@ was shared with other builds and test runs during these measurements.
 | A CUDA tensor is rebuilt where its reader is | pass (stand-in torch module) | It travels as a host array and lands on the reader's granted GPU, or in a driver on its current one; a reader with no GPU gets it on the CPU with CH112. Torch's own pickling names the writer's device index, which fails in a CPU call. `test_values.py::test_a_cuda_tensor_is_rebuilt_where_its_reader_is` fails with the old fallback. Not yet run on a GPU; three checks are in `bench/evals/gpu_check.py` for the next GPU job |
 | A version mismatch with a remote cluster is named | pass (local; the Python mismatch is simulated) | Workers learn the program's Python version from its run. When a function will not load on a worker running another version (remote clusters run their own Python), the error names both versions and the fix (CH115). A remote cluster on another Chimaera version warns once at `ch.init` (CH116). `test_defaults.py`, `test_cluster.py` |
 | A gather that outgrows the machine warns | pass (local; Linux container) | `ch.gather` warns once (CH117) when the results it has read pass a quarter of physical memory, counting arrays' bytes because a Linux arena result's stored size is only its frame. It points at `ch.as_completed` and `fn.map`. `test_values.py` |
-| A long-lived driver's argument blobs do not accumulate | pass (local; Linux container) | Blobs stored by content (arrays on macOS or without the arena, bytes, large Python objects) lasted until the run ended. In a soak, the run grew 4 MiB per wave of fresh 4 MiB arrays. Now a blob is held while its array lives or a pending call reads it, then deleted here and released on the peers that fetched it. A blob whose owner cannot be watched (bytes, lists) waits among the recently freed, up to 256 MiB, so sending the same object again still stores it once. A peer now reports a released input only after the fetch fails, because the same bytes sent again get the same id. Tests: `test_values.py::test_fresh_values_per_iteration_do_not_pile_up` (12 stored arrays when blobs last for the run) and `test_locality.py::test_bytes_sent_again_after_their_release_reach_a_peer_that_had_them` (fails with the old up-front check). Soak: 296 waves, run directory flat at 0 MiB |
+| A long-lived driver's argument blobs do not accumulate | pass (local; Linux container) | Blobs stored by content (arrays on macOS or without the arena, bytes, large Python objects) lasted until the run ended. In a soak, the run grew 4 MiB per wave of fresh 4 MiB arrays. Now a blob is held while its array lives or a pending call reads it, then deleted here and released on the peers that fetched it. A blob whose owner cannot be watched (bytes, lists) waits among the recently freed, up to 256 MiB, so sending the same object again still stores it once. A peer now reports a released input only after the fetch fails, because the same bytes sent again get the same id. Tests: `test_values.py::test_fresh_values_per_iteration_do_not_pile_up` (12 stored arrays when blobs last for the run) and `test_locality.py::test_bytes_sent_again_after_their_release_reach_a_peer_that_had_them` (fails with the old up-front check). Soak: 296 waves, run directory flat at 0 MiB. Because a lost result is made again by running its call, a call's inputs also stay while its future lives, and a call keeps the futures it depends on until its outcome (lineage; `test_values.py::test_a_calls_inputs_stay_while_its_result_is_held`). The runtime's event loop no longer holds the last finished future after handling it; it had kept one dropped future, and now its inputs, alive until the next event |
 | A busy peer's memory stays bounded | pass (local soak, release peer) | `heap -showSizes` on a peer after 700k calls showed exactly 200,000 blocks of 3 KB plus their parts, about 700 MB: the attempt log kept for `explain()`, capped only by count (ATTEMPT_LOG_CAP). It is now also capped at 8 MiB encoded, about 25,000 recent attempts. Physical footprint after 750k tiny calls: 833 MB before, 213 MB after. Together with the runtime owner's change keeping only a released call's outcome, a 1.3M-call mixed soak keeps peer memory flat rather than about 1.2 KB per call. The modules that use `explain()` pass (accounting, api, learning, memory, defaults, locality, compat, gang) |
+| Under a pod's task limit, calls wait for workers instead of failing | pass (unit; Linux container) | `pids.max` counts every thread. Starting more workers than fit failed with EAGAIN, and the calls were lost as "3 attempts lost to infrastructure failures; last: executor process exited". The peer now reads the tightest limit up its cgroup chain (`topology::pids_room`) and starts a worker only if it has room for it (4 tasks plus its threads; measured 3). Otherwise calls wait with a reason naming the limit, and `chimaera status` lists it. `topology.rs` unit test; `test_defaults.py::test_under_a_task_limit_calls_wait_for_workers_instead_of_failing` starts a peer in a cgroup with room for two workers: 2/2 pass, and 2/2 fail with the old behavior. Manual: `docker run --pids-limit=24`, 32 calls in 6.7 s |
+| More lints: large Python collections, hidden GPUs, functions defined per call | pass (local; Linux container for the first) | CH118: a list, dict, set or tuple that pickles to 8 MiB or more, passed to calls or stored with `ch.put`, warns once per site that every reader unpickles a copy, unlike a NumPy array or Arrow table (`test_values.py`). CH119: a CUDA "no device" error in a call that asked for no GPU, on a machine with GPUs, gets a note saying how to ask for one (`test_defaults.py`, simulated). CH120: the same code sent as 100 distinct functions warns once to define it once; the digest cache is bounded at 1,024 functions (`test_defaults.py`). Also fixed: a `ch.put` handle returned by a call was forwarded like a call's future and never resolved; it is now stored as the value (`test_values.py`, which failed every time before) |
+| A result's separately stored buffers are freed, placed by and fetched with it | pass (Linux container) | On Linux a call's large arrays are linked from the arena into files of their own, and the outcome named only the frame (often a few inline bytes). Releasing a result freed nothing: a 1-node cloud run looping over fresh 256 MiB results filled the pool and killed the peer. Placement saw no large input either, so follow-input, large arguments and broadcast slowed at 16 and 64 nodes. Outcomes now list those files (`ObjectRef.blobs`, with sizes, the writer named as holder). Release deletes them here and on peers that copied them; placement counts them; a peer fetches them before the call; output sizes are learned with them. `test_values.py::test_large_results_released_mid_run_free_their_files` (eight 32 MiB results; "8 results still stored" when release skips them). `test_locality.py` result-locality test: 3/3, flaky before |
 | In-memory objects spill before their filesystem fills | pass (Linux container) | Objects also move to disk when their tmpfs has under a fifth free, not only past 80% of the pool (/dev/shm defaults to half of RAM, smaller than the pool). 3 peers, objects on a 700 MiB tmpfs, 25 rounds of a 64 MiB `ch.put` read by 24 calls: failed within 4–17 rounds before, 25 of 25 in three runs after (arena on and off) |
 | A full disk is named in the error | pass (local, unit) | `test_values.py::test_a_full_disk_is_named_in_the_error`; objects are now written natively (`chimaera-py/src/objects.rs`), which owns removing a partial file on failure |
 | A memory or CPU limit on a parent cgroup is honored | pass (unit) | `topology.rs::chain_tests`: the pool, CPU capacity and available memory take the tightest limit from the process's cgroup up to the root (systemd slices and some runtimes leave the process's own cgroup unlimited) |

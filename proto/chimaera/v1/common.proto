@@ -37,6 +37,9 @@ message ObjectRef {
   // Run that owns the bytes; a run's objects live under one directory and are
   // reclaimed together when the run expires.
   bytes run = 7;
+  // Files of this run that the frame refers to (a result's large buffers,
+  // stored apart from it): fetched, placed by and freed with the object.
+  repeated ObjectRef blobs = 8;
 }
 
 message ErrorRecord {

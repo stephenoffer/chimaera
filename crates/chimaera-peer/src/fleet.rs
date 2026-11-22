@@ -353,8 +353,8 @@ struct Shadow {
     waiting: Arc<Mutex<HashMap<Vec<u8>, oneshot::Sender<pb::Outcome>>>>,
 }
 
-/// A delegated call's outcome, with a large value's files: (object id,
-/// bytes), the value's own file last after the parts it lists (see parts).
+/// A delegated call's outcome, with its files: (object id, bytes), the
+/// buffers it links and the parts it lists first, the value's own file last.
 pub type Delegated = Result<(pb::Outcome, Vec<(Vec<u8>, Vec<u8>)>), Lost>;
 
 impl Link {
@@ -451,14 +451,22 @@ impl Link {
             Some(pb::outcome::Value::Err(e)) if e.kind() != pb::error_record::Kind::User => {
                 Err(Lost::Lost(format!("the other cell failed it: {}", e.message)))
             }
-            Some(pb::outcome::Value::Ok(obj)) if obj.inline_data.is_empty() => {
-                let bytes = fetch(&mut client, obj).await.map_err(Lost::Lost)?;
+            Some(pb::outcome::Value::Ok(obj)) => {
                 let mut files = Vec::new();
-                for id in crate::parts::ids(&bytes) {
-                    let part = pb::ObjectRef { object_id: id.clone(), size: 0, ..obj.clone() };
-                    files.push((id, fetch(&mut client, &part).await.map_err(Lost::Lost)?));
+                // Buffers stored apart from the value (arena-linked arrays), inline or not.
+                for b in &obj.blobs {
+                    let run = if b.run.is_empty() { obj.run.clone() } else { b.run.clone() };
+                    let blob = pb::ObjectRef { run, ..b.clone() };
+                    files.push((b.object_id.clone(), fetch(&mut client, &blob).await.map_err(Lost::Lost)?));
                 }
-                files.push((obj.object_id.clone(), bytes));
+                if obj.inline_data.is_empty() {
+                    let bytes = fetch(&mut client, obj).await.map_err(Lost::Lost)?;
+                    for id in crate::parts::ids(&bytes) {
+                        let part = pb::ObjectRef { object_id: id.clone(), size: 0, blobs: Vec::new(), ..obj.clone() };
+                        files.push((id, fetch(&mut client, &part).await.map_err(Lost::Lost)?));
+                    }
+                    files.push((obj.object_id.clone(), bytes));
+                }
                 Ok((outcome, files))
             }
             _ => Ok((outcome, Vec::new())),

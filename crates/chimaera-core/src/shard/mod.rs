@@ -94,6 +94,8 @@ pub enum Event {
     Subscribe {
         producer: Tk,
         subscriber_vshard: u16,
+        /// The subscriber's hold generation; 0 asks for the outcome only.
+        hold: u32,
     },
     Outbox {
         seq: u64,
@@ -108,7 +110,10 @@ pub enum Event {
     },
     ActorChanged(Id),
     /// A bounded CancelRun stopped early; propose it again.
-    CancelRunContinues(Id),
+    CancelRunContinues {
+        run: Id,
+        v: u16,
+    },
     /// A run and its tasks were deleted after retention; its objects can go.
     RunExpired(Id),
     /// A run stopped being active (finished or cancelled): its non-detached
@@ -202,6 +207,17 @@ fn max_attempts(rec: &pb::TaskRecord) -> u32 {
         0 => DEFAULT_MAX_ATTEMPTS,
         n => n,
     }
+}
+
+/// A remote producer's read count here and the generation of this vshard's hold on it.
+fn remote_pins(kv: &dyn KvRead, key: &[u8]) -> (u32, u32) {
+    kv.get(key).map_or((0, 0), |b| {
+        (u32::from_be_bytes(b[..4].try_into().expect("u32")), u32::from_be_bytes(b[4..8].try_into().expect("u32")))
+    })
+}
+
+fn load_u32(kv: &dyn KvRead, key: &[u8]) -> Option<u32> {
+    kv.get(key).map(|b| u32::from_be_bytes(b[..4].try_into().expect("u32")))
 }
 
 fn effects(rec: &pb::TaskRecord) -> pb::Effects {
@@ -324,6 +340,8 @@ impl ShardState {
             Body::StoreWrite(w) => reply(pb::shard_reply::Body::Store(store::write(cx, v, w))),
             Body::StoreRead(r) => reply(pb::shard_reply::Body::Store(store::read(cx.kv, v, r, cx.now))),
             Body::Charge(c) => self.charge(cx, v, c),
+            Body::Unsubscribe(s) => self.unsubscribe(cx, v, s),
+            Body::CancelChildren(c) => self.cancel_children(cx, v, c),
             Body::AdoptVshard(_) | Body::Retire(_) | Body::OutboxAck(_) | Body::Gc(_) => unreachable!(),
         }
     }
@@ -421,9 +439,12 @@ impl ShardState {
                 for prefix in [
                     keys::tasks_of_run(v, &run),
                     keys::pairs_of_run(v, keys::CHILD, &run),
+                    keys::pairs_of_run(v, keys::REMOTE_CHILD, &run),
                     keys::pairs_of_run(v, keys::FORWARD, &run),
                     keys::pairs_of_run(v, keys::BUDGET, &run),
                     keys::pairs_of_run(v, keys::DEPS_LEFT, &run),
+                    keys::pairs_of_run(v, keys::HELD, &run),
+                    keys::pairs_of_run(v, keys::REMOTE_PINS, &run),
                 ] {
                     for (k, _) in cx.kv.scan_prefix(&prefix, budget - deleted) {
                         cx.kv.delete(&k);
@@ -453,10 +474,14 @@ impl ShardState {
     fn run_create(&self, cx: &mut Cx, v: u16, c: &pb::RunCreate) -> pb::ShardReply {
         let Some(mut run) = c.run.clone() else { return rejected("missing run") };
         let Ok(id) = Id::from_slice(&run.run) else { return rejected("bad run id") };
-        if id.vshard() != v {
+        // A copy in another vshard of the run's spread admits the calls placed
+        // there; the submission key stays with the run's own record.
+        let copy = id.vshard() != v;
+        if copy && !run.spread.contains(&(v as u32)) {
             return rejected("run id routes to another vshard");
         }
-        if !run.submission_key.is_empty()
+        if !copy
+            && !run.submission_key.is_empty()
             && let Some(existing) = cx.kv.get(&keys::submission_key(v, &run.tenant, &run.submission_key))
             && let Some(r) =
                 Id::from_slice(&existing).ok().and_then(|e| load::<pb::RunRecord>(cx.kv, &keys::run(v, &e)))
@@ -471,7 +496,7 @@ impl ShardState {
         if run.retention_ms == 0 {
             run.retention_ms = DEFAULT_RUN_RETENTION_MS;
         }
-        if !run.submission_key.is_empty() {
+        if !copy && !run.submission_key.is_empty() {
             cx.kv.put(keys::submission_key(v, &run.tenant, &run.submission_key), id.to_vec());
         }
         store(cx.kv, keys::run(v, &id), &run);
@@ -517,7 +542,7 @@ impl ShardState {
             cancelled += 1;
         }
         if page.len() == CANCEL_BATCH && cancelled > 0 {
-            cx.events.push(Event::CancelRunContinues(id));
+            cx.events.push(Event::CancelRunContinues { run: id, v });
         }
         reply(pb::shard_reply::Body::Run(rec))
     }
@@ -554,7 +579,7 @@ impl ShardState {
                 acks.push(ack_rec(tk, Status::Duplicate, &rec));
                 continue;
             }
-            match load::<pb::RunRecord>(cx.kv, &keys::run(tk.run.vshard(), &tk.run)) {
+            match load::<pb::RunRecord>(cx.kv, &keys::run(v, &tk.run)) {
                 Some(r) if r.state() == pb::run_record::State::Active => {}
                 _ => {
                     let mut a = ack(&tk.pb(), Status::Rejected);
@@ -565,7 +590,7 @@ impl ShardState {
             }
             // One pin for the submitting client, plus one per dependent or
             // forwarder that arrived before this producer did.
-            let early = [keys::DEPENDENT, keys::FORWARD]
+            let early = [keys::DEPENDENT, keys::FORWARD, keys::HELD]
                 .iter()
                 .map(|tag| cx.kv.scan_prefix(&keys::of_producer(v, *tag, tk.pair()), usize::MAX).len() as u32)
                 .sum::<u32>();
@@ -579,14 +604,22 @@ impl ShardState {
             rec.set_state(TState::Pending);
             // Cancelling a call cancels what it submitted, including calls a
             // cancelled body submits afterwards (cancellation is cooperative).
-            let parent = spec.parent.as_ref().and_then(Tk::parse).filter(|p| p.v() == v);
+            let submitter = spec.parent.as_ref().and_then(Tk::parse);
+            let parent = submitter.filter(|p| p.v() == v);
             if let Some(p) = parent {
                 cx.kv.put(keys::pair(v, keys::CHILD, p.pair(), tk.pair()), Vec::new());
+            }
+            // A parent in another vshard (a spread call making an actor or
+            // generator call): its cancellation arrives as CancelChildren.
+            let remote = submitter.filter(|p| p.v() != v);
+            if let Some(p) = remote {
+                cx.kv.put(keys::pair(v, keys::REMOTE_CHILD, p.pair(), tk.pair()), Vec::new());
             }
             let mut failed_dep: Option<pb::Outcome> = parent
                 .and_then(|p| load::<pb::TaskRecord>(cx.kv, &p.key())?.outcome)
                 .and_then(|o| cancelled_kind(&o))
-                .map(|k| err_outcome(k, "the call that submitted this one was cancelled"));
+                .map(|k| err_outcome(k, "the call that submitted this one was cancelled"))
+                .or_else(|| remote.and_then(|p| load(cx.kv, &keys::of_producer(v, keys::REMOTE_CHILD, p.pair()))));
             let mut seen = std::collections::BTreeSet::new();
             for dep in &spec.deps {
                 let Some(d) = Tk::parse(dep) else {
@@ -612,7 +645,7 @@ impl ShardState {
                 }
                 if d.v() == v && cx.kv.get(&d.key()).is_none() {
                     // A producer here that is not submitted yet must belong to a live run.
-                    let live = load::<pb::RunRecord>(cx.kv, &keys::run(d.run.vshard(), &d.run))
+                    let live = load::<pb::RunRecord>(cx.kv, &keys::run(v, &d.run))
                         .is_some_and(|r| r.state() == pb::run_record::State::Active);
                     if !live {
                         failed_dep = Some(err_outcome(
@@ -624,9 +657,6 @@ impl ShardState {
                 }
                 cx.kv.put(keys::pair(v, keys::DEPENDENT, d.pair(), tk.pair()), Vec::new());
                 rec.deps_remaining += 1;
-                if d.v() != v {
-                    cx.events.push(Event::Subscribe { producer: d, subscriber_vshard: v });
-                }
             }
             if let Some(o) = failed_dep {
                 // complete() drops this task's dependency entries and pins.
@@ -1055,7 +1085,8 @@ impl ShardState {
         rec.forwarded_to = Some(f.pb());
         cx.kv.put(keys::pair(tk.v(), keys::FORWARD, f.pair(), tk.pair()), Vec::new());
         if f.v() != tk.v() {
-            cx.events.push(Event::Subscribe { producer: f, subscriber_vshard: tk.v() });
+            // The forwarded outcome only: no hold (a forward keeps no reader).
+            cx.events.push(Event::Subscribe { producer: f, subscriber_vshard: tk.v(), hold: 0 });
         }
         store(cx.kv, tk.key(), &rec);
         ack_rec(tk, Status::Published, &rec)
@@ -1080,19 +1111,51 @@ impl ShardState {
         let msg = if c.message.is_empty() { "cancelled".to_string() } else { c.message.clone() };
         let rec = self.finish(cx, tk, rec, err_outcome(kind, msg));
         // Then everything it submitted, transitively, that has not finished.
-        let mut parents = vec![tk];
+        let why = format!("the call that submitted it ({}) was cancelled", tk.task.hex());
+        let (mut parents, mut visited) = (vec![tk], Vec::new());
         while let Some(p) = parents.pop() {
+            visited.push(p.pb());
             for (ckey, _) in cx.kv.scan_prefix(&keys::of_producer(v, keys::CHILD, p.pair()), usize::MAX) {
                 let (run, task) = keys::trailing_pair(&ckey);
                 let child = Tk { run, task };
                 parents.push(child);
                 if let Some(crec) = load::<pb::TaskRecord>(cx.kv, &child.key()).filter(|r| r.state() != TState::Done) {
-                    let why = format!("the call that submitted it ({}) was cancelled", tk.task.hex());
-                    self.finish(cx, child, crec, err_outcome(kind, why));
+                    self.finish(cx, child, crec, err_outcome(kind, why.clone()));
                 }
             }
         }
+        // Their actor and generator calls live in the run's own vshard when
+        // these were spread elsewhere.
+        let home = tk.run.vshard();
+        if home != v {
+            let cancel = pb::CancelChildren { parents: visited, reason: kind as i32, message: why };
+            self.append_entry(cx, home, None, None, Some(cancel));
+        }
         single(ack_rec(tk, Status::Accepted, &rec))
+    }
+
+    /// Cancel the calls here that cancelled calls in another vshard submitted,
+    /// and keep each cancellation, so a call a cancelled body submits later
+    /// fails at once. Sent through the outbox: it may arrive more than once.
+    fn cancel_children(&self, cx: &mut Cx, v: u16, c: &pb::CancelChildren) -> pb::ShardReply {
+        let kind = match c.reason() {
+            k @ (Kind::Deadline | Kind::ActorDied | Kind::Infeasible | Kind::Oom | Kind::Budget) => k,
+            _ => Kind::Cancelled,
+        };
+        for p in c.parents.iter().filter_map(Tk::parse) {
+            let mark = keys::of_producer(v, keys::REMOTE_CHILD, p.pair());
+            store(cx.kv, mark.clone(), &err_outcome(kind, c.message.clone()));
+            for (ckey, _) in cx.kv.scan_prefix(&mark, usize::MAX) {
+                if ckey.len() == mark.len() {
+                    continue; // the cancellation itself
+                }
+                let (run, task) = keys::trailing_pair(&ckey);
+                let cancel =
+                    pb::Cancel { task: Some(Tk { run, task }.pb()), reason: kind as i32, message: c.message.clone() };
+                self.cancel(cx, v, &cancel);
+            }
+        }
+        reply(pb::shard_reply::Body::Tasks(pb::TaskAcks::default()))
     }
 
     /// Add usage to a budgeted call's totals. Past a limit, cancel the call
@@ -1135,6 +1198,15 @@ impl ShardState {
     /// pinned through their own vshard's subscription.
     fn pin(&self, cx: &mut Cx, v: u16, producer: Tk) {
         if producer.v() != v {
+            // Held in its own vshard once per subscribing vshard, while calls
+            // here still read it: a new hold (and generation) subscribes.
+            let key = keys::of_producer(v, keys::REMOTE_PINS, producer.pair());
+            let (n, hold) = remote_pins(cx.kv, &key);
+            let hold = if n == 0 { hold + 1 } else { hold };
+            cx.kv.put(key, [(n + 1).to_be_bytes(), hold.to_be_bytes()].concat());
+            if n == 0 {
+                cx.events.push(Event::Subscribe { producer, subscriber_vshard: v, hold });
+            }
             return;
         }
         if let Some(mut p) = load::<pb::TaskRecord>(cx.kv, &producer.key()) {
@@ -1182,9 +1254,40 @@ impl ShardState {
             cx.kv.delete(&keys::pair(tk.v(), keys::DEPENDENT, d.pair(), tk.pair()));
             if d.v() == tk.v() {
                 self.unpin(cx, d);
+            } else {
+                self.unpin_remote(cx, tk.v(), d);
             }
         }
         rec
+    }
+
+    /// One fewer call in `v` reads the remote `producer`; the last one
+    /// releases this vshard's hold on it.
+    fn unpin_remote(&self, cx: &mut Cx, v: u16, producer: Tk) {
+        let key = keys::of_producer(v, keys::REMOTE_PINS, producer.pair());
+        let (n, hold) = remote_pins(cx.kv, &key);
+        if n == 0 {
+            return;
+        }
+        cx.kv.put(key, [(n - 1).to_be_bytes(), hold.to_be_bytes()].concat());
+        if n == 1 {
+            let release = pb::Subscribe { producer: Some(producer.pb()), subscriber_vshard: v as u32, hold };
+            self.append_entry(cx, producer.v(), None, Some(release), None);
+        }
+    }
+
+    /// Release a subscribing vshard's hold, unless it took a newer one since.
+    fn unsubscribe(&self, cx: &mut Cx, v: u16, s: &pb::Subscribe) -> pb::ShardReply {
+        let Some(p) = s.producer.as_ref().and_then(Tk::parse).filter(|t| t.v() == v) else {
+            return rejected("producer routes to another vshard");
+        };
+        let held = keys::held(v, p.pair(), s.subscriber_vshard as u16);
+        let released = load_u32(cx.kv, &held) == Some(s.hold);
+        if released {
+            cx.kv.delete(&held);
+            self.unpin(cx, p);
+        }
+        reply(pb::shard_reply::Body::Count(u64::from(released)))
     }
 
     /// Propagate `outcome` of `producer` to dependents recorded in vshard `v`
@@ -1254,10 +1357,21 @@ impl ShardState {
     }
 
     fn append_outbox(&self, cx: &mut Cx, target_vshard: u16, notify: pb::DepNotify) {
+        self.append_entry(cx, target_vshard, Some(notify), None, None);
+    }
+
+    fn append_entry(
+        &self,
+        cx: &mut Cx,
+        target_vshard: u16,
+        notify: Option<pb::DepNotify>,
+        unsubscribe: Option<pb::Subscribe>,
+        cancel_children: Option<pb::CancelChildren>,
+    ) {
         let seq_key = keys::meta(keys::META_OUTBOX_SEQ);
         let seq = load_u64(cx.kv, &seq_key) + 1;
         cx.kv.put(seq_key, seq.to_be_bytes().to_vec());
-        let entry = pb::OutboxEntry { seq, target_vshard: target_vshard as u32, notify: Some(notify) };
+        let entry = pb::OutboxEntry { seq, target_vshard: target_vshard as u32, notify, unsubscribe, cancel_children };
         store(cx.kv, keys::outbox(seq), &entry);
         cx.events.push(Event::Outbox { seq, target_vshard });
     }
@@ -1269,6 +1383,21 @@ impl ShardState {
             return single(ack(&key, Status::Rejected));
         };
         let sub_v = s.subscriber_vshard as u16;
+        // The subscriber's hold pins the producer once, however many replicas
+        // send it; a later generation replaces an older one in place.
+        let held = keys::held(v, p.pair(), sub_v);
+        match load_u32(cx.kv, &held).filter(|_| s.hold > 0) {
+            None if s.hold == 0 => {}
+            None => {
+                cx.kv.put(held, s.hold.to_be_bytes().to_vec());
+                if let Some(mut rec) = load::<pb::TaskRecord>(cx.kv, &p.key()) {
+                    rec.pins += 1;
+                    store(cx.kv, p.key(), &rec);
+                }
+            }
+            Some(g) if g < s.hold => cx.kv.put(held, s.hold.to_be_bytes().to_vec()),
+            Some(_) => {}
+        }
         match load::<pb::TaskRecord>(cx.kv, &p.key()) {
             Some(rec) if rec.state() == TState::Done => {
                 let o = rec.outcome.clone().unwrap_or_default();
@@ -1280,7 +1409,7 @@ impl ShardState {
                 single(ack_rec(p, Status::Accepted, &rec))
             }
             None => {
-                let live = load::<pb::RunRecord>(cx.kv, &keys::run(p.run.vshard(), &p.run))
+                let live = load::<pb::RunRecord>(cx.kv, &keys::run(v, &p.run))
                     .is_some_and(|r| r.state() == pb::run_record::State::Active);
                 if live {
                     cx.kv.put(keys::subscriber(v, p.pair(), sub_v), Vec::new());
@@ -1351,25 +1480,33 @@ pub mod read {
     }
 
     pub fn run(kv: &dyn KvRead, run: Id) -> Option<pb::RunRecord> {
-        load(kv, &keys::run(run.vshard(), &run))
+        run_in(kv, run.vshard(), run)
     }
 
-    /// The run records `vshard` holds, at most `limit`.
+    /// The run's record as `vshard` holds it: its own, or the copy a vshard of
+    /// its spread keeps.
+    pub fn run_in(kv: &dyn KvRead, vshard: u16, run: Id) -> Option<pb::RunRecord> {
+        load(kv, &keys::run(vshard, &run))
+    }
+
+    /// The runs whose own record `vshard` holds (not copies), at most `limit`.
     pub fn runs(kv: &dyn KvRead, vshard: u16, limit: usize) -> Vec<pb::RunRecord> {
         let mut prefix = vshard.to_be_bytes().to_vec();
         prefix.push(keys::RUN);
         kv.scan_prefix(&prefix, limit)
             .into_iter()
-            .filter(|(k, _)| k.len() == 3 + 16)
+            .filter(|(k, _)| k.len() == 3 + 16 && Id::from_slice(&k[3..]).is_ok_and(|id| id.vshard() == vshard))
             .map(|(_, v)| pb::RunRecord::decode(v.as_slice()).expect("shard state is corrupt"))
             .collect()
     }
 
     /// One page of a run's tasks after the task id `after` (exclusive; empty =
-    /// from the start), in task-id order.
+    /// from the start), in task-id order, from the vshard `after` names (the
+    /// run's own without one). [`page_start`] begins another vshard of its spread.
     pub fn tasks_page(kv: &dyn KvRead, run: Id, after: Option<Id>, limit: usize) -> Vec<(Tk, pb::TaskRecord)> {
-        let prefix = keys::tasks_of_run(run.vshard(), &run);
-        let after_key = after.map(|t| keys::task(run.vshard(), &run, &t)).unwrap_or_default();
+        let v = after.map_or(run.vshard(), |a| a.vshard());
+        let prefix = keys::tasks_of_run(v, &run);
+        let after_key = after.map(|t| keys::task(v, &run, &t)).unwrap_or_default();
         kv.scan_after(&prefix, &after_key, limit)
             .into_iter()
             .map(|(k, v)| {
@@ -1379,9 +1516,18 @@ pub mod read {
             .collect()
     }
 
-    /// Task records of one run, in key order, at most `limit`.
-    pub fn tasks_of_run(kv: &dyn KvRead, run: Id, limit: usize) -> Vec<pb::TaskRecord> {
-        kv.scan_prefix(&keys::tasks_of_run(run.vshard(), &run), limit)
+    /// A cursor for [`tasks_page`] that starts at the first task of `run` in
+    /// `vshard`: below every task id there (ids lead with cell and vshard).
+    pub fn page_start(run: Id, vshard: u16) -> Id {
+        let mut b = [0u8; 16];
+        b[0..2].copy_from_slice(&run.cell().to_be_bytes());
+        b[2..4].copy_from_slice(&vshard.to_be_bytes());
+        Id(b)
+    }
+
+    /// Task records of one run in `vshard`, in key order, at most `limit`.
+    pub fn tasks_of_run(kv: &dyn KvRead, vshard: u16, run: Id, limit: usize) -> Vec<pb::TaskRecord> {
+        kv.scan_prefix(&keys::tasks_of_run(vshard, &run), limit)
             .into_iter()
             .map(|(_, v)| pb::TaskRecord::decode(v.as_slice()).expect("shard state is corrupt"))
             .collect()
@@ -1389,6 +1535,17 @@ pub mod read {
 
     pub fn actor(kv: &dyn KvRead, actor: Id) -> Option<pb::ActorRecord> {
         load(kv, &keys::actor(actor.vshard(), &actor))
+    }
+
+    /// The actor records `vshard` holds, at most `limit`.
+    pub fn actor_records(kv: &dyn KvRead, vshard: u16, limit: usize) -> Vec<pb::ActorRecord> {
+        let mut prefix = vshard.to_be_bytes().to_vec();
+        prefix.push(keys::ACTOR);
+        kv.scan_prefix(&prefix, limit)
+            .into_iter()
+            .filter(|(k, _)| k.len() == 3 + 16)
+            .map(|(_, v)| pb::ActorRecord::decode(v.as_slice()).expect("shard state is corrupt"))
+            .collect()
     }
 
     /// Ids of the actors whose records live in `vshard`.
@@ -1437,6 +1594,10 @@ pub mod read {
                 Some((Tk { run, task }, attempt, (peer, inc)))
             })
             .collect()
+    }
+
+    pub fn outbox_entry(kv: &dyn KvRead, seq: u64) -> Option<pb::OutboxEntry> {
+        load(kv, &keys::outbox(seq))
     }
 
     pub fn outbox(kv: &dyn KvRead, limit: usize) -> Vec<pb::OutboxEntry> {

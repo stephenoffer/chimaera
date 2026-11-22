@@ -183,13 +183,21 @@ def _use_locked_env(project: str, envs: str) -> None:
             uv = shutil.which("uv")
             if uv is None:
                 raise RuntimeError("the project has a uv.lock, but uv is not on this peer's PATH: install uv on the peers")
-            done = subprocess.run(
-                [uv, "sync", "--frozen", "--no-install-project", "--python", sys.executable],
-                cwd=project,
-                env={**os.environ, "UV_PROJECT_ENVIRONMENT": env},
-                capture_output=True,
-                text=True,
-            )
+            limit = float(os.environ.get("CHIMAERA_ENV_BUILD_TIMEOUT", "900"))
+            try:
+                done = subprocess.run(
+                    [uv, "sync", "--frozen", "--no-install-project", "--python", sys.executable],
+                    cwd=project,
+                    env={**os.environ, "UV_PROJECT_ENVIRONMENT": env},
+                    capture_output=True,
+                    text=True,
+                    timeout=limit,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    f"installing the project's uv.lock on this peer took over {limit:g} s; "
+                    "raise CHIMAERA_ENV_BUILD_TIMEOUT on the peers if it needs longer"
+                ) from None
             if done.returncode != 0:
                 raise RuntimeError(f"installing the project's uv.lock on this peer failed:\n{done.stderr[-2000:]}")
             open(os.path.join(env, ".chimaera-ready"), "w").close()

@@ -422,14 +422,15 @@ fn is_object_name(name: &str) -> bool {
 /// inotify as they appear in the store: renamed into place from a writer's
 /// `.tmp` name, or hard-linked from a NumPy arena. Copies fetched from other
 /// peers (`.part` names) and spills are not replicated again. The copy lags
-/// the write by one transfer. `CHIMAERA_OBJECT_REPLICAS=0` turns this off.
+/// the write by one transfer. `CHIMAERA_OBJECT_REPLICAS=N` keeps N copies on
+/// the next N peers (default 1); 0 turns this off.
 #[cfg(target_os = "linux")]
 pub fn replicate_new_objects(
     objects: PathBuf,
     mesh: std::sync::Arc<crate::mesh::MeshClient>,
     rt: tokio::runtime::Handle,
 ) {
-    if std::env::var("CHIMAERA_OBJECT_REPLICAS").as_deref() == Ok("0") {
+    if replica_count() == 0 {
         return;
     }
     let _ = std::thread::Builder::new().name("chimaera-replicas".into()).spawn(move || {
@@ -552,24 +553,37 @@ fn replicate_one(
         return;
     };
     let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else { return };
-    let Some(node) = mesh.successor() else { return };
+    let nodes = mesh.successors(replica_count());
+    if nodes.is_empty() {
+        return;
+    }
     let mesh = mesh.clone();
     rt.spawn(async move {
         tokio::time::sleep(REPLICA_DELAY).await;
-        // At most REPLICAS_AT_ONCE copies in flight; the rest wait their turn.
+        // At most REPLICAS_AT_ONCE objects being copied; the rest wait their turn.
         let Ok(_turn) = replica_turns().acquire().await else { return };
-        if mesh.was_served(&object) || tokio::fs::metadata(&path).await.is_err() {
+        if tokio::fs::metadata(&path).await.is_err() {
             return;
         }
-        if let Err(e) = mesh.replicate(node, &run, &object, size, true).await {
-            crate::counters::REPLICATION_FAILURES.add(1);
-            tracing::warn!("no replica of {} on node {node}: {e}", path.display());
+        // A peer that fetched it already holds one copy.
+        let want = nodes.len() - usize::from(mesh.was_served(&object));
+        for &node in &nodes[..want] {
+            if let Err(e) = mesh.replicate(node, &run, &object, size, true).await {
+                crate::counters::REPLICATION_FAILURES.add(1);
+                tracing::warn!("no replica of {} on node {node}: {e}", path.display());
+            }
         }
     });
 }
 
-/// Replicas being copied at once, from one peer.
+/// Copies of each object on other peers (`CHIMAERA_OBJECT_REPLICAS`, default
+/// 1; 0 turns replicas off), on the next peers round the ring.
 #[cfg(target_os = "linux")]
+fn replica_count() -> usize {
+    std::env::var("CHIMAERA_OBJECT_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
+}
+
+/// Replicas being copied at once, from one peer.
 const REPLICAS_AT_ONCE: usize = 8;
 
 #[cfg(target_os = "linux")]
@@ -578,12 +592,71 @@ fn replica_turns() -> &'static tokio::sync::Semaphore {
     TURNS.get_or_init(|| tokio::sync::Semaphore::new(REPLICAS_AT_ONCE))
 }
 
-#[cfg(target_os = "linux")]
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     s.len()
         .is_multiple_of(2)
         .then(|| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect())
         .flatten()
+}
+
+/// Before this peer leaves (a drain): give every object it holds a copy on
+/// its ring successor, the next live peer that is not draining, which is
+/// where readers look once a holder is gone. Each copy is waited for, eight
+/// at a time, until `deadline`. A successor that already has an object
+/// answers at once. Returns (objects with a copy there, objects left behind).
+pub async fn hand_off(
+    objects: &crate::stores::ObjectStore,
+    mesh: &std::sync::Arc<crate::mesh::MeshClient>,
+    deadline: std::time::Instant,
+) -> (u64, u64) {
+    let held = held_objects(objects.dir());
+    let total = held.len() as u64;
+    let Some(node) = mesh.successor() else {
+        if total > 0 {
+            tracing::warn!("drain: no live peer to hand {total} objects to; they leave with this peer");
+        }
+        return (0, total);
+    };
+    let turns = std::sync::Arc::new(tokio::sync::Semaphore::new(REPLICAS_AT_ONCE));
+    let mut copies = tokio::task::JoinSet::new();
+    for (run, object, size) in held {
+        let (mesh, turns) = (mesh.clone(), turns.clone());
+        copies.spawn(async move {
+            let _turn = turns.acquire_owned().await.ok()?;
+            let left = deadline.checked_duration_since(std::time::Instant::now())?;
+            tokio::time::timeout(left, mesh.replicate(node, &run, &object, size, true)).await.ok()?.ok()
+        });
+    }
+    let mut copied = 0;
+    while let Some(r) = copies.join_next().await {
+        copied += u64::from(matches!(r, Ok(Some(()))));
+    }
+    if copied < total {
+        tracing::warn!(
+            "drain: {} of {total} objects have no copy on node {node} (out of time, or the copy failed)",
+            total - copied
+        );
+    }
+    (copied, total - copied)
+}
+
+/// (run, object id, size) of every complete object in the store at `dir`:
+/// in memory or spilled (a link to the disk copy), not partial files or the
+/// plane's own directories.
+fn held_objects(dir: &Path) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+    let mut out = Vec::new();
+    for run in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some(run_id) = decode_hex(&run.file_name().to_string_lossy()) else { continue };
+        for e in std::fs::read_dir(run.path()).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !is_object_name(&name) {
+                continue;
+            }
+            let Ok(m) = std::fs::metadata(e.path()) else { continue }; // follows a spilled object's link
+            out.push((run_id.clone(), decode_hex(&name).expect("checked"), m.len()));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -602,6 +675,22 @@ mod tests {
         assert!(d.path().join(".arena").join(&me).exists(), "a live process keeps its arena");
         assert!(!d.path().join(".arena/999999999").exists());
         assert!(d.path().join(".arena/not-a-pid").exists(), "unknown names are left alone");
+    }
+
+    #[test]
+    fn a_drain_hands_off_complete_objects_in_memory_and_spilled() {
+        let (d, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let run = d.path().join("ab".repeat(16));
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("11".repeat(16)), vec![1u8; 300]).unwrap();
+        std::fs::write(disk.path().join("spilled"), vec![2u8; 500]).unwrap();
+        std::os::unix::fs::symlink(disk.path().join("spilled"), run.join("22".repeat(16))).unwrap();
+        std::fs::write(run.join(format!("{}.part-0", "33".repeat(16))), b"partial").unwrap();
+        std::fs::create_dir_all(d.path().join(".arena/1")).unwrap();
+        std::fs::write(d.path().join(".arena/1/0"), b"arena").unwrap();
+        let mut held = held_objects(d.path());
+        held.sort();
+        assert_eq!(held, vec![(vec![0xab; 16], vec![0x11; 16], 300), (vec![0xab; 16], vec![0x22; 16], 500)]);
     }
 
     #[test]

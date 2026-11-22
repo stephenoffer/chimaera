@@ -21,6 +21,11 @@ def size_and_tail(b: bytes) -> tuple[int, bytes]:
     return len(b), bytes(b[-16:])
 
 
+@ch.remote
+def length_and_last(s: str) -> tuple[int, str]:
+    return len(s), s[-1]
+
+
 def _arena() -> bool:
     """Whether this process has the arena, checked against where it must."""
     ch.put(0)  # starts the runtime, which installs the arena where it can
@@ -54,6 +59,20 @@ def test_a_large_bytes_value_is_stored_by_link_again_and_again():
         assert _native.arena_stats()[3] == claims + 2, "both puts linked the bytes instead of copying them"
     assert ch.get(f) == b and ch.get(g) == b
     assert size_and_tail.remote(f).result(timeout=60) == (len(b), b[-16:])
+
+
+def test_a_large_str_is_encoded_once_and_comes_back_exactly():
+    from chimaera import _serde
+
+    arena = _arena()
+    s = "é" * (1 << 20) + "ascii" + "\ud800"  # 2 MiB of UTF-8, and a lone surrogate pickle allows
+    assert _serde.dumps_parts(s)[2] == 1, "the encoded string travels out of band, not in the pickle"
+    claims = _native.arena_stats()[3]
+    f = ch.put(s)
+    if arena:
+        assert _native.arena_stats()[3] == claims + 1, "the encoded bytes were linked, not copied again"
+    assert ch.get(f) == s
+    assert length_and_last.remote(s).result(timeout=60) == (len(s), "\ud800")
 
 
 def test_a_large_buffer_keeps_its_contents_as_it_grows_and_shrinks():

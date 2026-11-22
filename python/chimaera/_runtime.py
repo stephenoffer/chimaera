@@ -28,9 +28,13 @@ from typing import Any, Callable
 
 from . import _cluster, _context, _objects, _project, _serde, _values
 from ._errors import ChimaeraError, DataLost, Infeasible, QuorumLost, SerializationError, WorkflowDivergence
-from ._native import Client, blake3_digest, child_id, socket_path
+from ._native import Client, blake3_digest, child_id, derive_id, socket_path, vshard_of
 
 VERSION = "0.1.0"
+# Functions whose code digest is remembered (newest kept).
+CODE_CACHE_MAX = 1024
+# CH120: the same code sent as this many distinct functions.
+REWRAP_WARN_CALLS = 100
 CALL_FUNCTION, CALL_ACTOR_CTOR, CALL_ACTOR_METHOD, CALL_MAP_ITEM = 0, 1, 2, 3
 EFFECTS_CODE = {"none": 0, "idempotent": 1, "external": 2}
 # Items a generator call may run ahead of its consumer (unless max_in_flight says).
@@ -173,7 +177,10 @@ def read_object(object_dir: str, run: bytes, obj: bytes) -> Any:
     except FileNotFoundError as e:
         # The peer that held it is gone (or freed it); nothing rebuilds it.
         raise DataLost(f"value {obj.hex()} of run {run.hex()} is no longer stored on any live peer") from e
-    return _serde.read_file(path)
+    try:
+        return _serde.read_file(path)
+    except FileNotFoundError as e:  # a part or buffer it links, stored apart from it
+        raise DataLost(f"part of value {obj.hex()} of run {run.hex()} is no longer stored on any live peer") from e
 
 
 # Client variables every run ships to its executors: locale and hashing only.
@@ -181,6 +188,11 @@ def read_object(object_dir: str, run: bytes, obj: bytes) -> Any:
 # client unless named in CHIMAERA_ENV_PASSTHROUGH or passed to ch.init(env=...);
 # executors otherwise see their own peer's environment. The run's variables
 # are replicated with the run record, so they must not carry secrets.
+# Calls a second a driver submits before its calls spread over the run's
+# groups: below it one group commits them easily, and keeping a DAG in one
+# group saves the notices between groups that its dependencies would need.
+SPREAD_RATE = float(os.environ.get("CHIMAERA_SPREAD_RATE", "2000"))
+
 DEFAULT_PASSTHROUGH = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "PYTHONHASHSEED")
 
 
@@ -323,7 +335,11 @@ class Runtime:
         self._reads: dict[bytes, list[Any]] = {}
         self._streams: weakref.WeakValueDictionary[bytes, Any] = weakref.WeakValueDictionary()
         self.cond = threading.Condition()
-        self._code: dict[int, tuple[Any, bytes]] = {}
+        # id(callable) -> (callable, digest), newest last; bounded, since a
+        # program wrapping a fresh lambda per call would keep every one.
+        self._code: collections.OrderedDict[int, tuple[Any, bytes]] = collections.OrderedDict()
+        # CH120: code object -> how many distinct functions of it were sent.
+        self._rewraps: collections.Counter[Any] = collections.Counter()
         self._registered: set[bytes] = set()
         self._seq = itertools.count()
         self._nonce = os.urandom(8)
@@ -342,6 +358,11 @@ class Runtime:
         self._room_warned: set[str | None] = set()
         self._releases: list[bytes] = []
         self.run: bytes | None = None
+        # Vshards (in different groups) the run's calls are spread over; empty
+        # on a single peer, for a keyed run, or after attaching to a run.
+        self._spread: list[int] = []
+        # Submission rate over 250 ms windows (see SPREAD_RATE).
+        self._rate, self._rate_n, self._rate_t0 = 0.0, 0, time.monotonic()
         self.detached = False
         if not self.in_executor:
             want_detached = detached if detached is not None else os.environ.get("CHIMAERA_DETACH") == "1"
@@ -361,7 +382,7 @@ class Runtime:
             if project is not None:
                 ship[_project.ENV] = project[0].hex()
             try:
-                self.run, self.detached = self.client.create_run(
+                self.run, self.detached, self._spread = self.client.create_run(
                     self.tenant,
                     "",
                     want_detached,
@@ -387,23 +408,55 @@ class Runtime:
 
     # ---- submission -------------------------------------------------------
 
-    def new_key(self) -> bytes:
+    def new_key(self, spread: bool = False, deps: list[bytes] | tuple[bytes, ...] = ()) -> bytes:
         """Deterministic task key: a call inside a task derives from its parent
-        and sequence number, so a retried parent re-submits the same children."""
+        and sequence number, so a retried parent re-submits the same children.
+
+        `spread` (plain function calls): a child stays in its parent's
+        vshard, so its group commits the whole subtree and cancelling or
+        budgeting the parent reaches it; a driver's call goes to a vshard of the
+        run's spread: its inputs' when they share one, the run's own when
+        they do not, and while the driver submits faster than SPREAD_RATE the
+        next by sequence number, so a large run is committed by several group
+        leaders. Actor and generator calls stay in the run's own vshard, with
+        the actors whose events place them."""
         ctx = _context.current_task()
         if ctx is not None:
-            run = ctx.run
-            task = child_id(run, [ctx.task, b"child", ctx.next_child().to_bytes(8, "little")])
+            run, seq = ctx.run, ctx.next_child().to_bytes(8, "little")
+            if spread:
+                return run + child_id(ctx.task, [run, b"child", seq])
+            return run + child_id(run, [ctx.task, b"child", seq])
+        if self.run is None:
+            raise ChimaeraError("no run: submit from a driver or from inside a task")
+        run, seq = self.run, next(self._seq)
+        parts = [self._nonce, seq.to_bytes(8, "little")]
+        if not (spread and self._spread):
+            return run + child_id(run, parts)
+        homes = {vshard_of(d[16:]) if d[:16] == run else -1 for d in deps}
+        only = next(iter(homes)) if len(homes) == 1 else -1
+        if only in self._spread:
+            v = only
+        elif deps or not self._submitting_fast():
+            # Inputs from several vshards: the run's own collects their notices
+            # (spreading such calls would multiply the notices between groups).
+            return run + child_id(run, parts)
         else:
-            if self.run is None:
-                raise ChimaeraError("no run: submit from a driver or from inside a task")
-            run = self.run
-            task = child_id(run, [self._nonce, next(self._seq).to_bytes(8, "little")])
-        return run + task
+            v = self._spread[seq % len(self._spread)]
+        return run + derive_id(int.from_bytes(run[:2], "big"), v, [run, *parts])
+
+    def _submitting_fast(self) -> bool:
+        """Whether this driver submits faster than SPREAD_RATE: the last full
+        250 ms window's rate, or the current window's count already."""
+        now = time.monotonic()
+        if now - self._rate_t0 >= 0.25:
+            self._rate, self._rate_n, self._rate_t0 = self._rate_n / (now - self._rate_t0), 0, now
+        self._rate_n += 1
+        return self._rate >= SPREAD_RATE or self._rate_n >= SPREAD_RATE / 4
 
     def code_digest(self, obj: Any) -> bytes:
         cached = self._code.get(id(obj))
         if cached is not None and cached[0] is obj:
+            self._code.move_to_end(id(obj))
             return cached[1]
         preflight_captures(obj)
         blob = _serde.dump_code(obj)
@@ -412,7 +465,29 @@ class Runtime:
             self.client.put_code(digest, blob)
             self._registered.add(digest)
         self._code[id(obj)] = (obj, digest)
+        if len(self._code) > CODE_CACHE_MAX:
+            self._code.popitem(last=False)
+        self._note_rewrap(obj)
         return digest
+
+    def _note_rewrap(self, obj: Any) -> None:
+        """CH120: the same code wrapped as a new function again and again
+        (ch.remote(lambda ...) inside a loop). Each new function is pickled
+        and hashed on its first call, about 0.3 ms, 6x the cost of a call
+        through a function defined once."""
+        code = getattr(obj, "__code__", None)
+        if code is None:
+            return
+        self._rewraps[code] += 1
+        if self._rewraps[code] == REWRAP_WARN_CALLS:
+            warnings.warn(
+                f"CH120: {getattr(obj, '__qualname__', 'a function')} ({code.co_filename}:{code.co_firstlineno}) "
+                f"was sent as a new function {REWRAP_WARN_CALLS} times, each pickled and hashed again. Define the "
+                "remote function once, outside the loop, and call it many times.",
+                stacklevel=5,
+            )
+        if len(self._rewraps) > CODE_CACHE_MAX:
+            self._rewraps = collections.Counter(dict(self._rewraps.most_common(CODE_CACHE_MAX // 2)))
 
     def _connect_local(self, client_name: str) -> Client:
         socket = os.environ.get("CHIMAERA_PEER_SOCKET") if self.in_executor else None
@@ -453,6 +528,8 @@ class Runtime:
             else:
                 holds.append(hold)
         _values.repeats.note(site, enc)
+        if enc.collection is not None:
+            _values.collection_lint.note(site, *enc.collection)
         packed = {
             "args_size": enc.size,
             "args_oob": enc.oob,
@@ -609,6 +686,10 @@ class Runtime:
                     if box is not None:
                         box.append(ev)
                         changed = True
+            # Drop this batch's last future and stream before blocking for the
+            # next: held here, a dropped future would outlive the program's
+            # last reference (and keep its result and its call's inputs).
+            f = s = None
             if changed:
                 with self.cond:
                     self.cond.notify_all()

@@ -106,6 +106,10 @@ message RunRecord {
   ExecEnvSpec exec_env = 13;
   // The peer the run was created on: where its driver listens for output.
   PeerInc home = 14;
+  // Vshards holding a copy of this record, the run's own first. A run's
+  // top-level calls are spread over them (in different groups), so no single
+  // group leader commits every call of a large run. Empty: only the run's own.
+  repeated uint32 spread = 15;
 }
 
 message ActorSpec {
@@ -124,6 +128,9 @@ message ActorSpec {
   uint32 max_restarts = 8;
   bytes policy = 9;
   bool detached = 10;
+  // An unnamed actor's id is its creating run's child ("actor", nonce), so no
+  // such id is ever another's (a named actor's comes from tenant and name).
+  bytes nonce = 11;
 }
 
 message ActorRecord {
@@ -190,6 +197,10 @@ message ShardCmd {
     StoreWrite store_write = 31;
     StoreRead store_read = 32;
     Charge charge = 33;
+    // A subscribing vshard no longer reads the producer (sent through the outbox).
+    Subscribe unsubscribe = 34;
+    // Calls here that cancelled calls in another vshard submitted (sent through the outbox).
+    CancelChildren cancel_children = 35;
   }
 }
 
@@ -257,6 +268,16 @@ message Cancel {
   string message = 3;
 }
 
+// Cancelled calls whose children may live in the run's own vshard: actor and
+// generator calls a call makes stay there when the call itself was spread to
+// another vshard. That vshard cancels them, and remembers the cancellation so
+// calls a cancelled body submits afterwards fail at once.
+message CancelChildren {
+  repeated TaskKey parents = 1;
+  ErrorRecord.Kind reason = 2;
+  string message = 3;
+}
+
 // Usage charged to a budgeted call (the root) by the peers running it or
 // calls made inside it. Past a limit the shard cancels the root and
 // everything it submitted, with kind BUDGET. The limits travel with each
@@ -278,6 +299,9 @@ message CancelRun {
 message Subscribe {
   TaskKey producer = 1;
   uint32 subscriber_vshard = 2;
+  // Which of the subscriber's holds this is: an Unsubscribe for an older one
+  // than the producer last saw is stale.
+  uint32 hold = 3;
 }
 
 message DepNotify {
@@ -412,6 +436,10 @@ message OutboxEntry {
   uint64 seq = 1;
   uint32 target_vshard = 2;
   DepNotify notify = 3;
+  // Set instead of notify: release the subscriber's hold on a producer.
+  Subscribe unsubscribe = 4;
+  // Set instead of notify: cancel the calls cancelled calls submitted there.
+  CancelChildren cancel_children = 5;
 }
 
 // Ownership of one virtual shard by this group.

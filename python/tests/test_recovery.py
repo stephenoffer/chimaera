@@ -258,6 +258,37 @@ def test_a_run_ships_only_allowlisted_environment_variables():
     assert r.stdout.strip() == "[None, 'yes', '1', 'C.UTF-8']"
 
 
+def test_a_call_never_sees_the_peers_cluster_token():
+    # A call is a tenant's code: with the token it could act as an administrator.
+    home = tempfile.mkdtemp(prefix="cht", dir="/tmp")
+    log = open(os.path.join(home, "peer.log"), "ab")
+    env = dict(os.environ, CHIMAERA_CLUSTER_TOKEN="t" * 32, CHIMAERA_TOKEN="d" * 32)
+    peer = subprocess.Popen([BIN, "--dir", home, "peer", "start"], stdout=log, stderr=log, start_new_session=True, env=env)
+    try:
+        deadline = time.monotonic() + 30
+        while not os.path.exists(peer_socket(home)):
+            assert time.monotonic() < deadline, open(os.path.join(home, "peer.log")).read()
+            time.sleep(0.05)
+        r = run_script(
+            """
+            import os
+            import chimaera as ch
+
+            @ch.remote
+            def seen():
+                return [os.environ.get(k) for k in ("CHIMAERA_CLUSTER_TOKEN", "CHIMAERA_TOKEN", "CHIMAERA_EXECUTOR")]
+
+            print(seen.remote().result(timeout=60))
+            """,
+            home=home,
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "[None, None, '1']"
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=30)
+        peer.wait(timeout=30)
+
+
 def test_sigterm_lets_running_work_finish_then_stops_the_peer():
     home = tempfile.mkdtemp(prefix="chd", dir="/tmp")
     peer = _start_peer(home)

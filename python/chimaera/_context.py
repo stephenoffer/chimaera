@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextvars
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NoReturn
 
 
 @dataclass
@@ -24,7 +24,20 @@ class TaskContext:
     _reports: int = 0
     # This rank's Group inside a gang (fn.options(ranks=n).gang()), else None.
     gang: Any = None
+    # exit_actor() was called: the worker closes the actor once this call's outcome is sent.
+    exiting: bool = False
     _cancelled: threading.Event = field(default_factory=threading.Event)
+
+    def exit_actor(self) -> NoReturn:
+        """End the actor this method runs on, as ``close()`` on its handle does:
+        it is not restarted, its pending calls raise ``ch.ActorDied``, and so
+        does this call."""
+        from ._errors import ActorDied
+
+        if not self.actor:
+            raise RuntimeError("exit_actor() ends an actor: call it inside one of the actor's methods")
+        self.exiting = True
+        raise ActorDied("the actor ended itself with ch.context().exit_actor()")
 
     def next_child(self) -> int:
         self._children += 1

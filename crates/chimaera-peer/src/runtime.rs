@@ -267,7 +267,8 @@ pub async fn serve(
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     let stopping = Arc::new(Notify::new());
     let stop_signal = {
-        let (stopping, signal) = (stopping.clone(), wait_for_stop(shutdown.clone(), core_tx, idle_timeout));
+        let signal = wait_for_stop(shutdown.clone(), core_tx, router.clone(), objects.clone(), idle_timeout);
+        let stopping = stopping.clone();
         async move {
             signal.await;
             stopping.notify_one();
@@ -362,33 +363,86 @@ fn drain_grace() -> Duration {
 }
 
 /// SIGTERM (what Kubernetes, Slurm and systemd send): take no new work, let
-/// queued and running attempts finish and their results commit within the
-/// grace period, then stop. Attempts still running at the deadline are
-/// retried elsewhere.
-async fn drain(core: &mpsc::Sender<CoreMsg>) {
+/// queued and running attempts finish and their results commit, and hand
+/// this peer's group seats to other peers, all within the grace period; then
+/// stop. Attempts still running at the deadline are retried elsewhere.
+async fn drain(core: &mpsc::Sender<CoreMsg>, router: &Router, objects: &ObjectStore) {
     let grace = drain_grace();
     tracing::info!("SIGTERM: draining for up to {grace:?}");
     if core.send(CoreMsg::Drain).await.is_err() {
         return;
     }
     let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        if core.send(CoreMsg::Status { reply }).await.is_err() {
-            return;
+    let seats = hand_off_seats(router, deadline);
+    let calls_then_values = async {
+        while Instant::now() < deadline {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if core.send(CoreMsg::Status { reply }).await.is_err() {
+                return;
+            }
+            let Ok(s) = rx.await else { return };
+            if s.queued == 0 && s.running == 0 && s.proposals_in_flight == 0 {
+                tracing::info!("drained: no calls left");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        let Ok(s) = rx.await else { return };
-        if s.queued == 0 && s.running == 0 && s.proposals_in_flight == 0 {
-            tracing::info!("drained");
-            return;
+        if Instant::now() >= deadline {
+            tracing::warn!("drain grace period ended with work still running");
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    tracing::warn!("drain grace period ended with work still running");
+        // The values this peer holds outlive it on the peers readers ask next.
+        if let Some(mesh) = &router.mesh {
+            let (copied, left) = crate::objplane::hand_off(objects, mesh, deadline).await;
+            tracing::info!(copied, left, "drained: values handed to other peers");
+        }
+    };
+    tokio::join!(seats, calls_then_values);
 }
 
-async fn wait_for_stop(shutdown: Arc<Notify>, core: mpsc::Sender<CoreMsg>, idle: Option<Duration>) {
-    wait_for_stop_signal(shutdown, &core, idle).await;
+/// A draining cluster peer's seats: it hands the groups it leads to another
+/// voter, then waits (until `deadline`) while their leaders replace it as a
+/// voter (`cluster::replace_voters`). A group with no peer to take the seat
+/// keeps it: its other voters still hold a majority.
+async fn hand_off_seats(router: &Router, deadline: Instant) {
+    let Some(mesh) = &router.mesh else { return };
+    let me = router.node_id();
+    loop {
+        let mut held = Vec::new();
+        for g in router.hosted_groups() {
+            let (leader, voters) = g.view();
+            let taker = mesh.live_others().into_iter().any(|p| !voters.contains(&p.member.node_id));
+            if !voters.contains(&me) || !taker {
+                continue;
+            }
+            held.push(g.id);
+            let to = mesh.live_others().into_iter().map(|p| p.member.node_id).find(|n| voters.contains(n));
+            if leader == Some(me)
+                && let Some(to) = to
+                && let Err(e) = g.transfer_leader(to).await
+            {
+                tracing::debug!(group = g.id, "leadership transfer: {e}");
+            }
+        }
+        if held.is_empty() {
+            tracing::info!("drained: this peer holds no group seat another peer could take");
+            return;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(groups = ?held, "drain grace period ended still a voter of these groups");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+async fn wait_for_stop(
+    shutdown: Arc<Notify>,
+    core: mpsc::Sender<CoreMsg>,
+    router: Arc<Router>,
+    objects: ObjectStore,
+    idle: Option<Duration>,
+) {
+    wait_for_stop_signal(shutdown, &core, &router, &objects, idle).await;
     // What the peer learned outlives it: the next run starts right-sized.
     let (reply, rx) = tokio::sync::oneshot::channel();
     if core.send(CoreMsg::Persist { reply }).await.is_ok() {
@@ -396,7 +450,13 @@ async fn wait_for_stop(shutdown: Arc<Notify>, core: mpsc::Sender<CoreMsg>, idle:
     }
 }
 
-async fn wait_for_stop_signal(shutdown: Arc<Notify>, core: &mpsc::Sender<CoreMsg>, idle: Option<Duration>) {
+async fn wait_for_stop_signal(
+    shutdown: Arc<Notify>,
+    core: &mpsc::Sender<CoreMsg>,
+    router: &Router,
+    objects: &ObjectStore,
+    idle: Option<Duration>,
+) {
     let notified = shutdown.notified();
     tokio::pin!(notified);
     let mut idle_since = Instant::now();
@@ -416,7 +476,7 @@ async fn wait_for_stop_signal(shutdown: Arc<Notify>, core: &mpsc::Sender<CoreMsg
             _ = &mut notified => return,
             _ = tokio::signal::ctrl_c() => return,
             _ = term.recv() => {
-                drain(core).await;
+                drain(core, router, objects).await;
                 return;
             }
             Some(()) = async {
@@ -425,7 +485,7 @@ async fn wait_for_stop_signal(shutdown: Arc<Notify>, core: &mpsc::Sender<CoreMsg
                     None => std::future::pending().await,
                 }
             } => {
-                drain(core).await;
+                drain(core, router, objects).await;
                 return;
             }
             _ = tick.tick() => {

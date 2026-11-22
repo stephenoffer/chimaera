@@ -216,3 +216,38 @@ def test_a_result_stored_in_parts_in_another_cell_comes_back_whole(monkeypatch):
     finally:
         a.close()
         b.close()
+
+
+ARRAY = """
+import json, time
+import numpy as np
+import chimaera as ch
+
+@ch.remote(cpus=1)
+def work(i, secs):
+    time.sleep(secs)
+    # A large array: on Linux it is linked from the arena as a buffer of its own.
+    return ch.context().node, np.full(1 << 20, i, dtype=np.float64)
+
+start = time.time()
+out = [(node, int(a[0]), int(a[-1]), a.nbytes) for node, a in ch.get([work.remote(i, 2.0) for i in range(48)], timeout=300)]
+print("RESULT", round(time.time() - start, 2), json.dumps([(i, node, first == last == i and n == 8 << 20) for i, (node, first, last, n) in enumerate(out)]), flush=True)
+"""
+
+
+def test_a_large_array_result_from_another_cell_comes_back_whole(monkeypatch):
+    b = Cluster(3, clients=True)
+    monkeypatch.setenv("CHIMAERA_FLEET", f"b={b.client_addrs[0]}")
+    monkeypatch.setenv("CHIMAERA_FLEET_TOKEN_FILE", b.token)
+    a = Cluster(3)
+    try:
+        b_peers, _ = peers(b)
+        out = a.run(0, ARRAY)
+        assert out.returncode == 0, out.stderr[-3000:]
+        seconds, calls = result(out.stdout)
+        assert [i for i, _, _ in calls] == list(range(48))
+        assert all(ok for _, _, ok in calls), "every array arrived whole"
+        assert any(node in b_peers for _, node, _ in calls), ("no call ran in cell B", seconds)
+    finally:
+        a.close()
+        b.close()

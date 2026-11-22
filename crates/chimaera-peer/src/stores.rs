@@ -15,6 +15,12 @@ pub struct Identity {
     pub incarnation: u64,
 }
 
+/// The Raft node id of the peer with id `peer`.
+pub fn node_id_of(peer: &[u8]) -> u64 {
+    let h = blake3::hash(peer);
+    u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes")) & (u64::MAX >> 1)
+}
+
 impl Identity {
     /// Load or create the peer id under `dir`, and bump the incarnation. A
     /// restarted peer never reuses an incarnation, so grants and votes from the
@@ -45,8 +51,7 @@ impl Identity {
     /// can never vote again under the old one. Fencing of a restarted
     /// process's grants uses the incarnation, not the node id.
     pub fn node_id(&self) -> u64 {
-        let h = blake3::hash(&self.peer.0);
-        u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes")) & (u64::MAX >> 1)
+        node_id_of(&self.peer.0)
     }
 
     pub fn pb(&self) -> chimaera_core::pb::PeerInc {

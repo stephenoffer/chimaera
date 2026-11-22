@@ -223,7 +223,14 @@ unverified.
 
 SIGTERM (or SIGUSR1) drains a peer: it stops taking new work, other peers stop sending it
 any, and it waits up to `CHIMAERA_DRAIN_SECONDS` (default 30) for queued and
-running calls before it shuts down. Kubernetes' grace period uses SIGTERM;
+running calls before it shuts down. Within the same period it hands on what
+would otherwise go with it: groups it leads move to another voter, the
+groups' leaders replace it as a voter with a live peer that is not one (if
+there is such a peer), and once its calls are done it copies every value it
+stores to the peer readers ask next. The log says how many values were
+copied and how many were left behind at the deadline. Actors it hosts are not
+moved: they restart elsewhere as on a lost peer, counting against their
+restart limit. Kubernetes' grace period uses SIGTERM;
 Slurm jobs use SIGUSR1, because `srun` forwards it to the peers and turns
 SIGTERM into a kill (`--signal=B:USR1@120` in the job script).
 
@@ -239,7 +246,40 @@ and it has not been run against a real cloud.
 ### Tenants and quotas
 
 A run belongs to a tenant: `ch.init(tenant="team-a")`, or `CHIMAERA_TENANT`,
-else `"default"`. Start peers with `CHIMAERA_TENANT_QUOTAS="team-a=8,team-b=2"`
+else the tenant of the driver's credential, else `"default"`.
+
+Drivers on other machines that hold the cluster token can do anything. Give
+each team a driver credential instead:
+
+```sh
+chimaera cluster credential --tenant team-a --token-file token > team-a.cred
+```
+
+A driver presenting it (`CHIMAERA_TOKEN_FILE=team-a.cred`, or a profile's
+`token_file`) runs as `team-a`. Over a peer's client port it can then reach
+only that tenant's runs, actors, store namespaces, objects and logs, and the
+same holds for `chimaera runs`, `logs`, `inspect`, `explain` and `cancel`.
+Another tenant's run looks exactly like a missing one. A credential cannot
+stop a peer or list every peer's object store, and it can't name another
+tenant in a request. Peers check a credential against the cluster token
+without a table, so changing the token revokes every credential. Drivers on a
+peer's local socket are its owner and are not limited. Calls of a tenant's run
+see `CHIMAERA_TENANT` and use it as their default tenant; it is a name the
+driver chose, not an identity the peer checks.
+
+A credential limits what a tenant's drivers can ask peers for over the
+network. It does not sandbox the code a tenant runs, so it protects tenants
+who trust each other from mistakes, not from each other. Calls run as the
+peer's OS user. They can read whatever the peer can: its data directory,
+other runs' values on that machine, the peer's own environment and token
+file. They can also use the peer's local socket, which is not limited. So
+anyone who can submit a call can become an administrator of the whole
+cluster. Workers do not inherit the token in their own environment, which
+keeps it out of logs and child processes, but that is not a barrier. Give
+tenants that must not reach each other separate clusters, or run peers in
+a container or as a user per tenant.
+
+Start peers with `CHIMAERA_TENANT_QUOTAS="team-a=8,team-b=2"`
 to cap each tenant's CPUs on that peer:
 - **At the cap:** while a tenant's running calls hold its quota, its other calls wait, and other tenants' work goes ahead.
 - **Over the cap:** a call that asks for more than the whole quota fails as infeasible, naming the quota.
@@ -281,7 +321,7 @@ never work. It runs outside the peers, so user code never sits next to the
 credentials that scale the cluster.
 
 - **Grow:** after calls have been queued for `--up-after` seconds (default 30), by as many peers as the queue needs at the current peers' size.
-- **Shrink:** by one after the cluster has been mostly idle for `--down-after` seconds (default 300). Kubernetes removes the highest pod, and its SIGTERM drains it.
+- **Shrink:** by one after the cluster has been mostly idle for `--down-after` seconds (default 300), once the peer that would go (the highest pod; under `--slurm`, the newest spare's peer) holds no calls, actors or stored values. Kubernetes removes the highest pod, and its SIGTERM drains it: it hands the groups it leads, and its voter seats, to other peers before it stops.
 - **Hold:** while peers it asked for are still starting.
 
 Each change prints one JSON line with its reason. In the cluster,
@@ -487,8 +527,10 @@ one archive named by its content, at most `CHIMAERA_PROJECT_MAX_BYTES`
 (100 MiB). Each peer unpacks it once and puts it on the workers' `sys.path`.
 When the project has a `uv.lock`, each peer also installs the locked packages
 once, with its own Python (`uv sync --frozen`), and the workers put them
-ahead of the peer's own. `uv` must be on the peers' PATH; the runtime image
-includes it. Without a lock, third-party packages must already be on the
+ahead of the peer's own. An install that takes longer than
+`CHIMAERA_ENV_BUILD_TIMEOUT` seconds (set on the peers; default 900) fails
+the call that needed it, naming the setting. `uv` must be on the peers' PATH;
+the runtime image includes it. Without a lock, third-party packages must already be on the
 peers (the `image` mode).
 
 Only an allowlist of environment variables ships with a run: locale settings,

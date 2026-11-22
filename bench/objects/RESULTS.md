@@ -38,7 +38,12 @@ numbers is in [docs/objects.md](../../docs/objects.md).
   rerun after the pre-zeroed reserve was capped at 64 MiB files (it had
   distorted the memory pool's accounting); the other rows come from the same
   build without that cap, which does not affect them (no allocation is timed
-  there).
+  there). The `bytes` rows for `put`, put+get on huge pages and many 1 MB
+  objects were rerun on 2026-11-22 with Python's raw allocator routed to the
+  arena (`results/raw-arena-*.jsonl`); the Ray rows are the earlier ones,
+  from the same cluster and Ray build. The bench makes each value after the
+  runtime starts, so its large `bytes` live in the arena, as NumPy arrays
+  do in the NumPy rows.
 
 ## Where it is 50x or more, and where it cannot be
 
@@ -54,11 +59,13 @@ plane, not the cost of turning Python objects into bytes. The result:
 | `return` from a process, NumPy 1 GB | **53–138x** | the result is linked, not copied |
 | torch tensors, 16 MB–1 GB on huge pages (put, get, return, pipeline) | **10–64x** | Ray pickles tensors through a slow path |
 | `get` of a torch tensor, 256 MB–1 GB | **2,000–8,000x** | Ray copies on get; Chimaera maps |
+| `put` of Python `bytes`, 256 MB–1 GB | **104–2,368x** | large `bytes` live in the arena too (Python's raw allocator), so they are linked |
 | `put` of a 1 KB value | 11–30x | inline in the handle |
 | `get` of a 1–64 KB value on another node | **17–137x** | inline in the handle, no transfer at all |
 | first get of a spilled 256 MB object | **400x** | restore is a mapping of the disk file |
 | recovery when a node dies holding a value | **90–70,000x**, and values Ray loses survive | replicas on the next peer (Ray: 12–14 s of detection, then a re-run) |
-| bytes, str, dicts, lists, pandas, 1 MB+ | 0.5–1.7x | bound by pickling or by the one copy both must make |
+| `bytes` get, str up to 16 MB, dicts, lists, pandas, 1 MB+ | 0.5–1.7x | bound by pickling or by the one copy both must make |
+| `str` put of 256 MB | 1.9x (4 KiB pages), 3.8x (huge pages) | encoded to UTF-8 once into an arena block, then linked |
 | Arrow tables, 256 MB–1 GB | 6–9x on huge pages, about 1.2x on 4 KiB pages | Arrow buffers are copied (no zero-copy allocator for Arrow) |
 | one object to one other node, 1 MB–1 GB | 1.1–4x | network-bound: both near the NIC's rate; torch avoids Ray's slow path |
 
@@ -83,11 +90,10 @@ Every measured case where Chimaera is slower than Ray, or under 2x faster:
 
 | data, pattern | vs Ray | why | what helps |
 |---|---:|---|---|
-| Python `bytes`, 16 MB–1 GB, `put` in a tight loop | 0.3–0.5x | Ray copies into store memory it reuses in place, already mapped and warm. Chimaera gives each object its own file, so the kernel tracks every reader's mapping and frees memory safely, and a new file needs fresh pages. Pre-zeroed pages from the background reserve make a put as fast as Ray's (5.8 ms against 5.4 ms at 256 MB), but back-to-back puts use them up faster than they are refilled. | Gaps between puts let the reserve keep up. Put NumPy arrays instead of `bytes` (zero copy). |
-| Python `bytes`, get | 0.7–1.0x | Both runtimes copy into a new `bytes` object: Python's `bytes` cannot point at shared memory. | Use `bytearray`, NumPy or Arrow buffers, which are read in place. |
-| `str`, dicts, lists, pandas object columns, 1 MB+ | 0.8–1.8x | Pickling and unpickling (building Python objects one by one) is the whole cost in both runtimes. Plain dicts and lists already skip pickle's memo here (up to 6.9x less pickling time). | Columnar data (NumPy, Arrow) instead of Python objects. |
+| Python `bytes`, get of 256 MB–1 GB on 4 KiB pages | 0.8x (1.2–1.3x up to 16 MB; 1.5–1.7x on huge pages) | Both runtimes copy into a new `bytes` object: Python's `bytes` cannot point at shared memory. The new object is now allocated in the arena, and first-touch faults on 4 KiB tmpfs pages cost more than on the heap. | Huge pages, or `bytearray`, NumPy or Arrow buffers, which are read in place. `CHIMAERA_ARENA=0` restores heap allocation (and copied puts). |
+| dicts, lists, pandas object columns, 1 MB+; `str` up to 16 MB | 0.5–1.8x | Pickling and unpickling (building Python objects one by one) is the whole cost in both runtimes. Plain dicts and lists already skip pickle's memo here (up to 6.9x less pickling time). A top-level `str` is encoded once and linked: from 256 MB it is 1.5–3.8x faster than Ray. | Columnar data (NumPy, Arrow) instead of Python objects. |
 | writing 3x the memory limit (spill) | 0.5–0.7x | In this loop each new array is allocated in shared memory, where first-touch page faults cost more than on Ray's heap. The reserve covers only part of it. | Larger memory limit, or reusing arrays. |
-| many 1 MB objects | about 0.9x | One file and one copy per object, against Ray's copy into reused memory. | Batch small values into one array. |
+| many 1 MB objects, get | 1.0x | One file and one copy per object, against Ray's copy into reused memory (puts are 12x faster: linked). | Batch small values into one array. |
 | Arrow tables on 4 KiB pages | about 1.2x | Arrow buffers are copied; the zero-copy allocator covers NumPy only. | Huge pages (6–9x). |
 | small values through `return` and `pipeline` | 0.1–1x | The call path, not objects: an actor call costs about 1.9 ms in Chimaera against 0.37 ms in Ray. | Outside the object store (the runtime's call journal). |
 
@@ -105,7 +111,7 @@ far faster.
 | torch | 348 µs → 31 µs (**11x**) | 368 µs → 44 µs (8.3x) | 604 µs → 399 µs (1.5x) | 26.2 ms → 2.57 ms (**10x**) | 288 ms → 48 ms (6.0x) | 1.16 s → 234 ms (5.0x) |
 | nested | 314 µs → 39 µs (8.1x) | 352 µs → 47 µs (7.5x) | 422 µs → 645 µs (0.7x) | 1.90 ms → 137 µs (**14x**) | 6.47 ms → 132 µs (**49x**) | 21.0 ms → 137 µs (**154x**) |
 | arrow | 417 µs → 61 µs (6.8x) | 440 µs → 70 µs (6.3x) | 647 µs → 555 µs (1.2x) | 2.71 ms → 3.43 ms (0.8x) | 35.7 ms → 30.8 ms (1.2x) | 140 ms → 115 ms (1.2x) |
-| bytes | 167 µs → 6.4 µs (**26x**) | 182 µs → 25 µs (7.3x) | 348 µs → 343 µs (1.0x) | 1.27 ms → 2.77 ms (0.5x) | 14.9 ms → 44.0 ms (0.3x) | 131 ms → 246 ms (0.5x) |
+| bytes | 167 µs → 6.4 µs (**26x**) | 182 µs → 25 µs (7.3x) | 348 µs → 49 µs (7.1x) | 1.27 ms → 51 µs (**25x**) | 14.9 ms → 53 µs (**281x**) | 131 ms → 55 µs (**2,368x**) |
 | pydict | 161 µs → 7.7 µs (**21x**) | 254 µs → 53 µs (4.8x) | 938 µs → 942 µs (1.0x) | 11.0 ms → 13.8 ms (0.8x) | 264 ms → 271 ms (1.0x) | - |
 | pylist | 169 µs → 7.0 µs (**24x**) | 270 µs → 46 µs (5.9x) | 1.16 ms → 608 µs (1.9x) | 15.0 ms → 10.4 ms (1.4x) | 285 ms → 201 ms (1.4x) | - |
 | str | 191 µs → 6.4 µs (**30x**) | 195 µs → 15 µs (**13x**) | 502 µs → 609 µs (0.8x) | 11.3 ms → 6.80 ms (1.7x) | 292 ms → 349 ms (0.8x) | - |
@@ -122,7 +128,7 @@ tmpfs, so neither runtime has the page-size advantage.
 | torch | 641 µs → 369 µs (1.7x) | 27.7 ms → 608 µs (**46x**) | 300 ms → 10.6 ms (**28x**) | 1.21 s → 38.2 ms (**32x**) |
 | nested | 434 µs → 358 µs (1.2x) | 1.89 ms → 121 µs (**16x**) | 6.72 ms → 126 µs (**53x**) | 21.3 ms → 127 µs (**167x**) |
 | arrow | 651 µs → 430 µs (1.5x) | 2.74 ms → 1.85 ms (1.5x) | 37.2 ms → 5.91 ms (6.3x) | 154 ms → 19.6 ms (7.9x) |
-| bytes | 318 µs → 331 µs (1.0x) | 543 µs → 1.62 ms (0.3x) | 5.40 ms → 10.6 ms (0.5x) | 19.8 ms → 37.4 ms (0.5x) |
+| bytes | 318 µs → 49 µs (6.5x) | 543 µs → 51 µs (**11x**) | 5.40 ms → 52 µs (**104x**) | 19.8 ms → 54 µs (**363x**) |
 
 | put, then get in another process | 1M | 16M | 256M | 1G |
 |---|---:|---:|---:|---:|
@@ -130,7 +136,7 @@ tmpfs, so neither runtime has the page-size advantage.
 | torch | 1.01 ms → 465 µs (2.2x) | 19.6 ms → 726 µs (**27x**) | 576 ms → 10.1 ms (**57x**) | 2.27 s → 35.6 ms (**64x**) |
 | nested | 528 µs → 473 µs (1.1x) | 2.08 ms → 290 µs (7.2x) | 6.76 ms → 296 µs (**23x**) | 21.6 ms → 299 µs (**72x**) |
 | arrow | 1.05 ms → 576 µs (1.8x) | 4.11 ms → 1.93 ms (2.1x) | 50.4 ms → 5.68 ms (8.9x) | 148 ms → 18.7 ms (7.9x) |
-| bytes | 476 µs → 594 µs (0.8x) | 2.04 ms → 2.75 ms (0.7x) | 136 ms → 144 ms (0.9x) | 542 ms → 572 ms (0.9x) |
+| bytes | 476 µs → 219 µs (2.2x) | 2.04 ms → 1.04 ms (2.0x) | 136 ms → 79.3 ms (1.7x) | 542 ms → 310 ms (1.7x) |
 
 | return (producer process → driver) | 1M | 16M | 256M | 1G |
 |---|---:|---:|---:|---:|
@@ -156,7 +162,7 @@ the put and return paths reach hundreds.
 |---|---:|---:|
 | 1 KB | 149 µs → 8.0 µs (**19x**) | 15.5 µs → 5.8 µs (2.7x) |
 | 64 KB | 175 µs → 53 µs (3.3x) | 45.9 µs → 38.6 µs (1.2x) |
-| 1 MB | 502 µs → 541 µs (0.9x) | 515 µs → 592 µs (0.9x) |
+| 1 MB | 502 µs → 41 µs (**12x**) | 515 µs → 522 µs (1.0x) |
 
 ## Spill and restore
 
@@ -258,9 +264,19 @@ The full feature comparison with Ray's object store is in
 
 - **Writing under memory pressure** trails Ray, about 0.5x. The cause is the
   cost of the user's fresh arrays in tmpfs (see the spill section).
-- **Copied types:** `bytes`, Arrow and torch tensors from torch's own
-  allocator are copied once into shared memory. On warm huge pages Ray's
-  copy into its pre-faulted store is faster for `bytes`.
+- **Copied types:** Arrow buffers and torch tensors from torch's own
+  allocator are copied once into shared memory. Large Python `bytes`,
+  `bytearray`, `str` and lists are now allocated in the arena (stored by
+  link); on 4 KiB tmpfs pages that makes reading a 256 MB+ `bytes` or `str`
+  about 15% slower than before (huge pages: faster).
+- **Not re-measured:** the `bytes` rows for `return` and `pipeline` above
+  predate the raw-allocator arena.
+- **Large `str`** now travels out of band (`results/str-oob-*.jsonl`, one
+  run): put of 256 MB 291.8 ms → 153 ms on 4 KiB pages (1.9x Ray; it was
+  0.7x) and 77 ms on huge pages; put+get of 256 MB 1.5x (4 KiB) and 2.1x
+  (huge). At 1–16 MB it is 0.7–1.3x, and one 16 MB get on huge pages
+  measured 6.0 ms against 2.8 ms in the previous run (0.5x Ray); that run
+  was not repeated, so whether it is noise is not known.
 - **The call path** (1.9 ms per actor call against Ray's 0.37 ms) is not part
   of this work; it hides the object path for small values in `return` and
   `pipeline`.

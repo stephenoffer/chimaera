@@ -236,3 +236,16 @@ print("AFTER", len(held_on_p1()))
     )
     assert int(lines(out, "BEFORE")[0]) >= 1, f"p1 fetched no copy to release: {out.stdout}"
     assert int(lines(out, "AFTER")[0]) == 0, "p1 kept its copy after the driver released the value"
+
+
+def test_the_cli_lists_every_peers_object_store(zoned):
+    # `ray memory` covers the whole cluster; so does `chimaera objects --cluster`.
+    s = subprocess.run(
+        [BIN, "--dir", zoned.dir(0), "objects", "--cluster", "--json"], capture_output=True, text=True, timeout=60
+    )
+    assert s.returncode == 0, s.stderr
+    stores = json.loads(s.stdout)
+    assert len(stores) == 3, stores
+    assert [x.get("error") for x in stores] == [None] * 3, stores
+    assert sum(x["addr"] == "this peer" for x in stores) == 1
+    assert len({x["object_dir"] for x in stores}) == 3, "each peer reported its own store"

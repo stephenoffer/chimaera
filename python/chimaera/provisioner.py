@@ -13,7 +13,9 @@ JSON line saying what it saw.
   peers as the queue needs at the current peers' size, at least one.
 - **Shrink** by one when the cluster has been mostly idle (the CPU in use
   would fit on one peer fewer, at most half full) for ``--down-after``
-  seconds. Kubernetes removes the highest pod, whose SIGTERM drains it.
+  seconds, and the peer that would go is idle: no calls, no actors and no
+  stored values (its drain hands its group seats on, not those). Kubernetes
+  removes the highest pod, whose SIGTERM drains it.
 - **Hold** while peers it asked for are still starting, for up to
   ``--start-grace`` seconds; peers still not up then (no room for their pods)
   count as unavailable: it stops growing and may shrink them away.
@@ -65,8 +67,26 @@ class Memory:
     decisions: list[dict[str, Any]] = field(default_factory=list)
 
 
-def decide(nodes: list[Any], replicas: int, rules: Rules, memory: Memory, now: float) -> tuple[int, str]:
-    """The replica count to ask for, and why. `nodes` are ``ch.runs.cluster().nodes()``."""
+def busy(victim: Any) -> str | None:
+    """Why removing the peer `victim` (a ``Node``) now would lose work, or None."""
+    held = [
+        f"{n} {what}"
+        for n, what in (
+            (victim.cpu_used and f"{victim.cpu_used:g}", "CPUs in use"),
+            (victim.queued, "queued calls"),
+            (victim.actors, "actors"),
+            (victim.object_bytes, "bytes of stored values"),
+        )
+        if n
+    ]
+    return ", ".join(held) or None
+
+
+def decide(
+    nodes: list[Any], replicas: int, rules: Rules, memory: Memory, now: float, victim: Any = None
+) -> tuple[int, str]:
+    """The replica count to ask for, and why. `nodes` are ``ch.runs.cluster().nodes()``;
+    `victim` is the one a shrink would remove, when the pool knows it."""
     live = [n for n in nodes if n.alive]
     stuck = False
     if len(live) < replicas:
@@ -96,6 +116,9 @@ def decide(nodes: list[Any], replicas: int, rules: Rules, memory: Memory, now: f
     if replicas > rules.min and used <= 0.5 * per_peer * (replicas - 1):
         memory.idle_since = memory.idle_since if memory.idle_since is not None else now
         quiet = now - memory.idle_since
+        holding = busy(victim) if victim is not None else None
+        if quiet >= rules.down_after and holding:
+            return replicas, f"quiet for {quiet:.0f} s, but {victim.address}, the peer a shrink removes, holds {holding}"
         if quiet >= rules.down_after:
             memory.idle_since = None
             return replicas - 1, f"shrink: {used:.1f} of {cpus:.0f} CPUs in use for {quiet:.0f} s"
@@ -138,6 +161,11 @@ class StatefulSet:
         tls = ssl.create_default_context(cafile=os.path.join(self.sa_dir, "ca.crt"))
         with urllib.request.urlopen(req, context=tls, timeout=10) as r:
             return json.load(r)
+
+    def victim(self, nodes: list[Any], replicas: int) -> Any:
+        """The highest pod's peer: the one a smaller StatefulSet loses."""
+        prefix = f"{self.name}-{replicas - 1}."
+        return next((n for n in nodes if n.alive and n.address.startswith(prefix)), None)
 
     def replicas(self) -> int:
         if self.in_cluster:
@@ -182,6 +210,14 @@ class SlurmSpares:
 
     def replicas(self) -> int:
         return self.base + len(self._spares())
+
+    def victim(self, nodes: list[Any], replicas: int) -> Any:
+        """The newest spare job's peer: the one a shrink cancels."""
+        spares = self._spares()
+        if not spares:
+            return None
+        host = self._run("squeue", "-h", "-j", spares[-1], "-o", "%N").strip().split(".")[0]
+        return next((n for n in nodes if n.alive and n.address.rsplit(":", 1)[0].split(".")[0] == host), None)
 
     def scale(self, n: int) -> None:
         spares, want = self._spares(), max(0, n - self.base)
@@ -263,7 +299,8 @@ def run(pool: Any, rules: Rules, interval: float, out: Any = sys.stdout) -> None
             print(json.dumps({"at": time.time(), "error": str(e)}), file=out, flush=True)
             time.sleep(interval)
             continue
-        want, why = decide(nodes, replicas, rules, memory, time.monotonic())
+        victim = pool.victim(nodes, replicas) if hasattr(pool, "victim") else None
+        want, why = decide(nodes, replicas, rules, memory, time.monotonic(), victim)
         if want != replicas:
             pool.scale(want)
             record = {"at": time.time(), "from": replicas, "to": want, "why": why}

@@ -135,8 +135,10 @@ def _retry_exceptions(name: str, value: Any, out: Out) -> None:
 def _num_returns(name: str, value: Any, out: Out) -> None:
     if value in (None, 1):
         return
-    if value in ("streaming", "dynamic"):
-        raise unsupported(f"num_returns={value!r}", use="a generator function (it returns ch.Results)", lands="M1")
+    if value == "streaming":
+        return  # a generator function streams anyway: .remote() gives an ObjectRefGenerator
+    if value == "dynamic":
+        raise unsupported("num_returns='dynamic'", use="num_returns='streaming' (an ObjectRefGenerator)")
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"num_returns must be a positive integer, got {value!r}")
     out["returns"] = value  # .remote() then returns a list of `value` refs

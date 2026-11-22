@@ -1,0 +1,26 @@
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "1M", "op": "put", "median_s": 0.00046025650001979557, "min_s": 0.0003525569999851541, "n": 200, "payload": 1048576}
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "16M", "op": "put", "median_s": 0.010237900499987518, "min_s": 0.010029620000011619, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "str", "size": "256M", "op": "put", "median_s": 0.15313398450001614, "min_s": 0.15167485000000624, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "1M", "op": "put", "median_s": 4.875700000184224e-05, "min_s": 4.6601000008195115e-05, "n": 200, "payload": 1048576}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "16M", "op": "put", "median_s": 4.95159999900352e-05, "min_s": 4.743599998846548e-05, "n": 40, "payload": 16777216}
+{"runtime": "chimaera", "scenario": "put", "kind": "bytes", "size": "256M", "op": "put", "median_s": 5.137099998364647e-05, "min_s": 5.00400000191803e-05, "n": 8, "payload": 268435456}
+{"runtime": "chimaera", "done": "put", "wall_s": 3.6}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1M", "op": "get", "median_s": 0.00020960300000183452, "min_s": 0.0001988349999919592, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1M", "op": "put+get", "median_s": 0.0011212569999656807, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "1M", "op": "touch", "median_s": 1.633000010770047e-06, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "16M", "op": "get", "median_s": 0.002985172500018507, "min_s": 0.002927298000031442, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "16M", "op": "put+get", "median_s": 0.013206139999965671, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "16M", "op": "touch", "median_s": 2.6049999917177047e-06, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "256M", "op": "get", "median_s": 0.1427158175000045, "min_s": 0.14168214599999374, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "256M", "op": "put+get", "median_s": 0.2957726455000227, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "str", "size": "256M", "op": "touch", "median_s": 5.3530000059254235e-06, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1M", "op": "get", "median_s": 0.0001639134999891212, "min_s": 0.0001607159999821306, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1M", "op": "put+get", "median_s": 0.00023281999997948333, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "1M", "op": "touch", "median_s": 2.0851000016364196e-05, "n": 200}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "get", "median_s": 0.0018314385000053335, "min_s": 0.0017939429999955792, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "put+get", "median_s": 0.0018971699999781322, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "16M", "op": "touch", "median_s": 6.119900001522183e-05, "n": 40}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "get", "median_s": 0.16310136199999192, "min_s": 0.16015635000002248, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "put+get", "median_s": 0.16324704249998945, "n": 8}
+{"runtime": "chimaera", "scenario": "get", "kind": "bytes", "size": "256M", "op": "touch", "median_s": 0.0007492409999940719, "n": 8}
+{"runtime": "chimaera", "done": "get", "wall_s": 7.3}

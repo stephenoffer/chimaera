@@ -53,6 +53,12 @@ _OOB_MIN = 64 * 1024  # smaller buffers stay inside the pickle
 EXTERNAL = 1  # header flag: a blob-id table follows the buffer lengths
 OFFSETS = 2  # header flag: an offset table follows the blob ids
 _NO_BLOB = bytes(16)
+# Object files up to this size are read, not mapped. On macOS the first map of
+# a file costs about 2.5 ms however small it is (8 ms at 16 MB; reading 400 KB
+# takes 0.07 ms, measured on an M3 Pro), and every input a peer fetched is a
+# first map: a gather of 64 fetched inputs spent 180 ms mapping them. Larger
+# values stay mapped: no copy, paged in as they are touched.
+_READ_MAX = (16 << 20) if sys.platform == "darwin" else (1 << 20)
 
 # Fetches a blob another peer holds into this peer's store: (run, blob_id).
 # Set by the runtime; None means a missing blob is an error.
@@ -130,6 +136,25 @@ def _big_bytes(b: bytes | bytearray) -> Any:
     return Reduced()
 
 
+def _big_str(s: str) -> Any:
+    """A large top-level str, encoded to UTF-8 once and sent out of band:
+    the encoded bytes (in the arena when large, so then stored by link) go
+    into the object file as they are, instead of being encoded into pickle's
+    stream and copied from there. `surrogatepass` is what pickle uses, so the
+    string comes back exactly, lone surrogates included."""
+    data = s.encode("utf-8", "surrogatepass")
+
+    class Reduced:
+        def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
+            return (_str_from_utf8, (pickle.PickleBuffer(data),))
+
+    return Reduced()
+
+
+def _str_from_utf8(buf: Any) -> str:
+    return str(buf, "utf-8", "surrogatepass")
+
+
 def dumps_parts(
     value: Any, external: Callable[[memoryview], bytes | tuple[bytes, int] | None] | None = None
 ) -> tuple[list[bytes | memoryview], int, int]:
@@ -162,6 +187,8 @@ def dumps_parts(
 
     if type(value) in (bytes, bytearray) and len(value) >= _OOB_MIN:
         value = _big_bytes(value)
+    elif type(value) is str and len(value) >= _OOB_MIN:
+        value = _big_str(value)
     try:
         main = _pickle(value, _Pickler, keep)
     except (pickle.PicklingError, AttributeError, TypeError):
@@ -193,13 +220,19 @@ def dumps(value: Any) -> tuple[bytes, int]:
     return b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts), n
 
 
-def _map(path: str) -> mmap.mmap:
+def _map(path: str) -> mmap.mmap | bytearray:
     """Map a file copy-on-write (writable views, writes stay private); fall
-    back to read-only where the OS refuses private writable mappings."""
+    back to read-only where the OS refuses private writable mappings. A file
+    of at most _READ_MAX bytes is read into a private buffer instead."""
     with open(path, "rb") as f:
         size = os.fstat(f.fileno()).st_size
         if size == 0:
             raise ValueError(f"empty object file {path}")
+        if size <= _READ_MAX:
+            buf = bytearray(size)
+            if f.readinto(buf) != size:
+                raise ValueError(f"object file {path} changed while it was read")
+            return buf
         try:
             return mmap.mmap(f.fileno(), size, access=mmap.ACCESS_COPY)
         except OSError:  # strict overcommit (vm.overcommit_memory=2)

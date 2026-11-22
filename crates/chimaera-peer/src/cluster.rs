@@ -649,8 +649,71 @@ async fn liveness(
             }
         }
         replace_voters(&router, &mesh, &dead_since, &planned).await;
+        leave_stale_groups(&router, &mesh, &core, &members_file.with_file_name(HOSTED_FILE)).await;
         if stable_since.elapsed() >= rebalance_after() {
             rebalance(&router, &mesh, planned.len(), &mut changed_at).await;
+        }
+    }
+}
+
+/// How long a replica may go without hearing from its group's leader before
+/// it asks whether it is still a member.
+const STALE_AFTER: Duration = Duration::from_secs(5);
+
+/// A replica swapped out of its group (`rebalance`, `replace_voters`) stops
+/// receiving its log, but nothing tells this peer to stop serving it, and its
+/// copy grows stale while reads and watches go on using it. So a replica that
+/// has not heard from a leader for `STALE_AFTER` (or at all) asks the group's
+/// leader for the membership, and stops serving a group that no longer lists
+/// it; reads then go to the group's members. No answer (no leader reachable)
+/// changes nothing.
+async fn leave_stale_groups(
+    router: &Arc<Router>,
+    mesh: &Arc<MeshClient>,
+    core: &mpsc::Sender<CoreMsg>,
+    hosted_file: &std::path::Path,
+) {
+    let me = router.node_id();
+    for g in router.hosted_groups() {
+        // A replica that applied its own removal reports no leader contact
+        // at all; one that missed it, contact that grows old.
+        if router.leads(g.id) || g.since_leader_contact().is_some_and(|d| d < STALE_AFTER) {
+            continue;
+        }
+        // Only the leader answers, and it may be a peer this replica never
+        // heard of (leadership moves after seats do): ask the last leader it
+        // knew, then every live member.
+        let req = pb::ReadRequest {
+            cluster: mesh.cluster.clone(),
+            membership: true,
+            membership_group: g.id,
+            ..Default::default()
+        };
+        let hint = router.leader_hint(g.id);
+        let others = mesh.live_others().into_iter().map(|p| p.member.node_id).filter(|n| Some(*n) != hint);
+        let mut members = None;
+        for node in hint.into_iter().chain(others) {
+            if let Ok(reply) = mesh.read(node, req.clone()).await
+                && !reply.members.is_empty()
+            {
+                members = Some(reply.members);
+                break;
+            }
+        }
+        tracing::debug!(group = g.id, ?members, "no word from the group's leader lately: asked it for the members");
+        let Some(members) = members.filter(|m| !m.contains(&me)) else { continue };
+        tracing::info!(group = g.id, "this peer is no longer a member of the group: dropping its replica");
+        // Shut down before forgetting it: until then a re-add finds this
+        // instance, never a second one on the same storage.
+        g.shutdown().await;
+        router.remove_group(g.id);
+        // Reads and watches of the group now go to the members the leader named.
+        mesh.set_voters(g.id, members);
+        let _ = core.send(CoreMsg::Leading { group: g.id, leading: false }).await;
+        let _ = core.send(CoreMsg::GroupDropped { group: g.id }).await;
+        let ids: Vec<String> = router.hosted_groups().iter().map(|g| g.id.to_string()).collect();
+        if let Err(e) = write_atomic(hosted_file, ids.join("\n").as_bytes()) {
+            tracing::warn!("cannot record the groups this peer hosts: {e}");
         }
     }
 }
@@ -771,8 +834,14 @@ async fn replace_voters(
             continue;
         }
         let voters: BTreeSet<u64> = g.view().1.into_iter().collect();
-        let dead: Vec<u64> =
-            voters.iter().copied().filter(|n| dead_since.get(n).is_some_and(|t| t.elapsed() > REPLACE_AFTER)).collect();
+        // A draining voter is replaced at once: it is about to stop.
+        // Only a real drain: `draining` alone may mean a slow core (the ping handler).
+        let draining = |n: &u64| mesh.member(*n).and_then(|p| p.load).is_some_and(|l| l.stopping);
+        let dead: Vec<u64> = voters
+            .iter()
+            .copied()
+            .filter(|n| dead_since.get(n).is_some_and(|t| t.elapsed() > REPLACE_AFTER) || draining(n))
+            .collect();
         let missing = planned.get(&g.id).copied().unwrap_or(GROUP_VOTERS).saturating_sub(voters.len());
         if dead.is_empty() && missing == 0 {
             continue;
@@ -785,6 +854,9 @@ async fn replace_voters(
         for (gone, spare) in wanted.zip(spares.iter()) {
             let id = spare.member.node_id;
             match gone {
+                Some(gone) if draining(gone) => {
+                    tracing::info!(group = g.id, gone, added = id, "adding a voter: replacing a draining voter")
+                }
                 Some(gone) => tracing::info!(group = g.id, gone, added = id, "adding a voter: replacing a dead voter"),
                 None => tracing::info!(group = g.id, added = id, "adding a voter"),
             }

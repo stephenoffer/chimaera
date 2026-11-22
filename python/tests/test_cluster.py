@@ -418,6 +418,47 @@ print("SUM", sum(ch.get((add.remote(i, i) for i in range(50)), timeout=120)))
         c.close()
 
 
+def test_a_drained_peer_hands_its_voter_seats_and_values_to_other_peers():
+    c = Cluster(3, spares=1)
+    try:
+        stored = c.run(
+            0,
+            """
+import chimaera as ch
+ch.init(detach=True)
+ch.coord.Store("drain").put("v", ch.put(bytes(range(256)) * (16 << 10)))  # 4 MiB, held by this peer
+print("STORED")
+""",
+        )
+        assert lines(stored, "STORED") == [""], stored.stderr[-2000:]
+        c.signal(0, signal.SIGTERM)  # drain a founder: a voter of every group
+        c.procs[0].wait(timeout=60)
+        assert "replacing a draining voter" in "".join(c.log(i) for i in (1, 2, 3)), c.log(0)[-2000:]
+        assert "values handed to other peers" in c.log(0), c.log(0)[-2000:]
+        read = c.run(2, 'import chimaera as ch\nv = ch.coord.Store("drain").get("v").result(timeout=60)\nprint("READ", len(v), v[:3])\n')
+        assert lines(read, "READ") == [f"{4 << 20} {bytes(range(3))!r}"], read.stderr[-2000:]
+        # At once, before any dead voter could be replaced: a second founder.
+        # Groups that still counted the drained peer as a voter would have one
+        # live voter of three.
+        c.signal(1, signal.SIGKILL)
+        out = c.run(
+            2,
+            """
+import chimaera as ch
+
+@ch.remote
+def add(a, b):
+    return a + b
+
+print("SUM", sum(ch.get((add.remote(i, i) for i in range(50)), timeout=60)))
+""",
+            timeout=120,
+        )
+        assert lines(out, "SUM") == [str(sum(2 * i for i in range(50)))], out.stderr[-2000:]
+    finally:
+        c.close()
+
+
 @pytest.mark.slow
 def test_an_unsynced_peer_whose_machine_rebooted_rejoins_as_a_new_member(monkeypatch):
     # Without fsync a voter's log lives in the page cache: after a reboot it
@@ -670,6 +711,68 @@ def test_a_client_without_the_cluster_token_is_rejected(tcp):
     assert out.returncode != 0 and "token" in out.stderr, out.stderr[-2000:]
 
 
+def test_a_run_is_committed_by_several_groups_and_still_lists_and_cancels_as_one(monkeypatch):
+    # Leaders move toward an even spread after a second of steady membership,
+    # so the driver's peer soon leads only some groups: the run spreads over others.
+    monkeypatch.setenv("CHIMAERA_REBALANCE_SECONDS", "1")
+    monkeypatch.setenv("CHIMAERA_SPREAD_RATE", "0")  # spread however slowly the driver submits
+    c = Cluster(3, data_groups=6)
+    try:
+        deadline = time.monotonic() + 60
+        while not any(g["group"] > 0 and g["leader"] and not g["leading"] for g in status(c, 0)["groups"]):
+            assert time.monotonic() < deadline, status(c, 0)["groups"]
+            time.sleep(0.5)
+        out = c.run(
+            0,
+            """
+import time
+import chimaera as ch
+from chimaera._native import vshard_of
+from chimaera._runtime import Runtime
+
+@ch.remote
+def child(x):
+    return x
+
+@ch.remote
+def parent(n):
+    return sum(ch.get([child.remote(i) for i in range(n)]))
+
+@ch.remote
+def nap(i):
+    time.sleep(300)
+
+futs = [parent.remote(4) for _ in range(24)]
+print("SPREAD", len(Runtime.get()._spread))
+print("SHARDS", len({vshard_of(f.key[16:]) for f in futs}))
+print("SUM", sum(ch.get(futs, timeout=120)))
+run = ch.runs.current_run()
+print("LISTED", len(run.tasks()))
+naps = [nap.remote(i) for i in range(6)]
+deadline = time.monotonic() + 60
+while len(run.tasks("Running")) < 6 and time.monotonic() < deadline:
+    time.sleep(0.05)
+run.cancel()
+ends = set()
+for f in naps:
+    try:
+        f.result(timeout=60)
+        ends.add("finished")
+    except ch.Cancelled:
+        ends.add("cancelled")
+print("NAPS", sorted(ends), len({vshard_of(f.key[16:]) for f in naps}))
+""",
+        )
+        assert int(lines(out, "SPREAD")[0]) >= 2, out.stdout
+        assert int(lines(out, "SHARDS")[0]) >= 2, "the parents went to more than one group"
+        assert lines(out, "SUM") == [str(24 * 6)]
+        assert lines(out, "LISTED") == [str(24 * 5)], "every parent and child is listed, whichever group holds it"
+        ends, shards = lines(out, "NAPS")[0].rsplit(" ", 1)
+        assert ends == "['cancelled']" and int(shards) >= 2, "cancelling the run reaches every group it spread to"
+    finally:
+        c.close()
+
+
 def test_the_cli_lists_inspects_and_cancels_a_run_from_any_peer_over_tcp():
     # Four peers, groups of three voters: some peer holds no replica of the run's group.
     c = Cluster(4, clients=True)
@@ -794,6 +897,44 @@ except ch.NotFound:
     assert lines(out, "FORGED") == ["True", "actor hidden"], out.stdout + out.stderr[-2000:]
     claims = driver(bob, "import chimaera as ch\nch.init(tenant='alice')\n")
     assert claims.returncode != 0 and "credential is for tenant bob" in claims.stderr, claims.stderr[-2000:]
+    # An actor whose "constructor" is a call to alice's actor: refused, whoever asks.
+    stolen = driver(
+        bob,
+        """
+import os
+import chimaera as ch
+from chimaera._native import child_id
+from chimaera._options import Layer, resolve
+from chimaera._remote import _keyed_actor_id, build_call
+from chimaera._runtime import CALL_ACTOR_CTOR, CALL_ACTOR_METHOD
+
+@ch.remote
+class Counter:
+    def add(self):
+        return 0
+
+ch.init()
+rt = ch._runtime.Runtime.get()
+eff = resolve((), Layer({}, "test", "decorator"))
+key = rt.run + child_id(rt.run, [b"probe", os.urandom(8)])
+spec, _ = build_call(rt, Counter._cls, (), {}, kind=CALL_ACTOR_METHOD, eff=eff, actor=_keyed_actor_id("alice", "counter"),
+                     handle=1, seq=0, method="add", key=key)
+mine = child_id(rt.run, [b"actor", os.urandom(16)])
+ev = rt.wait_actor(rt.client.create_actor(mine, spec, "bob", "", spec["fn_digest"], 0, 0, False, False))
+print("CTOR", "refused" if ev[0] == "error" else "accepted", "own CALL_ACTOR_CTOR" in str(ev))
+# An unnamed actor at the id alice's named actor has: whether or not it
+# exists, refused the same way (no squatting, no telling it exists).
+theirs = _keyed_actor_id("alice", "counter")
+ctor_key = rt.run + child_id(rt.run, [theirs, b"ctor"])
+spec, _ = build_call(rt, Counter._cls, (), {}, kind=CALL_ACTOR_CTOR, eff=eff, actor=theirs, key=ctor_key)
+ev = rt.wait_actor(rt.client.create_actor(theirs, spec, "bob", "", spec["fn_digest"], 0, 0, False, False, os.urandom(16)))
+print("SQUAT", "refused" if ev[0] == "error" else "accepted", "must be derived" in str(ev))
+""",
+    )
+    assert lines(stolen, "CTOR") == ["refused True"], stolen.stdout + stolen.stderr[-2000:]
+    assert lines(stolen, "SQUAT") == ["refused True"], stolen.stdout + stolen.stderr[-2000:]
+    again = driver(alice, "import chimaera as ch\nprint('NEXT', ch.actor('counter').add.remote().result(timeout=60))\n")
+    assert lines(again, "NEXT") == ["2"], "alice finds her own named actor, which nobody else called: " + again.stderr[-2000:]
 
     def cli(cred: str, *args: str) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if not k.startswith("CHIMAERA_")}
@@ -926,6 +1067,62 @@ time.sleep(3)  # output is shipped to the driver's peer on the next housekeeping
         c.close()
 
 
+def test_values_lost_with_their_peer_are_made_again_from_their_calls():
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    go = os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+import chimaera as ch
+
+def on(slot):
+    return ch.dist.Placement(require={{"slot": slot}})
+
+def mark(name):
+    with open(os.path.join({marks!r}, name), "a") as f:
+        f.write("ran\\n")
+
+@ch.remote
+def make(n):
+    mark("make")
+    return bytes(range(256)) * (n // 256)
+
+@ch.remote
+def double(b):
+    mark("double")
+    return b + b
+
+@ch.remote
+def total(b):
+    return len(b), b[:3]
+
+a = make.options(placement=on("s1")).remote(1 << 20)
+b = double.options(placement=on("s1")).remote(a)
+ch.wait([b], timeout=60)
+print("READY", flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+print("TOTAL", total.options(placement=on("s2")).remote(b).result(timeout=120), flush=True)
+""",
+        )
+        assert driver.stdout.readline().strip() == "READY", driver.stderr.read()[-2000:]
+        c.signal(1, signal.SIGKILL)  # the only peer holding both values
+        open(go, "w").close()
+        out, err = driver.communicate(timeout=180)
+        assert f"TOTAL ({2 << 20}, {bytes(range(3))!r})" in out, out + err[-3000:]
+        ran = {n: len(open(os.path.join(marks, n)).read().splitlines()) for n in ("make", "double")}
+        if sys.platform == "darwin":  # no replicas here: both calls ran again, inputs first
+            assert ran == {"make": 2, "double": 2}, ran
+            assert "running the call that made it again" in c.log(2), c.log(2)[-2000:]
+        else:  # a replica may have served it instead
+            assert set(ran.values()) <= {1, 2}, ran
+    finally:
+        c.close()
+
+
 def test_a_generator_call_streams_on_its_consumers_peer(three):
     out = three.run(
         1,
@@ -1040,5 +1237,13 @@ def add(a, b):
 print("SUM", sum(ch.get([add.remote(i, i) for i in range(60)], timeout=120)))
 """
         assert lines(c.run(4, add), "SUM") == [str(sum(2 * i for i in range(60)))]
+        # A founder whose seat moved stops serving that group's stale copy, so
+        # a program on it still sees every call of every group finish.
+        deadline = time.monotonic() + 60
+        while not any("dropping its replica" in c.log(i) for i in range(3)) and time.monotonic() < deadline:
+            time.sleep(1)
+        assert any("dropping its replica" in c.log(i) for i in range(3)), "no founder gave up a seat's replica"
+        for i in range(6):
+            assert lines(c.run(i, add), "SUM") == [str(sum(2 * i for i in range(60)))], f"a program on peer {i}"
     finally:
         c.close()

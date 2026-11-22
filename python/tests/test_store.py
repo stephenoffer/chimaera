@@ -116,6 +116,20 @@ def test_watch_delivers_changes_in_order():
     assert got[0].version < got[1].version < got[2].version
 
 
+def test_a_watch_events_and_subscriptions_all_start_with_start():
+    s = ns()
+    s.put("jobs/old", 0)
+    first = s.put("jobs/a", 1)
+    assert next(s.watch("jobs/", start="earliest")).key == "jobs/old", "everything the namespace still holds"
+    s.put("jobs/b", 2)
+    assert next(s.watch("jobs/", start=first)).key == "jobs/b", "after a revision"
+    for bad in ("soon", -1, True):
+        with pytest.raises(ValueError, match="start: expected 'latest', 'earliest' or a position"):
+            s.watch(start=bad)
+        with pytest.raises(ValueError, match="start: expected"):
+            ch.runs.cluster().events(start=bad)
+
+
 def test_async_watch_wakes_on_a_change():
     s = ns()
     w = s.watch("k")
@@ -207,16 +221,16 @@ def qkey() -> str:
     return f"q-{uuid.uuid4().hex[:8]}"
 
 
-def test_durable_queue_is_fifo_and_bounded():
+def test_a_work_queue_is_fifo_bounded_and_synchronous():
     import queue
 
-    q = ch.coord.Queue(maxsize=3, name=qkey(), durable=True)
-    assert isinstance(q, ch.coord.Queue)
+    q = ch.coord.WorkQueue(qkey(), maxsize=3)
+    assert not isinstance(q, ch.coord.Queue)
     for i in range(3):
-        q.put(i)
+        assert q.put(i) is None  # stored when it returns
     with pytest.raises(queue.Full):
         q.put(99, timeout=0.2)
-    assert [q.get().result() for _ in range(3)] == [0, 1, 2] and q.qsize() == 0
+    assert [q.get() for _ in range(3)] == [0, 1, 2] and q.qsize() == 0
     with pytest.raises(queue.Empty):
         q.get(timeout=0.2)
     q.put("last")
@@ -227,7 +241,7 @@ def test_durable_queue_is_fifo_and_bounded():
 
 
 def test_a_failed_claim_is_delivered_again():
-    q = ch.coord.Queue(name=qkey(), durable=True)
+    q = ch.coord.WorkQueue(qkey())
     q.put("job")
     with pytest.raises(RuntimeError):
         with q.claim() as item:
@@ -247,11 +261,11 @@ def die_holding_a_claim(q):
 
 
 def test_an_item_whose_consumer_died_is_delivered_again():
-    q = ch.coord.Queue(name=qkey(), durable=True)
+    q = ch.coord.WorkQueue(qkey())
     q.put("job")
     with pytest.raises(ch.InfrastructureFailure):
         die_holding_a_claim.remote(q).result(timeout=60)
-    assert q.get(timeout=10).result() == "job"
+    assert q.get(timeout=10) == "job"
 
 
 @ch.remote
@@ -259,13 +273,13 @@ def consume_all(q):
     return sorted(q)
 
 
-def test_durable_queue_is_shared_by_key_across_calls():
+def test_a_work_queue_is_shared_by_name_across_calls():
     key = qkey()
-    q = ch.coord.Queue(name=key, durable=True)
+    q = ch.coord.WorkQueue(key)
     for i in range(20):
         q.put(i)
     q.close()
-    parts = ch.get((consume_all.remote(ch.coord.Queue(name=key, durable=True)) for _ in range(3)), timeout=120)
+    parts = ch.get((consume_all.remote(ch.coord.WorkQueue(key)) for _ in range(3)), timeout=120)
     assert sorted(x for p in parts for x in p) == list(range(20))
 
 

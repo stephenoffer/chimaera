@@ -98,6 +98,12 @@ impl Router {
         self.groups.write().expect("lock").insert(g.id, g);
     }
 
+    /// Stop serving `group` from this peer: it is no longer a member.
+    pub fn remove_group(&self, group: u32) -> Option<Group> {
+        self.leading.write().expect("lock").remove(&group);
+        self.groups.write().expect("lock").remove(&group)
+    }
+
     pub fn hosted(&self, group: u32) -> Option<Group> {
         self.groups.read().expect("lock").get(&group).cloned()
     }
@@ -175,6 +181,20 @@ impl Router {
     /// A follower's view may lag the leader's.
     pub fn read<T>(&self, vshard: u16, f: impl FnOnce(&dyn KvRead) -> T) -> Option<T> {
         self.hosted(self.group_of(vshard))?.read(f).ok()
+    }
+
+    /// The actor records this peer's replica of `group` holds; None when this
+    /// peer does not host the group.
+    pub fn actors_of(&self, group: u32) -> Option<Vec<pb::ActorRecord>> {
+        let vshards = self.vshards_of(group);
+        self.hosted(group)?
+            .read(|kv| {
+                vshards
+                    .iter()
+                    .flat_map(|v| chimaera_core::shard::read::actor_records(kv, *v as u16, usize::MAX))
+                    .collect::<Vec<_>>()
+            })
+            .ok()
     }
 
     /// The runs whose records this peer's replica of `group` holds, without

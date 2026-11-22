@@ -157,6 +157,12 @@ message ReadRequest {
   uint32 limit = 7;
   // > 0: list the runs whose records group `list_runs_group` holds (`chimaera runs`).
   uint32 list_runs_group = 8;
+  // > 0: list the actors whose records group `list_actors_group` holds.
+  uint32 list_actors_group = 9;
+  // Ask group `membership_group`'s leader for its members (only the leader
+  // answers): a replica that stopped hearing from it checks it was not removed.
+  bool membership = 10;
+  uint32 membership_group = 11;
 }
 
 message ReadReply {
@@ -166,6 +172,8 @@ message ReadReply {
   string error = 4;
   repeated TaskKey page_keys = 5;   // keys of `tasks` in page mode
   repeated RunRecord runs = 6;      // list_runs_group's runs, without exec_env
+  repeated ActorRecord actors = 7;  // list_actors_group's actors
+  repeated uint64 members = 8;      // membership_group's voters and learners
 }
 
 // An attempt the leader granted to the target, with everything needed to run
@@ -264,6 +272,9 @@ message PingReply {
   // CPUs this peer's running calls hold per tenant that has a cluster share
   // (CHIMAERA_TENANT_SHARES); the others add these up when admitting.
   map<string, double> tenant_cpu = 18;
+  // The peer is draining (SIGTERM): it will stop. `draining` alone may also
+  // mean its core has not answered yet (see the ping handler).
+  bool stopping = 19;
 }
 
 message ForgetRequest {

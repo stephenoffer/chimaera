@@ -58,9 +58,12 @@ def init(
     secrets: the run's variables are stored with the run. Executors get secrets
     from their peer's own environment.
 
-    `tenant` (default ``$CHIMAERA_TENANT``, else "default") is who the run's
-    work is charged to: peers with ``CHIMAERA_TENANT_QUOTAS`` hold a tenant's
-    calls back while its running calls use its quota of CPUs.
+    `tenant` (default ``$CHIMAERA_TENANT``, else the tenant of a driver
+    credential from ``chimaera cluster credential``, else "default") owns the
+    run: its actors, store namespaces and logs, and the CPUs charged to it
+    (peers with ``CHIMAERA_TENANT_QUOTAS`` hold a tenant's calls back while
+    its running calls use its quota). A driver credential reaches only its own
+    tenant's work.
     """
     with _Runtime._lock:
         if _Runtime._instance is None:

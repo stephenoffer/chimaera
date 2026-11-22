@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from ._remote import ActorClass, ActorHandle
-from ._unsupported import unsupported
 
 
 def exit_actor() -> None:
-    raise unsupported("ray.actor.exit_actor()", why="an actor is ended by its owner", use="ray.kill(handle)")
+    """End the actor this method runs on (``ch.context().exit_actor()``)."""
+    import chimaera as ch
+
+    ctx = ch.context()  # None outside a call
+    if ctx is None or ctx.actor_id is None:
+        raise TypeError("exit_actor API is called on a non-actor worker")
+    ctx.exit_actor()
 
 
 __all__ = ["ActorClass", "ActorHandle", "exit_actor"]

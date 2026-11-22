@@ -418,8 +418,8 @@ fn cross_vshard_dependency_resolves_through_outbox_once() {
     let cons = task_id(V, 0);
     h.submit(spec(prod, &[], pb::Effects::None, 3), Some(p));
     let (_, ev) = h.submit(spec(cons, &[prod], pb::Effects::None, 3), None);
-    assert!(ev.contains(&Event::Subscribe { producer: prod, subscriber_vshard: V }));
-    h.raw(Body::Subscribe(pb::Subscribe { producer: Some(prod.pb()), subscriber_vshard: V as u32 }), V2);
+    assert!(ev.contains(&Event::Subscribe { producer: prod, subscriber_vshard: V, hold: 1 }));
+    h.raw(Body::Subscribe(pb::Subscribe { producer: Some(prod.pb()), subscriber_vshard: V as u32, hold: 1 }), V2);
     let r = h.publish(prod, 1, p, obj(3));
     assert_eq!(status(&r), Status::Published);
     let entries = h.a.scan_prefix(&keys::outbox_prefix(), 10);
@@ -433,6 +433,44 @@ fn cross_vshard_dependency_resolves_through_outbox_once() {
     assert_eq!(status(&first_ack(&dup.reply)), Status::Duplicate);
     h.raw(Body::OutboxAck(pb::OutboxAck { seqs: vec![entry.seq] }), V2);
     assert!(h.a.scan_prefix(&keys::outbox_prefix(), 10).is_empty());
+}
+
+#[test]
+fn a_dependent_in_another_vshard_holds_its_producer_until_it_finishes() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let (prod, cons) = (task_id(V2, 0), task_id(V, 0));
+    h.submit(spec(prod, &[], pb::Effects::None, 3), Some(p));
+    let (_, ev) = h.submit(spec(cons, &[prod], pb::Effects::None, 3), None);
+    assert!(ev.contains(&Event::Subscribe { producer: prod, subscriber_vshard: V, hold: 1 }));
+    // Every replica of the subscriber's group sends it: it pins once.
+    let sub = pb::Subscribe { producer: Some(prod.pb()), subscriber_vshard: V as u32, hold: 1 };
+    h.raw(Body::Subscribe(sub.clone()), V2);
+    h.raw(Body::Subscribe(sub), V2);
+    assert_eq!(h.task(prod).unwrap().pins, 2, "the client's pin and the subscriber's hold");
+    // The client lets go before the producer finishes: the hold keeps its result.
+    h.raw(Body::Release(pb::Release { tasks: vec![prod.pb()] }), V2);
+    h.publish(prod, 1, p, obj(3));
+    assert!(h.task(prod).unwrap().spec.is_some(), "kept while a call in another vshard still reads it");
+    let outbox = |h: &Harness| -> Vec<pb::OutboxEntry> {
+        h.a.scan_prefix(&keys::outbox_prefix(), 100)
+            .iter()
+            .map(|(_, v)| pb::OutboxEntry::decode(v.as_slice()).unwrap())
+            .collect()
+    };
+    let notify = outbox(&h).into_iter().find_map(|e| e.notify).expect("the outcome goes to the subscriber");
+    assert!(h.raw(Body::DepNotify(notify), V).events.contains(&Event::DepsSatisfied(cons)));
+    h.grant(cons, p, false);
+    h.publish(cons, 1, p, obj(4));
+    // The reader finished: its vshard releases the hold through the outbox.
+    let release = outbox(&h).into_iter().find_map(|e| e.unsubscribe).expect("the hold is released");
+    assert_eq!((release.subscriber_vshard, release.hold), (V as u32, 1));
+    let stale = h.raw(Body::Unsubscribe(pb::Subscribe { hold: 0, ..release.clone() }), V2);
+    assert!(stale.events.is_empty() && h.task(prod).unwrap().pins == 1, "an older hold's release is ignored");
+    let done = h.raw(Body::Unsubscribe(release.clone()), V2);
+    assert!(done.events.iter().any(|e| matches!(e, Event::Releasable { task, .. } if *task == prod)));
+    assert!(h.task(prod).unwrap().spec.is_none(), "released: shrunk to a tombstone");
+    assert!(h.raw(Body::Unsubscribe(release), V2).events.is_empty(), "a repeated release is ignored");
 }
 
 #[test]
@@ -598,6 +636,83 @@ fn finished_run_cancels_leftovers_and_expires() {
     assert!(gc.events.contains(&Event::RunExpired(run_id(V))));
     assert!(h.task(a).is_none() && h.task(b).is_none());
     assert!(h.a.get(&keys::run(V, &run_id(V))).is_none());
+}
+
+#[test]
+fn cancelling_a_spread_call_cancels_its_calls_in_the_runs_own_vshard_and_later_ones_at_once() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let run = run_id(V);
+    let copy = pb::RunRecord { run: run.to_vec(), spread: vec![V as u32, V2 as u32], ..Default::default() };
+    h.raw(Body::RunCreate(pb::RunCreate { run: Some(copy) }), V2);
+    // A call spread to V2 makes an actor call, which stays in the run's own vshard.
+    let parent = Tk { run, task: Id::derive(0, V2, &[b"spread", b"parent"]) };
+    let child = Tk { run, task: run.child(&[b"actor call"]) };
+    h.submit(spec(parent, &[], pb::Effects::None, 3), Some(p));
+    h.submit(child_of(child, parent), Some(p));
+    assert_eq!(child.v(), V);
+    let budget = pb::Cancel { task: Some(parent.pb()), reason: Kind::Budget as i32, message: "budget exceeded".into() };
+    h.raw(Body::Cancel(budget), V2);
+    assert_eq!(err_kind(&h.task(parent).unwrap()), Some(Kind::Budget));
+    assert_eq!(err_kind(&h.task(child).unwrap()), None, "not yet: it lives in another vshard");
+    let entries: Vec<pb::OutboxEntry> =
+        h.a.scan_prefix(&keys::outbox_prefix(), 100)
+            .iter()
+            .map(|(_, v)| pb::OutboxEntry::decode(v.as_slice()).unwrap())
+            .collect();
+    let entry = entries.iter().find(|e| e.cancel_children.is_some()).expect("the run's own vshard hears of it");
+    assert_eq!(entry.target_vshard, V as u32);
+    let cancel = entry.cancel_children.clone().unwrap();
+    h.raw(Body::CancelChildren(cancel.clone()), V);
+    let rec = h.task(child).unwrap();
+    assert_eq!(err_kind(&rec), Some(Kind::Budget), "the budget's kind reaches the child");
+    // Delivered again (the outbox retries): nothing changes.
+    h.raw(Body::CancelChildren(cancel), V);
+    assert_eq!(h.task(child).unwrap().outcome, rec.outcome);
+    // A call the cancelled body makes afterwards fails at once.
+    let late = Tk { run, task: run.child(&[b"late actor call"]) };
+    h.submit(child_of(late, parent), Some(p));
+    assert_eq!(err_kind(&h.task(late).unwrap()), Some(Kind::Budget));
+    // The links and the cancellation expire with the run.
+    h.raw(Body::RunFinish(pb::RunFinish { run: run.to_vec(), state: 0 }), V);
+    h.hlc += hlc::from_ms(DEFAULT_RUN_RETENTION_MS + 1);
+    h.raw(Body::Gc(pb::Gc { max_keys: 1000 }), V);
+    assert!(h.a.scan_prefix(&keys::pairs_of_run(V, keys::REMOTE_CHILD, &run), 10).is_empty());
+}
+
+#[test]
+fn a_run_spread_over_another_vshard_admits_calls_there_and_its_copy_ends_and_expires_there() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let run = run_id(V);
+    let rec = |spread: Vec<u32>| pb::RunRecord { run: run.to_vec(), tenant: "t".into(), spread, ..Default::default() };
+    let copy = |h: &mut Harness, spread| h.raw(Body::RunCreate(pb::RunCreate { run: Some(rec(spread)) }), V2);
+    let in_v2 = Tk { run, task: Id::derive(0, V2, &[b"spread", b"1"]) };
+    let (ack, _) = h.submit(spec(in_v2, &[], pb::Effects::None, 3), Some(p));
+    assert_eq!(status(&ack), Status::Rejected, "no copy there yet: the run is not active in that vshard");
+    let refused = copy(&mut h, vec![V as u32]);
+    assert!(matches!(refused.reply.body, Some(pb::shard_reply::Body::Rejected(_))), "a vshard the run does not name");
+    copy(&mut h, vec![V as u32, V2 as u32]);
+    let (ack, _) = h.submit(spec(in_v2, &[], pb::Effects::None, 3), None);
+    assert_eq!(status(&ack), Status::Accepted);
+    // The copy is not a run of its own: listings show the run once.
+    let listed = |h: &Harness, v| read::runs(&h.a, v, 100).iter().filter(|r| r.run == run.to_vec()).count();
+    assert_eq!((listed(&h, V), listed(&h, V2)), (1, 0));
+    assert_eq!(read::run_in(&h.a, V2, run).map(|r| r.tenant), Some("t".to_string()));
+    let page = read::tasks_page(&h.a, run, Some(read::page_start(run, V2)), 10);
+    assert_eq!(page.iter().map(|(tk, _)| *tk).collect::<Vec<_>>(), vec![in_v2]);
+    assert!(read::tasks_page(&h.a, run, None, 10).iter().all(|(tk, _)| tk.v() == V), "the run's own vshard alone");
+    // Ending the copy cancels the calls it admitted and leaves the run's own record.
+    let end = h.raw(Body::CancelRun(pb::CancelRun { run: run.to_vec(), message: String::new() }), V2);
+    assert!(end.events.contains(&Event::RunEnded(run)));
+    assert_eq!(err_kind(&h.task(in_v2).unwrap()), Some(Kind::Cancelled));
+    assert_eq!(read::run(&h.a, run).unwrap().state(), pb::run_record::State::Active);
+    // The copy expires with its calls; the run's own record stays until it ends.
+    h.hlc += hlc::from_ms(DEFAULT_RUN_RETENTION_MS + 1);
+    let gc = h.raw(Body::Gc(pb::Gc { max_keys: 100 }), V2);
+    assert!(gc.events.contains(&Event::RunExpired(run)));
+    assert!(h.task(in_v2).is_none() && read::run_in(&h.a, V2, run).is_none());
+    assert!(read::run(&h.a, run).is_some());
 }
 
 #[test]
@@ -963,21 +1078,25 @@ fn run_case(defs: &[TaskDef], ops: &[Op], sm: ShardState) -> Result<(), TestCase
                 match e {
                     Event::DepsSatisfied(t) => *deps_satisfied.entry(*t).or_default() += 1,
                     Event::Done { task, .. } => *done_events.entry(*task).or_default() += 1,
-                    Event::Subscribe { producer, subscriber_vshard } => pending.push(Pending {
+                    Event::Subscribe { producer, subscriber_vshard, hold } => pending.push(Pending {
                         v: producer.v(),
                         body: Body::Subscribe(pb::Subscribe {
                             producer: Some(producer.pb()),
                             subscriber_vshard: *subscriber_vshard as u32,
+                            hold: *hold,
                         }),
                         ack_seq: None,
                     }),
                     Event::Outbox { seq, target_vshard } => {
                         let entry: pb::OutboxEntry = load(&h.a, &keys::outbox(*seq)).expect("outbox entry exists");
-                        pending.push(Pending {
-                            v: *target_vshard,
-                            body: Body::DepNotify(entry.notify.unwrap()),
-                            ack_seq: Some(*seq),
-                        });
+                        let body = match (entry.notify, entry.unsubscribe, entry.cancel_children) {
+                            (Some(n), _, _) => Body::DepNotify(n),
+                            (None, Some(u), _) => Body::Unsubscribe(u),
+                            (None, None, c) => {
+                                Body::CancelChildren(c.expect("an outbox entry carries one of the three"))
+                            }
+                        };
+                        pending.push(Pending { v: *target_vshard, body, ack_seq: Some(*seq) });
                     }
                     _ => {}
                 }

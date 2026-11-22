@@ -40,9 +40,74 @@ class PutRef:
         return f"<ObjectRef put {self._ref.id[-12:]}>"
 
 
+class ItemRef:
+    """One item of an ``ObjectRefGenerator``: already resolved (or the error
+    the generator raised there, raised by ``ray.get``)."""
+
+    __slots__ = ("_value", "_error")
+
+    def __init__(self, value: Any = None, error: BaseException | None = None) -> None:
+        self._value, self._error = value, error
+
+    def result(self, timeout: float | None = None) -> Any:
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (ItemRef, (self._value, self._error))
+
+    def __repr__(self) -> str:
+        return "<ObjectRef generator item>"
+
+
+class ObjectRefGenerator:
+    """What a generator task or method returns in Ray: one ref per yielded
+    value, in order, as they arrive (``for ref in gen: ray.get(ref)``)."""
+
+    def __init__(self, results: ch.Results[Any]) -> None:
+        self._results, self._it, self._done = results, iter(results), False
+
+    def __iter__(self) -> ObjectRefGenerator:
+        return self
+
+    def __next__(self) -> ItemRef:
+        if self._done:
+            raise StopIteration
+        try:
+            return ItemRef(next(self._it))
+        except StopIteration:
+            self._done = True
+            raise
+        except Exception as e:  # Ray hands the error out as the next ref
+            self._done = True
+            return ItemRef(error=e)
+
+    def __aiter__(self) -> ObjectRefGenerator:
+        return self
+
+    async def __anext__(self) -> ItemRef:
+        import asyncio
+
+        try:
+            return await asyncio.to_thread(self.__next__)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    def completed(self) -> ItemRef:
+        """A ref that resolves once the generator has finished."""
+        for _ in self:
+            pass
+        return ItemRef(None)
+
+
+def _streamed(f: Any) -> Any:
+    return ObjectRefGenerator(f) if isinstance(f, ch.Results) else f
+
+
 def _resolve(x: Any) -> Any:
     # Ray passes top-level ``ray.put`` references to the callee as values.
-    return x.result() if isinstance(x, PutRef) else x
+    return x.result() if isinstance(x, (PutRef, ItemRef)) else x
 
 
 def _as_ray(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -77,11 +142,47 @@ def _resolving(fn: Callable[..., Any], alias: bool) -> Callable[..., Any]:
 
         return call_async
 
+    if inspect.isgeneratorfunction(fn):  # still a generator: the call streams
+
+        @functools.wraps(fn)
+        def call_gen(*args: Any, **kwargs: Any) -> Any:
+            a, k = prepare(args, kwargs)
+            yield from fn(*a, **k)
+
+        return call_gen
+
+    if inspect.isasyncgenfunction(fn):
+
+        @functools.wraps(fn)
+        async def call_agen(*args: Any, **kwargs: Any) -> Any:
+            a, k = prepare(args, kwargs)
+            async for item in fn(*a, **k):
+                yield item
+
+        return call_agen
+
     @functools.wraps(fn)
     def call(*args: Any, **kwargs: Any) -> Any:
         a, k = prepare(args, kwargs)
         return fn(*a, **k)
 
+    return call
+
+
+_GENERATOR_METHOD = "__chimaera_compat_generator__"
+
+
+def _collected(fn: Callable[..., Any], alias: bool) -> Callable[..., Any]:
+    """A generator method as a method returning its items: Chimaera streams
+    generator functions, not methods, so the shim hands the items out as an
+    ObjectRefGenerator once the method returns (``ActorMethod.remote``)."""
+    gen = _resolving(fn, alias)
+
+    @functools.wraps(fn)
+    def call(*args: Any, **kwargs: Any) -> list[Any]:
+        return list(gen(*args, **kwargs))
+
+    setattr(call, _GENERATOR_METHOD, True)
     return call
 
 
@@ -91,7 +192,7 @@ def _resolving_class(cls: type, alias: bool) -> type:
     for name in dir(cls):
         attr = inspect.getattr_static(cls, name)
         if isinstance(attr, types.FunctionType) and (name == "__init__" or not name.startswith("__")):
-            ns[name] = _resolving(attr, alias)
+            ns[name] = _collected(attr, alias) if inspect.isgeneratorfunction(attr) else _resolving(attr, alias)
     try:
         sub = type(cls.__name__, (cls,), ns)
     except TypeError:  # a metaclass that refuses subclassing
@@ -110,8 +211,6 @@ class RemoteFunction:
     list of them with ``num_returns=n``."""
 
     def __init__(self, fn: Callable[..., Any], options: Mapping[str, Any], base: ch.typing.RemoteFunction | None = None) -> None:
-        if inspect.isgeneratorfunction(fn) or inspect.isasyncgenfunction(fn):
-            raise unsupported("a generator remote function", use="generator functions in chimaera directly", lands="M1")
         self._fn = fn
         self._options = dict(options)
         self._base = base or ch.remote(_resolving(fn, _installed()))
@@ -127,7 +226,7 @@ class RemoteFunction:
     def remote(self, *args: Any, **kwargs: Any) -> Any:
         args, kwargs = _as_ray(args, kwargs)
         f = self._view.remote(*args, **kwargs)
-        return list(f.split(self._returns)) if self._returns > 1 else f
+        return list(f.split(self._returns)) if self._returns > 1 else _streamed(f)
 
     def options(self, **options: Any) -> RemoteFunction:
         return RemoteFunction(self._fn, {**self._options, **options}, self._base)
@@ -183,7 +282,9 @@ class ActorHandle:
     def __getattr__(self, name: str) -> ActorMethod:
         if name.startswith("__"):
             raise AttributeError(name)
-        return ActorMethod(getattr(self._actor, name))
+        cls = getattr(self._actor, "_cls", None)
+        streams = getattr(inspect.getattr_static(cls, name, None), _GENERATOR_METHOD, False) if cls else False
+        return ActorMethod(getattr(self._actor, name), streams)
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (ActorHandle, (self._actor,))
@@ -192,15 +293,29 @@ class ActorHandle:
         return f"Actor({self._actor!r})"
 
 
-class ActorMethod:
-    __slots__ = ("_method",)
+class _Items:
+    """A finished generator method's items, iterated like ``ch.Results``."""
 
-    def __init__(self, method: Any) -> None:
-        self._method = method
+    def __init__(self, future: ch.Future[list[Any]]) -> None:
+        self._future = future
+
+    def __iter__(self) -> Any:
+        return iter(self._future.result())
+
+
+class ActorMethod:
+    __slots__ = ("_method", "_streams")
+
+    def __init__(self, method: Any, streams: bool = False) -> None:
+        self._method, self._streams = method, streams
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
         args, kwargs = _as_ray(args, kwargs)
         f = self._method.remote(*args, **kwargs)
+        if self._streams:
+            return ObjectRefGenerator(_Items(f))  # type: ignore[arg-type]
+        if isinstance(f, ch.Results):
+            return ObjectRefGenerator(f)
         try:  # a method declared (or called) with num_returns=n gives n refs, as in Ray
             return list(f.split())
         except TypeError:
@@ -211,8 +326,10 @@ class ActorMethod:
         out: dict[str, Any] = {}
         for name, value in options.items():
             if name == "num_returns":
-                if value in ("streaming", "dynamic"):
-                    raise unsupported(f"num_returns={value!r}", use="a generator method", lands="M1")
+                if value == "streaming":
+                    continue  # a generator method streams anyway
+                if value == "dynamic":
+                    raise unsupported("num_returns='dynamic'", use="num_returns='streaming' (an ObjectRefGenerator)")
                 if int(value) > 1:
                     out["returns"] = int(value)
             elif name in ("max_task_retries", "max_retries"):
@@ -221,7 +338,7 @@ class ActorMethod:
                 out.update({k: v for k, v in _options.translate({name: value}, _options.TASK).items() if k == name})
             elif name not in ("name", "enable_task_events"):
                 raise unsupported(f"actor method .options({name}=...)", use="method .options() in chimaera")
-        return ActorMethod(self._method.options(**out))
+        return ActorMethod(self._method.options(**out), self._streams)
 
 
 def get_actor(name: str, namespace: str | None = None) -> ActorHandle:

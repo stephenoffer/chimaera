@@ -244,6 +244,30 @@ machine loss but not a simultaneous power loss of all three. Runs that need more
 then acknowledge after a group-committed fsync, adding roughly one fsync (tens of microseconds on NVMe) to `external`
 starts and nothing to other calls.
 
+### Runs spread over several groups
+
+Until the journal lands, every call commits in a Raft group, and one group's leader commits roughly 10,000 calls
+a second. In the 64-node evaluation the busiest peer, the one leading the run's group, used 1.04 cores in the
+nested-call workload and 1.27 in the shuffle, while the other 63 stayed under 0.3. Those two workloads ran 4 and
+8.5 times slower than on Ray. A run therefore names
+up to 16 vshards (`CHIMAERA_RUN_SPREAD`), each in a data group led by a different peer, and keeps a copy of its
+record in each. Placement follows three rules:
+
+- A driver's call goes to the vshard its inputs share; to the run's own vshard when its inputs span several,
+  so their notices converge on one group; and otherwise round robin over the spread.
+- A call's children stay in its vshard, so one group commits a parent's whole subtree, and cancelling or
+  budgeting the parent reaches every child through the same index.
+- Actor and generator calls stay in the run's own vshard, next to the actors whose events place them.
+
+Ending a run in its own group ends every copy, which cancels the calls each admitted; the copies expire with
+it. Listing walks the vshards in id order, since task ids lead with their vshard.
+
+A dependent in another vshard holds its producer there. The first one to arrive subscribes, which pins the
+producer once for that vshard. When the last one finishes, the release goes back through the outbox. Every
+replica of the subscriber's group sends each subscription, so a hold is idempotent per vshard, and it carries
+a generation so that a late release of an older hold is ignored. Without the hold, a producer whose caller had
+let go of it was freed before a remote dependent read it.
+
 ### Actor calls take the direct path
 
 An actor handle caches the actor's generation and host. A method call goes from the caller's agent to the host's

@@ -23,7 +23,7 @@ import chimaera as ch
 
 from . import _state
 from ._nodes import available_resources, cluster_resources, nodes
-from ._remote import ActorClass, ActorHandle, PutRef, RemoteFunction, get_actor, make
+from ._remote import ActorClass, ActorHandle, ItemRef, ObjectRefGenerator, PutRef, RemoteFunction, get_actor, make
 from ._unsupported import ChimaeraCompatWarning, Unsupported, UnsupportedAttribute, unsupported, warn_once
 from .exceptions import GetTimeoutError, reraise
 from .runtime_context import get_runtime_context
@@ -37,6 +37,7 @@ class ObjectRef(abc.ABC):
 
 ObjectRef.register(ch.Future)
 ObjectRef.register(PutRef)
+ObjectRef.register(ItemRef)
 
 _INIT_IGNORED = (
     "num_cpus",
@@ -262,8 +263,7 @@ def install() -> None:
 
 _KNOWN_UNSUPPORTED = {
     "timeline": ("`chimaera explain RUN`", ""),
-    "ObjectRefGenerator": ("a generator function, which returns ch.Results", "M1"),
-    "DynamicObjectRefGenerator": ("a generator function, which returns ch.Results", "M1"),
+    "DynamicObjectRefGenerator": ("num_returns='streaming' (an ObjectRefGenerator)", ""),
     "java_function": ("Python; Chimaera is Python-only", ""),
     "java_actor_class": ("Python; Chimaera is Python-only", ""),
     "cpp_function": ("Python; Chimaera is Python-only", ""),
@@ -293,6 +293,7 @@ __all__ = [
     "ChimaeraCompatWarning",
     "UnsupportedAttribute",
     "ObjectRef",
+    "ObjectRefGenerator",
     "RemoteFunction",
     "Unsupported",
     "actor",

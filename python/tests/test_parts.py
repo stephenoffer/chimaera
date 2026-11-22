@@ -72,6 +72,14 @@ print("NODES", json.dumps(nodes), flush=True)
 wait_for(LOOKED)  # the test looks at the stores
 whole = f.result(timeout=60)  # read here, through this driver's peer
 print("WHOLE", json.dumps([(w[0], len(w)) for w in whole]), flush=True)
+wait_for(BROKEN)  # the test removed one part from every peer
+from chimaera._runtime import Runtime, read_object
+run, name = (bytes.fromhex(h) for h in open(BROKEN).read().split())
+try:
+    read_object(Runtime.get().object_dir, run, name)
+    print("LOST", json.dumps("read without its part"), flush=True)
+except ch.errors.DataLost as e:
+    print("LOST", json.dumps(str(e)), flush=True)
 del f, parts, whole, got
 gc.collect()
 print("RELEASED", flush=True)
@@ -92,8 +100,9 @@ def stored(c: Cluster, i: int) -> dict[str, bytes]:
 
 def test_a_consumer_at_scale_fetches_only_its_value_and_parts_go_with_their_result():
     c = Cluster(3)  # three peers, a consumer on each: parts pay (see worth_splitting)
-    looked, done = os.path.join(c.root, "looked"), os.path.join(c.root, "done")
-    drv = c.driver(0, DRIVER.replace("LOOKED", repr(looked)).replace("DONE", repr(done)))
+    looked, broken, done = (os.path.join(c.root, n) for n in ("looked", "broken", "done"))
+    driver = DRIVER.replace("LOOKED", repr(looked)).replace("BROKEN", repr(broken)).replace("DONE", repr(done))
+    drv = c.driver(0, driver)
     try:
         def line(key: str):
             text = drv.stdout.readline()
@@ -118,6 +127,13 @@ def test_a_consumer_at_scale_fetches_only_its_value_and_parts_go_with_their_resu
 
         open(looked, "w").close()
         assert line("WHOLE") == [[0, 2 << 20], [1, 2 << 20], [2, 2 << 20]], "the whole result rebuilds from its parts"
+        gone = glob.glob(os.path.join(c.root, "p*", "objects", "*", part_names[0]))
+        assert gone, "the part is stored somewhere"
+        for path in gone:
+            os.unlink(path)
+        with open(broken, "w") as f:
+            f.write(f"{os.path.basename(os.path.dirname(gone[0]))} {name}")
+        assert "part of value" in line("LOST"), "a lost part reads as DataLost, naming the value"
         assert drv.stdout.readline().strip() == "RELEASED"
         deadline = time.monotonic() + 30
         while name in stored(c, producer) and time.monotonic() < deadline:
@@ -131,3 +147,19 @@ def test_a_consumer_at_scale_fetches_only_its_value_and_parts_go_with_their_resu
         if drv.poll() is None:
             drv.kill()
         c.close()
+
+
+def test_a_small_object_file_is_read_and_a_large_one_mapped_both_private(tmp_path):
+    # A first map costs ~2.5 ms on macOS however small the file; every input a
+    # peer fetched is a first map, so small files are read instead.
+    import mmap
+
+    for n, kind in ((1000, bytearray), ((_serde._READ_MAX >> 3) + 1, mmap.mmap)):
+        value = bytes(range(256)) * (n * 8 // 256 + 1)
+        parts, _, _ = _serde.dumps_parts(bytearray(value))
+        path = str(tmp_path / f"o{n}")
+        _serde.write_file(path, parts)
+        assert isinstance(_serde._map(path), kind)
+        got = _serde.read_file(path)
+        got[0] = (got[0] + 1) % 256  # writable, and private to this reader
+        assert _serde.read_file(path) == bytearray(value)

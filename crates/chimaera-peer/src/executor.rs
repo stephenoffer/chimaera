@@ -177,6 +177,11 @@ impl Supervisor {
             .stderr(log)
             .process_group(0)
             .envs(&env.env)
+            // The cluster's credentials stay with the peer: a call is the
+            // tenant's code, and the token would make it an administrator.
+            .env_remove("CHIMAERA_CLUSTER_TOKEN")
+            .env_remove("CHIMAERA_TOKEN")
+            .env_remove("CHIMAERA_TOKEN_FILE")
             .env("PYTHONPATH", env.sys_path.join(":"))
             .env("PYTHONUNBUFFERED", "1")
             .env("CHIMAERA_EXECUTOR", "1");

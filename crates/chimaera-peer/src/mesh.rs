@@ -92,6 +92,9 @@ impl tonic::service::Interceptor for CheckToken {
 }
 
 const MAX_MESSAGE: usize = 256 << 20;
+/// Peers an uploaded code blob is copied to (besides the one it reached);
+/// others fetch it from them on first use.
+const CODE_COPIES: usize = 3;
 const FETCH_CHUNK: usize = 4 << 20;
 /// Objects this large come over several streams at once (the guides measured
 /// 8-10x from multiple connections on large transfers).
@@ -170,7 +173,7 @@ pub struct MeshClient {
     /// Objects fetched recently (locality hints for other peers).
     recent: Mutex<VecDeque<(Instant, Vec<u8>)>>,
     /// Which peer holds the parts of results fetched here (see parts).
-    parts: crate::parts::Hints,
+    parts: Arc<crate::parts::Hints>,
     /// Objects other peers asked this one for, and when: their fetched copy
     /// already makes a replica unnecessary (see objplane).
     served: Mutex<HashMap<Vec<u8>, Instant>>,
@@ -261,7 +264,7 @@ impl MeshClient {
             bandwidth: Mutex::new(HashMap::new()),
             fetched: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
-            parts: crate::parts::Hints::default(),
+            parts: Arc::default(),
             served: Mutex::new(HashMap::new()),
             received: Mutex::new(Vec::new()),
             swim: Mutex::new(Swim::new(me_node, swim_inc(me_inc), me_node, swim_config())),
@@ -341,7 +344,12 @@ impl MeshClient {
     }
 
     pub fn member_by_peer(&self, peer: &[u8]) -> Option<PeerView> {
-        self.members.read().expect("lock").values().find(|p| p.member.peer == peer).cloned()
+        let ms = self.members.read().expect("lock");
+        // A peer's node id is derived from its id: look it up, not through every member.
+        match ms.get(&crate::stores::node_id_of(peer)).filter(|p| p.member.peer == peer) {
+            Some(p) => Some(p.clone()),
+            None => ms.values().find(|p| p.member.peer == peer).cloned(),
+        }
     }
 
     /// Record a member (or a newer incarnation of one), and tell SWIM.
@@ -576,15 +584,19 @@ impl MeshClient {
     /// Where this peer's objects are replicated: the next live member by
     /// node id, wrapping around (None when alone).
     pub fn successor(&self) -> Option<u64> {
-        let mut ids: Vec<u64> = self.live_others().iter().map(|p| p.member.node_id).collect();
-        ids.sort_unstable();
-        ids.iter().copied().find(|&n| n > self.me.node_id).or_else(|| ids.first().copied())
+        self.successors(1).first().copied()
     }
 
-    /// Give every live peer a copy of a code blob (best effort): the peer a
-    /// program connected to may die while its calls still need the code.
+    /// The next `n` live peers after this one by node id, in ring order (the
+    /// peers readers search when a holder is gone; draining ones are left out).
+    pub fn successors(&self, n: usize) -> Vec<u64> {
+        ring_after(self.me.node_id, self.live_others().iter().map(|p| p.member.node_id).collect(), n)
+    }
+
+    /// Give `CODE_COPIES` live peers a copy of a code blob (best effort): the
+    /// peer a program connected to may die while its calls still need the code.
     pub fn spread_code(self: &Arc<Self>, digest: Vec<u8>, code: Vec<u8>) {
-        for p in self.live_others() {
+        for p in self.code_order(&digest).into_iter().take(CODE_COPIES) {
             let (mesh, node) = (self.clone(), p.member.node_id);
             let req = pb::MeshPutCode { cluster: self.cluster.clone(), digest: digest.clone(), code: code.clone() };
             tokio::spawn(async move {
@@ -939,7 +951,11 @@ impl MeshClient {
         let result = if dest.exists() {
             Ok(())
         } else {
-            self.fetch_from(run, object, size, holders, &dest).await.map(|node| self.parts.learn(run, &dest, node))
+            self.fetch_from(run, object, size, holders, &dest).await.map(|node| {
+                // Off the async workers: it reads the fetched file's header.
+                let (hints, run, dest) = (self.parts.clone(), run.to_vec(), dest.clone());
+                tokio::task::spawn_blocking(move || hints.learn(&run, &dest, node));
+            })
         };
         drop(held);
         let mut inflight = self.inflight.lock().expect("lock");
@@ -994,14 +1010,27 @@ impl MeshClient {
         Err(last)
     }
 
-    /// Make a code blob present in the local store, from any live member.
-    /// The store checks the bytes against the digest.
+    /// Live members in the order a code blob is looked for: the
+    /// `CODE_COPIES` that `spread_code` sent it to first (rendezvous hashing,
+    /// so every peer agrees), then the rest.
+    fn code_order(&self, digest: &[u8]) -> Vec<PeerView> {
+        let rank = |node: u64| {
+            let h = blake3::Hasher::new().update(digest).update(&node.to_le_bytes()).finalize();
+            u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes"))
+        };
+        let mut live = self.live_others();
+        live.sort_by_key(|p| std::cmp::Reverse(rank(p.member.node_id)));
+        live
+    }
+
+    /// Make a code blob present in the local store, from its holders first,
+    /// else any live member. The store checks the bytes against the digest.
     pub async fn localize_code(&self, store: &CodeStore, digest: &[u8]) -> std::io::Result<()> {
         if store.has(digest) {
             return Ok(());
         }
         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no peer holds the code");
-        for p in self.live_others() {
+        for p in self.code_order(digest) {
             let Ok(mut c) = self.rpc(p.member.node_id) else { continue };
             let req = pb::FetchRequest {
                 cluster: self.cluster.clone(),
@@ -1220,9 +1249,35 @@ impl pb::mesh_server::Mesh for MeshService {
         self.0.check(&r.cluster)?;
         let router = self.0.router()?;
         let mut reply = pb::ReadReply::default();
+        // A listing asked linearizably comes from the leader, which has applied every commit.
+        let list_group = if r.list_runs_group > 0 { r.list_runs_group } else { r.list_actors_group };
+        if list_group > 0
+            && r.linearizable
+            && let Err(e) = match router.hosted(list_group) {
+                Some(g) if router.leads(list_group) => g.linearizable().await.map_err(|e| e.to_string()),
+                _ => Err("not this group's leader".to_string()),
+            }
+        {
+            reply.error = e;
+            return Ok(Response::new(reply));
+        }
         if r.list_runs_group > 0 {
             match router.runs_of(r.list_runs_group) {
                 Some(runs) => reply.runs = runs,
+                None => reply.error = "group not hosted here".into(),
+            }
+            return Ok(Response::new(reply));
+        }
+        if r.membership {
+            match router.hosted(r.membership_group) {
+                Some(g) if router.leads(g.id) => reply.members = g.members(),
+                _ => reply.error = "not this group's leader".into(),
+            }
+            return Ok(Response::new(reply));
+        }
+        if r.list_actors_group > 0 {
+            match router.actors_of(r.list_actors_group) {
+                Some(actors) => reply.actors = actors,
                 None => reply.error = "group not hosted here".into(),
             }
             return Ok(Response::new(reply));
@@ -1232,6 +1287,11 @@ impl pb::mesh_server::Mesh for MeshService {
             .first()
             .and_then(Tk::parse)
             .map(|t| t.v())
+            // A page of a run's tasks continues in the vshard its cursor names
+            // (a vshard of the run's spread, in another group than the run's own).
+            .or_else(|| {
+                chimaera_core::ids::Id::from_slice(&r.after_task).ok().filter(|_| r.limit > 0).map(|i| i.vshard())
+            })
             .or_else(|| chimaera_core::ids::Id::from_slice(&r.run).ok().map(|i| i.vshard()))
             .or_else(|| chimaera_core::ids::Id::from_slice(&r.actor).ok().map(|i| i.vshard()));
         let Some(v) = vshard else { return Ok(Response::new(reply)) };
@@ -1448,9 +1508,26 @@ impl pb::mesh_server::Mesh for MeshService {
     }
 }
 
+/// The first `n` of `ids` after `me` going round the ring of node ids.
+fn ring_after(me: u64, mut ids: Vec<u64>, n: usize) -> Vec<u64> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids.retain(|&id| id != me);
+    let start = ids.iter().position(|&id| id > me).unwrap_or(0);
+    (0..ids.len().min(n)).map(|i| ids[(start + i) % ids.len()]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use tonic::service::Interceptor;
+
+    #[test]
+    fn successors_go_round_the_ring_after_this_peer() {
+        assert_eq!(super::ring_after(5, vec![9, 2, 7], 2), vec![7, 9]);
+        assert_eq!(super::ring_after(8, vec![9, 2, 7], 2), vec![9, 2], "past the end it wraps");
+        assert_eq!(super::ring_after(9, vec![9, 2, 7], 5), vec![2, 7], "never itself, at most the others");
+        assert!(super::ring_after(1, vec![], 1).is_empty());
+    }
 
     #[test]
     fn a_peer_from_another_release_is_refused() {

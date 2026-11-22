@@ -68,3 +68,12 @@ def parse_duration(value: float | int | str | _dt.timedelta, field: str = "durat
     if math.isnan(seconds) or seconds < 0:
         raise ValueError(f"{field}: duration must be a non-negative number, got {value!r}")
     return seconds
+
+
+def start_position(start: object) -> str | int:
+    """Where a subscription, watch or event stream begins: ``"latest"`` (what
+    happens from now on), ``"earliest"`` (everything still held) or a position
+    (an offset, revision or sequence number) >= 0."""
+    if start in ("latest", "earliest") or (isinstance(start, int) and not isinstance(start, bool) and start >= 0):
+        return start  # type: ignore[return-value]
+    raise ValueError(f"start: expected 'latest', 'earliest' or a position >= 0, got {start!r}")
