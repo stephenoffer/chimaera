@@ -209,6 +209,16 @@ fn max_attempts(rec: &pb::TaskRecord) -> u32 {
     }
 }
 
+fn pins_key(tk: Tk) -> Vec<u8> {
+    keys::of_producer(tk.v(), keys::PINS, tk.pair())
+}
+
+/// `tk`'s live pin count: its own key, or the count a record from before that
+/// key carries; None when the task was never submitted here.
+fn pin_count(kv: &dyn KvRead, tk: Tk) -> Option<u32> {
+    load_u32(kv, &pins_key(tk)).or_else(|| load::<pb::TaskRecord>(kv, &tk.key()).map(|r| r.pins))
+}
+
 /// A remote producer's read count here and the generation of this vshard's hold on it.
 fn remote_pins(kv: &dyn KvRead, key: &[u8]) -> (u32, u32) {
     kv.get(key).map_or((0, 0), |b| {
@@ -444,6 +454,7 @@ impl ShardState {
                     keys::pairs_of_run(v, keys::BUDGET, &run),
                     keys::pairs_of_run(v, keys::DEPS_LEFT, &run),
                     keys::pairs_of_run(v, keys::HELD, &run),
+                    keys::pairs_of_run(v, keys::PINS, &run),
                     keys::pairs_of_run(v, keys::REMOTE_PINS, &run),
                 ] {
                     for (k, _) in cx.kv.scan_prefix(&prefix, budget - deleted) {
@@ -601,6 +612,7 @@ impl ShardState {
                 submitted_hlc: cx.now,
                 ..Default::default()
             };
+            cx.kv.put(pins_key(tk), (1 + early).to_be_bytes().to_vec());
             rec.set_state(TState::Pending);
             // Cancelling a call cancels what it submitted, including calls a
             // cancelled body submits afterwards (cancellation is cooperative).
@@ -1209,22 +1221,31 @@ impl ShardState {
             }
             return;
         }
-        if let Some(mut p) = load::<pb::TaskRecord>(cx.kv, &producer.key()) {
-            p.pins += 1;
-            store(cx.kv, producer.key(), &p);
+        self.add_pin(cx, producer);
+    }
+
+    /// One more holder of `tk`'s result, if it was submitted (a producer
+    /// submitted later counts the dependents that arrived first).
+    fn add_pin(&self, cx: &mut Cx, tk: Tk) {
+        if let Some(n) = pin_count(cx.kv, tk) {
+            cx.kv.put(pins_key(tk), (n + 1).to_be_bytes().to_vec());
         }
     }
 
-    fn unpin(&self, cx: &mut Cx, producer: Tk) {
-        let Some(mut p) = load::<pb::TaskRecord>(cx.kv, &producer.key()) else { return };
-        if p.pins == 0 {
-            return;
+    /// One holder fewer; the last lets a finished call's result go. Whether
+    /// there was a pin to drop.
+    fn unpin(&self, cx: &mut Cx, producer: Tk) -> bool {
+        let Some(n) = pin_count(cx.kv, producer).filter(|n| *n > 0) else { return false };
+        cx.kv.put(pins_key(producer), (n - 1).to_be_bytes().to_vec());
+        if n == 1
+            && let Some(p) = load::<pb::TaskRecord>(cx.kv, &producer.key())
+            && p.state() == TState::Done
+            && p.spec.is_some()
+        {
+            let tomb = tombstone(cx, producer, &p);
+            store(cx.kv, producer.key(), &tomb);
         }
-        p.pins -= 1;
-        if p.pins == 0 && p.state() == TState::Done {
-            p = tombstone(cx, producer, &p);
-        }
-        store(cx.kv, producer.key(), &p);
+        true
     }
 
     fn complete(&self, cx: &mut Cx, tk: Tk, mut rec: pb::TaskRecord, outcome: pb::Outcome) -> pb::TaskRecord {
@@ -1239,7 +1260,7 @@ impl ShardState {
         rec.outcome = Some(outcome.clone());
         rec.done_hlc = cx.now;
         cx.events.push(Event::Done { task: tk, outcome });
-        if rec.pins == 0 {
+        if pin_count(cx.kv, tk).unwrap_or(rec.pins) == 0 {
             let tomb = tombstone(cx, tk, &rec);
             store(cx.kv, tk.key(), &tomb);
         } else {
@@ -1390,10 +1411,7 @@ impl ShardState {
             None if s.hold == 0 => {}
             None => {
                 cx.kv.put(held, s.hold.to_be_bytes().to_vec());
-                if let Some(mut rec) = load::<pb::TaskRecord>(cx.kv, &p.key()) {
-                    rec.pins += 1;
-                    store(cx.kv, p.key(), &rec);
-                }
+                self.add_pin(cx, p);
             }
             Some(g) if g < s.hold => cx.kv.put(held, s.hold.to_be_bytes().to_vec()),
             Some(_) => {}
@@ -1442,16 +1460,9 @@ impl ShardState {
         let mut released = 0u64;
         for key in &r.tasks {
             let Some(tk) = Tk::parse(key).filter(|t| t.v() == v) else { continue };
-            let Some(mut rec) = load::<pb::TaskRecord>(cx.kv, &tk.key()) else { continue };
-            if rec.pins == 0 {
-                continue;
+            if self.unpin(cx, tk) {
+                released += 1;
             }
-            rec.pins -= 1;
-            if rec.pins == 0 && rec.state() == TState::Done {
-                rec = tombstone(cx, tk, &rec);
-            }
-            store(cx.kv, tk.key(), &rec);
-            released += 1;
         }
         reply(pb::shard_reply::Body::Count(released))
     }
@@ -1469,6 +1480,11 @@ pub mod read {
 
     pub fn task(kv: &dyn KvRead, tk: Tk) -> Option<pb::TaskRecord> {
         load(kv, &tk.key())
+    }
+
+    /// How many hold `tk`'s result: its callers, dependents and holds.
+    pub fn pins(kv: &dyn KvRead, tk: Tk) -> u32 {
+        pin_count(kv, tk).unwrap_or(0)
     }
 
     /// Outcome of `producer` as seen from a dependent in `vshard`: its own

@@ -24,6 +24,7 @@ pub const STORE_LOG: u8 = b'J'; // ch.Store change log: namespace, revision
 pub const STORE_LOG_META: u8 = b'U'; // ch.Store change log bounds
 pub const SUBSCRIBER: u8 = b'B'; // producer -> remote subscriber vshard
 pub const NOTIFIED: u8 = b'N'; // remote producer outcome received
+pub const PINS: u8 = b'u'; // task -> its live pin count (callers, dependents, holds)
 pub const HELD: u8 = b'h'; // producer -> remote subscriber vshard holding it: the hold's generation
 pub const REMOTE_PINS: u8 = b'r'; // remote producer -> calls here still reading it, and the hold's generation
 pub const GRANT: u8 = b'G'; // live attempt by peer incarnation

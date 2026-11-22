@@ -447,7 +447,7 @@ fn a_dependent_in_another_vshard_holds_its_producer_until_it_finishes() {
     let sub = pb::Subscribe { producer: Some(prod.pb()), subscriber_vshard: V as u32, hold: 1 };
     h.raw(Body::Subscribe(sub.clone()), V2);
     h.raw(Body::Subscribe(sub), V2);
-    assert_eq!(h.task(prod).unwrap().pins, 2, "the client's pin and the subscriber's hold");
+    assert_eq!(read::pins(&h.a, prod), 2, "the client's pin and the subscriber's hold");
     // The client lets go before the producer finishes: the hold keeps its result.
     h.raw(Body::Release(pb::Release { tasks: vec![prod.pb()] }), V2);
     h.publish(prod, 1, p, obj(3));
@@ -466,7 +466,7 @@ fn a_dependent_in_another_vshard_holds_its_producer_until_it_finishes() {
     let release = outbox(&h).into_iter().find_map(|e| e.unsubscribe).expect("the hold is released");
     assert_eq!((release.subscriber_vshard, release.hold), (V as u32, 1));
     let stale = h.raw(Body::Unsubscribe(pb::Subscribe { hold: 0, ..release.clone() }), V2);
-    assert!(stale.events.is_empty() && h.task(prod).unwrap().pins == 1, "an older hold's release is ignored");
+    assert!(stale.events.is_empty() && read::pins(&h.a, prod) == 1, "an older hold's release is ignored");
     let done = h.raw(Body::Unsubscribe(release.clone()), V2);
     assert!(done.events.iter().any(|e| matches!(e, Event::Releasable { task, .. } if *task == prod)));
     assert!(h.task(prod).unwrap().spec.is_none(), "released: shrunk to a tombstone");
@@ -598,13 +598,13 @@ fn a_result_stays_pinned_until_its_dependents_complete() {
     let (c, d) = (task_id(V, 2), task_id(V, 3));
     h.submit(spec(d, &[c], pb::Effects::None, 3), None);
     h.submit(spec(c, &[], pb::Effects::None, 3), Some(p));
-    assert_eq!(h.task(c).unwrap().pins, 2);
+    assert_eq!(read::pins(&h.a, c), 2);
     // A dependent cancelled before its producer exists leaves no stale pin.
     let (e, f) = (task_id(V, 4), task_id(V, 5));
     h.submit(spec(f, &[e], pb::Effects::None, 3), None);
     h.cancel(f);
     h.submit(spec(e, &[], pb::Effects::None, 3), Some(p));
-    assert_eq!(h.task(e).unwrap().pins, 1, "only the client pin remains");
+    assert_eq!(read::pins(&h.a, e), 1, "only the client pin remains");
     // A dependent that fails on one dep releases the pins it took on the others.
     let (g, x, y) = (task_id(V, 6), task_id(V, 7), task_id(V, 8));
     h.submit(spec(g, &[], pb::Effects::None, 3), Some(p));
@@ -612,7 +612,7 @@ fn a_result_stays_pinned_until_its_dependents_complete() {
     h.submit(spec(x, &[], pb::Effects::None, 3), Some(p));
     h.submit(spec(y, &[g, x], pb::Effects::None, 3), None);
     assert_eq!(err_kind(&h.task(y).unwrap()), Some(Kind::Causal));
-    assert_eq!(h.task(x).unwrap().pins, 1, "pin on x released by y's completion");
+    assert_eq!(read::pins(&h.a, x), 1, "pin on x released by y's completion");
 }
 
 #[test]
@@ -1256,7 +1256,7 @@ fn a_forwarded_call_waits_without_a_worker_and_takes_the_target_outcome() {
     assert_eq!(h.task(a).unwrap().outcome, f_outcome, "the forwarder resolves to the target's result");
     assert!(done.events.iter().any(|e| matches!(e, Event::Done { task, .. } if *task == a)));
     assert_eq!(h.task(b).unwrap().state(), TState::Ready, "dependents of the forwarder are released");
-    assert!(h.task(f).unwrap().pins >= 2, "the target stays pinned for the forwarder");
+    assert!(read::pins(&h.a, f) >= 2, "the target stays pinned for the forwarder");
 }
 
 #[test]
@@ -1285,7 +1285,7 @@ fn forwarding_to_a_call_not_yet_submitted_resolves_when_it_finishes() {
     forward(&mut h, a, 1, p, f);
     let (ack, _) = h.submit(spec(f, &[], pb::Effects::None, 3), Some(p));
     assert_eq!(status(&ack), Status::Granted);
-    assert_eq!(h.task(f).unwrap().pins, 2, "the early forwarder pins the target");
+    assert_eq!(read::pins(&h.a, f), 2, "the early forwarder pins the target");
     h.publish(f, 1, p, obj(5));
     assert_eq!(h.task(a).unwrap().outcome, h.task(f).unwrap().outcome);
 }
@@ -1339,12 +1339,12 @@ fn the_same_producer_passed_twice_is_one_dependency() {
     h.submit(spec(a, &[], pb::Effects::None, 3), Some(p));
     h.submit(spec(b, &[a, a], pb::Effects::None, 3), None);
     assert_eq!(h.task(b).unwrap().deps_remaining, 1);
-    assert_eq!(h.task(a).unwrap().pins, 2, "the client's pin plus one for the dependent");
+    assert_eq!(read::pins(&h.a, a), 2, "the client's pin plus one for the dependent");
     h.publish(a, 1, p, obj(1));
     assert_eq!(h.task(b).unwrap().state(), TState::Ready, "a duplicated dependency must not block forever");
     h.grant(b, p, false);
     h.publish(b, 1, p, obj(2));
-    assert_eq!(h.task(a).unwrap().pins, 1, "unpinned once when the dependent completes");
+    assert_eq!(read::pins(&h.a, a), 1, "unpinned once when the dependent completes");
 }
 
 // ---------------------------------------------------------------------------
