@@ -223,18 +223,17 @@ Scatter calls split each result into buckets by key, and one gather call per out
 The result of `reduce_by_key` is a `ch.data.Partitioned`. The partitions stay on the workers until you read them:
 
 ```python run
-assert len(totals) == 2
-for part in totals:                       # one dict per partition: word -> count
-    assert all(isinstance(word, str) for word in part)
-assert dict(totals.items()) == counts
+assert len(totals) == 2                   # two partitions, still on the workers
+assert dict(totals.items()) == counts     # every (word, count) pair, partition by partition
+assert totals.to_dict() == counts
 ```
 
-`to_dict()` and `items()` bring every pair to the script; `totals.map(fn)` runs a remote function on each partition's dict instead.
+`items()` and `to_dict()` bring every pair to the script. `totals.map(fn)` runs a remote function on each partition instead, where the data already is.
 
 <details>
 <summary>More: what each partition holds</summary>
 
-Each partition is a dict from key to its value (to the list of its values without a `combine`), and a key lives in one partition only. `totals.futures` holds one future per partition.
+A key lives in one partition only, and without a `combine` its value is the list of its values. `totals.futures` holds one future per partition.
 
 </details>
 

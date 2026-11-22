@@ -374,7 +374,7 @@ values, but bind it where only your scraper can reach it.
 <summary>More: every metric, other paths, a script's own peer, Kubernetes</summary>
 
 - Gauges: calls queued and running, CPUs in use, workers, object and memory bytes, connected drivers, proposals in flight, and dispatch latency (p50 and p99).
-- Counters since the peer started: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a cancelled call, and failed object replicas.
+- Counters since the peer started: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a canceled call, and failed object replicas.
 - On cluster peers, `chimaera_groups_without_leader`, and for each group they hold, `chimaera_group_leading{group="N"}` plus, on the leader, `chimaera_group_max_lag_entries{group="N"}`.
 
 Every other path answers 404.
