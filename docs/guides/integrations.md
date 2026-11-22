@@ -28,14 +28,10 @@ with ch.Executor() as ex:
     assert ex.submit(lambda x: x + offset, 1).result() == 11   # lambdas and closures work
 ```
 
-`submit` returns a standard `concurrent.futures.Future`, which
-`concurrent.futures.wait`, `as_completed`, `add_done_callback` and
-`asyncio.wrap_future` all accept. Done-callbacks run on a thread of their own,
-so a slow one never holds up other results.
-
-The constructor takes the same call options as `@ch.remote(...)` and applies
-them to every call. It does not take `max_workers`: the cluster's capacity,
-not a pool size, decides how many calls run at once.
+`submit` returns a standard `concurrent.futures.Future`. The constructor takes
+the same call options as `@ch.remote(...)` and applies them to every call. It
+does not take `max_workers`: the cluster's capacity, not a pool size, decides
+how many calls run at once.
 
 ```python run
 ex = ch.Executor(cpus=0.5, max_attempts=1)
@@ -48,7 +44,12 @@ except ch.OptionsError as e:
     assert "unknown option 'max_workers'" in str(e)
 ```
 
-Good to know:
+<details>
+<summary>More: callbacks, decorated functions, canceling and two rough edges</summary>
+
+`concurrent.futures.wait`, `as_completed`, `add_done_callback` and
+`asyncio.wrap_future` all accept these futures. Done-callbacks run on a
+thread of their own, so a slow one never holds up other results.
 
 - A function already decorated with `@ch.remote` keeps its options; the
   executor's override the ones with the same name.
@@ -67,6 +68,8 @@ Two rough edges remain:
   `chimaera: done-callback raised RuntimeError('cannot schedule new futures after shutdown')`
   on stderr. Ignore it; the future is already canceled.
 
+</details>
+
 ## Run joblib's Parallel on Chimaera
 
 Importing `chimaera.joblib` registers a backend named `"chimaera"`. It needs
@@ -84,12 +87,19 @@ with parallel_config(backend="chimaera", n_jobs=4):
 assert squares == [i * i for i in range(100)]
 ```
 
-Each batch joblib dispatches becomes one Chimaera call, and joblib sizes its
-batches by how long they take, so many small tasks share a call. `n_jobs` is
-the number of batches in flight: by default, and with `-1`, the CPU count of
-the machine your script runs on. Chimaera places the batches on whichever
+Each batch joblib dispatches becomes one Chimaera call, placed on whichever
 peers have room. When a task raises, `Parallel` raises that error and the
-batches still running are canceled. `return_as="generator"` works too.
+batches still running are canceled.
+
+<details>
+<summary>More: batch sizes, n_jobs and generator output</summary>
+
+joblib sizes its batches by how long they take, so many small tasks share a
+call. `n_jobs` is the number of batches in flight: by default, and with `-1`,
+the CPU count of the machine your script runs on. `return_as="generator"`
+works too.
+
+</details>
 
 ## Use it from asyncio
 
@@ -112,10 +122,10 @@ async def main() -> list[int]:
 assert asyncio.run(main()) == [3, 2, 4, 0, 2, 4]
 ```
 
-Inside a coroutine, use `await` rather than `.result()`, which blocks the loop
-until the call finishes. A timeout from `asyncio.wait_for`, or canceling the
-task that awaits, ends your wait but not the call; call `.cancel()` on the
-future to stop it.
+Inside a coroutine, use `await`: `.result()` blocks the loop until the call
+finishes. A timeout from `asyncio.wait_for`, or canceling the task that
+awaits, ends your wait but not the call; call `.cancel()` on the future to
+stop it.
 
 A map, a generator's stream and `ch.as_completed` all work with `async for`,
 and `with ch.defaults(...)` has an `async with` form.
@@ -158,10 +168,17 @@ fetcher = Fetcher.options(concurrency=4).remote()
 assert ch.get([fetcher.get.remote(i) for i in range(4)]) == [0, 1, 2, 3]
 ```
 
-An actor's async methods run on one event loop in the actor's process.
 `async` alone doesn't change how many calls run at once: still one, unless you
 set `concurrency`. With `concurrency=4`, up to four calls overlap at their
-`await` points. [actors.md](actors.md) has the rest.
+`await` points.
+
+<details>
+<summary>More: where the methods run</summary>
+
+An actor's async methods run on one event loop in its process.
+[actors.md](actors.md) has the rest.
+
+</details>
 
 ## Check types with mypy
 
@@ -182,9 +199,8 @@ or to `pyproject.toml`:
 plugins = ["chimaera.mypy"]
 ```
 
-The plugin checks `Counter.remote(...)` against `__init__` and types it
-`Actor[Counter]`. It checks `handle.method.remote(...)` against the method and
-types it as a `Future` of the method's return type. Take this file:
+With it, mypy checks `Counter.remote(...)` against `__init__` and
+`handle.method.remote(...)` against the method. Take this file:
 
 ```python
 import chimaera as ch
@@ -224,6 +240,12 @@ app.py:24: note: "options" defined in "chimaera._remote"
 Found 4 errors in 1 file (checked 1 source file)
 ```
 
+<details>
+<summary>More: inferred types, life without the plugin, and known gaps</summary>
+
+Those calls get real types: `Counter.remote(...)` is an `Actor[Counter]`, and
+a method call is a `Future` of the method's return type.
+
 Without the plugin, mypy reports `"type[Counter]" has no attribute "remote"`
 instead, and the handle's calls go unchecked (their type is `Any`). The errors
 on `add` appear either way, since functions and `.options(...)` are typed
@@ -241,6 +263,8 @@ Known gaps:
   coroutine, not of the value the method returns.
 - A generator function needs a return annotation (`-> Iterator[int]`).
   Without one, mypy types the call as a `Future`, not a stream.
+
+</details>
 
 For your own annotations, `ch.Future[T]` and `ch.Results[T]` are at the top
 level, and `chimaera.typing` has the rest: `RemoteFunction`, `RemoteMethod`,
@@ -272,10 +296,17 @@ assert bump(Tally.remote()).result() == 1
 ## Run a Ray program
 
 `python -m chimaera.compat.ray app.py` runs an unmodified Ray script.
-`import chimaera.compat.ray as ray` maps Ray Core's API (`remote`, `get`,
-`put`, `wait`, `cancel`, `kill`, named and detached actors, `ActorPool`) onto
-Chimaera, and anything that doesn't map raises `Unsupported` naming the
-Chimaera alternative. [from-ray.md](from-ray.md) walks through a port, and
-[../compat-ray.md](../compat-ray.md) has the full table.
+`import chimaera.compat.ray as ray` maps Ray Core's API onto Chimaera, and
+anything that doesn't map raises `Unsupported` naming the Chimaera
+alternative. [from-ray.md](from-ray.md) walks through a port.
+
+<details>
+<summary>More: which Ray APIs map</summary>
+
+The mapping covers `remote`, `get`, `put`, `wait`, `cancel`, `kill`, named
+and detached actors, and `ActorPool`. [../compat-ray.md](../compat-ray.md)
+has the full table.
+
+</details>
 
 Next: run all of this on several machines with [clusters.md](clusters.md).

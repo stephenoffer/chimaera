@@ -1,8 +1,9 @@
 # Environment variables
 
 Every `CHIMAERA_*` environment variable the code reads: who reads it, its
-default and what it does. Names and defaults come from the code: the Python
-package (`python/chimaera/`) and the Rust crates (`crates/`).
+default and what it does. Most programs need none of them. Names and defaults
+come from the code itself, in the Python package (`python/chimaera/`) and the
+Rust crates (`crates/`).
 
 "Read by" names the process that looks at the variable:
 
@@ -110,11 +111,11 @@ object store these tune.
 | `CHIMAERA_FLEET_DIRECTORY` | peer | unset | A directory cell that lists the fleet's cells |
 | `CHIMAERA_CELL` | peer | unset | This cell's entry in the directory: `name@host:port` |
 
-## Set by Chimaera
+## Variables the runtime sets
 
 The peer and the driver set these for workers and for programs that
-`chimaera run` or `submit` starts. You can read the public ones inside a
-call. Don't set any of them yourself.
+`chimaera run` or `submit` starts. Read the public ones inside a call if you
+need them. Never set them yourself.
 
 | Variable | Set by, for | What it holds |
 |---|---|---|

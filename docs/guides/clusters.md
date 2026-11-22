@@ -21,18 +21,24 @@ node = where.remote().result()
 assert node in {n.peer for n in ch.runs.cluster().nodes()}
 ```
 
-The local peer keeps its data and `peer.log` in `~/.chimaera/local` (or
-`$CHIMAERA_HOME`), and later scripts reuse it while it runs. Started with `--idle-timeout 600`, it
-exits after ten minutes with no connected script and no work. To stop it
-now:
+Later scripts reuse that peer while it runs. To stop it now:
 
 ```bash
 chimaera stop
 ```
 
+<details>
+<summary>More: where it keeps data, when it exits by itself, upgrades</summary>
+
+That peer keeps its data and `peer.log` in `~/.chimaera/local` (or
+`$CHIMAERA_HOME`). Started with `--idle-timeout 600`, it exits after ten
+minutes with no connected script and no work.
+
 `chimaera stop` and Ctrl-C stop a peer without draining. After you rebuild
 or upgrade Chimaera, scripts warn with CH111 until you stop the old peer
 ([observability.md](observability.md#understand-the-chnnn-warnings)).
+
+</details>
 
 ## Start a cluster
 
@@ -45,7 +51,7 @@ chimaera cluster cert --ca ca --name gpu1 --out tls-gpu1  # one per machine
 ```
 
 Copy `ca/token` and the machine's `tls-<name>` directory to each machine,
-and start a peer there:
+and start its peer:
 
 ```bash
 chimaera peer start \
@@ -66,19 +72,27 @@ chimaera peer start \
 | `--cluster` | Cluster name (default `chimaera`); peers of different clusters refuse each other |
 | `--cpus` | CPUs to offer (default: what this process is allowed to use) |
 
+Founders hold the Raft groups from the start; spares add capacity and
+replace lost voters. Use at least three founders, or one machine going down
+costs a group its majority. Give every peer identical `--seeds`.
+
+<details>
+<summary>More: other flags, tokens without TLS, joining with no token</summary>
+
 `--advertise`, `--bootstrap-expect`, `--data-groups` and the rest are in
 [../cli.md](../cli.md#chimaera-peer-start).
 
-Founders hold the Raft groups from the start; spares add capacity and
-replace lost voters. Use at least three founders, or one machine going down
-costs a group its majority. Give every peer the same `--seeds`.
-
-Without TLS, `chimaera cluster token > token` makes a token on its own; a
+Without TLS, `chimaera cluster token > token` makes a token by itself; a
 token must be at least 16 characters. `--insecure` lets peers join with no
 token, so use it only on a network you trust.
 
-To try it on one machine, start three founders and a spare with TLS, each
-on its own ports and data directory (`--dir`):
+</details>
+
+<details>
+<summary>More: try a four-peer cluster on one machine</summary>
+
+Start three founders and a spare with TLS, each on separate ports and a
+separate data directory (`--dir`):
 
 ```bash
 chimaera cluster init --out ca
@@ -92,13 +106,15 @@ done
 ```
 
 Give `--dir` an absolute path. Workers start in your script's directory,
-so with a relative one they can't find the peer and calls hang.
+so with a relative one they can't find their peer and calls hang.
 
 The spare (`p3`) is ready and holds no groups:
 
 ```text
 INFO chimaera_peer::cluster: cluster peer ready node=6222675771281290418 addr=127.0.0.1:17704 hosted=[]
 ```
+
+</details>
 
 ## Point a script at the cluster
 
@@ -122,19 +138,24 @@ peers = ["10.0.0.1:7710", "10.0.0.2:7710", "10.0.0.3:7710"]   # the peers' --cli
 
 `peers` lists client addresses, tried in order until one answers. The token
 comes from `~/.chimaera/clusters/lab/token` and the CA from
-`~/.chimaera/clusters/lab/ca.pem`; the keys `token_file` and `ca` name other
-files. Keep credentials out of the profile itself. A `CHIMAERA_TOKEN` or
-`CHIMAERA_TOKEN_FILE` in the environment overrides the profile's token.
-`default = "local"`, or `cluster="local"`, means the local peer.
+`~/.chimaera/clusters/lab/ca.pem`. `ch.init(cluster=...)` must come before
+your script's first call.
+
+<details>
+<summary>More: other credential files, the one-machine profile, switching, connection errors</summary>
+
+The keys `token_file` and `ca` name other files. Keep credentials out of
+the profile itself. A `CHIMAERA_TOKEN` or `CHIMAERA_TOKEN_FILE` in the
+environment overrides the profile's token. `default = "local"`, or
+`cluster="local"`, means the local peer.
 
 For the one-machine cluster above, copy `ca/token` and `ca/ca.pem` to
 `~/.chimaera/clusters/lab/` and set `peers` to this:
 `["127.0.0.1:17711", "127.0.0.1:17712", "127.0.0.1:17713"]`.
 Then `ch.init(cluster="lab")` connects to it.
 
-`ch.init(cluster=...)` must come before the script's first call. To switch,
-call `ch.shutdown()` and then `ch.init` again. An unknown name fails and
-lists the profiles the file has:
+To switch, call `ch.shutdown()` and then `ch.init` again. An unknown name
+fails and lists the profiles the file has:
 
 ```python run
 import tempfile
@@ -161,8 +182,10 @@ Other ways a connection fails:
 | `RuntimeError: h2 protocol error: http2 error` | The peers use TLS and the script has no CA (`ca.pem` or `CHIMAERA_CA`) |
 | warning CH116 | The cluster runs a different Chimaera version than your script |
 
-The CLI picks a cluster the same way, except that `--dir` or
-`CHIMAERA_HOME` means the local peer unless you also pass `--cluster`:
+</details>
+
+The CLI chooses the same way, except that `--dir` or `CHIMAERA_HOME`
+means the local peer unless you also pass `--cluster`:
 
 ```bash
 chimaera status --cluster lab
@@ -204,9 +227,9 @@ print("total", sum(ch.get([sq.remote(i) for i in range(20)])))
 print("live peers", sum(n.alive for n in ch.runs.cluster().nodes()))
 ```
 
-`chimaera run` runs the program here with `CHIMAERA_CLUSTER` set, so only
-its calls run on the cluster. `helper.py` reaches the workers with the project (see
-below):
+`chimaera run` starts your program here with `CHIMAERA_CLUSTER` set: it
+stays on your machine and only its calls go out. `helper.py`
+reaches the workers with the project (see below):
 
 ```bash
 chimaera run --cluster lab -- python app.py
@@ -218,13 +241,18 @@ total 2470
 live peers 4
 ```
 
-The run ends when the program exits. `--detach` keeps it going so its
-calls finish and you can read them later, but only if the program doesn't
-call `ch.init()` itself. An explicit `ch.init()` uses its own
-`detach=False`; such a program asks with `ch.init(detach=True)`.
+<details>
+<summary>More: keep a run going with --detach</summary>
 
-To run the program itself on the cluster, use `chimaera submit`. It returns
-once the cluster holds it:
+The run ends when the program exits. `--detach` keeps it going so its
+calls finish and you can read them later. A program that calls
+`ch.init()` itself ignores the flag, since an explicit `ch.init()` uses
+its own `detach=False`; ask with `ch.init(detach=True)` there.
+
+</details>
+
+To run the whole program remotely too, use `chimaera submit`, which
+returns as soon as the cluster holds it:
 
 ```text
 $ chimaera submit --cluster lab -- python app.py
@@ -242,45 +270,56 @@ $ chimaera cancel 00000158597987ff150ede66097dafc5 --cluster lab
 run 00000158597987ff150ede66097dafc5 cancelled
 ```
 
-Good to know about `submit`:
+<details>
+<summary>More: at-most-once starts, logs, ending a submitted run</summary>
 
-- It ships the current directory as the project of a detached run, starts the program on a peer as that run's one call, and prints the run's id.
-- The program runs at most once. If its peer is lost, the call fails rather than start the program again.
+`submit` ships the current directory as the project of a detached run,
+starts the program on one of the peers as that run's one call, and prints
+the run's id.
+
+- The program runs at most once. If its peer is lost, the call fails rather than start it again.
 - A leading `python` or `python3` becomes the peer's own interpreter.
-- The program's output is the run's log: `chimaera logs RUN --cluster lab`. Its own `ch.init()` starts a second run, which `chimaera runs` lists separately.
-- The run stays `active` after the program exits, until `chimaera cancel RUN --cluster lab` ends it.
-- It first runs `python3 -m chimaera._submit` on your machine, so that `python3` needs Chimaera installed (`CHIMAERA_PYTHON` names another interpreter).
+- Its output is the run's log: `chimaera logs RUN --cluster lab`. Its own `ch.init()` starts a second run, which `chimaera runs` lists separately.
+- The run stays `active` after its program exits, until `chimaera cancel RUN --cluster lab` ends it.
+- `submit` first runs `python3 -m chimaera._submit` on your machine, so that `python3` needs Chimaera installed (`CHIMAERA_PYTHON` names another interpreter).
+
+</details>
 
 ## Get your code and settings to the workers
 
-Your script ships its project to the cluster: the `sys.path` directories
+Your script uploads its project: the `sys.path` directories
 that aren't the interpreter's, a virtualenv's or Chimaera's own, and never
-your home directory or `/`. They go as one archive named by its content, so
-an unchanged project uploads once. Each peer unpacks it once onto the
-workers' `sys.path`.
+your home directory or `/`. An unchanged project uploads once. With a
+`uv.lock`, each peer also installs your third-party packages; without one,
+every peer must have them already.
 
-The archive skips `.git`, `__pycache__`, virtualenvs, `node_modules`,
-`build`, `dist`, `target` and other caches. It may hold at most 100 MiB
-(`CHIMAERA_PROJECT_MAX_BYTES`); past that, `ch.init` fails and names the
-largest files.
+<details>
+<summary>More: what the archive skips, its size limit, package installs, Python versions</summary>
 
-If the project has a `uv.lock`, each peer installs its third-party packages
-once with `uv sync --frozen` and its own Python. Workers put them ahead of
-the peer's own. Without a lock, every peer must already have them
-installed. `uv` must be on the peers' `PATH`, and an install slower than
+The project goes as one archive named by its content, and each peer
+unpacks it once onto the workers' `sys.path`. The archive skips `.git`,
+`__pycache__`, virtualenvs, `node_modules`, `build`, `dist`, `target` and
+other caches. It may hold at most 100 MiB (`CHIMAERA_PROJECT_MAX_BYTES`);
+past that, `ch.init` fails and names the largest files.
+
+Packages from a `uv.lock` go in once per peer, with `uv sync --frozen` and
+that peer's Python, and workers put them ahead of what that Python
+already has. `uv`
+must be on the peers' `PATH`, and an install slower than
 `CHIMAERA_ENV_BUILD_TIMEOUT` seconds (set on the peers; default 900) fails
 the call that needed it.
 
 On another machine, workers run the peer's Python (`CHIMAERA_PYTHON`, else
 `python3`), which needs Chimaera installed. Functions defined in your
-script travel as bytecode, so that Python must be the same minor version
-as yours, or the call fails with CH115.
+script travel as bytecode, so that Python must match your minor version,
+or the call fails with CH115.
 
-Environment variables stay behind unless you send them, even on the local
-peer. A run carries `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `PYTHONHASHSEED`,
-whatever `ch.init(env=...)` adds, and the variables whose names match
-`CHIMAERA_ENV_PASSTHROUGH` (comma-separated, `*` wildcards allowed).
-Workers take everything else from their peer's environment:
+</details>
+
+Environment variables stay behind unless you send them, even when
+everything runs on your laptop. Send them with `ch.init(env=...)` or name them in
+`CHIMAERA_ENV_PASSTHROUGH`. Workers take everything else from their peer's
+environment:
 
 ```python run
 os.environ["APP_STAGE"] = "test"
@@ -299,9 +338,19 @@ assert settings.remote().result() == {"APP_STAGE": "test", "MODEL_SIZE": "small"
 
 Never ship secrets this way: a run's variables are stored with its record,
 which is replicated across peers. Put secrets in the peers' own environment
-(a Kubernetes Secret, the Slurm job's environment). Workers never see the
-cluster token; the peer removes `CHIMAERA_CLUSTER_TOKEN`, `CHIMAERA_TOKEN`
-and `CHIMAERA_TOKEN_FILE` before starting them.
+(a Kubernetes Secret, the Slurm job's environment).
+
+<details>
+<summary>More: variables every run carries, passthrough patterns, what workers never see</summary>
+
+A run also carries `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ` and `PYTHONHASHSEED`.
+`CHIMAERA_ENV_PASSTHROUGH` is comma-separated, with `*` wildcards allowed.
+
+Workers never see the token: the peer removes
+`CHIMAERA_CLUSTER_TOKEN`, `CHIMAERA_TOKEN` and `CHIMAERA_TOKEN_FILE` before
+starting them.
+
+</details>
 
 ## Share a cluster between teams
 
@@ -325,24 +374,30 @@ $ chimaera inspect 000001994bf57c4e7d950c570c16c8e7
 chimaera: tenant team-a has no run 000001994bf57c4e7d950c570c16c8e7
 ```
 
-A credential also works as a profile's `token_file`. Every run belongs to a
+A credential is not a sandbox. Calls run as the peer's OS user and can read
+whatever it can, so credentials guard teams that trust each other against
+mistakes, not against each other.
+
+<details>
+<summary>More: picking a tenant, revoking credentials, quotas</summary>
+
+Credentials also work as a profile's `token_file`. Every run belongs to a
 tenant: `ch.init(tenant="team-a")`, else `CHIMAERA_TENANT`, else the tenant
 of the script's credential, else `"default"`.
 
-A credential can't stop a peer, and changing the cluster token revokes them
-all. It is not a sandbox. Calls run as the peer's OS user and can read what
-the peer can, so credentials guard teams that trust each other against
-mistakes, not against each other. Per-tenant CPU quotas
-(`CHIMAERA_TENANT_QUOTAS`, `CHIMAERA_TENANT_SHARES`) and the full security
-model are in [../deploy.md](../deploy.md#tenants-and-quotas).
+Credentials can't stop peers, and changing the cluster token revokes them
+all. Per-tenant CPU quotas (`CHIMAERA_TENANT_QUOTAS`,
+`CHIMAERA_TENANT_SHARES`) and the full security model are in
+[../deploy.md](../deploy.md#tenants-and-quotas).
+
+</details>
 
 ## Take a peer out of service
 
 Send a peer SIGTERM (or SIGUSR1) to drain it. It stops taking new work,
-other peers stop sending it any, and it waits up to `CHIMAERA_DRAIN_SECONDS`
-(default 30) for its queued and running calls. Meanwhile it hands the Raft
-groups it leads to other voters, gives its voter seats to live peers and
-copies its stored values to other peers. The spare above, drained:
+waits up to `CHIMAERA_DRAIN_SECONDS` (default 30) for its queued and
+running calls, and meanwhile hands what it holds to other peers. The spare
+above, drained:
 
 ```text
 INFO chimaera_peer::runtime: SIGTERM: draining for up to 30s
@@ -351,20 +406,29 @@ INFO chimaera_peer::runtime: drained: no calls left
 INFO chimaera_peer::runtime: drained: values handed to other peers copied=0 left=0
 ```
 
-Its actors don't move. They restart elsewhere as on a lost peer, which
-counts against their restart limit.
-
 Kubernetes sends SIGTERM. Under Slurm, use SIGUSR1, which `srun` forwards.
+Actors don't move with a drain: they restart elsewhere as on a lost peer,
+which counts against their restart limit.
+
+<details>
+<summary>More: what a drain hands over, cloud preemption</summary>
+
+Other peers stop sending a draining peer any work. It hands the Raft groups
+it leads to other voters, gives its voter seats to live peers and copies
+its stored values elsewhere.
+
 On cloud VMs, `CHIMAERA_PREEMPTION_NOTICES=gce|aws|azure` drains the peer
 when the provider announces a preemption
 ([../deploy.md](../deploy.md#draining-and-preemption)).
 
+</details>
+
 ## When a peer dies
 
-A group keeps working while a majority of its voters is alive. The other
-peers notice the dead one, stop sending it work and retire it. Its calls
-are retried elsewhere within their `max_attempts`, and its actors restart
-under their restart policy.
+A group keeps working while a majority of its voters is alive. The
+survivors notice the dead peer, stop sending it work and retire it. Its
+calls are retried elsewhere within their `max_attempts`, and its actors
+restart under their restart policy.
 
 Here the spare was drained, then a founder killed with `kill -9`. The two
 peers left kept serving: `app.py` ran again, and `chimaera status` showed
@@ -384,11 +448,18 @@ $ chimaera status --cluster lab
     127.0.0.1:17701 (this peer) · 0.0/2.0 CPU in use · 0 queued
 ```
 
-Started again with the same `--dir`, the killed peer rejoined as a new
+<details>
+<summary>More: bringing a peer back, rebuilding a group</summary>
+
+Started again with its old `--dir`, the killed peer rejoined as a new
 incarnation. If a group's other voters are gone for good,
-`chimaera cluster recover` rebuilds it around a surviving peer
-([../deploy.md](../deploy.md#providers)). [failures.md](failures.md) covers
-what a script sees when a call or a value is lost.
+`chimaera cluster recover` rebuilds it around one surviving peer
+([../deploy.md](../deploy.md#providers)).
+
+</details>
+
+[failures.md](failures.md) covers what a script sees when a call or a
+value is lost.
 
 ## Start peers with your platform's tools
 
@@ -404,8 +475,8 @@ Each platform has a launcher:
 | Machines you reach by SSH | `chimaera up lab` and `chimaera down lab`, with `provider = "ssh"` and `hosts` in the profile | [SSH and plain VMs](../deploy.md#ssh-and-plain-vms) |
 | Clouds | a SkyPilot task that runs `chimaera peer start --provider sky` | [Clouds](../deploy.md#clouds) |
 
-[../deploy.md](../deploy.md) also says which of these have been tested where.
+[The deployment guide](../deploy.md) also says which of these have been tested where.
 Every flag is in [../cli.md](../cli.md), and every environment variable in
 [../configuration.md](../configuration.md).
 
-Next: watch what the cluster is doing with [observability.md](observability.md).
+Next: watch what your cluster is doing with [observability.md](observability.md).

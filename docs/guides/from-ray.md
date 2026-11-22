@@ -127,9 +127,15 @@ so they run in the order they were made.
 ### There is no head node
 
 Every machine runs the same `chimaera` peer, and the state that matters is
-replicated across peers with Raft. There's no head node to size or to lose. On a
-laptop your script starts a local peer the first time it needs one; to use a
-cluster, point the script at it ([clusters.md](clusters.md)).
+replicated across peers with Raft. There's no head node to size or to lose.
+
+<details>
+<summary>More: laptops and clusters</summary>
+
+On a laptop your script starts a local peer the first time it needs one; to use
+a cluster, point the script at it ([clusters.md](clusters.md)).
+
+</details>
 
 ### Options are checked where you write them
 
@@ -144,17 +150,22 @@ except ch.OptionsError as e:
 ```
 
 One trap: `max_retries` suggests `max_restarts`, the actor option, but for a
-function you want `max_attempts`. Conflicting options, such as
-`effects="external"` with `max_attempts=3`, raise when you make the call.
-`cpus` must be above zero, so Ray's `num_cpus=0` has no direct equivalent; an
-actor holds no CPU unless you ask ([actors.md](actors.md)).
+function you want `max_attempts`.
+
+<details>
+<summary>More: conflicting options, and asking for zero CPUs</summary>
+
+Conflicting options, such as `effects="external"` with `max_attempts=3`, raise
+when you make the call. `cpus` must be above zero, so Ray's `num_cpus=0` has no
+direct equivalent; an actor holds no CPU unless you ask ([actors.md](actors.md)).
+
+</details>
 
 ### Your exceptions are not retried
 
-As in Ray, an exception your code raises fails the call at once. Only lost
-workers and peers are retried, up to `max_attempts` (default 3 attempts in all;
-Ray's default `max_retries=3` gives 4). Name the exceptions worth retrying as
-types, because `retry_exceptions=True` is rejected.
+As in Ray, an exception your code raises fails the call at once; only lost
+workers and peers are retried. Name the exceptions worth retrying as types,
+because `retry_exceptions=True` is rejected.
 
 ```python run
 import os
@@ -169,6 +180,14 @@ def flaky(marker: str) -> str:
 
 assert flaky.remote(tempfile.mktemp()).result() == "ok"     # retried once
 ```
+
+<details>
+<summary>More: how many attempts by default</summary>
+
+Retries stop at `max_attempts` (default 3 attempts in all; Ray's default
+`max_retries=3` gives 4).
+
+</details>
 
 ### Declare calls with side effects
 
@@ -190,14 +209,19 @@ except ch.OutcomeUnknown as e:
     assert "may have started" in str(e)
 ```
 
+<details>
+<summary>More: the idempotent level</summary>
+
 `effects="idempotent"` says a repeat is harmless. [failures.md](failures.md)
 covers what each level allows.
+
+</details>
 
 ### Arrays arrive writable
 
 Ray hands a task read-only NumPy arrays, so `arr[0] = 1` raises there. Chimaera
 maps the stored value copy-on-write: the array is writable, and a write stays
-private to the call that made it.
+private to its call.
 
 ```python run
 import numpy as np
@@ -212,24 +236,34 @@ assert bump.remote(zeros).result() == 1.0
 assert bump.remote(zeros).result() == 1.0     # the stored array is unchanged
 ```
 
+<details>
+<summary>More: hosts with strict memory overcommit</summary>
+
 On a host that refuses private writable mappings (strict memory overcommit),
 the array falls back to read-only. [data.md](data.md) has the details.
+
+</details>
 
 ### Memory is measured, not declared
 
 You rarely need `memory=`. The peer measures each function's memory peak and
 reserves that for its later calls, so calls wait for memory instead of
-overcommitting a machine. Values you set still win, `memory_limit=` enforces a
-cap, and `chimaera profiles` shows what was learned
-([resources.md](resources.md)).
+overcommitting a machine.
+
+<details>
+<summary>More: your own values, hard caps and learned profiles</summary>
+
+Values you set still win, `memory_limit=` enforces a cap, and
+`chimaera profiles` shows what was learned ([resources.md](resources.md)).
+
+</details>
 
 ### Futures inside lists arrive as values
 
 Ray resolves only refs passed directly as arguments; refs inside a list stay
-refs for the task to `ray.get`. Chimaera resolves futures directly in the
-arguments and one level inside a list, tuple or dict value, and starts the call
-once they're ready. To pass the futures themselves, wrap the argument in
-`ch.handles(...)`.
+refs for the task to `ray.get`. Chimaera also resolves futures one level inside
+a list, tuple or dict value, and starts the call once they're ready. To pass
+the futures themselves, wrap the argument in `ch.handles(...)`.
 
 ```python run
 @ch.remote
@@ -262,17 +296,30 @@ on the class. Ray's `allow_out_of_order_execution` has no equivalent.
 
 `.options(name=...)` returns the existing actor if there is one, where Ray's
 default raises. A name covers your whole tenant on the cluster, not one job's
-namespace, so put the namespace in the name (`"ns/name"`). `ch.actor(name)`
-raises `ch.NotFound` (a `LookupError`) where `ray.get_actor` raises
-`ValueError`, and a name stays taken after its actor ends
+namespace, so put the namespace in the name (`"ns/name"`).
+
+<details>
+<summary>More: lookup errors and names that stay taken</summary>
+
+`ch.actor(name)` raises `ch.NotFound` (a `LookupError`) where `ray.get_actor`
+raises `ValueError`, and a name stays taken after its actor ends
 ([actors.md](actors.md#find-an-actor-by-name)).
+
+</details>
 
 ### `ch.wait` waits for everything by default
 
-`ray.wait` returns after one ref and caps the ready list at `num_returns`.
-`ch.wait` waits for all futures unless you pass `num_returns`, and even then its
-`done` list holds every finished future, which can be more than `num_returns`.
-It fetches values only if you pass `fetch_local=True`.
+`ray.wait` returns after one ref; `ch.wait` waits for all futures unless you
+pass `num_returns`.
+
+<details>
+<summary>More: the size of done, and fetching values</summary>
+
+`ray.wait` caps the ready list at `num_returns`. Even with `num_returns`, the
+`done` list from `ch.wait` holds every finished future, which can be more than
+`num_returns`. It fetches values only if you pass `fetch_local=True`.
+
+</details>
 
 ```python run
 done, pending = ch.wait(futures, num_returns=1, timeout=10)
@@ -291,9 +338,9 @@ assert tokenize("The cat", {"the"}) == ["cat"]
 ## Run a Ray program unchanged
 
 The shim in `chimaera.compat.ray` maps Ray Core's API onto Chimaera and needs no
-Ray installation. Run a whole program with `-m`, which installs the shim as
-`ray` (with `ray.exceptions`, `ray.util` and their submodules) before your
-script starts. Here it is on the Ray program above, saved as `app.py`:
+Ray installation. Run a whole program with `-m`, which installs it as `ray`
+before your script starts. Here it is on the Ray program above, saved as
+`app.py`:
 
 ```bash
 python -m chimaera.compat.ray app.py
@@ -303,11 +350,7 @@ python -m chimaera.compat.ray app.py
 [('cat', 2), ('sat', 2)]
 ```
 
-`chimaera run -- python -m chimaera.compat.ray app.py` works too, and with
-`--cluster lab` the program's `ray.init()` connects to that cluster profile.
-The shim refuses `ray.init(address=...)` itself.
-
-In your own code, import the shim under the name `ray`:
+In your own code, import it under the name `ray`:
 
 ```python run
 import chimaera.compat.ray as ray
@@ -341,21 +384,30 @@ except KeyError as e:                               # also a ray.exceptions.RayT
     assert isinstance(e, ray.exceptions.RayTaskError)
 ```
 
-What to expect from the shim:
+The shim covers Ray Core only and keeps Ray's defaults where they differ. The
+full option-by-option table is in [../compat-ray.md](../compat-ray.md).
 
-- It covers Ray Core only. `ray.data`, `ray.train`, `ray.tune`, `ray.serve` and
-  the other libraries raise `Unsupported`.
+<details>
+<summary>More: submodules, clusters, warnings and Ray's defaults</summary>
+
+The `-m` form installs `ray.exceptions`, `ray.util` and their submodules too.
+`chimaera run -- python -m chimaera.compat.ray app.py` works as well, and with
+`--cluster lab` the program's `ray.init()` connects to that cluster profile.
+The shim refuses `ray.init(address=...)` itself.
+
+- `ray.data`, `ray.train`, `ray.tune`, `ray.serve` and the other libraries
+  raise `Unsupported`.
 - A feature that doesn't map raises `Unsupported` (a `NotImplementedError`)
   naming the Chimaera alternative. An option that behaves differently warns
   once with a `ChimaeraCompatWarning` coded CHR001 (ignored), CHR002 (accepted,
   not enforced yet) or CHR003 (different semantics).
-- It keeps Ray's defaults where they differ: four attempts for a task, one for
-  an actor call, and 1,000 concurrent calls for an async actor. A named actor
+- The Ray defaults it keeps: four attempts for a task, one for an actor call,
+  and 1,000 concurrent calls for an async actor. A named actor
   without a namespace is scoped to the run.
 - A call's ref is a Chimaera future, so `await ref`, `ch.as_completed` and the
   rest of the native API work on it. (`ray.put` returns a thin wrapper around
   one.)
 
-The full option-by-option table is in [../compat-ray.md](../compat-ray.md).
+</details>
 
 Next: put state in actors the Chimaera way in [actors.md](actors.md).

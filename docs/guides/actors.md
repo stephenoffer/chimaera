@@ -8,7 +8,7 @@ counter and ends with state that survives a crash.
 ## Create an actor and call it
 
 Put `@ch.remote` on a class. `Class.remote(...)` starts an instance in a worker
-and returns a handle; `handle.method.remote(...)` runs a method there and
+and returns a handle; `handle.method.remote(...)` runs the method there and
 returns a future.
 
 ```python run
@@ -30,24 +30,28 @@ assert Counter(0).add(5) == 5                                   # still an ordin
 assert Counter.remote(1).add.remote().result() == 2             # no handle kept: still works
 ```
 
+Each actor lives until you close it or its run ends, handle or no handle.
+
+<details>
+<summary>More: constructor checks and two common mistakes</summary>
+
 `Class.remote(...)` checks your arguments against `__init__` on your line and
 returns once the peer accepts the actor. `__init__` runs in the worker; if it
-raises, every call to the actor raises that same error. The actor lives until
-you close it or its run ends, handle or no handle.
-
-Good to know:
+raises, every call to that actor raises that error.
 
 - Calling a handle's method without `.remote` raises a `TypeError` that names
   the fix: `Counter.add runs in the actor, not here: call it with .add.remote(...)`.
-- A method can't stream with `yield`. Calling a generator method fails with
+- Methods can't stream with `yield`. Calling a generator method fails with
   `TypeError: cannot pickle 'generator' object`, so return a list, or stream
   from a generator function ([tasks.md](tasks.md)).
+
+</details>
 
 ## Calls through one handle run in order
 
 Calls through one handle start one at a time, in the order you made them, so
-methods never race on `self`. A method that raises fails only its own call: the
-actor keeps running, and anything the method changed before raising stays
+methods never race on `self`. A method that raises fails only its own call. The
+actor keeps running, and whatever that call changed before raising stays
 changed.
 
 ```python run
@@ -72,6 +76,9 @@ ledger.record.remote("close")
 assert ledger.all.remote().result() == ["open", "close"]
 ```
 
+<details>
+<summary>More: order across handles, and methods that block on other calls</summary>
+
 Order is per handle. A handle you pass to another call is a separate handle
 there, as is one from `ch.actor(name)`: its calls keep their own order,
 interleaved with yours.
@@ -85,16 +92,18 @@ def deposit_twice(counter, amount: int) -> int:
 assert deposit_twice.remote(Counter.remote(0), 5).result() == 10
 ```
 
-One exception to "one at a time": while a method waits on another call's
-result (`.result()`, `ch.get`, a queue), the actor may start its next call, so
+One exception to "one at a time": while a running call waits on another call's
+result (`.result()`, `ch.get`, a queue), the next queued call may start, so
 calls that wait on each other can't deadlock. Don't hold an invariant on `self`
 across such a wait.
+
+</details>
 
 ## Write async methods
 
 Give an async actor `concurrency=N` and up to N calls run as coroutines on its
 one event loop, where an awaiting call holds no thread. Without it, `async def`
-changes nothing: one call at a time, awaiting or not.
+changes nothing: calls still run one by one, awaiting or not.
 
 ```python run
 import asyncio
@@ -119,14 +128,14 @@ assert max(ch.get([overlapping.fetch.remote() for _ in range(10)])) > 1
 
 ## Run calls side by side
 
-With `concurrency=N` on the class (default 1), plain methods run N at a time
-on threads. They start in order and finish in any order, so guard shared state
+With `concurrency=N` on the class (default 1), plain methods run N at once on
+threads. They start in order and finish in any order, so guard shared state
 yourself (a `threading.Lock`).
 
-To keep a slow method from blocking quick ones, put the quick ones in a
-concurrency group: declare `groups={name: concurrency}` on the class and assign
-methods with `@ch.method(group=...)`. `@ch.method(concurrency=N)` gives one
-method a lane of its own.
+To keep a slow method from blocking quick ones, declare
+`groups={name: concurrency}` on the class and put the quick ones in a
+concurrency group with `@ch.method(group=...)`. `@ch.method(concurrency=N)`
+gives one method a lane of its own.
 
 ```python run
 import threading
@@ -156,15 +165,21 @@ naps = [svc.nap.remote(0.2), svc.nap.remote(0.2)]
 assert len({f.result() for f in naps}) == 2         # two threads at once
 ```
 
-Each lane (the default one, each group, each method with its own `concurrency`)
-starts its calls in arrival order and doesn't wait on the others. A method takes
-`group=` or `concurrency=`, not both, and naming a group the class didn't
-declare fails at decoration with a `TypeError` listing the declared groups.
+<details>
+<summary>More: how lanes start calls, and decoration errors</summary>
+
+Within each lane (the default one, each group, each method given
+`concurrency`), calls start in arrival order, and no lane waits for another.
+Each method takes `group=` or `concurrency=`, not both, and naming an
+undeclared group fails at decoration with a `TypeError` listing the declared
+groups.
+
+</details>
 
 ## Set options for a method or one call
 
-Options go on the class, on a method with `@ch.method(...)`, or on one view of
-a method with `.options(...)`.
+Options go on the class, on a method (`@ch.method(...)`), or on one view of
+that method (`.options(...)`).
 
 ```python run
 @ch.remote
@@ -195,15 +210,15 @@ Options are checked on the line that sets them: `stats.bounds.options(bogus=1)`
 raises `ch.OptionsError` naming the option.
 
 A deadline or `cancel()` ends your wait at once. The running method stops only
-when it checks `ch.context().cancelled()`, and until then the actor is busy
-with it.
+when it checks `ch.context().cancelled()`, and until then it keeps the actor
+busy.
 
 ## Find an actor by name
 
 A name is one actor across the cluster for your tenant, reached by every script
-or call that uses it. `Class.options(name=...).remote(...)` gets or creates it
-(later constructor arguments are ignored), and `ch.actor(name)` finds it from
-anywhere without the class.
+or call using it. `Class.options(name=...).remote(...)` gets or creates it
+(later constructor arguments are ignored), and anywhere else `ch.actor(name)`
+finds it with just the name.
 
 ```python run
 name = f"registry-{ch.init()}"           # the run id keeps the name fresh (see below)
@@ -219,15 +234,21 @@ except ch.NotFound:                       # also a LookupError
     pass
 ```
 
+A name stays bound to its actor after that actor ends. Until that is fixed,
+give each new actor a new name, as the example does with the run id.
+
+<details>
+<summary>More: when named actors end, and listing or reusing names</summary>
+
 - A named actor still ends with the run that created it, unless it was created
   with `detach=True`.
 - `ch.runs.actors(prefix)` lists live named actors, as does
   `chimaera actors --prefix P` from a shell.
-- A name stays bound to its actor after the actor ends, and creating it again
-  doesn't start a new one. Calls through the handle raise `ch.ActorDied` in the
-  same run and wait forever in a later one, while `ch.actor(name)` raises
-  `ch.NotFound`. Until that is fixed, give each new actor a new name, as the
-  example does with the run id.
+- Creating a name again after its actor ends doesn't start a new one. Calls
+  through the handle raise `ch.ActorDied` in the same run and wait forever in a
+  later one, while `ch.actor(name)` raises `ch.NotFound`.
+
+</details>
 
 ## Keep an actor after your script exits
 
@@ -262,14 +283,20 @@ temp.close()
 assert isinstance(temp.add.remote(1).exception(), ch.ActorDied)
 ```
 
-`close()` returns at once without waiting for calls in flight, so wait on their
-futures first if you need the results. Inside a method,
-`ch.context().exit_actor()` ends the actor, and that call raises `ch.ActorDied`
-too.
+`close()` returns without waiting for calls in flight, so wait on their
+futures first if you need the results.
 
-Good to know: a handle reserves the names `close` and `id` (`handle.id` is the
-actor's id). A method with either name gets a warning at decoration and can't
-be reached through the handle, so rename it.
+<details>
+<summary>More: exit_actor() and the reserved names close and id</summary>
+
+Inside a method, `ch.context().exit_actor()` ends its actor, and that call
+raises `ch.ActorDied` too.
+
+A handle reserves the names `close` and `id` (`handle.id` is the actor's id).
+Methods with either name get a warning at decoration and can't be reached
+through the handle, so rename them.
+
+</details>
 
 ## Restart an actor after a crash
 
@@ -306,6 +333,10 @@ assert w.work.remote().result() == 1              # a fresh instance: state star
 
 A call that was running when the process died is never replayed; it raises
 `ch.ActorDied`. Calls that hadn't started run on the new instance, in order.
+
+<details>
+<summary>More: drained peers, and every reason for ActorDied</summary>
+
 Moving off a drained peer restarts the actor without using up a restart.
 
 `ch.ActorDied` (an `InfrastructureFailure`) means the call won't run: the actor
@@ -313,11 +344,13 @@ was closed, ended itself or with its run, died with `restart="never"` or ran
 out of restarts, or died while this call was running. The other errors are in
 [failures.md](failures.md).
 
+</details>
+
 ## Give an actor CPUs and memory
 
-An actor asks for no CPU unless you set `cpus`, so idle actors never block other
-calls. With `@ch.remote(cpus=2)` it holds two CPUs for its whole life and
-won't start until some peer has them free. A request no peer could ever meet
+Actors ask for no CPU unless you set `cpus`, so idle ones never block other
+calls. With `@ch.remote(cpus=2)` each instance holds two CPUs for its whole
+life and won't start until some peer has them free. A request no peer could ever meet
 makes `Class.remote(...)` raise `ch.Infeasible`, naming the constraint. Memory,
 GPUs and placement work as they do for functions; see
 [resources.md](resources.md).
@@ -350,30 +383,33 @@ with Model.options(replicas=3).pool("v1") as pool:
     assert pool.predict.remote(1).result() == "v2:1" and len(pool) == 4
 ```
 
+Each call goes to the replica with the fewest calls in flight when you make
+it. There's no order across replicas. Ray's `ActorPool` maps here
+([from-ray.md](from-ray.md)).
+
+<details>
+<summary>More: default size, map, route, resize, upgrade and close</summary>
+
 - Without `replicas=`, you get one replica per core, at most 8.
-- Each call goes to the replica with the fewest calls in flight when you make
-  it. There's no order across replicas.
 - `pool.method.map(items)` streams results in input order (`ordered=False` for
   completion order), keeping 16 calls per replica in flight.
-- `route(key)` sends every call for a key to one replica by rendezvous hashing
+- `route(key)` sends all calls for a key to one replica by rendezvous hashing
   of `str(key)`, so a resize moves only a few keys.
 - `resize(n)` grows or shrinks the pool (`n` at least 1), dropping the newest
   replicas first. `upgrade(*args, cls=None, surge=1, **kwargs)` rebuilds every
   replica from new arguments or a new class, `surge` at a time. Either way a
   leaving replica takes no new calls and closes once its calls finish.
 - `close()`, or leaving the `with` block, ends every replica.
-- Pool methods take only `.remote` and `.map`, so set call options on the class
-  (`Model.options(cpus=2, replicas=3)`). A pool handle reserves `close`,
-  `decisions`, `resize`, `route` and `upgrade`.
+- Pool methods take only `.remote` and `.map`, so set call options when you
+  build the pool (`Model.options(cpus=2, replicas=3)`). A pool handle reserves
+  `close`, `decisions`, `resize`, `route` and `upgrade`.
 
-Ray's `ActorPool` maps here ([from-ray.md](from-ray.md)).
+</details>
 
 ## Share a pool and size it from load
 
-`name=` makes a pool that other scripts and calls share. Its membership lives in
-the cluster's replicated store, and other handles re-read it at most once a
-second. Only a named pool can be passed to a call; an unnamed one raises
-`ch.SerializationError`.
+Pass `name=` and other scripts and calls can share the pool. Only a named pool
+can be passed to calls; an unnamed one raises `ch.SerializationError`.
 
 ```python run
 shared = Model.options(name="docs/model", replicas=2).pool("v1")
@@ -387,11 +423,9 @@ assert ask.remote(shared, 5).result() == "v1:5"
 shared.close()
 ```
 
-`replicas=ch.auto(initial, min=, max=)` sizes a pool from load, starting at
-`initial` (default 1). It doubles while calls in flight stay above 80% of what
-the replicas can run at once for 0.75 s, up to `max` (default the larger of
-`initial` and the core count). After a minute under 25% busy it drops one
-replica, down to `min` (default 1). `pool.decisions` says what it did and why.
+`replicas=ch.auto(initial, min=, max=)` sizes a pool from load: it grows while
+replicas stay busy and shrinks after a quiet minute. `pool.decisions` says what
+it did and why.
 
 ```python run
 @ch.remote
@@ -407,15 +441,28 @@ assert elastic.decisions[0].startswith("grow 1 -> 2")
 elastic.close()
 ```
 
+<details>
+<summary>More: shared membership and the auto-sizing thresholds</summary>
+
+A named pool's membership lives in the cluster's replicated store, and other
+handles re-read it at most once a second.
+
+Auto-sizing starts at `initial` (default 1). It doubles while calls in flight
+stay above 80% of what the replicas can run at once for 0.75 s, up to `max`
+(default the larger of `initial` and the core count). After a minute under 25% busy it
+drops one replica, down to `min` (default 1).
+
 Growth helps only calls made after it. Calls already queued on a busy replica
 stay there.
+
+</details>
 
 ## Batch calls into one method call
 
 Write the method for a list; callers still pass one item each. With
-`@ch.method(batch=ch.Batch(max_size=, max_wait=))` the actor collects calls
-until it has `max_size` of them or the first has waited `max_wait`, runs the
-method once, and gives each caller its element of the returned list.
+`@ch.method(batch=ch.Batch(max_size=, max_wait=))`, calls queue up until there
+are `max_size` of them or the first has waited `max_wait`. Then the method runs
+once, and each caller gets its element of the returned list.
 
 ```python run
 @ch.remote
@@ -438,21 +485,26 @@ sizes = embedder.sizes.remote().result()
 assert sum(sizes) == 20 and max(sizes) <= 8
 ```
 
+<details>
+<summary>More: batch defaults, length rules, errors and lanes</summary>
+
 - `ch.Batch()` defaults to `max_size=32` and `max_wait=0.005` (seconds, or a
   string such as `"5ms"`).
 - Call it with exactly one positional argument. The method gets the arguments
   in arrival order and must return a list of the same length, or every call in
   the batch fails with a `ValueError` giving both counts. If the method raises,
-  every call in the batch gets the error.
-- A batched method has a lane of its own, so it can run while another of the
-  actor's methods does. The peer keeps up to two batches in flight, so the
-  next fills while one runs. `async def` works too.
-- `batch=` belongs on the method (on `@ch.remote` it raises `ch.OptionsError`)
-  and can't be combined with `group=` or `concurrency=`.
+  every caller in the batch gets the error.
+- A batched method gets a separate lane, so it can run while other methods do.
+  The peer keeps at most two batches going, so the next fills while one runs.
+  `async def` works too.
+- `batch=` goes in `@ch.method(...)` (on `@ch.remote` it raises
+  `ch.OptionsError`) and can't be combined with `group=` or `concurrency=`.
+
+</details>
 
 ## Keep state through crashes with a durable actor
 
-`@ch.remote(state=ch.durable.State())` commits the actor's state with every
+`@ch.remote(state=ch.durable.State())` commits the actor's state after each
 call. A restarted instance resumes from the last commit instead of running
 `__init__` again, and a repeated command gets its first reply.
 
@@ -487,6 +539,9 @@ os.kill(acct.pid.remote().result(), signal.SIGKILL)
 assert acct.deposit.remote(0).result() == 7       # resumed from the last commit
 ```
 
+<details>
+<summary>More: what gets committed, command ids, the 1 MiB cap and restarts</summary>
+
 - After each method returns, the instance's attributes (or what `__getstate__`
   returns) are pickled and committed before the reply goes out. A call that
   raises commits nothing and puts the instance back at the last commit.
@@ -495,13 +550,15 @@ assert acct.deposit.remote(0).result() == 7       # resumed from the last commit
   `ch.errors.CommandConflict`. Without one, the call's own id is used, so a
   call cut off by a crash is retried on the restarted instance without being
   applied twice. Command ids are kept for 7 days.
-- Pickled state is capped at 1 MiB. A call that grows it past that fails with
+- Pickled state is capped at 1 MiB. Growing it past that fails the call with
   `ch.errors.RemoteError` ("durable state exceeds the 1 MiB inline limit") and
   leaves the state at the last commit. Keep large data elsewhere and store its
   key.
-- A durable actor runs one call at a time, so setting `concurrency` raises
+- A durable actor runs calls one by one, so setting `concurrency` raises
   `ch.OptionsError`.
 - It restarts after a crash whatever `restart=` says, up to `max_restarts`
   (default 3).
+
+</details>
 
 Next: give actors CPUs, memory and GPUs in [resources.md](resources.md).

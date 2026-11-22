@@ -20,7 +20,10 @@ means = ch.get([column_mean.remote(table, c) for c in range(4)])
 assert means == [199998.0, 199999.0, 200000.0, 200001.0]
 ```
 
-Each call receives the value, read from the stored copy, and your script gets it back with `table.result()`.
+Each call receives the value, read from the stored copy, and you get it back with `table.result()`. Arguments are captured at `.remote()`, so changing the array afterward doesn't change what the call sees. To feed one call's large result to the next, pass the future instead of calling `.result()` on it, and the data goes worker to worker.
+
+<details>
+<summary>More: how arguments travel by size, and the warnings that catch waste</summary>
 
 You don't always need `ch.put`: every call stores its arguments by size.
 
@@ -31,14 +34,13 @@ You don't always need `ch.put`: every call stores its arguments by size.
 | A NumPy array, `bytes` or other buffer of 1 MiB or more, or a top-level argument that pickles to 1 MiB or more | stored once, named by a hash of its contents; every call that passes the same bytes reads that one copy |
 | `ch.put(value)` | inside the future when it is 256 KiB or less, else one stored file |
 
-The rules people trip on:
-
-- Arguments are captured at `.remote()`. Changing the array afterward doesn't change what the call sees.
 - Passing the same large value straight to many calls stores it once but hashes it every time. Once one line has done that 20 times and spent 0.1 s or more encoding, warning `CH107` suggests `ch.put(value)` or binding it once with `fn.partial(value)`.
 - A large `list` or `dict` is stored once, but every call that reads it unpickles its own full copy. A NumPy array or an Arrow table is mapped instead, one copy per machine. Warning `CH118` fires for collections of 8 MiB or more.
 - Don't call `.result()` on a large value only to pass it to the next call. Pass the future, and the value goes worker to worker (warning `CH103` points this out).
 - A future passed as an argument, or one level inside a list, tuple or dict argument, arrives as its value. Nested deeper it arrives as a future. [tasks.md](tasks.md) covers dependencies and `ch.handles`.
 - An open file can't be sent. Pass its path and open it in the call.
+
+</details>
 
 ## Write to an array inside a call
 
@@ -64,6 +66,8 @@ A stored value's file is mapped copy-on-write (small files are read instead). Ra
 
 ## Know what is kept after a run
 
+Chimaera deletes what it stored on this schedule:
+
 | What | Deleted |
 |---|---|
 | A call's argument file (64 KiB to 1 MiB) | when the call ends |
@@ -71,7 +75,7 @@ A stored value's file is mapped copy-on-write (small files are read instead). Ra
 | Large arguments, and `ch.put` values your script made | when the run ends |
 | Results, stream items, and `ch.put` values made inside a call | 24 hours after the run ends |
 
-Results outlive the run, so another process can read them by run id:
+Results outlive their run, so another process can read them by run id:
 
 ```python
 import chimaera as ch
@@ -81,11 +85,14 @@ for task_id, value, error in run.outcomes():
     print(task_id, value if error is None else error)
 ```
 
-Good to know:
+<details>
+<summary>More: exceptions to this schedule</summary>
 
-- A dropped `ch.put` value waits for the end of the run instead when its future was sent to an actor or nested deeper than one level in an argument, or when a script connected to a remote cluster made it.
+- A dropped `ch.put` value waits until its run ends instead when its future was sent to an actor or nested deeper than one level in an argument, or when a script connected to a remote cluster made it.
 - While a detached actor of the run is alive, the run's stored arguments and `ch.put` values stay too, because a restart rebuilds the actor from them.
-- A `ch.put` future kept outside the run, such as in a `ch.coord.Store` key, stops reading when the run ends, unless the value was small enough to travel inside the future.
+- A `ch.put` future kept outside the run, such as in a `ch.coord.Store` key, stops reading when that run ends, unless the value was small enough to travel inside the future.
+
+</details>
 
 ## See what the object store holds
 
@@ -102,11 +109,16 @@ objects in .../objects (huge pages: false)
         16.0 MiB  000003df45a0b6526faca7be64431c6e/2073c64c0226e4386789053c9da3b8b1  (memory)
 ```
 
-`--json` prints the same as JSON, and `--cluster` asks every live peer for its store.
+`--json` prints it as JSON, and `--cluster` asks every live peer for its store.
 
 ## Let objects spill to disk
 
-On Linux the peer keeps objects in memory: a huge-page tmpfs if one is mounted, else `/dev/shm` when it has at least 2 GiB. Past 80% of the memory limit it moves the oldest objects to disk in the background, and past the limit plus a quarter, new objects go straight to disk. A spilled object is read by mapping its disk file, so there's no restore step. Nor is there a store-full error: a full disk raises `OSError` naming the directory. On macOS, or when the object directory is already on disk, nothing spills.
+On Linux the peer keeps objects in memory when it can, and as memory fills it moves the oldest ones to disk in the background. A spilled object is read by mapping its disk file, so there's no restore step. Nor is there a store-full error: a full disk raises `OSError` naming the directory. On macOS, or when the object directory is already on disk, nothing spills.
+
+<details>
+<summary>More: where objects live, when they spill, and the variables that tune it</summary>
+
+The memory is a huge-page tmpfs if one is mounted, else `/dev/shm` when it has at least 2 GiB. Past 80% of the memory limit the peer moves the oldest objects to disk, and past the limit plus a quarter, new objects go straight to disk.
 
 These are the peer's environment variables, so set them where the peer starts:
 
@@ -119,7 +131,9 @@ These are the peer's environment variables, so set them where the peer starts:
 | `CHIMAERA_OBJECT_REPLICAS` | `1` | copies of each object kept on other peers (Linux only); `0` turns them off |
 | `CHIMAERA_SPILL_URL` | unset | spill to `s3://`, `gs://` or `az://`; only in a peer built with the `object-store-spill` cargo feature, which is off by default |
 
-[../objects.md](../objects.md) covers the internals and every setting, and [../configuration.md](../configuration.md) lists all variables.
+[../objects.md](../objects.md) has the internals and every setting, and [../configuration.md](../configuration.md) lists all variables.
+
+</details>
 
 ## Process data in partitions
 
@@ -170,30 +184,43 @@ assert sorted(os.listdir(out)) == ["_manifest.json", "part-00000.jsonl", "part-0
 | A glob or a directory | one per file. `.jsonl`/`.ndjson` rows are dicts, `.csv` rows are dicts of strings, `.parquet` rows are dicts (needs `pyarrow`), any other file gives lines |
 | An `ext.Source` | whatever its `partitions()` returns |
 
-Every peer that may run a call must read the files at the same path, and a pattern that matches nothing raises `FileNotFoundError`.
-
-`columns=` keeps only those keys of dict rows. `filter=` is either a callable on each row or a list of `(column, op, value)` triples, all of which must hold; the ops are `==`, `!=`, `<`, `<=`, `>`, `>=`, `in` and `not in`:
+Every peer that may run a call must find the files under the path you give. `columns=` keeps only those keys of dict rows, and `filter=` keeps only the rows that pass:
 
 ```python run
 info_only = ch.data.partitions(os.path.join(logs, "*.jsonl"), columns=["text"], filter=[("level", "==", "info")])
 assert count_words.map(info_only).reduce_by_key(operator.add).to_dict()["cat"] == 2
 ```
 
+<details>
+<summary>More: filter operators, missing files and two parquet filter bugs</summary>
+
+A pattern that matches nothing raises `FileNotFoundError`.
+
+`filter=` is either a callable on each row or a list of `(column, op, value)` triples, all of which must hold; the ops are `==`, `!=`, `<`, `<=`, `>`, `>=`, `in` and `not in`.
+
 Only `.parquet` pushes the filter and columns down into the reader; other formats read the whole file in the worker and filter there. In this build, parquet filters have two bugs. A triple whose value is a number, such as `("age", ">", 20)`, raises `TypeError`, and filtering on a column you left out of `columns=` drops every row. Until they're fixed, use a callable filter on parquet and keep the filtered column in `columns=`.
+
+</details>
 
 ### Group by key with `reduce_by_key`
 
-`results.reduce_by_key(combine=None, *, partitions=None)` regroups results that are iterables of `(key, value)` pairs by key. The pairs move between workers, never through your script: scatter calls split each result into buckets by key, and one gather call per output partition merges its buckets. A worker that dies re-runs only its own call.
+`results.reduce_by_key(combine=None, *, partitions=None)` regroups results that are iterables of `(key, value)` pairs by key. The pairs move between workers, never through your script. `combine` folds two values for the same key and must be associative (`operator.add`); without it, each key maps to the list of its values.
 
-- `combine` folds two values for the same key and must be associative (`operator.add`). Without it, each key maps to the list of its values.
+<details>
+<summary>More: output partitions, key rules and how the shuffle runs</summary>
+
+Scatter calls split each result into buckets by key, and one gather call per output partition merges its buckets. A worker that dies re-runs only its own call.
+
 - `partitions` sets the number of output partitions, by default the number of inputs capped at the peer's usable cores.
 - Keys go to buckets by a stable hash, so they must pickle the same way in every process: `str`, `bytes`, numbers and tuples of them do.
 - When nothing has read the map yet, as in the example, its function runs inside the scatter calls and its pairs are never stored in between.
 - Each gather reads one small handle per input, so keep inputs × partitions in the low millions.
 
+</details>
+
 ### Read a `Partitioned` result
 
-`reduce_by_key` returns a `ch.data.Partitioned`. The partitions stay on the workers until you read them:
+The result of `reduce_by_key` is a `ch.data.Partitioned`. The partitions stay on the workers until you read them:
 
 ```python run
 assert len(totals) == 2
@@ -202,11 +229,18 @@ for part in totals:                       # one dict per partition: word -> coun
 assert dict(totals.items()) == counts
 ```
 
-Each partition is a dict from key to its value (to the list of its values without a `combine`), and a key lives in one partition only. `to_dict()` and `items()` bring every pair to the script; `totals.map(fn)` runs a remote function on each partition's dict instead. `totals.futures` holds one future per partition.
+`to_dict()` and `items()` bring every pair to the script; `totals.map(fn)` runs a remote function on each partition's dict instead.
+
+<details>
+<summary>More: what each partition holds</summary>
+
+Each partition is a dict from key to its value (to the list of its values without a `combine`), and a key lives in one partition only. `totals.futures` holds one future per partition.
+
+</details>
 
 ### Write to a sink
 
-`write(sink)` writes each partition in its own call, so the data never passes through your script, then calls the sink's `commit` once. It works on a `Partitioned` and on a map's results (each result becomes one partition). `ext.FileSink(directory, format="jsonl")` writes `part-00000.jsonl` and so on, one JSON value per line (a pair becomes `["the", 3]`), then `_manifest.json`:
+`write(sink)` writes each partition in a separate call, so the data never passes through your script, then calls the sink's `commit` once. `ext.FileSink(directory, format="jsonl")` writes `part-00000.jsonl` and so on, then `_manifest.json`:
 
 ```python run
 with open(os.path.join(out, "_manifest.json")) as f:
@@ -214,7 +248,16 @@ with open(os.path.join(out, "_manifest.json")) as f:
 assert manifest["parts"][0]["part"] == 0 and sum(p["rows"] for p in manifest["parts"]) == 7
 ```
 
-Each part is written under a temporary name and renamed, so a retried write replaces the whole file and writing the result again leaves identical files. `format="parquet"` (or `write_parquet(directory)`) needs `pyarrow`. On a cluster, put the directory on storage every peer can write.
+On a cluster, put the directory on storage every peer can write.
+
+<details>
+<summary>More: what write accepts, the file format, retries and parquet</summary>
+
+`write` works on a `Partitioned` and on a map's results (each result becomes one partition). The file sink writes one JSON value per line (a pair becomes `["the", 3]`).
+
+Each part is written under a temporary name and renamed, so a retried write replaces the whole file and writing the result again leaves identical files. `format="parquet"` (or `write_parquet(directory)`) needs `pyarrow`.
+
+</details>
 
 ### Plug in your own source or sink
 
@@ -245,7 +288,14 @@ def squared(partition) -> list[int]:
 assert squared.map(ch.data.partitions(Ranges(25))).write(SumSink()).result() == sum(x * x for x in range(25))
 ```
 
-Sources and sinks are pickled to the workers, so keep their state small: paths, URIs, credential names. A retried call runs `write` again for its partition, so `write` must be idempotent (overwrite a part, never append to it). Put one-time steps, such as publishing a table, in `commit`.
+A retried call runs `write` again for its partition, so `write` must be idempotent (overwrite a part, never append to it).
+
+<details>
+<summary>More: what a source or sink may hold, and where one-time steps go</summary>
+
+Sources and sinks are pickled to the workers, so keep their state small: paths, URIs, credential names. Put one-time steps, such as publishing a table, in `commit`.
+
+</details>
 
 ### Send a type pickle can't handle
 
@@ -275,7 +325,7 @@ def bump(t: Tally) -> int:
 assert bump.remote(Tally(41)).result() == 42
 ```
 
-`loads` must be a module-level function, not a lambda. Every process that sends the type must register it, including a worker that returns a `Tally`, so put the call in a module that both your script and your functions import.
+`loads` must be a module-level function, not a lambda. Every process that sends the type must register it, including a worker whose result is a `Tally`, so put the call in a module that both your script and your functions import.
 
 ## Stream items from a generator
 
@@ -292,9 +342,16 @@ assert next(stream) == {"id": 0}
 assert sum(1 for _ in stream) == 99
 ```
 
-The generator runs at most `max_in_flight` items ahead of you (default 64), so a slow consumer holds back the producer instead of filling memory. `stream.close()` stops it, and `async for` works too.
+The generator runs at most `max_in_flight` items ahead of you (default 64), so a slow consumer holds back the producer instead of filling memory.
+
+<details>
+<summary>More: stopping a stream, async iteration and actor generators</summary>
+
+`stream.close()` stops the generator, and `async for` works too.
 
 Generator methods on actors don't stream yet: the call fails with `cannot pickle 'generator' object`. Return a list from the method or put items on a `ch.coord.Queue` instead. [tasks.md](tasks.md) covers generators in full, with errors, retries and replay.
+
+</details>
 
 ## Share state between calls
 
@@ -320,7 +377,14 @@ q.close()
 assert total.result() == 45
 ```
 
-`put` and `get` return futures. With `maxsize=` set, a `put` on a full queue waits inside the queue for room; the default `maxsize=0` means unbounded. With `timeout=`, a `put`'s future fails with the standard library's `queue.Full` and a `get`'s with `queue.Empty`. After `close()`, a `put` fails with `ch.errors.Closed`, and `get` drains what's left, then fails with `Closed`. `name="jobs"` shares one queue among everyone who names it; the first creator's `maxsize` applies.
+`put` and `get` return futures, and iterating a queue takes items until it's closed and empty. `name="jobs"` shares one queue among everyone who names it.
+
+<details>
+<summary>More: bounded queues, timeouts and closing</summary>
+
+With `maxsize=` set, a `put` on a full queue waits inside the queue for room; the default `maxsize=0` means unbounded. With `timeout=`, a `put`'s future fails with the standard library's `queue.Full` and a `get`'s with `queue.Empty`. After `close()`, a `put` fails with `ch.errors.Closed`, and `get` drains what's left, then fails with `Closed`. When several callers share a name, the first creator's `maxsize` applies.
+
+</details>
 
 ### Broadcast through a topic
 
@@ -333,11 +397,18 @@ topic.close()
 assert list(sub) == [0, 1, 2]
 ```
 
-Every subscriber gets every item, at its own pace. The topic keeps a bounded log of the newest items: `retain=1024` (the default) counts items, `retain="1 GiB"` counts bytes. `subscribe("latest")` starts at items published from now on, `"earliest"` at everything retained, and an integer at that offset. A subscriber that falls behind the log skips ahead, and `sub.skipped` says how many items it missed.
+Every subscriber gets every item, at its own pace, from a bounded log of the newest items.
+
+<details>
+<summary>More: how much a topic keeps, where subscribers start, and falling behind</summary>
+
+`retain=1024` (the default) counts items, `retain="1 GiB"` counts bytes. `subscribe("latest")` starts at items published from now on, `"earliest"` at everything retained, and an integer at that offset. A subscriber that falls behind the log skips ahead, and `sub.skipped` says how many items it missed.
+
+</details>
 
 ### Keep replicated state in a store
 
-A `ch.coord.Store` namespace is a set of keys kept in one Raft group. Every operation on it is linearizable, and it survives the loss of any process and a minority of peers. Keys outlive the run, so the example takes a fresh namespace:
+A `ch.coord.Store` namespace is a set of keys kept in one Raft group. Every operation on it is linearizable, and it survives the loss of any process and a minority of peers. Keys outlive your run, so the example takes a fresh namespace:
 
 ```python run
 import uuid
@@ -367,7 +438,10 @@ def meet(store, parties: int) -> int:
 assert ch.get([meet.remote(store, 2) for _ in range(2)]) == [1, 1]
 ```
 
-What each part does:
+A namespace is one Raft group, so spread heavy traffic over several namespaces.
+
+<details>
+<summary>More: versions, value size, expiry, leases, watches and barriers</summary>
 
 - `put` returns the key's new version. `if_version=v` makes it a compare-and-set that raises `ch.errors.VersionConflict` (its `.version` is the current one); `if_version=0` means "only if the key doesn't exist". `delete` takes `if_version=` too.
 - Values are pickled and limited to 1 MiB; a bigger one raises `ValueError`. Store a `ch.put` future instead; it reads only while its run lasts.
@@ -377,7 +451,7 @@ What each part does:
 - `barrier(key, parties).wait()` returns once that many callers arrive, round after round.
 - `scan(prefix)` and `keys(prefix)` list keys in order.
 
-A namespace is one Raft group, so spread heavy traffic over several namespaces.
+</details>
 
 ### Hand out work that must not be lost
 
@@ -396,6 +470,13 @@ with jobs.claim() as job:                 # delivered again
 assert jobs.qsize() == 0
 ```
 
-Unlike `Queue`, its methods are synchronous: `put` returns once the item is stored, and `get()` claims and removes in one step. `maxsize=`, `timeout=`, `close()` and iteration work as they do on `Queue`. Pass the queue to calls, or open it by name from any process.
+Pass the queue to calls, or open it by name from any process.
+
+<details>
+<summary>More: how WorkQueue differs from Queue</summary>
+
+Unlike `Queue`, its methods are synchronous: `put` returns once the item is stored, and `get()` claims and removes in one step. `maxsize=`, `timeout=`, `close()` and iteration work as they do on `Queue`.
+
+</details>
 
 Next: [failures.md](failures.md) covers what happens to calls, actors and stored values when processes and machines fail.
