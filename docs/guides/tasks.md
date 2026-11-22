@@ -22,13 +22,15 @@ future = word_count.remote("blue sky")      # runs on a worker
 assert future.result() == 2
 ```
 
-`word_count(...)` stays a plain local call. `word_count.remote(...)` checks
-the arguments against the signature, so `add.remote(1)` raises `TypeError` on
-that line, before anything leaves your process. Otherwise you get a
-`ch.Future` back at once.
+`word_count(...)` stays a plain local call, and `word_count.remote(...)` hands
+you a `ch.Future` at once.
 
 <details>
-<summary>More: connecting, pickling and resources</summary>
+<summary>More: argument checks, connecting, pickling and resources</summary>
+
+`.remote(...)` first checks the arguments against the signature, so
+`add.remote(1)` raises `TypeError` on that line, before anything leaves your
+process.
 
 Your script's first call connects to a peer, starting a local one if none is
 running ([clusters.md](clusters.md) covers clusters).
@@ -59,13 +61,13 @@ except TimeoutError:
 assert slow.result() == 1.0 and slow.done()
 ```
 
-`f.result()` hands back the value or raises the call's error. Your own
-exceptions come back with their original type and the remote traceback
-([failures.md](failures.md)). Submit everything before you wait, or use
-`fn.map`.
+`f.result()` hands back the value or raises the call's error.
 
 <details>
-<summary>More: every future method, and warning CH101</summary>
+<summary>More: error types, every future method, and warning CH101</summary>
+
+Your own exceptions come back with their original type and the remote
+traceback ([failures.md](failures.md)).
 
 | On a future | What it does |
 |---|---|
@@ -83,8 +85,8 @@ exceptions come back with their original type and the remote traceback
 
 An exception that nothing reads is printed on stderr.
 
-Waiting on each call from one line before making the next draws warning CH101
-after 200 in a row.
+Submit everything before you wait, or use `fn.map`. Waiting on each call from
+one line before making the next draws warning CH101 after 200 in a row.
 
 </details>
 
@@ -103,14 +105,16 @@ assert finished.cancel() is False           # too late: the result stays
 assert finished.result() == 3
 ```
 
-`cancel()` returns at once. `True` means the call had not finished, and its
+`cancel()` returns at once: `True` means the call had not finished, and its
 result now raises `ch.Cancelled` (unless it finishes first); `False` means it
-had and keeps its outcome. Canceling a call also cancels every call it
-started, including ones it starts afterward. In long loops, check
-`ch.context().cancelled()` so your code can stop by itself.
+had and keeps its outcome.
 
 <details>
-<summary>More: the grace period and force=True</summary>
+<summary>More: calls it started, the grace period and force=True</summary>
+
+Canceling a call also cancels every call it started, including ones it starts
+afterward. In long loops, check `ch.context().cancelled()` so your code can
+stop by itself.
 
 A running call gets a grace period to stop by itself. After 2 s Chimaera
 interrupts it (a `time.sleep` or a pure-Python loop on its main thread raises
@@ -125,7 +129,7 @@ included. Later calls on that actor raise `ch.ActorDied`.
 ## Pass futures into other calls
 
 A future passed as an argument arrives as its value, sent straight from the
-worker that made it once it is ready. You never download it.
+worker that made it once it is ready, so you never download it.
 
 ```python run
 total = add.remote(word_count.remote("blue sky"), word_count.remote("rain today"))
@@ -145,12 +149,12 @@ def first_done(futures: list[ch.Future[int]]) -> int:
 assert first_done.remote(ch.handles(counts)).result() in (2, 3)
 ```
 
+<details>
+<summary>More: failed inputs, ch.handles, nested futures, and storing a large value once</summary>
+
 If the input failed, the dependent call fails with the same error. To pass
 futures as futures on purpose, wrap the argument in `ch.handles(...)` like
 `first_done`.
-
-<details>
-<summary>More: nested futures, and storing a large value once</summary>
 
 Futures one level inside a list, tuple or dict value arrive as values too.
 Deeper ones, and those in dict keys, sets, or subclasses of list, tuple and
@@ -164,7 +168,8 @@ returns a finished future to pass like any other
 
 ## Map a function over many items
 
-`fn.map` fans a function out over thousands of items, a window at a time.
+`fn.map` fans a function out over thousands of items, a window at a time, so
+a slow consumer slows the producer instead of filling memory.
 
 ```python run
 assert list(word_count.map(["a", "a b", "a b c"])) == [1, 2, 3]
@@ -181,14 +186,14 @@ assert [o.index for o in inverse.map([1, 0, 2]).outcomes() if o.error] == [1]
 assert list(word_count.options(latency="interactive").map(["a", "b c"])) == [1, 2]
 ```
 
+<details>
+<summary>More: results and errors, window and batching rules, and when mapping starts</summary>
+
 `fn.map(items)` returns a `ch.Results`, a single-pass iterator in input
 order; `ordered=False` yields results as they finish. A failed item raises its
 error at its position. Catch it and keep iterating, or read `.outcomes()`,
 whose `(index, value, error)` tuples never raise. More items go out as you
-read, so a slow consumer slows the producer instead of filling memory.
-
-<details>
-<summary>More: window and batching rules, and when mapping starts</summary>
+read.
 
 The default window is the larger of 256 items and 32 per usable core (widened
 so every core can hold two batches), and 256 MiB of arguments plus the
@@ -230,12 +235,12 @@ assert double(4) == 8                       # still callable locally
 assert list(word_count.map(["a", "b c"]).map(double)) == [2, 4]
 ```
 
+<details>
+<summary>More: partial's bound values and options, and futures between stages</summary>
+
 `fn.partial(*args, **kwargs)` binds arguments as `functools.partial` does. The
 remote function it returns ships the bound values once with the code, not with
 every call. That matters for a big map over a large lookup table.
-
-<details>
-<summary>More: options and futures between stages</summary>
 
 Options from `.options(...)` carry over to the partial.
 
@@ -257,12 +262,15 @@ assert sorted(f.result() for f in ch.as_completed(futures)) == [0, 1, 2, 3, 4]
 assert ch.gather(add.remote(1, 2), add.remote(3, 4)).result() == [3, 7]
 ```
 
+`ch.get` returns every value in order, and `ch.as_completed` hands you each
+future as it finishes.
+
+<details>
+<summary>More: memory on big lists, the four helpers in full, and warning CH117</summary>
+
 `ch.get` on a list holds every value in your script's memory at once. For
 big lists, consume results with `ch.as_completed` or `fn.map`, or reduce them
 inside calls.
-
-<details>
-<summary>More: the four helpers in full, and warning CH117</summary>
 
 | Helper | Returns | Notes |
 |---|---|---|
@@ -277,9 +285,8 @@ Past a quarter of the machine's memory, `ch.get` warns (CH117).
 
 ## Build the graph as you go
 
-A call can return a future instead of a value, and whoever waits gets that
-future's final value. The worker is free as soon as the function returns, so
-recursion like `fib` never ties up workers, however deep it goes.
+A call can return a future instead of a value, so recursion like `fib` never
+ties up workers, however deep it goes.
 
 ```python run
 @ch.remote
@@ -298,11 +305,14 @@ lo, hi = bounds.remote([4, 1, 9]).split()
 assert add.remote(lo, hi).result() == 10 and lo.result() == 1
 ```
 
+<details>
+<summary>More: returning a future, and rules for splitting a result</summary>
+
+Whoever waits gets the returned future's final value, and the worker is free
+as soon as the function returns.
+
 With `returns=n`, `.split()` gives one future per value. Each part is a
 separate dependency, so whatever takes `lo` receives only that value.
-
-<details>
-<summary>More: rules for splitting a result</summary>
 
 A function with `returns=n` must return a tuple or list of exactly `n` values,
 or reading a part raises `ValueError`. Without `returns=`, call `.split(n)`. Canceling a
@@ -329,13 +339,13 @@ with countdown.remote(1_000_000) as stream:
     assert next(stream) == 1_000_000        # leaving the block stops the generator
 ```
 
+<details>
+<summary>More: pausing, worker death, errors, closing early, and async streams</summary>
+
 The generator pauses once it is `max_in_flight` items ahead of you (default
 64). If its worker dies mid-stream, it runs again from the start on another
 worker and skips the items you already have, so make it yield the same items
 each time.
-
-<details>
-<summary>More: errors, closing early, and async streams</summary>
 
 An exception in the generator is raised after the items before it.
 `stream.close()`, like leaving a `with` block, stops the generator and drops
@@ -374,6 +384,11 @@ except ch.DeadlineExceeded:
     pass
 ```
 
+`fn.policy().describe()` lists each effective value and where it came from.
+
+<details>
+<summary>More: which setting wins, typos, deadline rules, priority, and the defaults table</summary>
+
 The first of these that sets an option wins:
 
 1. `fn.options(...)`, a configured copy; the original is unchanged.
@@ -382,12 +397,8 @@ The first of these that sets an option wins:
 4. What the runtime has learned about the function ([resources.md](resources.md)).
 5. Built-in defaults.
 
-`fn.policy().describe()` lists each effective value and where it came from. A
-deadline cancels the call that long after `.remote()`, while
+A deadline cancels the call that long after `.remote()`, while
 `result(timeout=...)` only limits how long you wait.
-
-<details>
-<summary>More: typos, deadline rules, priority, and the defaults table</summary>
 
 A typo or a bad value raises `ch.OptionsError` on the line where you wrote it,
 with a suggestion.
@@ -428,11 +439,13 @@ assert ch.context() is None                 # None in your script
 ```
 
 Inside a running call, `ch.context()` tells your code which attempt it is on
-and where it runs, and `report(**metrics)` sends progress the caller reads with
-`future.metrics()`.
+and where it runs.
 
 <details>
-<summary>More: every field on the context</summary>
+<summary>More: reporting progress, and every field on the context</summary>
+
+Its `report(**metrics)` sends progress the caller reads with
+`future.metrics()`.
 
 `ch.context()` carries `run_id`, `task_id`, `attempt` (1 on the first try),
 `item_index` (the position in a map), `cpus`, `node` (the peer's id) and
@@ -454,7 +467,7 @@ chimaera: waiting for 4 unfinished calls and 1 unread map before exiting (Ctrl-C
 ```
 
 <details>
-<summary>More: streams, failed scripts and ch.shutdown()</summary>
+<summary>More: streams, failed scripts, ch.shutdown() and a late detach</summary>
 
 Streams nobody reads are stopped, not waited on. If the script raised
 (`chimaera: cancelling 1 unfinished call: the script failed`), or you press
@@ -462,11 +475,12 @@ Ctrl-C before or during that wait, the unfinished work is canceled instead.
 `ch.shutdown()` runs the same wait at any point (`cancel=True` cancels
 instead of waiting); the next call connects again.
 
+`ch.init(detach=True)` after the script's first call is silently ignored.
+
 </details>
 
 To let the work outlive the script, call `ch.init(detach=True)` before its
-first call (after that it is silently ignored). Reattach from any other
-process by the run's id:
+first call, then reattach from any other process by the run's id:
 
 ```python
 import time

@@ -105,12 +105,12 @@ defaults to `False`. Use `ch.init(detach=True)` there.
 
 ### `chimaera submit`
 
-Run a program remotely. One peer runs it as the only call of a
-detached run, with this directory shipped as its project. `submit` prints
-the run's id and returns (`chimaera logs RUN`, `chimaera cancel RUN`).
+Run a program on the cluster in the background and get its run id back.
 
 <details>
 <summary><code>chimaera submit [OPTIONS] &lt;COMMAND&gt;...</code></summary>
+
+One peer runs it as the only call of a detached run, with this directory shipped as its project. `submit` prints the run's id and returns (`chimaera logs RUN`, `chimaera cancel RUN`).
 
 ```text
 chimaera submit [OPTIONS] <COMMAND>...
@@ -442,13 +442,12 @@ chimaera cluster cert [OPTIONS] --ca <CA> --name <NAME> --out <OUT>
 
 ### `chimaera cluster credential`
 
-Print a driver credential for TENANT. Drivers presenting it (as
-$CHIMAERA_TOKEN, or a profile's token file) reach only that tenant's runs,
-actors, store and logs, and cannot stop peers. Changing the cluster token
-revokes every credential.
+Print a driver credential for TENANT.
 
 <details>
 <summary><code>chimaera cluster credential [OPTIONS] --tenant &lt;TENANT&gt;</code></summary>
+
+Drivers presenting it (as $CHIMAERA_TOKEN, or a profile's token file) reach only that tenant's runs, actors, store and logs, and cannot stop peers. Changing the cluster token revokes every credential.
 
 ```text
 chimaera cluster credential [OPTIONS] --tenant <TENANT>
@@ -465,14 +464,12 @@ chimaera cluster credential [OPTIONS] --tenant <TENANT>
 
 ### `chimaera cluster recover`
 
-Rebuild group GROUP around this stopped peer when the group's other voters
-are gone for good. This peer becomes the group's only voter and keeps the
-commits it holds; commits it never received are lost. Once it runs, the
-cluster adds voters back. Use the surviving replica that holds the most of
-the group's log.
+Rebuild group GROUP around this stopped peer when the group's other voters are gone for good.
 
 <details>
 <summary><code>chimaera cluster recover [OPTIONS] --group &lt;GROUP&gt;</code></summary>
+
+This peer becomes the group's only voter and keeps the commits it holds; commits it never received are lost. Once it runs, the cluster adds voters back. Use the surviving replica that holds the most of the group's log.
 
 ```text
 chimaera cluster recover [OPTIONS] --group <GROUP>

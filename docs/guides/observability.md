@@ -36,11 +36,6 @@ What the script printed:
 (tokenize pid=61338) INFO etl: got 19 chars
 ```
 
-Workers log at your script's level, so
-`logging.basicConfig(level=logging.INFO)` in the script shows `log.info`
-from inside calls. At the default `WARNING` level those records are
-dropped.
-
 The output outlives your script: its peer keeps it, and `run.logs()` reads
 it back:
 
@@ -63,6 +58,11 @@ chimaera logs 0000027da0522d95e30e656fd7268a93
 
 <details>
 <summary>More: how workers get your log level, the line format, following, where output is kept</summary>
+
+Workers log at your script's level, so
+`logging.basicConfig(level=logging.INFO)` in the script shows `log.info`
+from inside calls. At the default `WARNING` level those records are
+dropped.
 
 The run carries your root logger's level, and a worker with no logging
 handlers of its own calls `logging.basicConfig` at that level.
@@ -273,6 +273,9 @@ peer 0000000024e6 (incarnation 1) · 0.00/12.00 CPU in use · 16 executors (0 bu
   automatic: 23 learned function profile(s), saved in .../profiles.pb
 ```
 
+<details>
+<summary>More: a table of the other commands, and --cluster</summary>
+
 The other commands:
 
 | Command | Shows |
@@ -291,6 +294,8 @@ The other commands:
 `--cluster NAME` to ask a cluster instead of the local peer
 ([clusters.md](clusters.md)). If a peer itself misbehaves, read
 `peer.log` in its data directory.
+
+</details>
 
 <details>
 <summary>More: cluster status, sample runs, profiles and doctor output, peer and worker logs</summary>

@@ -87,12 +87,12 @@ with parallel_config(backend="chimaera", n_jobs=4):
 assert squares == [i * i for i in range(100)]
 ```
 
+<details>
+<summary>More: how batches run, errors, n_jobs and generator output</summary>
+
 Each batch joblib dispatches becomes one Chimaera call, placed on whichever
 peers have room. When a task raises, `Parallel` raises that error and the
 batches still running are canceled.
-
-<details>
-<summary>More: batch sizes, n_jobs and generator output</summary>
 
 joblib sizes its batches by how long they take, so many small tasks share a
 call. `n_jobs` is the number of batches in flight: by default, and with `-1`,

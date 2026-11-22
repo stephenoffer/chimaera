@@ -24,12 +24,14 @@ assert gang.result() == [4950] * 4
 ```
 
 `fn.options(ranks=n).gang(*args)` starts n calls of `fn` with the same
-arguments. The `Gang` it returns is a future of all their return values, in
-rank order: wait on it, `await` it, pass it to another call, or `cancel()`
-it to stop them all.
+arguments and returns a `Gang`, a future of all their return values in rank
+order.
 
 <details>
-<summary>More: per-rank resources, retries and misuse errors</summary>
+<summary>More: using the Gang, per-rank resources, retries and misuse errors</summary>
+
+Wait on the `Gang`, `await` it, pass it to another call, or `cancel()` it to
+stop them all.
 
 Each rank gets the gang's `cpus`, `memory`, `memory_limit`, `gpus`, `device`,
 `placement`, `priority` and `deadline` (see [resources.md](resources.md)).
@@ -66,10 +68,10 @@ assert envs[0]["MASTER_ADDR"] == envs[1]["MASTER_ADDR"]
 | `MASTER_ADDR`, `MASTER_PORT` | Rank 0's host and a free port there |
 | `CHIMAERA_GANG`, `CHIMAERA_GANG_GENERATION` | The gang's id and its current generation |
 
-In Python, `ch.context().gang` carries this information as a `Group`.
-
 <details>
 <summary>More: the Group's fields, and reused workers</summary>
+
+In Python, `ch.context().gang` carries this information as a `Group`.
 
 A `Group` has `rank`, `size`, `local_rank`, `local_size`, `generation`, `id`
 and `master` (an `(addr, port)` pair). Outside a gang, `ch.context().gang`
@@ -95,13 +97,13 @@ def exchange() -> tuple:
 assert exchange.options(ranks=3).gang().result() == [(["worker-0", "worker-1", "worker-2"], 8, 1234)] * 3
 ```
 
+<details>
+<summary>More: the 1 MiB limit, what each collective returns, timeouts and mismatches</summary>
+
 They go through the cluster's replicated store, so they suit configs,
 seeds, metrics and file lists that pickle to at most 1 MiB each. Move
 tensors with `torch.distributed`. All ranks must call the same sequence of
 collectives.
-
-<details>
-<summary>More: what each collective returns, timeouts and mismatches</summary>
 
 | Collective | Returns |
 |---|---|
@@ -119,9 +121,9 @@ different collectives, they wait for each other instead of mixing data, and
 ## Use torch.distributed
 
 `g.torch()` initializes the default `torch.distributed` process group for
-this gang and returns the module, with a backend that fits each rank's
-devices. This DDP example with checkpoints needs torch, eight GPUs (on any
-number of peers) and a checkpoint path every peer can read:
+this gang and returns the module. This DDP example with checkpoints needs
+torch, eight GPUs (on any number of peers) and a checkpoint path every peer
+can read:
 
 ```python
 import os
@@ -184,7 +186,7 @@ rank.
 ## Keep a gang alive as actors
 
 `Class.options(ranks=n).gang(*args)` builds n instances together, each with
-the rendezvous environment set for good in its own process. So `__init__`
+the rendezvous environment set for good in its own process, so `__init__`
 can call `ch.context().gang.torch()` and load a model once:
 
 ```python run
@@ -209,12 +211,12 @@ with Worker.options(ranks=3).gang(100) as workers:
     assert workers.where.remote().result() == [(0, 2, 2), (1, 2, 2)]
 ```
 
+<details>
+<summary>More: lost ranks, calling one rank or all of them, resizing and closing</summary>
+
 A lost rank breaks the gang: its calls raise `ch.ActorDied`, and nothing
 restarts on its own. Call `workers.restart()` to start a new generation, and
 restore your checkpoint in `__init__`.
-
-<details>
-<summary>More: calling one rank or all of them, resizing and closing</summary>
 
 - `workers.method.remote(...)` runs on every rank and gives one future of the
   results in rank order; `workers[i].method.remote(...)` runs on rank `i`.
@@ -242,11 +244,11 @@ print(elastic.decisions)  # ['generation 1: 2 ranks: the live peers hold 24 of t
 assert elastic.decisions[0].startswith("generation 1: 2 ranks")
 ```
 
+<details>
+<summary>More: losing a peer, how capacity is counted, and when the size changes</summary>
+
 An elastic gang that loses a peer comes back smaller instead of waiting for
 a replacement, and `gang.decisions` says why each generation got its size.
-
-<details>
-<summary>More: how capacity is counted, and when the size changes</summary>
 
 The count goes by the peers' CPUs, and GPUs when ranks ask for them. It
 counts capacity, not what is free right now. The first generation starts at
@@ -278,12 +280,12 @@ assert retried.result() == [(0, 2), (1, 2)]
 assert retried.generation == 2
 ```
 
+<details>
+<summary>More: resuming, why the restart takes 15 s, and GangFailed</summary>
+
 Resume from your own checkpoint; `g.generation` tells you which try this
 is. After `max_attempts` generations have each lost a rank, the gang fails
 with `ch.errors.GangFailed`.
-
-<details>
-<summary>More: why the restart takes 15 s, and the GangFailed message</summary>
 
 Before restarting, the supervisor waits up to 15 s to see whether
 the dead rank's peer is gone, so the new one isn't sized to fit on it.
@@ -322,11 +324,11 @@ except ValueError as e:
     assert "bad shard" in str(e)
 ```
 
-Ranks are placed one at a time today, not all or nothing, so size each
-gang to what is free when it starts.
-
 <details>
 <summary>More: what happens when not all ranks fit</summary>
+
+Ranks are placed one at a time today, not all or nothing, so size each
+gang to what is free when it starts.
 
 With too little free capacity, whichever ranks fit start and wait at the
 rendezvous. If some rank hasn't arrived within 300 s, the
@@ -358,11 +360,11 @@ for l in learners:
     l.close()
 ```
 
+<details>
+<summary>More: passing the handle, when join waits, new generations, and misuse</summary>
+
 Pass the handle to the members. Inside a member's method, `handle.join()`
 returns its `Group`, with a gang rank's collectives, `torch()` and `mesh()`.
-
-<details>
-<summary>More: when join waits, new generations, and misuse</summary>
 
 The first `join()` in each member waits for all of them; later ones return
 that `Group`. To start a new generation for a changed set of actors, call
@@ -388,8 +390,7 @@ assert out[0] == ([0, 1], [0, 2], 1)
 assert out[3] == ([2, 3], [1, 3], 5)
 ```
 
-An axis has the store collectives but no torch process group of its own,
-so for tensors, build torch's own mesh after `g.torch()`. This needs torch
+For tensors, build torch's own mesh after `g.torch()`. This needs torch
 and eight GPUs:
 
 ```python
@@ -407,8 +408,9 @@ train_2d.options(ranks=8).gang(1000).result()
 ```
 
 <details>
-<summary>More: axis order and sizes, an axis's ranks, and its errors</summary>
+<summary>More: an axis's collectives, order and sizes, and its errors</summary>
 
+An axis has the store collectives but no torch process group of its own.
 The last axis varies fastest, as in torch's `DeviceMesh`. The sizes must multiply to the group's size, or it raises `ValueError`.
 Each axis has `ranks` (their ranks in the whole gang), and its `torch()`
 raises `RuntimeError`.
@@ -455,11 +457,11 @@ except TimeoutError as e:
     assert "timed out: rank 1 last entered #0 (rendezvous" in str(e)
 ```
 
+<details>
+<summary>More: the collectives explain sees, its fields, and hangs inside NCCL</summary>
+
 `explain()` sees the rendezvous and the four store collectives, not calls
 inside `torch.distributed`.
-
-<details>
-<summary>More: the fields explain returns, and hangs inside NCCL</summary>
 
 On a gang, a class gang or a group handle, `explain()` returns the current
 `generation`, a `ranks` list with each rank's last collective (its number,
