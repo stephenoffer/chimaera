@@ -317,7 +317,7 @@ raft group's leader, which the design's partitioning of runs across groups
 
 ## Smart defaults: learned reservations, memory, large values
 
-Plan `mellow-finding-scone.md`. All results are **local** (macOS 14, 12 cores,
+All results are **local** (macOS 14, 12 cores,
 36 GiB; Linux results from the colima dev container where noted). The machine
 was shared with other builds and test runs during these measurements.
 
