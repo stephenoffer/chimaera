@@ -422,7 +422,7 @@ use_spot = true
 ```
 
 - `chimaera run --cluster NAME -- python app.py` keeps the driver on your machine.
-- `chimaera submit --cluster NAME -- python app.py` runs the driver on the cluster, detached, and prints the run id. `logs`, `inspect`, `attach` and `cancel` take `--cluster` too.
+- Running the driver itself on the cluster (`chimaera submit`) isn't in this release yet. `logs`, `inspect` and `cancel` take `--cluster` too, and `ch.runs.attach(run_id)` reattaches to a run from Python.
 - Run history lives in the long-lived cluster, so it is still there after the job ends.
 
 A peer uses two ports: the peer port (7700) for other peers, and the client
