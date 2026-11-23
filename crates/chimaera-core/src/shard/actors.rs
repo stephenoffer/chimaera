@@ -70,8 +70,11 @@ impl ShardState {
             cx.kv.delete(&keys::actor_host(v, &old.0, old.1, &id));
         }
         let reason = a.reason.clone().unwrap_or_default();
-        let rec =
-            if a.terminal { self.actor_ended(cx, v, id, rec, reason) } else { self.actor_lost(cx, v, id, rec, reason) };
+        let rec = if a.terminal {
+            self.actor_ended(cx, v, id, rec, reason)
+        } else {
+            self.actor_lost(cx, v, id, rec, reason, !a.moved)
+        };
         Self::actor_reply(AStatus::Ok, Some(&rec), &a.actor)
     }
 
@@ -82,13 +85,17 @@ impl ShardState {
         id: Id,
         mut rec: pb::ActorRecord,
         reason: pb::ErrorRecord,
+        counted: bool,
     ) -> pb::ActorRecord {
         let spec = rec.spec.clone().unwrap_or_default();
         let restart = spec.restart() != pb::actor_spec::Restart::Never || spec.durable;
         let max = if spec.max_restarts == 0 { DEFAULT_MAX_ATTEMPTS } else { spec.max_restarts };
         rec.host = None;
-        if restart && rec.restarts < max {
-            rec.restarts += 1;
+        // A move (its host drained) restarts it without using up a restart.
+        if restart && (rec.restarts < max || !counted) {
+            if counted {
+                rec.restarts += 1;
+            }
             rec.set_state(AState::Restarting);
         } else {
             rec.set_state(AState::Dead);

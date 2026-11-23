@@ -18,6 +18,63 @@ from chimaera._executor import python_mismatch
 PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
+def test_calling_an_actor_method_directly_says_to_use_remote():
+    # The usual first mistake: c.inc(1) instead of c.inc.remote(1). Python's
+    # own error named only a type ("'RemoteMethod' object is not callable").
+    r = run_script(
+        """
+        import chimaera as ch
+
+        @ch.remote
+        class Counter:
+            def inc(self, k):
+                return k
+
+        c = Counter.remote()
+        try:
+            c.inc(1)
+        except TypeError as e:
+            print("ERROR", e)
+        print("TEMPORARY", Counter.remote().inc.remote(5).result(timeout=60))  # a handle never stored works
+        """
+    )
+    assert r.returncode == 0, r.stderr
+    assert "Counter.inc" in r.stdout and ".inc.remote(...)" in r.stdout, r.stdout
+    assert "TEMPORARY 5" in r.stdout, r.stdout
+
+
+def test_an_async_actors_awaiting_calls_hold_no_threads():
+    # An I/O actor (async methods, high concurrency) awaits many calls at once.
+    # Each awaiting call held a thread: 500 calls, 505 threads. Its coroutines
+    # now run on the actor's loop and wait without one.
+    r = run_script(
+        """
+        import asyncio, threading, time
+        import chimaera as ch
+
+        @ch.remote(concurrency=300)
+        class Waiter:
+            async def wait(self, s):
+                await asyncio.sleep(s)
+                return ch.context() is not None
+
+            def threads(self):
+                return threading.active_count()
+
+        w = Waiter.remote()
+        calls = [w.wait.remote(2) for _ in range(200)]
+        time.sleep(1)
+        print("THREADS", w.threads.remote().result(timeout=60))
+        print("DONE", sum(ch.get(calls, timeout=120)))
+        """,
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    out = dict(line.split() for line in r.stdout.splitlines() if line.startswith(("THREADS", "DONE")))
+    assert out["DONE"] == "200", r.stdout  # every call finished, each with its task context
+    assert int(out["THREADS"]) < 50, r.stdout
+
+
 def test_a_function_wrapped_anew_for_every_call_warns_once():
     # ch.remote(lambda ...) inside a loop sends a new function each time, each
     # pickled and hashed again (6x slower than a function defined once).
@@ -366,3 +423,592 @@ def test_under_a_task_limit_calls_wait_for_workers_instead_of_failing(tmp_path):
             os.rmdir(cg)
         except OSError:
             pass  # a worker still exiting: the cgroup goes with the container
+
+
+def test_a_failed_call_whose_error_nothing_read_is_reported():
+    # Ray Client drops an error nobody ray.get()s: the failure vanishes. Here a
+    # dropped failed future says so on stderr (as asyncio does for a task's
+    # exception never retrieved), and so do ones still held at exit. Errors that
+    # were read, handed to another call, or cancelled stay quiet.
+    r = run_script(
+        """
+        import gc, time
+        import chimaera as ch
+
+        @ch.remote
+        def dropped():
+            raise ValueError("first failure")
+
+        @ch.remote
+        def read():
+            raise ValueError("read failure")
+
+        @ch.remote
+        def upstream():
+            raise ValueError("upstream failure")
+
+        @ch.remote
+        def ident(x):
+            return x
+
+        @ch.remote
+        def nap():
+            time.sleep(30)
+
+        @ch.remote
+        def held():
+            raise KeyError("held at exit")
+
+        f = dropped.remote()
+        ch.wait([f], timeout=60)
+        del f
+        gc.collect()
+
+        g = read.remote()
+        try:
+            g.result(timeout=60)
+        except ValueError:
+            pass
+        del g
+
+        up = upstream.remote()
+        down = ident.remote(up)
+        try:
+            down.result(timeout=60)
+        except ValueError:
+            pass
+        del up, down
+
+        c = nap.remote()
+        time.sleep(0.5)
+        c.cancel()
+        ch.wait([c], timeout=60)
+        del c
+        gc.collect()
+
+        h = held.remote()
+        ch.wait([h], timeout=60)
+        print("end")
+        """,
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    lines = [line for line in r.stderr.splitlines() if "nothing read its error" in line]
+    assert len(lines) == 2, r.stderr
+    assert "dropped" in lines[0] and "ValueError: first failure" in lines[0] and "script.py:" in lines[0], lines
+    assert "held" in lines[1] and "KeyError" in lines[1], lines
+
+
+def test_shared_objects_in_a_calls_arguments_stay_shared():
+    # Ray pickles each argument on its own: the same list passed twice arrives
+    # as two lists, and two bound methods of one object get two objects. A
+    # call's arguments are pickled together here, so identity survives.
+    r = run_script(
+        """
+        import chimaera as ch
+
+        class Counter:
+            def __init__(self):
+                self.n = 0
+
+            def bump(self):
+                self.n += 1
+
+            def read(self):
+                return self.n
+
+        @ch.remote
+        def same(a, b):
+            return a is b
+
+        @ch.remote
+        def both(bump, read):
+            bump()
+            return bump.__self__ is read.__self__, read()
+
+        x = [1, 2, 3]
+        c = Counter()
+        print(same.remote(x, x).result(timeout=60), same.remote([1], [1]).result(timeout=60))
+        print(*both.remote(c.bump, c.read).result(timeout=60))
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["True", "False", "True", "1"], r.stdout
+
+
+def test_settings_left_empty_mean_their_defaults():
+    # `CHIMAERA_MEMORY_POOL=` in a compose file or pod spec is common; the peer
+    # used to refuse to start ("expected a size like 8GiB"), and an empty
+    # CHIMAERA_PYTHON named no interpreter at all.
+    import tempfile
+
+    home = tempfile.mkdtemp(prefix="chm", dir="/tmp")
+    try:
+        r = run_script(
+            """
+            import chimaera as ch
+
+            @ch.remote
+            def one():
+                return 1
+
+            print(one.remote().result(timeout=60))
+            """,
+            home=home,
+            env={"CHIMAERA_MEMORY_POOL": "", "CHIMAERA_PYTHON": " "},
+            timeout=120,
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.split() == ["1"], r.stdout
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+
+
+def test_many_calls_waiting_on_calls_they_started_are_reported_once():
+    # With hosting off (CHIMAERA_HOST_WHILE_WAITING=0), each call waiting inside
+    # a call keeps its own worker process; Ray warns with a process count only.
+    # Here the driver is told once, with the fix. (With hosting on, the default,
+    # their processes run other calls meanwhile and stay few.)
+    import tempfile
+
+    home = tempfile.mkdtemp(prefix="chm", dir="/tmp")
+    try:
+        r = run_script(
+            """
+            import os, time
+            import chimaera as ch
+
+            @ch.remote
+            def tree(depth):
+                if depth == 0:
+                    time.sleep(0.02)
+                    return 1
+                return sum(ch.get([tree.remote(depth - 1) for _ in range(3)]))
+
+            # Enough waiting calls (a 3-way tree of depth d has (3**d - 1) / 2) to
+            # pass the notice's bar of max(32, 4 per CPU) processes.
+            depth = 1
+            while (3**depth - 1) // 2 < max(32, 4 * (os.cpu_count() or 1)) + 8:
+                depth += 1
+            print(tree.remote(depth).result(timeout=240) == 3**depth)
+            """,
+            home=home,
+            env={"CHIMAERA_HOST_WHILE_WAITING": "0"},
+            timeout=300,
+        )
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["True"], r.stdout
+    notes = [line for line in r.stderr.splitlines() if "held by calls waiting inside a call" in line]
+    assert len(notes) == 1, r.stderr
+    assert "pass them to the next call" in notes[0], notes
+
+
+
+def test_an_argument_nested_too_deeply_to_pickle_says_so():
+    # A linked list 100,000 levels deep overflows the pickler's stack: the error
+    # names the depth and how to send it, not advice about unpicklable objects.
+    r = run_script(
+        """
+        import chimaera as ch
+
+        @ch.remote
+        def length(node):
+            return 0
+
+        head = None
+        for _ in range(100_000):
+            head = [head]
+        try:
+            length.remote(head)
+        except ch.SerializationError as e:
+            print(e)
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "argument 'node' nests too deeply to pickle" in r.stdout, r.stdout
+    assert "send it flat" in r.stdout, r.stdout
+
+
+def test_a_stream_or_map_read_to_the_end_says_so_when_read_again():
+    # Ray's ObjectRefGenerator yields nothing the second time, silently: a
+    # sum over it is 0 and a max of it fails as "empty".
+    r = run_script(
+        """
+        import chimaera as ch
+
+        @ch.remote
+        def gen(n):
+            for i in range(n):
+                yield i
+
+        @ch.remote
+        def sq(x):
+            return x * x
+
+        s = gen.remote(3)
+        print(list(s))
+        try:
+            list(s)
+        except RuntimeError as e:
+            print("stream:", e)
+        m = sq.map(range(4))
+        print(sum(m))
+        try:
+            max(m)
+        except RuntimeError as e:
+            print("map:", e)
+        part = gen.remote(4)
+        for x in part:
+            break
+        print(list(part))  # a pass that stopped early goes on where it stopped
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    assert lines[0] == "[0, 1, 2]", lines
+    assert lines[1].startswith("stream: this stream was already read to the end"), lines
+    assert lines[2] == "14", lines
+    assert lines[3].startswith("map: this map was already read to the end"), lines
+    assert lines[4] == "[1, 2, 3]", lines
+
+
+def test_closing_an_actor_runs_its_cleanup():
+    # Ray's kill skips __del__ and atexit: connections and locks stay open.
+    import tempfile
+
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    r = run_script(
+        f"""
+        import os, time
+        import chimaera as ch
+
+        @ch.remote
+        class Holder:
+            def __init__(self, path):
+                import atexit
+                self.path = path
+                atexit.register(lambda: open(path + ".atexit", "w").close())
+
+            def __del__(self):
+                open(self.path + ".del", "w").close()
+
+            def pid(self):
+                return os.getpid()
+
+        h = Holder.remote({os.path.join(marks, "m")!r})
+        pid = h.pid.remote().result(timeout=60)
+        start = time.time()
+        h.close()
+        while time.time() - start < 10:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        print(round(time.time() - start, 2))
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    assert os.path.exists(os.path.join(marks, "m.del")), "__del__ did not run"
+    assert os.path.exists(os.path.join(marks, "m.atexit")), "atexit handlers did not run"
+    assert float(r.stdout.split()[-1]) < 3, f"the worker took {r.stdout.split()[-1]} s to exit after close"
+
+
+def test_an_actor_waiting_on_its_own_queued_call_fails_fast():
+    # A one-at-a-time actor whose method waits for another call to itself can
+    # never get it; Ray hangs. Here the wait raises at once, saying why.
+    r = run_script(
+        """
+        import time
+        import chimaera as ch
+
+        @ch.remote
+        class Loop:
+            def __init__(self):
+                self.me = None
+
+            def set(self, h):
+                self.me = h
+
+            def inner(self):
+                return 1
+
+            def outer(self):
+                return self.me.inner.remote().result()
+
+        h = Loop.remote()
+        h.set.remote(h).result(timeout=60)
+        start = time.time()
+        try:
+            h.outer.remote().result(timeout=60)
+        except ch.Infeasible as e:
+            print(round(time.time() - start, 1), str(e).splitlines()[0])
+        print(h.inner.remote().result(timeout=60))  # the actor keeps serving
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    first, last = r.stdout.splitlines()[0], r.stdout.splitlines()[-1]
+    assert float(first.split()[0]) < 10, first
+    assert "deadlock: Loop.outer waits for Loop.inner" in first, first
+    assert last == "1", r.stdout
+
+
+def test_actors_made_for_a_call_or_two_each_warn_once():
+    # A new actor per item or request is a new worker process each time (the
+    # guides' "actor churn"); actors made once and reused, and named actors
+    # looked up again and again, stay quiet.
+    r = run_script(
+        """
+        import chimaera as ch
+
+        @ch.remote
+        class Scorer:
+            def score(self, x):
+                return x + 1
+
+        for i in range(22):
+            s = Scorer.remote()
+            s.score.remote(i).result(timeout=60)
+            s.close()
+
+        team = [Scorer.remote() for _ in range(22)]
+        for s in team:
+            for i in range(3):
+                s.score.remote(i).result(timeout=60)
+        for s in team:
+            s.close()
+
+        for i in range(22):
+            Scorer.options(name="one").remote().score.remote(i).result(timeout=60)
+        print("ok")
+        """,
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr
+    notes = [line for line in r.stderr.splitlines() if "CH121" in line]
+    assert len(notes) == 1, r.stderr
+    assert "script.py:10: UserWarning: CH121: Scorer actors made here" in notes[0], notes
+
+
+def test_an_async_method_that_blocks_its_actors_loop_is_named_once():
+    # A blocking call inside an ``async def`` holds the actor's one event loop:
+    # every other call waits, and Ray says nothing.
+    r = run_script(
+        """
+        import asyncio, time
+        import chimaera as ch
+
+        @ch.remote
+        class Service:
+            async def slow(self):
+                time.sleep(1.6)
+                return 1
+
+            async def fine(self):
+                await asyncio.sleep(1.6)
+                return 2
+
+        s = Service.remote()
+        print(ch.get([s.slow.remote(), s.slow.remote(), s.fine.remote()], timeout=60))
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    notes = [line for line in r.stderr.splitlines() if "held its actor's event loop" in line]
+    assert len(notes) == 1, r.stderr
+    assert "Service.slow has held" in notes[0] and "script.py:8," in notes[0], notes  # the time.sleep line
+
+
+def test_a_call_failing_on_an_environment_variable_the_program_has_says_how_to_pass_it():
+    # Calls see only the variables a run passes (secrets stay home); a bare
+    # KeyError('MY_SETTING') used to be all a call reading one got.
+    r = run_script(
+        """
+        import os
+        import chimaera as ch
+
+        @ch.remote
+        def read(name):
+            return os.environ[name]
+
+        for name in ("CH_TEST_SETTING", "CH_TEST_NOWHERE"):
+            try:
+                read.remote(name).result(timeout=60)
+            except KeyError as e:
+                notes = [n for n in getattr(e, "__notes__", []) if n.startswith("CH122")]
+                print(name, notes[0] if notes else "no note")
+        ch.shutdown()
+        ch.init(env={"CH_TEST_SETTING": os.environ["CH_TEST_SETTING"]})
+        print(read.remote("CH_TEST_SETTING").result(timeout=60))
+        """,
+        env={"CH_TEST_SETTING": "blue"},
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    assert lines[0].startswith("CH_TEST_SETTING CH122: CH_TEST_SETTING is set where the program runs"), lines
+    assert "ch.init(env={'CH_TEST_SETTING'" in lines[0], lines
+    assert lines[1] == "CH_TEST_NOWHERE no note", lines
+    assert lines[2] == "blue", lines
+
+
+def test_named_actors_from_threads_exit_in_a_call_and_futures_across_sessions():
+    # Three Ray traps: get-or-create of a named actor from several threads is
+    # not thread-safe; exit() inside a function fails to pickle or kills the
+    # worker; an ObjectRef from before a re-init hangs. Here each just works.
+    r = run_script(
+        """
+        import sys, threading
+        import chimaera as ch
+
+        @ch.remote
+        class Counter:
+            def __init__(self):
+                self.n = 0
+
+            def bump(self):
+                self.n += 1
+                return self.n
+
+        seen = []
+        def make():
+            seen.append(Counter.options(name="shared").remote().bump.remote().result(timeout=60))
+        threads = [threading.Thread(target=make) for _ in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        print(sorted(seen))
+
+        @ch.remote
+        def leave(how):
+            if how == "exit":
+                exit(3)
+            sys.exit(4)
+
+        @ch.remote
+        def sq(x):
+            return x * x
+
+        for how in ("exit", "sys"):
+            try:
+                leave.remote(how).result(timeout=60)
+            except Exception as e:
+                print(how, type(e).__name__, "SystemExit" in str(e))
+        print(sq.remote(7).result(timeout=60))
+
+        before = sq.remote(3)
+        before.result(timeout=60)
+        ch.shutdown()
+        ch.init()
+        print(before.result(timeout=10), sq.remote(4).result(timeout=60))
+        """,
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    assert lines[0] == "[1, 2, 3, 4, 5, 6, 7, 8]", lines  # one actor, eight calls
+    assert lines[1] == "exit RemoteError True" and lines[2] == "sys RemoteError True", lines
+    assert lines[3] == "49", lines  # the worker survived
+    assert lines[4] == "9 16", lines
+
+
+def test_a_call_on_another_machine_missing_a_file_says_files_are_not_copied():
+    # "Works on my machine": a path that exists where the program runs is
+    # missing on the peer that ran the call. A peer with another machine id
+    # stands in for another machine.
+    import tempfile
+
+    home = tempfile.mkdtemp(prefix="chm", dir="/tmp")
+    data = os.path.join(home, "data.csv")
+    with open(data, "w") as f:
+        f.write("1,2\n")
+    peer = subprocess.Popen([BIN, "--dir", home, "peer", "start"], env=dict(os.environ, CHIMAERA_MACHINE_ID="elsewhere"),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        r = run_script(
+            f"""
+            import os
+            import chimaera as ch
+
+            @ch.remote
+            def load(path):
+                return open(path).read()
+
+            for path in ({data!r}, "/nowhere/at/all.csv"):
+                try:
+                    load.remote(path + ".gone").result(timeout=60)
+                except FileNotFoundError as e:
+                    notes = [n for n in getattr(e, "__notes__", []) if n.startswith("CH123")]
+                    print(notes[0][:60] if notes else "no note")
+            """,
+            home=home,
+            timeout=120,
+        )
+        assert r.returncode == 0, r.stderr
+        lines = r.stdout.splitlines()
+        assert len(lines) == 2 and all(line.startswith("CH123: this call ran on ") for line in lines), lines
+        same = run_script(
+            """
+            import chimaera as ch
+
+            @ch.remote
+            def load(path):
+                return open(path).read()
+
+            try:
+                load.remote("/nowhere/at/all.csv").result(timeout=60)
+            except FileNotFoundError as e:
+                print(any(n.startswith("CH123") for n in getattr(e, "__notes__", [])))
+            """,
+            home=home,
+            env={"CHIMAERA_MACHINE_ID": "elsewhere"},  # the program on the peer's machine: no note
+            timeout=120,
+        )
+        assert same.returncode == 0, same.stderr
+        assert same.stdout.split() == ["False"], same.stdout
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+        peer.wait(timeout=30)
+
+
+def test_nested_pydantic_models_arrive_whole_or_fail_saying_how_to_fix_it():
+    # Ray loses field values of nested pydantic v1 models passed as arguments,
+    # silently. Pydantic 2 models round-trip whole; a v1 model defined in the
+    # main script cannot travel (its compiled validators do not pickle), and
+    # the error says to define it in a module instead.
+    pydantic = pytest.importorskip("pydantic")
+    r = run_script(
+        """
+        import pydantic
+        import chimaera as ch
+        from pydantic import BaseModel
+
+        class Inner(BaseModel):
+            x: int
+            tags: list = []
+
+        class Outer(BaseModel):
+            name: str
+            inner: Inner
+            items: list = []
+
+        @ch.remote
+        def echo(o):
+            return o
+
+        o = Outer(name="a", inner=Inner(x=7, tags=["t"]), items=[Inner(x=1)])
+        try:
+            print(echo.remote(o).result(timeout=60) == o)
+        except ch.SerializationError as e:
+            print("define the model in a module" in str(e))
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["True"], (pydantic.VERSION, r.stdout)

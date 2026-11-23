@@ -36,8 +36,13 @@ replicas() { kubectl get statefulset chimaera -o jsonpath='{.spec.replicas}'; }
 [ -n "${CHIMAERA_IMAGE:-}" ] || "$here/../images/build.sh" "$image"
 kind create cluster --name "$cluster" --kubeconfig "$KUBECONFIG" --wait 180s
 kind load docker-image "$image" --name "$cluster"
-token=$(docker run --rm "$image" chimaera cluster token)
-kubectl create secret generic chimaera-token --from-literal=token="$token"
+# The cluster CA and token (`cluster init`), made in the image and kept in
+# Secrets: peers issue themselves certificates from the CA (mutual TLS).
+ca=$(mktemp -d)
+docker run --rm "$image" sh -c 'chimaera cluster init --out /tmp/ca >/dev/null && tar -C /tmp/ca -cf - .' | tar -C "$ca" -xf -
+kubectl create secret generic chimaera-token --from-file=token="$ca/token"
+kubectl create secret generic chimaera-tls --from-file="$ca/ca.pem" --from-file="$ca/ca.key"
+rm -rf "$ca"
 docker run --rm "$image" chimaera k8s render --image "$image" --replicas 1 --cpus 1 \
   --namespace default --provisioner 3 | kubectl apply -f -
 # Faster than the defaults, for a test: later flags win.

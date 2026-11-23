@@ -12,7 +12,7 @@ import pytest
 
 import chimaera as ch
 from chimaera._runtime import peer_socket
-from conftest import BIN, run_script
+from conftest import BIN, REPO, run_script
 
 
 def _tmpfile(name: str) -> str:
@@ -236,6 +236,73 @@ time.sleep(600)
         peer.wait(timeout=30)
 
 
+def _running(pid: int) -> bool:
+    """Whether `pid` is still running. An exited process nobody has reaped yet
+    (a zombie: in a container, orphans go to a PID 1 that may never reap them)
+    has stopped running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:  # no /proc (macOS): ask ps
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(state) and not state.startswith("Z")
+
+
+def test_an_executor_whose_peer_dies_exits_even_inside_a_long_call():
+    import shutil
+    import sys
+
+    home = tempfile.mkdtemp(prefix="chk", dir="/tmp")
+    pid_file = os.path.join(home, "executor.pid")
+    peer = _start_peer(home)
+    driver = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            f"""
+import os, time, chimaera as ch
+
+@ch.remote
+def nap():
+    with open({pid_file!r} + ".tmp", "w") as f:
+        f.write(str(os.getpid()))
+    os.rename({pid_file!r} + ".tmp", {pid_file!r})
+    time.sleep(600)
+
+f = nap.remote()
+time.sleep(600)
+""",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(os.environ, CHIMAERA_HOME=home, CHIMAERA_BIN=BIN, PYTHONPATH=os.path.join(REPO, "python")),
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not os.path.exists(pid_file):
+            assert time.monotonic() < deadline and driver.poll() is None, "the call never started"
+            time.sleep(0.05)
+        with open(pid_file) as f:
+            pid = int(f.read())
+        os.kill(peer.pid, signal.SIGKILL)  # no shutdown message: the executor sees its socket close
+        peer.wait(timeout=10)
+        deadline = time.monotonic() + 15
+        while _running(pid):
+            assert time.monotonic() < deadline, "the executor outlived its peer"
+            time.sleep(0.1)
+    finally:
+        driver.kill()
+        driver.wait(timeout=10)
+        if peer.poll() is None:
+            peer.kill()
+            peer.wait(timeout=10)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_a_run_ships_only_allowlisted_environment_variables():
     r = run_script(
         """
@@ -277,6 +344,38 @@ def test_a_call_never_sees_the_peers_cluster_token():
             @ch.remote
             def seen():
                 return [os.environ.get(k) for k in ("CHIMAERA_CLUSTER_TOKEN", "CHIMAERA_TOKEN", "CHIMAERA_EXECUTOR")]
+
+            print(seen.remote().result(timeout=60))
+            """,
+            home=home,
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == "[None, None, '1']"
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=30)
+        peer.wait(timeout=30)
+
+
+def test_a_call_never_sees_the_cluster_ca_its_peer_was_given():
+    # slurm-launch passes the cluster CA to its peers in the environment; with
+    # its key, a call could mint peer certificates.
+    home = tempfile.mkdtemp(prefix="cht", dir="/tmp")
+    log = open(os.path.join(home, "peer.log"), "ab")
+    env = dict(os.environ, CHIMAERA_TLS_CA_PEM="pem", CHIMAERA_TLS_CA_KEY="secret-key")
+    peer = subprocess.Popen([BIN, "--dir", home, "peer", "start"], stdout=log, stderr=log, start_new_session=True, env=env)
+    try:
+        deadline = time.monotonic() + 30
+        while not os.path.exists(peer_socket(home)):
+            assert time.monotonic() < deadline, open(os.path.join(home, "peer.log")).read()
+            time.sleep(0.05)
+        r = run_script(
+            """
+            import os
+            import chimaera as ch
+
+            @ch.remote
+            def seen():
+                return [os.environ.get(k) for k in ("CHIMAERA_TLS_CA_PEM", "CHIMAERA_TLS_CA_KEY", "CHIMAERA_EXECUTOR")]
 
             print(seen.remote().result(timeout=60))
             """,

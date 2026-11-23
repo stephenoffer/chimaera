@@ -222,11 +222,25 @@ def _exceptions(name: str, v: Any) -> tuple[type[BaseException], ...]:
     return items
 
 
+CACHE_TTL = 7 * 86400.0  # what cache=True keeps a result for, in seconds
+
+
+def _cache_ttl(name: str, v: Any) -> float:
+    """cache=True keeps results 7 days, False turns caching off, else a time to live."""
+    if v is True or v is False:
+        return CACHE_TTL if v else 0.0
+    seconds = _units.parse_duration(v, name)
+    if seconds <= 0:
+        raise ValueError(f"{name}= is True, False or a time to live, not {v!r}")
+    return seconds
+
+
 def _batch_on_method(name: str, v: Any) -> Any:
     raise ValueError(f"{name}= batches one actor method's calls: put it on the method, @ch.method(batch=ch.Batch(...))")
 
 
-# name -> (validator, where it may be set). Where: "any", "actor", "pool", "decorator".
+# name -> (validator, where it may be set). Where: "any", "actor", "pool",
+# "decorator", "call" (one call's view), "function" (a function's decorator or views).
 FIELDS: dict[str, tuple[Any, str]] = {
     "cpus": (_or_auto(_pos_float), "any"),
     "memory": (_or_auto(lambda n, v: _units.parse_bytes(v, n)), "any"),
@@ -250,6 +264,7 @@ FIELDS: dict[str, tuple[Any, str]] = {
     "latency": (_latency, "any"),
     "adaptive": (_choice(("on", "observe", "frozen")), "any"),
     "deterministic": (_bool, "any"),
+    "cache": (_cache_ttl, "function"),
     "replicas": (_or_auto(_pos_int), "pool"),
     "ranks": (_or_auto(_pos_int), "any"),
     "name": (_str, "actor"),
@@ -289,6 +304,7 @@ class Options(TypedDict, total=False):
     latency: str | float
     adaptive: Literal["on", "observe", "frozen"]
     deterministic: bool
+    cache: bool | str | float | _dt.timedelta
     replicas: int | Auto | Literal["auto"]
     ranks: int | Auto | Literal["auto"]
     name: str
@@ -343,6 +359,11 @@ def validate(options: Mapping[str, Any], *, kind: str, target: str, source: str)
             raise OptionsError(f"option {name!r} names one call; set it with .options(...) on that call ({source})")
         if name in IDENTITY and kind == "scope":
             raise OptionsError(f"option {name!r} names one actor; set it on that actor's .options(...) ({source})")
+        if where == "function" and target != "function":
+            raise OptionsError(
+                f"option {name!r} is set per function, on its decorator or .options(...), not on {target}s: "
+                f"it must not reach functions that are not deterministic ({source})"
+            )
         if where == "actor" and target not in ("actor", "pool", "scope"):
             raise OptionsError(f"option {name!r} applies to actors, not to {target}s ({source})")
         if where == "pool" and target not in ("pool", "actor", "scope"):

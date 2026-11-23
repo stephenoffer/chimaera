@@ -9,3 +9,5 @@ __pycache__/
 /dist/
 .chimaera/
 /results/
+/CLAUDE.local.md
+/.claude/

@@ -31,6 +31,32 @@ def test_a_stored_tuple_decodes_whole_or_one_value_at_a_time(tmp_path):
             assert got == expected == whole[i]
 
 
+def test_one_value_of_a_stored_tuple_is_read_without_the_rest(tmp_path):
+    value = ("small", list(range(1000)), np.arange(200_000, dtype=np.float64), {"k": (1, 2)}, b"x" * 70_000)
+    parts, _, _ = _serde.dumps_seq(value)
+    path = tmp_path / "obj"
+    path.write_bytes(_bytes(parts))
+    for i, expected in enumerate(value):
+        got = _serde.read_part(str(path), i, len(value))
+        if isinstance(expected, np.ndarray):
+            assert np.array_equal(got, expected) and got.ctypes.data % 64 == 0, "buffers stay aligned"
+            got[0] = 1.0  # writable, as a mapped copy-on-write value is
+        else:
+            assert got == expected
+    single = tmp_path / "single"
+    single.write_bytes(_bytes(_serde.dumps_parts((1, 2, 3))[0]))
+    assert _serde.read_part(str(single), 2, 3) == 3  # not stored element by element: decoded whole
+
+
+def test_stored_bytes_read_in_one_copy_and_other_files_as_before(tmp_path):
+    values = [b"z" * ((_serde._READ_MAX) + 4096), b"tiny", bytearray(b"q" * 100_000), {"a": [1, 2]}, "s" * 70_000]
+    for i, v in enumerate(values):
+        path = tmp_path / f"o{i}"
+        path.write_bytes(_bytes(_serde.dumps_parts(v)[0]))
+        got = _serde.read_file(str(path))
+        assert type(got) is type(v) and got == v
+
+
 def test_a_plain_object_still_gives_its_parts():
     parts, _, _ = _serde.dumps_parts((1, 2, 3))
     assert _serde.loads_part(_bytes(parts), 1, 3) == 2

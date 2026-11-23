@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
 
+# The built-in actor method that ``close(drain=True)`` calls last (see
+# ``Executor.shut_down``).
+SHUTDOWN_METHOD = "__chimaera_shutdown__"
+
+
 @dataclass
 class TaskContext:
     run: bytes

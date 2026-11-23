@@ -30,7 +30,7 @@ class Future(Generic[T]):
 
     __slots__ = (
         "_rt", "key", "_outcome", "_value", "_has_value", "_exc", "_callbacks", "_site", "_escaped", "_arg_bytes", "_put",
-        "_returns", "_owned", "__weakref__",
+        "_returns", "_owned", "_device_holds", "_seen", "__weakref__",
     )
 
     def __init__(self, rt: Any, key: bytes, site: str | None = None) -> None:
@@ -50,6 +50,8 @@ class Future(Generic[T]):
         # Files of a ch.put value this handle owns: deleted with it unless it
         # escaped (was pickled or passed by reference to a call).
         self._owned: list[str] | None = None
+        self._device_holds: list[Any] | None = None  # CUDA tensors a put shares (see _values._cuda_share)
+        self._seen = False  # its outcome was read, or handed to a call or callback (see _unread_error)
 
     def __repr__(self) -> str:
         state = "done" if self.done() else "pending"
@@ -94,6 +96,7 @@ class Future(Generic[T]):
         """Call ``fn(self)`` once the call has finished: at once if it has,
         else on a thread for callbacks, in the order they were added, so a
         slow callback delays only the callbacks after it, never results."""
+        self._seen = True  # the callback reads the outcome
         if self.done():
             fn(self)
         else:
@@ -110,6 +113,7 @@ class Future(Generic[T]):
     def _wait(self, timeout: float | None) -> bool:
         if self.done():
             return True
+        start_pending()
         rt = self._rt
         rt.client.flush()
         ctx = _context.current_task()
@@ -165,13 +169,16 @@ class Future(Generic[T]):
         return None
 
     def _value_or_raise(self) -> T:
+        self._seen = True
         if self._exc is not None:
             raise self._exc
         if self._has_value:
             return self._value
         assert self._outcome is not None
         if self._outcome[0] == "ok":
-            self._value = self._rt.read_value(self._outcome)
+            # A call's result names its call, which can run again if every
+            # copy is lost; a put value has no call to remake it.
+            self._value = self._rt.read_value(self._outcome, self.key if self._put is None else None)
             self._has_value = True
             if self._put is None:
                 _values.fetched.note_fetched(self._value, self._outcome[4])
@@ -189,6 +196,9 @@ class Future(Generic[T]):
         method's cancellation stays cooperative: check ``ch.context().cancelled()``."""
         if self.done():
             return self._cancelled()
+        from . import _direct
+
+        _direct.cancel(self)  # a direct call: its executor hears of it at once
         self._rt.client.cancel(self.key, force)
         return True
 
@@ -237,6 +247,8 @@ class Future(Generic[T]):
     def __reduce__(self) -> tuple[Any, ...]:
         if self._put is not None:
             self._escaped = True  # copies may outlive this handle: keep its files for the run
+            if self._device_holds:
+                _values.keep_device_holds(self._device_holds)  # and its shared GPU memory
             return (_resolved_future, self._put)
         # An embedded future is a handle: it pins its result for the run's
         # lifetime and can be awaited wherever it is unpickled.
@@ -270,10 +282,56 @@ class Future(Generic[T]):
                 except Exception:  # noqa: S110 -- best effort during garbage collection
                     pass
             return
+        if _unread_failure(self):
+            try:
+                _note_unread(rt, [self])
+            except Exception:  # noqa: S110 -- best effort during garbage collection
+                pass
         try:
             rt.release_later(self.key)
         except Exception:  # noqa: S110 -- best effort during garbage collection
             return
+
+
+UNREAD_SHOWN = 10  # failed calls whose errors nobody read, shown one by one; then counted
+_PACKAGE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _unread_failure(f: Future[Any]) -> bool:
+    """True if `f`'s call failed and nothing read its error: not read, not
+    handed to another call or a callback, not cancelled (nor its actor closed
+    by the program), and made by the program rather than the runtime itself."""
+    out = f._outcome
+    failed = f._exc is not None or out is not None and out[0] == "err"
+    if f._seen or f._escaped or not failed or f._cancelled():
+        return False
+    if out is not None and out[1] == "actor_died" and "actor closed" in (out[3] or ""):
+        return False
+    site = f._site or ""
+    return bool(site) and not site.startswith(_PACKAGE)
+
+
+def _note_unread(rt: Any, futures: list[Future[Any]]) -> None:
+    """Say on stderr that these calls failed and nothing read their errors,
+    as asyncio does for a task's exception never retrieved (Ray Client drops
+    such an error silently). Past UNREAD_SHOWN, they are only counted, and
+    the count is printed at exit."""
+    for f in futures:
+        f._seen = True
+        rt.unread_errors += 1
+        if rt.unread_errors > UNREAD_SHOWN:
+            continue
+        if f._exc is not None:
+            type_name, message = type(f._exc).__name__, str(f._exc)
+        else:
+            _, kind, type_name, message = f._outcome[:4]  # type: ignore[index]
+            type_name = (type_name or kind).removeprefix("builtins.")
+        first = (message or "").strip().splitlines()[:1]
+        name = rt._names.get(f.key) or "a call"
+        sys.stderr.write(
+            f"chimaera: {name} (called at {f._site}) failed and nothing read its error: "
+            f"{type_name}: {first[0] if first else ''}\n"
+        )
 
 
 _callbacks: queue.SimpleQueue[tuple[Callable[[Any], object], Any]] | None = None
@@ -413,6 +471,22 @@ class _Chunk(list):  # type: ignore[type-arg]
 CHUNK_TARGET_S = 0.1
 MAX_CHUNK = 4096
 
+# A function's map made by the driver submits nothing until it is read, or the
+# driver submits or waits on anything else: reduce_by_key can then run the
+# function inside its scatter calls instead (see Results.claim).
+_unstarted: set[Results[Any]] = set()
+_unstarted_lock = threading.Lock()
+
+
+def start_pending() -> None:
+    """Start the maps nothing has read yet: the driver moved on."""
+    while _unstarted:
+        with _unstarted_lock:
+            if not _unstarted:
+                return
+            results = _unstarted.pop()
+        results._start()
+
 
 def _future_from_key(key: bytes) -> Future[Any]:
     from ._runtime import Runtime
@@ -516,8 +590,12 @@ def put(value: T) -> Future[T]:
     # the call may return the handle, and the peer keeps results, not the
     # run's other values, once the run ends.
     prefix = run[:4] if ctx is not None else b""
-    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, max(rt.inline_limit, PUT_INLINE), prefix)
+    holds: list[Any] = []
+    limit = max(rt.inline_limit, PUT_INLINE)
+    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, limit, prefix, holds)
     f = _resolved_future(run, object_id, inline, size)
+    if holds:
+        f._device_holds = holds  # readers on this machine may map them while the future lives
     if type(value) in _values._COLLECTIONS:
         caller = sys._getframe(1)
         _values.collection_lint.note(f"{caller.f_code.co_filename}:{caller.f_lineno}", type(value).__name__, size, 3)
@@ -590,7 +668,14 @@ def _values_of(futures: list[Future[T]], timeout: float | None) -> list[T]:
     held = 0
     for f in futures:
         left = None if deadline is None else max(0.0, deadline - time.monotonic())
-        out.append(f.result(left))
+        try:
+            out.append(f.result(left))
+        except TimeoutError:
+            raise
+        except BaseException:
+            for g in futures:
+                g._seen = True  # asked for together: the error raised answers for the rest
+            raise
         if f._put is None and f._outcome is not None and f._outcome[0] == "ok":
             # A Linux arena array's stored size is only the frame that links
             # it, but it pins its pages while held here: count its bytes.
@@ -726,7 +811,10 @@ class Results(Generic[T]):
     """A single-pass stream of results from ``fn.map``.
 
     At most ``window`` items are in flight; more are submitted as results are
-    consumed, so a slow consumer bounds the work and memory upstream. An item's
+    consumed, so a slow consumer bounds the work and memory upstream. A
+    function's map made by the driver submits its first items when it is first
+    read, or when the driver submits or waits on anything else, or at exit
+    (see ``claim``). An item's
     error is raised at its position; if caught, iteration continues. Leaving a
     ``with`` block or calling ``close()`` cancels outstanding items and closes
     the source.
@@ -743,7 +831,10 @@ class Results(Generic[T]):
         chunk: Callable[[int, list[Any]], Future[Any]] | None = None,
         parallel: int = 1,
         grow_window: bool = False,
+        origin: tuple[Any, Any, bool] | None = None,
     ) -> None:
+        # `origin` (function, options, single source) marks a function's map
+        # whose first items wait for a read (see start_pending and claim).
         # `chunk(first_index, items)` submits several items as one call whose
         # value is a _Chunk. Chunks start at one item and grow only by the
         # worker time items are measured to take (A1), so slow items are never
@@ -771,6 +862,20 @@ class Results(Generic[T]):
         self._closed = False
         self._waker = _AsyncWaker()
         self._registry: set[Any] | None = None
+        self._origin = origin
+        self._started = False
+        if origin is None:
+            self._start()
+        else:
+            with _unstarted_lock:
+                _unstarted.add(self)
+
+    def _start(self) -> None:
+        with _unstarted_lock:
+            if self._started:
+                return
+            self._started = True
+            _unstarted.discard(self)
         self._fill()
         if self._slots:
             # Until read to the end or closed, the driver finishes it at exit.
@@ -778,6 +883,17 @@ class Results(Generic[T]):
             if not rt.in_executor:
                 self._registry = rt._open_maps
                 self._registry.add(self)
+
+    def claim(self) -> tuple[tuple[Any, Any, bool], Iterator[Any]] | None:
+        """The function, options and items of a map that has submitted nothing
+        yet, taken from this stream (which then yields nothing), for a caller
+        that runs the function itself (reduce_by_key); None otherwise."""
+        with _unstarted_lock:
+            if self._started or self._origin is None:
+                return None
+            self._started = self._closed = True
+            _unstarted.discard(self)
+        return self._origin, self._source
 
     def _end(self) -> None:
         if self._registry is not None:
@@ -884,10 +1000,12 @@ class Results(Generic[T]):
                 self._buf.append((slot.first + j, v, None, slot, j))
 
     def _next_item(self) -> tuple[int, Any, BaseException | None, _Slot, int]:
+        self._start()
         if self._buf:
             return self._buf.popleft()
         if self._closed or not self._slots:
             self._end()
+            self._finished = not self._closed
             raise StopIteration
         if self._ordered:
             slot = self._pop_ordered()
@@ -898,6 +1016,7 @@ class Results(Generic[T]):
         return self._buf.popleft()
 
     def __iter__(self) -> Iterator[T]:
+        _not_again(self)
         return self
 
     def __next__(self) -> T:
@@ -925,6 +1044,7 @@ class Results(Generic[T]):
         Items submitted from here on are one call each, so cancelling an
         item's future cancels only that item."""
         self._chunk = None
+        self._start()
         while True:
             if self._buf:
                 _, _, _, slot, j = self._buf.popleft()
@@ -967,7 +1087,9 @@ class Results(Generic[T]):
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        with _unstarted_lock:
+            self._started = self._closed = True  # a map never read submits nothing now
+            _unstarted.discard(self)
         self._end()
         close = getattr(self._source, "close", None)
         if callable(close):
@@ -985,9 +1107,11 @@ class Results(Generic[T]):
         self.close()
 
     def __aiter__(self) -> AsyncIterator[T]:
+        _not_again(self)
         return self
 
     async def __anext__(self) -> T:
+        self._start()
         if not self._buf:
             if self._closed or not self._slots:
                 self._end()
@@ -1011,6 +1135,18 @@ class Results(Generic[T]):
         if err is not None:
             raise err
         return value
+
+
+def _not_again(it: Any) -> None:
+    """A map's results and a generator call's items are delivered once: a
+    second pass after reading one to the end would silently see nothing (as
+    Ray's ObjectRefGenerator does), so say so instead."""
+    if getattr(it, "_finished", False):
+        what = "stream" if isinstance(it, Stream) else "map"
+        raise RuntimeError(
+            f"this {what} was already read to the end, and its items are delivered once: "
+            "keep them with items = list(...) to go over them again"
+        )
 
 
 class Stream(Results[T]):
@@ -1045,6 +1181,7 @@ class Stream(Results[T]):
             self._items.setdefault(index, outcome)
 
     def __iter__(self) -> Stream[T]:
+        _not_again(self)
         return self
 
     def __next__(self) -> T:
@@ -1055,6 +1192,7 @@ class Stream(Results[T]):
                 if self._fut.done():
                     count = self._fut._value_or_raise()  # the generator's error, if it raised
                     if self._next >= count:
+                        self._finished = True
                         raise StopIteration
                     raise StreamInterrupted(f"the stream ended after {self._next} of {count} items")
                 rt.cond.wait(1.0)
@@ -1066,6 +1204,7 @@ class Stream(Results[T]):
         return rt.read_value(outcome)
 
     def __aiter__(self) -> Stream[T]:
+        _not_again(self)
         return self
 
     async def __anext__(self) -> T:

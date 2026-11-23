@@ -2,8 +2,10 @@
 //!
 //! An executor is `python -m chimaera._executor` started with the run's own
 //! interpreter, working directory and import path. It connects back over a
-//! Unix socket, says hello, and then runs one attempt at a time. The user's
-//! main script is never re-executed: callables arrive as code blobs.
+//! Unix socket, says hello, and then runs one attempt at a time, except while
+//! every attempt in it waits on futures: then it may run another of the same
+//! run on a thread beside them (see `sharing`). The user's main script is
+//! never re-executed: callables arrive as code blobs.
 //!
 //! Each executor leads its own process group, so killing it also kills any
 //! processes the task spawned.
@@ -157,7 +159,7 @@ impl Supervisor {
         let python = if Path::new(&env.python).is_file() {
             env.python.clone()
         } else {
-            std::env::var("CHIMAERA_PYTHON").unwrap_or_else(|_| "python3".into())
+            std::env::var("CHIMAERA_PYTHON").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "python3".into())
         };
         let cwd = if !env.cwd.is_empty() && Path::new(&env.cwd).is_dir() {
             PathBuf::from(&env.cwd)
@@ -182,6 +184,10 @@ impl Supervisor {
             .env_remove("CHIMAERA_CLUSTER_TOKEN")
             .env_remove("CHIMAERA_TOKEN")
             .env_remove("CHIMAERA_TOKEN_FILE")
+            // Nor the cluster CA (main.rs takes it out of the peer's own
+            // environment too): its key would let a call mint peer certificates.
+            .env_remove(crate::tls::CA_KEY_ENV)
+            .env_remove(crate::tls::CA_PEM_ENV)
             .env("PYTHONPATH", env.sys_path.join(":"))
             .env("PYTHONUNBUFFERED", "1")
             .env("CHIMAERA_EXECUTOR", "1");
@@ -224,6 +230,7 @@ impl Supervisor {
             };
         }
         no_core_dumps(&mut cmd);
+        lower_priority(&mut cmd);
         if let Some(group) = cgroup {
             join_cgroup_before_exec(&mut cmd, group)?;
         }
@@ -259,6 +266,26 @@ impl Supervisor {
                 libc::killpg(pid as i32, libc::SIGKILL);
             }
         }
+    }
+
+    /// Ask an executor to exit, as a program is asked to: SIGTERM to its
+    /// process group, so its own cleanup runs (the actor's `__del__`, `atexit`
+    /// handlers, its children's). It is stopped outright after `grace` if it
+    /// is still there (a no-op once it exited and was forgotten).
+    pub fn close(self: &Arc<Self>, exec: u32, grace: std::time::Duration) {
+        if let Some(pid) = self.pids.lock().expect("pids").get(&exec).copied()
+            && pid > 0
+        {
+            // SAFETY: killpg only sends a signal; the group id is our child's.
+            unsafe {
+                libc::killpg(pid as i32, libc::SIGTERM);
+            }
+        }
+        let sup = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            sup.kill(exec);
+        });
     }
 
     pub fn pid(&self, exec: u32) -> Option<u32> {
@@ -338,6 +365,24 @@ fn no_core_dumps(cmd: &mut tokio::process::Command) {
         cmd.pre_exec(|| {
             let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
             libc::setrlimit(libc::RLIMIT_CORE, &zero);
+            Ok(())
+        });
+    }
+}
+
+/// How much lower an executor's CPU priority is than its peer's.
+const EXECUTOR_NICE: libc::c_int = 5;
+
+/// Executors run [`EXECUTOR_NICE`] below the peer: the peer must not queue
+/// behind saturated executors, and the value is relative, so an already-niced
+/// peer's executors stay at least as polite.
+fn lower_priority(cmd: &mut tokio::process::Command) {
+    // SAFETY: runs in the forked child before exec and only calls nice(), a
+    // thin setpriority wrapper that does not allocate. Its result is ignored:
+    // a priority already at the floor stays there.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::nice(EXECUTOR_NICE);
             Ok(())
         });
     }

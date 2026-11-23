@@ -151,3 +151,14 @@ def test_a_method_the_pool_hides_is_named():
     with pytest.warns(UserWarning, match="Sized defines resize, which a pool handle reserves"):
         pool = Sized.options(replicas=1).pool()
     pool.close()
+
+
+def test_pool_method_options_apply_on_whichever_replica_takes_the_call():
+    with Model.options(replicas=2).pool() as pool:
+        with pytest.raises(ch.OptionsError):
+            pool.predict.options(no_such_option=1)
+        with pytest.raises(ch.DeadlineExceeded):
+            pool.predict.options(deadline="200ms").remote(1, delay=5).result(timeout=30)
+        with pytest.raises(ch.DeadlineExceeded):
+            pool.route("k").predict.options(deadline="200ms").remote(2, delay=5).result(timeout=30)
+        assert pool.predict.options(max_attempts=2).remote(3).result(timeout=30) == ("v1", 3)

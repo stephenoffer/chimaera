@@ -136,17 +136,42 @@ pub struct ObjectStore {
     /// pressure; each spilled object goes to the next one in turn.
     spill: Vec<PathBuf>,
     next_spill: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Object storage that spilled objects go to instead (CHIMAERA_SPILL_URL).
+    remote: Option<std::sync::Arc<crate::remote_spill::RemoteSpill>>,
 }
 
 impl ObjectStore {
     pub fn open(dir: PathBuf) -> io::Result<ObjectStore> {
         std::fs::create_dir_all(&dir)?;
-        Ok(ObjectStore { dir, spill: Vec::new(), next_spill: Default::default() })
+        Ok(ObjectStore { dir, spill: Vec::new(), next_spill: Default::default(), remote: None })
     }
 
     /// Spill to `dirs` (on disk) when the store itself is in memory (tmpfs).
     pub fn with_spill(self, dirs: Vec<PathBuf>) -> ObjectStore {
         ObjectStore { spill: dirs, ..self }
+    }
+
+    /// Spill to object storage instead of the spill directories.
+    /// Where spilled objects go, for messages: the spill store's URL, or disk.
+    pub fn spill_target(&self) -> String {
+        self.remote.as_ref().map_or_else(|| "disk".to_string(), |r| r.url.clone())
+    }
+
+    pub fn with_remote(self, remote: std::sync::Arc<crate::remote_spill::RemoteSpill>) -> ObjectStore {
+        ObjectStore { remote: Some(remote), ..self }
+    }
+
+    /// Make the object's file readable here: true when it is, after
+    /// downloading it from object storage if it was spilled there (its path
+    /// is then a link to a cache file not yet restored). False: not here.
+    pub fn ensure_local(&self, run: &[u8], object: &[u8]) -> io::Result<bool> {
+        let path = self.path(run, object);
+        if path.exists() {
+            return Ok(true);
+        }
+        let (Some(remote), Ok(target)) = (&self.remote, std::fs::read_link(&path)) else { return Ok(false) };
+        remote.download(&hex(run), &hex(object), &target)?;
+        Ok(true)
     }
 
     /// The next spill directory, in turn (None: this store does not spill).
@@ -166,7 +191,7 @@ impl ObjectStore {
     /// a symlink to its copy, so every reader keeps working unchanged; a
     /// reader that already mapped it keeps its pages until it is done.
     pub fn spill_oldest(&self, want: u64) -> io::Result<u64> {
-        if self.spill.is_empty() {
+        if self.spill.is_empty() && self.remote.is_none() {
             return Ok(0);
         }
         let mut files = Vec::new();
@@ -200,8 +225,11 @@ impl ObjectStore {
             for _ in 0..spill_threads().min(picked.len()) {
                 s.spawn(|| {
                     while let Some((len, path)) = picked.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-                        let spill = self.next_spill().expect("checked above");
-                        match self.spill_one(spill, path) {
+                        let spilled = match &self.remote {
+                            Some(remote) => self.spill_remote(remote, path),
+                            None => self.spill_one(self.next_spill().expect("checked above"), path),
+                        };
+                        match spilled {
                             Ok(()) => {
                                 moved.fetch_add(*len, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -218,6 +246,24 @@ impl ObjectStore {
             Some(e) if moved.load(std::sync::atomic::Ordering::Relaxed) == 0 => Err(e),
             _ => Ok(moved.into_inner()),
         }
+    }
+
+    /// Upload one in-memory object to object storage and make its path a
+    /// link to its cache file, which the first reader restores.
+    fn spill_remote(&self, remote: &crate::remote_spill::RemoteSpill, path: &Path) -> io::Result<()> {
+        let rel = path.strip_prefix(&self.dir).expect("listed under the store");
+        let (Some(run), Some(object)) =
+            (rel.parent().and_then(|r| r.to_str()), rel.file_name().and_then(|o| o.to_str()))
+        else {
+            return Err(io::Error::other("not an object path"));
+        };
+        remote.upload(path, run, object)?;
+        let target = remote.cache.join(rel);
+        std::fs::create_dir_all(target.parent().expect("run directory"))?;
+        let link = path.with_extension("spilling");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link)?;
+        std::fs::rename(&link, path) // readers see the file or the link
     }
 
     /// Copy one in-memory object to the spill directory and make its path a
@@ -253,10 +299,22 @@ impl ObjectStore {
     }
 
     fn remove(&self, run: &[u8], object: &[u8]) {
-        let _ = std::fs::remove_file(self.path(run, object));
+        let path = self.path(run, object);
+        let remote = self.remote.as_ref().filter(|r| self.spilled_remotely(r, &path));
+        let _ = std::fs::remove_file(&path);
         for spill in &self.spill {
             let _ = std::fs::remove_file(spill.join(hex(run)).join(hex(object)));
         }
+        if let Some(remote) = remote {
+            let _ = std::fs::remove_file(remote.cache.join(hex(run)).join(hex(object)));
+            remote.delete(&hex(run), Some(vec![hex(object)]));
+        }
+    }
+
+    /// Whether the object at `path` was spilled to object storage (its path
+    /// links into the remote cache).
+    fn spilled_remotely(&self, remote: &crate::remote_spill::RemoteSpill, path: &Path) -> bool {
+        std::fs::read_link(path).is_ok_and(|t| t.starts_with(&remote.cache))
     }
 
     /// Delete an ended run's content-addressed values: large arguments, uploads
@@ -271,6 +329,7 @@ impl ObjectStore {
         let (dir, run_hex) = (self.dir.join(run.hex()), run.hex());
         let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
         let mut freed = 0;
+        let mut gone = Vec::new();
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -279,10 +338,19 @@ impl ObjectStore {
                 continue;
             }
             freed += std::fs::metadata(e.path()).map_or(0, |m| m.len());
+            if self.remote.as_ref().is_some_and(|r| self.spilled_remotely(r, &e.path())) {
+                gone.push(name.to_string());
+            }
             let _ = std::fs::remove_file(e.path());
             for spill in &self.spill {
                 let _ = std::fs::remove_file(spill.join(&run_hex).join(name));
             }
+        }
+        if let Some(remote) = self.remote.as_ref().filter(|_| !gone.is_empty()) {
+            for name in &gone {
+                let _ = std::fs::remove_file(remote.cache.join(&run_hex).join(name));
+            }
+            remote.delete(&run_hex, Some(gone));
         }
         freed
     }
@@ -291,6 +359,10 @@ impl ObjectStore {
         let _ = std::fs::remove_dir_all(self.dir.join(run.hex()));
         for spill in &self.spill {
             let _ = std::fs::remove_dir_all(spill.join(run.hex()));
+        }
+        if let Some(remote) = &self.remote {
+            let _ = std::fs::remove_dir_all(remote.cache.join(run.hex()));
+            remote.delete(&run.hex(), None);
         }
     }
 
@@ -489,6 +561,38 @@ mod tests {
         assert!(!store.path(&run.0, &value).exists(), "the stored argument is gone");
         assert!(store.path(&run.0, &result.0).exists(), "the result stays for reattaching clients");
         assert_eq!(store.delete_values(&run), 0);
+    }
+
+    #[cfg(feature = "object-store-spill")]
+    #[test]
+    fn objects_spilled_to_object_storage_come_back_on_first_read_and_go_with_their_run() {
+        let (mem, bucket, cache) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let url = format!("file://{}", bucket.path().display());
+        let peer = "ab".repeat(16);
+        let remote = crate::remote_spill::RemoteSpill::open(&url, &peer, cache.path().to_path_buf()).unwrap();
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_remote(std::sync::Arc::new(remote));
+        let run = Id::derive(0, 0, &[b"run"]);
+        for (i, size) in [(1u8, 3000usize), (2, 1000)] {
+            let path = store.path(&run.0, &[i]);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![i; size]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
+        }
+        assert_eq!(store.spill_oldest(2000).unwrap(), 3000, "the oldest goes to object storage");
+        let remote_dir = bucket.path().join(format!("chimaera-{}", &peer[..16])).join(run.hex());
+        assert_eq!(std::fs::read(remote_dir.join("01")).unwrap(), vec![1u8; 3000], "uploaded");
+        let path = store.path(&run.0, &[1]);
+        assert!(!path.exists(), "its path waits for the first reader to restore it");
+        assert!(store.ensure_local(&run.0, &[1]).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 3000], "restored through the same path");
+        assert!(store.ensure_local(&run.0, &[2]).unwrap(), "an object never spilled is simply here");
+        store.delete_run(&run);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while remote_dir.join("01").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50)); // deleted in the background
+        }
+        assert!(!remote_dir.join("01").exists(), "the remote copy goes with its run");
     }
 
     #[test]

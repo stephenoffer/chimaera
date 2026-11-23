@@ -196,6 +196,40 @@ also caught a starting peer being declared dead while its core was not yet
 answering pings, and a dead identity kept alive by a new one answering at its
 address).
 
+## Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22, evening)
+
+Same machines and method as the morning round below (c7i.4xlarge, one peer
+per machine started through Ray, at least 60 s of repetitions per workload, 35 s
+at 64 nodes, median shown; node loss runs once). Built from a snapshot of the
+working tree at 15:42 MST that compiled, passed a local smoke run of every
+workload and 478 tests on Linux. All four jobs (1, 4, 16 and 64 nodes) finished
+every workload for both runtimes.
+
+| Workload | 1 node Ray | 1 node Chimaera | 4 Ray | 4 Chimaera | 16 Ray | 16 Chimaera | 64 Ray | 64 Chimaera |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Independent no-op tasks (/s) | 6,887 | 13,588 | 6,993 | 16,987 | 6,084 | 16,105 | 5,123 | 12,096 |
+| CPU scaling efficiency | 0.700 | 0.694 | 0.724 | 0.726 | 0.710 | 0.710 | 0.661 | 0.603 |
+| Map of tiny items, naive (/s) | 6,558 | 1,738,476 | 6,740 | 885,102 | 5,939 | 759,987 | 5,246 | 749,701 |
+| 512 MiB value to 2 x CPUs readers (s) | 0.009 | 0.008 | 0.025 | 0.030 | 0.089 | 0.110 | 0.397 | 0.397 |
+| 32 MiB array passed straight to 2 x CPUs calls (s) | 0.054 | 0.008 | 0.211 | 0.043 | 0.892 | 0.194 | 3.539 | 0.737 |
+| 10 calls on a 256 MiB value just made (s) | 0.212 | 0.257 | 0.223 | 0.262 | 0.225 | 0.261 | 0.227 | 0.270 |
+| Actor calls (/s) | 8,538 | 13,040 | 8,845 | 12,697 | 8,510 | 12,008 | 8,872 | 9,475 |
+| Nested tasks, 4 x CPUs parents of 8 (s) | 0.148 | 0.054 | 0.323 | 0.256 | 0.437 | 0.606 | 1.388 | 0.937 |
+| Shuffle, 3.2M pairs (s) | 0.206 | 0.297 | 0.143 | 0.400 | 0.135 | 0.458 | 0.132 | 0.675 |
+| A node killed under 4 x CPUs one-second tasks (s) | 7.77 | 5.44 | 18.43 | 9.57 | 18.26 | 6.44 | 18.55 | 9.66 |
+
+Changed since the morning round, on the Chimaera side:
+- **Shuffle:** shuffle buckets and partitions are dicts rather than lists of pairs. A gather reads only its own bucket of each scatter's file. Inputs held on other peers are fetched concurrently. The eval's clock now stops for Chimaera where it stops for Ray: before, Chimaera's included a Python sum over every pair. It went from 0.441 to 0.297 s on one node and from 0.842 to 0.675 s at 64.
+- **Calls on a value just made:** a large `bytes` value is read with one `pread` instead of being copied out of a fresh mapping, which went from 0.310 to 0.257 s on one node and from 0.376 to 0.270 s at 64.
+- **Actor calls at 64 nodes:** these now finish ahead of Ray (9,475/s against 8,872); the morning round ran out of time before Ray's pass.
+
+Where Ray is still ahead:
+- **Shuffle at every size:** 1.4x on one node, 2.8x at 4, 3.4x at 16 and 5.1x at 64. Timed by phase on three local peers, the scatters are on par with Ray's, and the rest is spent before the gathers are dispatched, in the shard's handling of the 4,096 dependency edges.
+- **Calls on a value just made:** 16 to 21% at every size.
+- **CPU scaling at 64 nodes:** 0.603 against 0.661; level at 4 and 16, and within 1% on one node.
+- **Broadcast at 4 and 16 nodes:** 20 to 24%; level at 64, and Chimaera ahead on one node.
+- **Nested tasks at 16 nodes:** 0.606 s against 0.437; at 16 nodes in the morning it was Chimaera 0.395 against Ray 0.486. Its spread is wide (p10 0.35 s, p90 0.72 s), so part of this is variance.
+
 ## Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22)
 
 Same method as the runs below: c7i.4xlarge machines, one Chimaera peer per

@@ -71,8 +71,15 @@ def run_child(python: str, runtime: str, workload: str, env: dict[str, str]) -> 
 
 
 def main() -> None:
+    """Start both clusters, run each workload against each runtime for the
+    given rounds (alternating which goes first), then write the medians."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--ray-python", required=True, help="a Python with Ray installed")
+    ap.add_argument(
+        "--chimaera-python",
+        default=sys.executable,
+        help="the Python for Chimaera's drivers (and so its executors); give the Ray one to compare on one interpreter",
+    )
     ap.add_argument("--nodes", type=int, default=3)
     ap.add_argument("--cpus-per-node", type=int, default=4)
     ap.add_argument("--rounds", type=int, default=3)
@@ -97,7 +104,7 @@ def main() -> None:
         "ray": dict(os.environ, RAY_ADDRESS=ray_address),
         "chimaera": dict(os.environ, CHIMAERA_HOME=cluster.dir(0), PYTHONPATH=os.path.join(REPO, "python")),
     }
-    pythons = {"ray": a.ray_python, "chimaera": sys.executable}
+    pythons = {"ray": a.ray_python, "chimaera": a.chimaera_python}
     records = []
     try:
         for rnd in range(a.rounds):
@@ -128,6 +135,7 @@ def main() -> None:
         "nodes": a.nodes,
         "cpus_per_node": a.cpus_per_node,
         "rounds": a.rounds,
+        "pythons": {rt: subprocess.run([py, "-c", "import platform; print(platform.python_version())"], capture_output=True, text=True).stdout.strip() for rt, py in pythons.items()},
         "load_avg_after": os.getloadavg(),
     }
     with open(os.path.join(a.out, f"local{a.nodes}-{stamp}.json"), "w") as f:

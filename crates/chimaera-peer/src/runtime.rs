@@ -30,7 +30,11 @@ pub struct PeerConfig {
 
 /// Default data directory of the local peer: `$CHIMAERA_HOME` or `~/.chimaera/local`.
 pub fn default_local_dir() -> PathBuf {
-    if let Ok(h) = std::env::var("CHIMAERA_HOME") {
+    // Empty counts as unset, as in the Python client (`CHIMAERA_HOME=` in a
+    // compose file or pod spec).
+    if let Ok(h) = std::env::var("CHIMAERA_HOME")
+        && !h.trim().is_empty()
+    {
         return PathBuf::from(h);
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -95,7 +99,14 @@ impl Node {
         if !spill.is_empty() {
             objects = objects.with_spill(spill.clone());
         }
-        crate::objplane::start(objects.dir().to_path_buf(), spill);
+        if let Some(url) = std::env::var("CHIMAERA_SPILL_URL").ok().filter(|u| !u.is_empty() && in_memory) {
+            let cache = dir.join("spill-restored");
+            match crate::remote_spill::RemoteSpill::open(&url, &identity.peer.hex(), cache) {
+                Ok(remote) => objects = objects.with_remote(std::sync::Arc::new(remote)),
+                Err(e) => tracing::error!("not spilling to object storage: {e}; spilling to local disk instead"),
+            }
+        }
+        crate::objplane::start(objects.dir().to_path_buf(), spill, dir);
         let code = CodeStore::open(dir.join("code"))?;
         let (core_tx, core_rx) = mpsc::channel::<CoreMsg>(65536);
         Ok((Node { dir: dir.to_path_buf(), identity, shape, capacity, objects, code, core_tx, core_rx }, lock))
@@ -228,6 +239,7 @@ pub async fn serve(
         memory_bytes: shape.memory_bytes,
         version: env!("CARGO_PKG_VERSION").into(),
         gpus: shape.gpus.iter().map(|g| g.uuid.clone()).collect(),
+        direct_actor_calls: true,
     };
     let shutdown = Arc::new(Notify::new());
     let ingress = Arc::new(Ingress::new(
@@ -312,14 +324,14 @@ fn memory_budget(
     objects: &ObjectStore,
 ) -> io::Result<crate::budget::Budget> {
     let budget = crate::budget::Budget::plan(shape.memory_bytes, crate::budget::is_tmpfs(objects.dir()));
-    match std::env::var("CHIMAERA_MEMORY_POOL") {
-        Ok(v) => crate::budget::parse_size(&v).map(|pool| budget.with_pool(pool)).ok_or_else(|| {
+    match std::env::var("CHIMAERA_MEMORY_POOL").ok().filter(|v| !v.trim().is_empty()) {
+        Some(v) => crate::budget::parse_size(&v).map(|pool| budget.with_pool(pool)).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("CHIMAERA_MEMORY_POOL={v:?}: expected a size like 8GiB"),
             )
         }),
-        Err(_) => Ok(budget),
+        None => Ok(budget),
     }
 }
 

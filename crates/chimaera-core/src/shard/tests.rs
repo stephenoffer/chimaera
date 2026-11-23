@@ -201,6 +201,37 @@ fn chain_becomes_ready_after_producer_publishes() {
     assert_eq!(dup.outcome, Some(pb::Outcome { attempt: 1, peer: Some(peer_pb(p)), ..obj(1) }));
 }
 
+fn ran(tk: Tk, deps: &[Tk], o: pb::Outcome) -> pb::TaskSpec {
+    let ran = pb::Ran { outcome: Some(o), entry_unix_ns: 1, exit_unix_ns: 2, ..Default::default() };
+    pb::TaskSpec { ran: Some(ran), ..spec(tk, deps, pb::Effects::None, 3) }
+}
+
+#[test]
+fn a_call_the_direct_path_ran_is_recorded_done_and_wakes_its_dependents() {
+    let mut h = Harness::new(ShardState::new());
+    let (ctor, call, dependent) = (task_id(V, 0), task_id(V, 1), task_id(V, 2));
+    let p = (peer(0), 1);
+    h.submit(spec(ctor, &[], pb::Effects::None, 3), Some(p));
+    h.publish(ctor, 1, p, obj(1));
+    // A dependent that arrives before the record waits for it.
+    let (ack_d, _) = h.submit(spec(dependent, &[call], pb::Effects::None, 3), None);
+    assert_eq!(ack_d.state(), TState::Pending);
+    let (ack, ev) = h.submit(ran(call, &[ctor], obj(7)), Some(p));
+    assert_eq!(status(&ack), Status::Accepted);
+    assert!(!ev.contains(&Event::Ready(call)), "a call that already ran is never placed");
+    let rec = h.task(call).unwrap();
+    assert_eq!(rec.state(), TState::Done);
+    let outcome = rec.outcome.clone().unwrap();
+    assert_eq!((outcome.value, outcome.attempt), (obj(7).value, 1));
+    let stored = rec.spec.as_ref().unwrap();
+    assert!(stored.ran.is_none() && stored.deps.is_empty(), "the outcome is stored once and nothing is awaited");
+    assert_eq!(rec.attempts.len(), 1);
+    assert_eq!(h.task(dependent).unwrap().state(), TState::Ready);
+    assert_eq!(read::pins(&h.a, ctor), 1, "the recorded call holds no pin on the constructor");
+    // The client resubmitting after a broken connection finds it recorded.
+    assert_eq!(status(&h.submit(ran(call, &[ctor], obj(9)), Some(p)).0), Status::Duplicate);
+}
+
 fn publish_raw(h: &mut Harness, tk: Tk, attempt: u32, p: PeerInc, o: pb::Outcome) -> Applied {
     h.raw(
         Body::Publish(pb::PublishResults {
@@ -529,9 +560,60 @@ fn durable_actor_commands_are_deduplicated() {
         }),
         V,
     );
-    h.raw(Body::ActorDied(pb::ActorDied { actor: actor.to_vec(), generation: 2, reason: None, terminal: true }), V);
+    h.raw(
+        Body::ActorDied(pb::ActorDied {
+            actor: actor.to_vec(),
+            generation: 2,
+            reason: None,
+            terminal: true,
+            moved: false,
+        }),
+        V,
+    );
     let rec: pb::ActorRecord = load(&h.a, &keys::actor(V, &actor)).unwrap();
     assert_eq!(rec.state(), AState::Dead, "a terminal end is never restarted");
+}
+
+#[test]
+fn moving_an_actor_off_a_draining_peer_does_not_use_up_a_restart() {
+    let mut h = Harness::new(ShardState::new());
+    let actor = Id::derive(0, V, &[b"moved"]);
+    let spec = pb::ActorSpec {
+        actor: actor.to_vec(),
+        max_restarts: 1,
+        restart: pb::actor_spec::Restart::Fresh as i32,
+        ..Default::default()
+    };
+    h.raw(Body::ActorCreate(pb::ActorCreate { spec: Some(spec) }), V);
+    let place = |h: &mut Harness, generation: u64, host: usize| {
+        h.raw(
+            Body::ActorPlace(pb::ActorPlace {
+                actor: actor.to_vec(),
+                expected_generation: generation,
+                host: Some(peer_pb((peer(host), 1))),
+            }),
+            V,
+        );
+    };
+    let died = |h: &mut Harness, generation: u64, moved: bool| {
+        h.raw(
+            Body::ActorDied(pb::ActorDied { actor: actor.to_vec(), generation, reason: None, terminal: false, moved }),
+            V,
+        );
+        load::<pb::ActorRecord>(&h.a, &keys::actor(V, &actor)).unwrap()
+    };
+    place(&mut h, 0, 0);
+    // A crash uses its one restart.
+    let rec = died(&mut h, 1, false);
+    assert_eq!((rec.state(), rec.restarts), (AState::Restarting, 1));
+    place(&mut h, 1, 1);
+    // Its restarts are used up, yet a move still restarts it, uncounted.
+    let rec = died(&mut h, 2, true);
+    assert_eq!((rec.state(), rec.restarts), (AState::Restarting, 1), "a move is not a failure");
+    place(&mut h, 2, 2);
+    // The next crash finds its restarts used up.
+    let rec = died(&mut h, 3, false);
+    assert_eq!(rec.state(), AState::Dead);
 }
 
 fn releases(events: &[Event], tk: Tk) -> bool {
@@ -1036,6 +1118,7 @@ fn run_case(defs: &[TaskDef], ops: &[Op], sm: ShardState) -> Result<(), TestCase
                         generation: actor_gen,
                         reason: None,
                         terminal: false,
+                        moved: false,
                     }),
                     V,
                 ))

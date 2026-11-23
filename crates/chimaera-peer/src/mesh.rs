@@ -434,14 +434,23 @@ impl MeshClient {
 
     /// Live members other than this peer that take new work.
     pub fn live_others(&self) -> Vec<PeerView> {
-        self.members
-            .read()
-            .expect("lock")
-            .values()
-            .filter(|p| !p.dead && !p.suspect && p.member.node_id != self.me.node_id)
-            .filter(|p| !p.load.as_ref().is_some_and(|l| l.draining))
-            .cloned()
-            .collect()
+        self.members.read().expect("lock").values().filter(|p| self.takes_work(p)).cloned().collect()
+    }
+
+    /// Node ids of the members `live_others` lists whose record passes
+    /// `keep`, copying no view: placing a call weighs only a few of them.
+    pub fn live_other_ids(&self, keep: impl Fn(&pb::Member) -> bool) -> Vec<u64> {
+        let ms = self.members.read().expect("lock");
+        ms.values().filter(|p| self.takes_work(p) && keep(&p.member)).map(|p| p.member.node_id).collect()
+    }
+
+    /// Whether `live_others` would list anyone.
+    pub fn has_live_others(&self) -> bool {
+        self.members.read().expect("lock").values().any(|p| self.takes_work(p))
+    }
+
+    fn takes_work(&self, p: &PeerView) -> bool {
+        !p.dead && !p.suspect && p.member.node_id != self.me.node_id && !p.load.as_ref().is_some_and(|l| l.draining)
     }
 
     // ---- calls ------------------------------------------------------------
@@ -549,10 +558,7 @@ impl MeshClient {
         let mut c = self.rpc(node)?;
         // A waited copy is one transfer: allow it 25 MB/s at worst.
         let limit = if wait { CALL_TIMEOUT + Duration::from_secs_f64(size as f64 / 25e6) } else { CALL_TIMEOUT };
-        tokio::time::timeout(limit, c.replicate(req))
-            .await
-            .map_err(std::io::Error::other)?
-            .map_err(status_err)?;
+        tokio::time::timeout(limit, c.replicate(req)).await.map_err(std::io::Error::other)?.map_err(status_err)?;
         Ok(())
     }
 
@@ -646,6 +652,11 @@ impl MeshClient {
             })?
             .into_inner();
         self.swim_in(std::mem::take(&mut reply.updates));
+        if reply.node_id != 0 && reply.node_id != node {
+            // Another process (a restarted peer with a new identity) holds
+            // this node's address: the node itself did not answer.
+            return Err(std::io::Error::other(format!("node {} answers at node {node}'s address", reply.node_id)));
+        }
         Ok(reply)
     }
 
@@ -735,6 +746,11 @@ impl MeshClient {
         let tmp =
             dest.with_extension(format!("part-{}-{}", std::process::id(), FETCH_SEQ.fetch_add(1, Ordering::Relaxed)));
         let started = Instant::now();
+        if let Some(n) = self.same_machine_copy(node, run, object, size, dest).await {
+            self.note_transfer(node, n, started.elapsed());
+            self.note_recent(object);
+            return Ok(n);
+        }
         // Size unknown (a reader asked by name): learn it from a one-byte
         // range, so a large object still comes over parallel streams.
         let size = if size == 0 { self.object_size(node, run, object).await.unwrap_or(0) } else { size };
@@ -865,6 +881,37 @@ impl MeshClient {
             return Err(std::io::Error::other(format!("short fetch: {got} of {total:?} bytes")));
         }
         Ok(got)
+    }
+
+    /// Take an object held by a peer on this same machine straight from its
+    /// store, when this peer can see it: a hard link when both stores are on
+    /// one filesystem (no bytes move), else a kernel copy. Objects never
+    /// change once stored, so the link is the object. None when that is not
+    /// possible (another machine, a store this peer cannot see or may not
+    /// read, a size that does not match): the caller fetches over the network.
+    async fn same_machine_copy(&self, node: u64, run: &[u8], object: &[u8], size: u64, dest: &Path) -> Option<u64> {
+        let holder = self.members.read().expect("lock").get(&node).map(|p| p.member.clone())?;
+        if holder.host.is_empty() || holder.host != self.me.host || holder.object_dir.is_empty() {
+            return None;
+        }
+        // A spilled object is a link to its disk copy: take the copy itself.
+        let src = Path::new(&holder.object_dir).join(hex(run)).join(hex(object));
+        let src = tokio::fs::canonicalize(&src).await.ok()?;
+        let len = tokio::fs::metadata(&src).await.ok()?.len();
+        if size != 0 && len != size {
+            return None;
+        }
+        let tmp =
+            dest.with_extension(format!("part-{}-{}", std::process::id(), FETCH_SEQ.fetch_add(1, Ordering::Relaxed)));
+        if tokio::fs::hard_link(&src, &tmp).await.is_err() && tokio::fs::copy(&src, &tmp).await.ok() != Some(len) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return None;
+        }
+        if tokio::fs::rename(&tmp, dest).await.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return None;
+        }
+        Some(len)
     }
 
     fn note_transfer(&self, node: u64, bytes: u64, took: Duration) {
@@ -1067,7 +1114,24 @@ impl MeshClient {
 
     /// Node ids of the peers listed as an object's locations.
     pub fn holders(&self, obj: &pb::ObjectRef) -> Vec<u64> {
-        obj.locations.iter().filter_map(|l| self.member_by_peer(&l.peer).map(|p| p.member.node_id)).collect()
+        // Under one read lock, copying no member's view: placement asks this
+        // for every input of every call (a shuffle's gather has 64).
+        let ms = self.members.read().expect("lock");
+        obj.locations
+            .iter()
+            .filter_map(|l| {
+                let id = crate::stores::node_id_of(&l.peer);
+                match ms.get(&id) {
+                    Some(p) if p.member.peer == l.peer => Some(id),
+                    _ => ms.values().find(|p| p.member.peer == l.peer).map(|p| p.member.node_id),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether `node` lately reported fetching `object`, without copying its view.
+    pub fn recently_has(&self, node: u64, object: &[u8]) -> bool {
+        self.members.read().expect("lock").get(&node).is_some_and(|p| p.recently_has(object))
     }
 }
 
@@ -1080,7 +1144,7 @@ impl Transport for MeshTransport {
         let cluster = self.0.cluster.clone();
         Box::pin(async move {
             let mut c = client?;
-            let req = pb::RaftRequest { cluster, group, kind: kind.code() as u32, body };
+            let req = pb::RaftRequest { cluster, group, kind: kind.code() as u32, body, target };
             let r = c.raft(req).await.map_err(|s| std::io::Error::other(format!("node {target}: {}", s.message())))?;
             Ok(r.into_inner().body)
         })
@@ -1093,7 +1157,7 @@ impl Transport for MeshTransport {
             use futures_util::StreamExt;
             let mut c = client?;
             let size = file.metadata()?.len();
-            let first = pb::SnapshotChunk { cluster, group, header, size, data: Vec::new() };
+            let first = pb::SnapshotChunk { cluster, group, header, size, data: Vec::new(), target };
             let rest = snapshot_chunks(tokio::fs::File::from_std(file), FETCH_CHUNK)
                 .map(|data| pb::SnapshotChunk { data, ..Default::default() });
             let r = c
@@ -1143,6 +1207,17 @@ pub struct MeshServer {
 }
 
 impl MeshServer {
+    /// Refuse a message for another node: one that restarted at this address
+    /// under a new identity (a rebooted, unsynced peer) must not take its
+    /// predecessor's Raft traffic and serve that group as if it were a member.
+    fn addressed_to_me(&self, target: u64) -> Result<(), Status> {
+        let me = self.mesh.me.node_id;
+        if target != 0 && target != me {
+            return Err(Status::failed_precondition(format!("this address is node {me} now, not node {target}")));
+        }
+        Ok(())
+    }
+
     fn router(&self) -> Result<&Arc<Router>, Status> {
         self.router.get().ok_or_else(|| Status::unavailable("peer is still forming the cluster"))
     }
@@ -1179,6 +1254,7 @@ impl pb::mesh_server::Mesh for MeshService {
     async fn raft(&self, req: Request<pb::RaftRequest>) -> Result<Response<pb::RaftReply>, Status> {
         let r = req.into_inner();
         self.0.check(&r.cluster)?;
+        self.0.addressed_to_me(r.target)?;
         let kind = RpcKind::from_code(r.kind as u8).ok_or_else(|| Status::invalid_argument("unknown raft rpc"))?;
         let group = match self.0.router()?.hosted(r.group) {
             Some(g) => g,
@@ -1197,6 +1273,7 @@ impl pb::mesh_server::Mesh for MeshService {
         let mut chunks = req.into_inner();
         let first = chunks.message().await?.ok_or_else(|| Status::invalid_argument("an empty snapshot stream"))?;
         self.0.check(&first.cluster)?;
+        self.0.addressed_to_me(first.target)?;
         // Unique per transfer: two installs of one group may overlap.
         let path = self.0.scratch.join(format!("incoming-{}-{}.snap", first.group, crate::router::now_ns()));
         let written = async {
@@ -1354,6 +1431,9 @@ impl pb::mesh_server::Mesh for MeshService {
             self.0.mesh.note_served(&r.object_id); // not a size probe: a copy is on its way
         }
         let path = if r.code { self.0.code.path(&r.object_id) } else { self.0.objects.path(&r.run, &r.object_id) };
+        if !r.code {
+            crate::ingress::restore(&self.0.objects, &r.run, &r.object_id).await; // spilled to object storage
+        }
         let chunks =
             crate::stores::read_chunks(&path, r.offset, r.len, FETCH_CHUNK).await.map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => Status::not_found(e.to_string()),

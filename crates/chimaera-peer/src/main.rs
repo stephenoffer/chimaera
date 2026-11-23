@@ -43,6 +43,16 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// Run a program on the cluster: it runs on a peer as the one call of a
+    /// detached run, with this directory shipped as its project; this prints
+    /// the run's id and returns (`chimaera logs RUN`, `chimaera cancel RUN`).
+    Submit {
+        /// A cluster profile or tcp://host:port (default: as for a driver).
+        #[arg(long)]
+        cluster: Option<String>,
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
     /// Peer status: executors, queue, CPU in use, why work is waiting.
     Status {
         #[arg(long)]
@@ -72,7 +82,14 @@ enum Cmd {
     },
     /// Cancel a run: its unfinished calls are cancelled and its actors stopped.
     Cancel {
-        run: String,
+        /// Runs to cancel (ids as `chimaera runs` prints them).
+        runs: Vec<String>,
+        /// Instead, the active runs whose command contains this text.
+        #[arg(long = "match", conflicts_with = "runs")]
+        pattern: Option<String>,
+        /// With --match: cancel them. Without it, only list what would be cancelled.
+        #[arg(long)]
+        yes: bool,
         #[command(flatten)]
         at: At,
     },
@@ -220,8 +237,14 @@ enum PeerCmd {
         #[arg(long)]
         insecure: bool,
         /// Directory with this peer's mutual-TLS files (`chimaera cluster cert`).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "tls_ca")]
         tls_dir: Option<PathBuf>,
+        /// The cluster CA's directory (`chimaera cluster init --out DIR`): this
+        /// peer issues itself a certificate from it at start, and takes the
+        /// token from DIR/token unless one is given. A launcher ships this one
+        /// directory to every peer, as it would ship the token.
+        #[arg(long)]
+        tls_ca: Option<PathBuf>,
         /// Also accept drivers on other machines at this address (host:port).
         /// They must present the cluster token, and use TLS when --tls-dir is set.
         #[arg(long)]
@@ -274,7 +297,24 @@ enum ClusterCmd {
     },
 }
 
+/// The cluster CA passed in the environment (slurm-launch to its peers and
+/// spares), taken out of it: no child of this process (executors run
+/// tenants' code) may inherit the CA's key.
+fn take_ca_from_env() -> Option<(String, String)> {
+    use chimaera_peer::tls::{CA_KEY_ENV, CA_PEM_ENV};
+    let ca = std::env::var(CA_PEM_ENV).ok().zip(std::env::var(CA_KEY_ENV).ok());
+    // SAFETY: called first in main, before any thread is started (the async
+    // runtime and the logger come later), so nothing reads the environment
+    // concurrently.
+    unsafe {
+        std::env::remove_var(CA_PEM_ENV);
+        std::env::remove_var(CA_KEY_ENV);
+    }
+    ca
+}
+
 fn main() -> ExitCode {
+    let ca_from_env = take_ca_from_env();
     // The peer level decides how a release is rolled out (docs/deploy.md, "Upgrading").
     let version: &'static str =
         format!("{} (peer level {})", env!("CARGO_PKG_VERSION"), chimaera_proto::PEER_LEVEL).leak();
@@ -311,6 +351,7 @@ fn main() -> ExitCode {
                         token_file,
                         insecure,
                         tls_dir,
+                        tls_ca,
                         client_listen,
                     },
             } => {
@@ -350,7 +391,35 @@ fn main() -> ExitCode {
                 {
                     return Err(format!("--bootstrap-expect {n} but there are {} seeds", addrs.seeds.len()));
                 }
+                let token_file = token_file.or_else(|| {
+                    let from_ca = tls_ca.as_ref().map(|ca| ca.join("token")).filter(|t| t.exists());
+                    from_ca.filter(|_| std::env::var_os("CHIMAERA_CLUSTER_TOKEN").is_none())
+                });
                 let token = cluster_token(token_file.as_deref(), insecure)?;
+                // A CA passed in the environment (slurm-launch, its spares) is
+                // used as a --tls-ca directory under the data directory.
+                let tls_ca = match (tls_ca, ca_from_env) {
+                    (Some(ca), _) => Some(ca),
+                    (None, Some((pem, key))) if tls_dir.is_none() => {
+                        let out = dir.join("tls-ca");
+                        chimaera_peer::tls::write_ca(&out, &pem, &key)
+                            .map_err(|e| format!("cannot write the cluster CA into {}: {e}", out.display()))?;
+                        Some(out)
+                    }
+                    _ => None,
+                };
+                let tls_dir = match (tls_dir, tls_ca) {
+                    (Some(d), _) => Some(d),
+                    (None, Some(ca)) => {
+                        // A fresh key at every start; the name peers verify is fixed.
+                        let out = dir.join("tls");
+                        let _ = std::fs::remove_dir_all(&out);
+                        chimaera_peer::tls::issue(&ca, &format!("{cluster}-peer"), &out)
+                            .map_err(|e| format!("cannot issue this peer's certificate from {}: {e}", ca.display()))?;
+                        Some(out)
+                    }
+                    (None, None) => None,
+                };
                 let tls = tls_dir.as_deref().map(chimaera_peer::tls::load).transpose().map_err(|e| e.to_string())?;
                 let cfg = chimaera_peer::cluster::ClusterConfig {
                     dir,
@@ -367,9 +436,17 @@ fn main() -> ExitCode {
                 chimaera_peer::cluster::run_cluster(cfg).await.map_err(|e| e.to_string()).map(|_| 0)
             }
             Cmd::Run { detach, cluster, command } => run_program(&dir, detach, cluster.as_deref(), &command).await,
+            Cmd::Submit { cluster, command } => {
+                // `python3 -m chimaera._submit -- COMMAND`, aimed like `chimaera run`.
+                let python =
+                    std::env::var("CHIMAERA_PYTHON").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "python3".into());
+                let submit: Vec<String> =
+                    [python, "-m".into(), "chimaera._submit".into(), "--".into()].into_iter().chain(command).collect();
+                run_program(&dir, false, cluster.as_deref(), &submit).await
+            }
             Cmd::Status { json, at } => status(connect(&dir, local, &at).await?, json).await,
             Cmd::Runs { limit, json, at } => runs(connect(&dir, local, &at).await?, limit, json).await,
-            Cmd::Cancel { run, at } => cancel(connect(&dir, local, &at).await?, &run).await,
+            Cmd::Cancel { runs, pattern, yes, at } => cancel_many(connect(&dir, local, &at).await?, runs, pattern, yes).await,
             Cmd::Actors { prefix, json, at } => actors(connect(&dir, local, &at).await?, prefix, json).await,
             Cmd::Objects { json, cluster } => objects(&dir, json, cluster).await,
             Cmd::Logs { run, follow, at } => logs(connect(&dir, local, &at).await?, &run, follow).await,
@@ -431,7 +508,7 @@ fn main() -> ExitCode {
                 }
                 Ok(0)
             }
-            Cmd::SlurmLaunch { port, command } => launch::slurm::launch(dir_flag, port, &command).await,
+            Cmd::SlurmLaunch { port, command } => launch::slurm::launch(dir_flag, port, &command, ca_from_env).await,
             Cmd::Up { name } => launch::ssh::up(&name),
             Cmd::Down { name } => launch::ssh::down(&name),
         }
@@ -544,7 +621,8 @@ async fn objects(dir: &std::path::Path, json: bool, cluster: bool) -> Result<u8,
         vec![chimaera_peer::objplane::inventory(std::path::Path::new(&object_dir))]
     };
     if json {
-        let out = if cluster { serde_json::Value::Array(stores) } else { stores.into_iter().next().unwrap_or_default() };
+        let out =
+            if cluster { serde_json::Value::Array(stores) } else { stores.into_iter().next().unwrap_or_default() };
         println!("{out}");
         return Ok(0);
     }
@@ -565,18 +643,31 @@ fn print_objects(inv: &serde_json::Value) {
     let mib = |v: &serde_json::Value| v.as_u64().unwrap_or(0) as f64 / (1 << 20) as f64;
     println!("objects in {} (huge pages: {})", inv["object_dir"].as_str().unwrap_or(""), inv["huge_pages"]);
     println!("  in memory: {} objects, {:.1} MiB", inv["in_memory"]["objects"], mib(&inv["in_memory"]["bytes"]));
-    println!("  on disk:   {} objects, {:.1} MiB (spilled, or replicas of other peers' objects)",
-        inv["on_disk"]["objects"], mib(&inv["on_disk"]["bytes"]));
+    println!(
+        "  on disk:   {} objects, {:.1} MiB (spilled, or replicas of other peers' objects)",
+        inv["on_disk"]["objects"],
+        mib(&inv["on_disk"]["bytes"])
+    );
     let arenas = inv["arenas"].as_array().cloned().unwrap_or_default();
     let arena_bytes: f64 = arenas.iter().map(|a| mib(&a["bytes"])).sum();
     println!("  arenas:    {:.1} MiB of arrays and large Python values in {} processes", arena_bytes, arenas.len());
     println!("  reserve:   {:.1} MiB of pre-zeroed pages", mib(&inv["reserve_bytes"]));
     for r in inv["runs"].as_array().into_iter().flatten() {
-        println!("  run {}: {} objects, {:.1} MiB in memory, {:.1} MiB on disk",
-            r["run"].as_str().unwrap_or(""), r["objects"], mib(&r["memory_bytes"]), mib(&r["disk_bytes"]));
+        println!(
+            "  run {}: {} objects, {:.1} MiB in memory, {:.1} MiB on disk",
+            r["run"].as_str().unwrap_or(""),
+            r["objects"],
+            mib(&r["memory_bytes"]),
+            mib(&r["disk_bytes"])
+        );
     }
     for o in inv["largest"].as_array().into_iter().flatten() {
-        println!("  {:>10.1} MiB  {}  ({})", mib(&o["bytes"]), o["object"].as_str().unwrap_or(""), o["where"].as_str().unwrap_or(""));
+        println!(
+            "  {:>10.1} MiB  {}  ({})",
+            mib(&o["bytes"]),
+            o["object"].as_str().unwrap_or(""),
+            o["where"].as_str().unwrap_or("")
+        );
     }
 }
 
@@ -796,6 +887,44 @@ async fn actors(mut c: Client, prefix: String, json: bool) -> Result<u8, String>
         eprintln!("no replica of group {} answered: their actors are missing above", groups.join(", "));
     }
     Ok(0)
+}
+
+/// Cancel the named runs, or the active runs whose command contains
+/// `pattern` (listed, not cancelled, unless `yes`).
+async fn cancel_many(mut c: Client, runs: Vec<String>, pattern: Option<String>, yes: bool) -> Result<u8, String> {
+    let runs = match pattern {
+        None if runs.is_empty() => return Err("name the runs to cancel, or select them with --match TEXT".into()),
+        None => runs,
+        Some(text) => {
+            let r =
+                c.list_runs(pb::ListRunsRequest { limit: 0 }).await.map_err(|e| e.message().to_string())?.into_inner();
+            if !r.unavailable.is_empty() {
+                eprintln!("some groups did not answer: their runs are not matched");
+            }
+            let matched: Vec<String> = r
+                .runs
+                .iter()
+                .filter(|run| run.state() == pb::run_record::State::Active && run.description.contains(&text))
+                .filter_map(|run| Id::from_slice(&run.run).ok().map(|i| i.hex()))
+                .collect();
+            if !yes {
+                for id in &matched {
+                    println!("would cancel {id}");
+                }
+                println!("{} active run(s) match {text:?}; add --yes to cancel them", matched.len());
+                return Ok(0);
+            }
+            matched
+        }
+    };
+    let mut failed = 0;
+    for run in &runs {
+        if let Err(e) = cancel(c.clone(), run).await {
+            eprintln!("{e}");
+            failed += 1;
+        }
+    }
+    if failed > 0 { Err(format!("{failed} of {} runs were not cancelled", runs.len())) } else { Ok(0) }
 }
 
 async fn cancel(mut c: Client, run: &str) -> Result<u8, String> {

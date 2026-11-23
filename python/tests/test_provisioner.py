@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 
 import pytest
 
 import chimaera as ch
 from chimaera._cluster import Node
 from chimaera.provisioner import Memory, Rules, StatefulSet, decide
+from conftest import BIN
 
 
 def node(cpus=4.0, used=0.0, queued=0, alive=True, address="a:1"):
@@ -178,7 +180,7 @@ def test_skypilot_spares_launch_join_and_drain_before_teardown(tmp_path, monkeyp
     assert len(launches) == 2 and pool.replicas() == 3
     first = launches[0]
     assert first.startswith(
-        "sky [launch] [-c] [chimaera-spare-1] [-y] [-d] [--env] [CHIMAERA_CLUSTER_TOKEN] [--infra] [aws] [--use-spot] [chimaera peer start"
+        "sky [launch] [-c] [chimaera-spare-1] [-y] [-d] [--secret] [CHIMAERA_CLUSTER_TOKEN] [--infra] [aws] [--use-spot] [chimaera peer start"
     )
     assert "--listen 0.0.0.0:7700" in first and "--seeds 10.0.0.5:7700,10.0.0.6:7700]" in first
     assert "chimaera-spare-2" in launches[1]
@@ -198,3 +200,39 @@ def test_skypilot_spares_launch_join_and_drain_before_teardown(tmp_path, monkeyp
     peers[:] = [node(2, 0, address="")]  # a local peer: nothing for a spare to join
     with pytest.raises(RuntimeError, match="no live peer has a network address"):
         again.scale(2)
+
+
+def test_sky_spares_get_certificates_of_their_own_and_never_the_ca_key(tmp_path, monkeypatch):
+    from chimaera.provisioner import SkySpares
+
+    log = tmp_path / "calls"
+    sky = tmp_path / "sky"
+    sky.write_text(f'#!/bin/sh\nfor a in "$@"; do printf "[%s]" "$a" >> {log}; done\necho >> {log}\n')
+    sky.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("CHIMAERA_CLUSTER_TOKEN", "t")
+    ca = tmp_path / "ca"
+    subprocess.run([BIN, "cluster", "init", "--out", str(ca)], check=True, capture_output=True)
+    monkeypatch.setenv("CHIMAERA_TLS_CA", str(ca))
+    monkeypatch.setenv("CHIMAERA_BIN", BIN)
+    ch.coord.Store("provisioner/sky").delete("spares")
+    peers = [node(2, 0, address="10.0.0.5:7700")]
+    monkeypatch.setattr(ch.runs, "cluster", lambda: type("View", (), {"nodes": lambda self: peers})())
+    pool = SkySpares(1, ["--infra", "aws"], drain_s=0)
+    pool.scale(2)
+    for c in pool._children:
+        c.wait(timeout=30)
+    (launch,) = log.read_text().splitlines()
+    assert launch.startswith("[launch][-c][chimaera-spare-1][-y][-d][--secret][CHIMAERA_CLUSTER_TOKEN][--infra][aws][")
+    task = launch.rsplit("[", 1)[1].rstrip("]")
+    text = open(task).read()
+    assert "--tls-dir ~/.chimaera/spare-tls" in text and "chmod 600 ~/.chimaera/spare-tls/peer.key" in text
+    uploaded = [line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("  ~/.chimaera/spare-tls/")]
+    assert sorted(os.path.basename(f) for f in uploaded) == ["ca.pem", "peer.key", "peer.pem"]
+    assert not any("ca.key" in line for line in text.splitlines()), "the CA's key stays here"
+    # The spare's certificate is signed by the cluster CA.
+    certs = os.path.dirname(uploaded[0])
+    assert open(os.path.join(certs, "ca.pem")).read() == (ca / "ca.pem").read_text()
+    verify = subprocess.run(["openssl", "verify", "-CAfile", str(ca / "ca.pem"), os.path.join(certs, "peer.pem")],
+                            capture_output=True, text=True)
+    assert verify.returncode == 0, verify.stdout + verify.stderr

@@ -458,9 +458,10 @@ def run_workload(rt: str, name: str) -> dict:
 
             gen = remote(produce)
             t0 = time.perf_counter()
-            result = gen.map(range(maps)).reduce_by_key(operator.add, partitions=parts)
-            total = sum(v for part in result for _, v in part)
+            # Stop the clock where Ray's does: every partition in the driver.
+            reduced = list(gen.map(range(maps)).reduce_by_key(operator.add, partitions=parts))
             dt = time.perf_counter() - t0
+            total = sum(sum(d.values()) for d in reduced)
         assert total == maps * per, total
         return {"seconds": round(dt, 3), "pairs": maps * per}
 

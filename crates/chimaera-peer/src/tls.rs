@@ -43,13 +43,42 @@ fn write_private(path: &Path, data: &str) -> io::Result<()> {
 
 /// Create `out/ca.pem`, `out/ca.key` and `out/token`. Refuses to overwrite.
 pub fn init(out: &Path, token: &str) -> io::Result<()> {
-    std::fs::create_dir_all(out)?;
-    let key = KeyPair::generate().map_err(err)?;
-    let cert = ca_params()?.self_signed(&key).map_err(err)?;
-    write_private(&out.join("ca.key"), &key.serialize_pem())?;
-    std::fs::write(out.join("ca.pem"), cert.pem())?;
+    if !init_ca(out)? {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already holds a CA", out.display())));
+    }
     write_private(&out.join("token"), &format!("{token}\n"))
 }
+
+/// Create a cluster CA (`out/ca.pem`, `out/ca.key`) unless `out` holds one.
+/// Whether it was created now.
+pub fn init_ca(out: &Path) -> io::Result<bool> {
+    if out.join("ca.pem").exists() {
+        return Ok(false);
+    }
+    let (pem, key) = new_ca()?;
+    write_ca(out, &pem, &key)?;
+    Ok(true)
+}
+
+/// A new cluster CA: (certificate PEM, private key PEM).
+pub fn new_ca() -> io::Result<(String, String)> {
+    let key = KeyPair::generate().map_err(err)?;
+    let cert = ca_params()?.self_signed(&key).map_err(err)?;
+    Ok((cert.pem(), key.serialize_pem()))
+}
+
+/// Write a CA into `out` (replacing one there), as `--tls-ca` reads it.
+pub fn write_ca(out: &Path, pem: &str, key: &str) -> io::Result<()> {
+    std::fs::create_dir_all(out)?;
+    let _ = std::fs::remove_file(out.join("ca.key"));
+    write_private(&out.join("ca.key"), key)?;
+    std::fs::write(out.join("ca.pem"), pem)
+}
+
+/// The variables a launcher passes a CA in to peers on other nodes, where
+/// no shared directory holds it (Slurm: node-local data, srun's environment).
+pub const CA_PEM_ENV: &str = "CHIMAERA_TLS_CA_PEM";
+pub const CA_KEY_ENV: &str = "CHIMAERA_TLS_CA_KEY";
 
 /// Issue a peer certificate from the CA in `ca_dir` into `out` (`ca.pem`,
 /// `peer.pem`, `peer.key`): the directory a peer's `--tls-dir` points at.

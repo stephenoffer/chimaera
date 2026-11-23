@@ -303,7 +303,6 @@ fn write_file(path: &Path, parts: &[&[u8]], total: usize) -> io::Result<u64> {
 /// reports a full tmpfs as an error instead of a SIGBUS at first touch.
 fn parallel_fill(file: &std::fs::File, parts: &[&[u8]], total: usize) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     // SAFETY: a fresh shared mapping of a file we own; unmapped below.
     let base = unsafe {
         libc::mmap(
@@ -325,49 +324,55 @@ fn parallel_fill(file: &std::fs::File, parts: &[&[u8]], total: usize) -> io::Res
         starts.push(off);
         off += p.len();
     }
-    let chunks = total.div_ceil(CHUNK);
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, MAX_THREADS).min(chunks);
-    let next = AtomicUsize::new(0);
-    let failed: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                loop {
-                    let c = next.fetch_add(1, Ordering::Relaxed);
-                    if c >= chunks || failed.lock().expect("lock").is_some() {
-                        return;
-                    }
-                    let (cs, ce) = (c * CHUNK, ((c + 1) * CHUNK).min(total));
-                    if let Err(e) = populate_write(base_addr + cs, ce - cs) {
-                        *failed.lock().expect("lock") = Some(e);
-                        return;
-                    }
-                    for (i, p) in parts.iter().enumerate() {
-                        let (ps, pe) = (starts[i], starts[i] + p.len());
-                        let (s0, e0) = (ps.max(cs), pe.min(ce));
-                        if s0 < e0 {
-                            // SAFETY: [s0, e0) lies inside the mapping and inside
-                            // part i; chunks are disjoint, so no two threads write
-                            // the same bytes.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    p.as_ptr().add(s0 - ps),
-                                    (base_addr + s0) as *mut u8,
-                                    e0 - s0,
-                                );
-                            }
-                        }
-                    }
+    let r = for_chunks(total, |cs, ce| {
+        populate_write(base_addr + cs, ce - cs)?;
+        for (i, p) in parts.iter().enumerate() {
+            let (ps, pe) = (starts[i], starts[i] + p.len());
+            let (s0, e0) = (ps.max(cs), pe.min(ce));
+            if s0 < e0 {
+                // SAFETY: [s0, e0) lies inside the mapping and inside part i;
+                // chunks are disjoint, so no two threads write the same bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(p.as_ptr().add(s0 - ps), (base_addr + s0) as *mut u8, e0 - s0);
                 }
-            });
+            }
         }
+        Ok(())
     });
     // SAFETY: unmapping the mapping created above.
     unsafe { libc::munmap(base, total) };
-    match failed.into_inner().expect("lock") {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    r
+}
+
+/// Run `work(start, end)` over `len` bytes in CHUNK pieces, on the calling
+/// thread and up to MAX_THREADS - 1 helpers. A helper the system refuses (a
+/// pod's pids.max counts threads) only leaves more pieces for the others,
+/// never a panic. Stops at the first error and returns it.
+fn for_chunks(len: usize, work: impl Fn(usize, usize) -> io::Result<()> + Sync) -> io::Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let chunks = len.div_ceil(CHUNK);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, MAX_THREADS).min(chunks);
+    let next = AtomicUsize::new(0);
+    let failed: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
+    let run = || {
+        loop {
+            let c = next.fetch_add(1, Ordering::Relaxed);
+            if c >= chunks || failed.lock().expect("lock").is_some() {
+                return;
+            }
+            if let Err(e) = work(c * CHUNK, ((c + 1) * CHUNK).min(len)) {
+                *failed.lock().expect("lock") = Some(e);
+                return;
+            }
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 1..threads {
+            let _ = std::thread::Builder::new().spawn_scoped(s, run);
+        }
+        run();
+    });
+    failed.into_inner().expect("lock").map_or(Ok(()), Err)
 }
 
 #[cfg(target_os = "linux")]
@@ -631,6 +636,11 @@ mod arena {
                     return std::ptr::null_mut();
                 }
                 let b = base as usize;
+                if !warm && len >= POPULATE_MIN && populate_parallel(b, len).is_err() {
+                    libc::munmap(base, len);
+                    libc::unlink(c.as_ptr());
+                    return std::ptr::null_mut(); // the filesystem is full: the heap it is
+                }
                 self.lo.fetch_min(b, Ordering::Relaxed);
                 self.hi.fetch_max(b + len, Ordering::Relaxed);
                 self.live.lock().expect("lock").insert(b, Alloc { len, path, published: false, foreign: false });
@@ -893,6 +903,16 @@ mod arena {
 
     type Guards =
         (std::sync::MutexGuard<'static, BTreeMap<usize, Alloc>>, std::sync::MutexGuard<'static, Vec<(usize, Alloc)>>);
+
+    /// New blocks at least this large are populated as they are handed out, on
+    /// several threads. Otherwise the code filling one (a NumPy copy, a `str`
+    /// encode) faults its tmpfs pages in 4 KiB at a time on its own thread,
+    /// which costs more than the copy itself; write_object does the same.
+    const POPULATE_MIN: usize = 8 << 20;
+
+    fn populate_parallel(base: usize, len: usize) -> io::Result<()> {
+        for_chunks(len, |cs, ce| populate_write(base + cs, ce - cs))
+    }
 
     thread_local! {
         /// The arena's locks, held by the forking thread across fork() so the
@@ -1170,13 +1190,23 @@ mod arena {
             if a.published && changed(base, a, ptr, len) {
                 return Ok(None);
             }
-            match std::fs::hard_link(&a.path, &dest) {
+            let mut linked = std::fs::hard_link(&a.path, &dest);
+            if matches!(&linked, Err(e) if e.kind() == io::ErrorKind::NotFound) {
+                std::fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")))?;
+                linked = std::fs::hard_link(&a.path, &dest); // a concurrent claim may win: checked below
+            }
+            match linked {
                 Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    std::fs::create_dir_all(dest.parent().unwrap_or(Path::new(".")))?;
-                    std::fs::hard_link(&a.path, &dest)?;
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    // Fine if it is this allocation, claimed before. Another file
+                    // (a result of the same call, run again on this peer) is never
+                    // linked against or removed: the caller copies instead.
+                    use std::os::unix::fs::MetadataExt;
+                    let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).ok();
+                    if id(&a.path).is_none() || id(&a.path) != id(&dest) {
+                        return Ok(None);
+                    }
                 }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
             }
             if !a.published {

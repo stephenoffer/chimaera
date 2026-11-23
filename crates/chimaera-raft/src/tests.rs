@@ -483,8 +483,7 @@ async fn a_late_learner_installs_the_leaders_snapshot() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let (h2, rx) = RaftHost::open(&dir.path().join("n2"), 2, net.clone(), DiskDurability::Os).unwrap();
-    std::mem::forget(rx);
+    let (h2, mut learner_events) = RaftHost::open(&dir.path().join("n2"), 2, net.clone(), DiskDurability::Os).unwrap();
     let learner = h2.start_group(0, BTreeMap::new(), false).await.unwrap();
     net.nodes.lock().unwrap().insert(2, learner.clone());
     tokio::time::timeout(Duration::from_secs(20), leader.add_learner(2, "node-2")).await.unwrap().unwrap();
@@ -496,6 +495,13 @@ async fn a_late_learner_installs_the_leaders_snapshot() {
     }
     assert_eq!(learner.read(|kv| read::ready(kv, 9, 1000).len()).unwrap(), 30);
     assert_eq!(snapshot_files(&dir.path().join("n2")).len(), 1);
+    // The commands the snapshot covered raised no events: the install says so,
+    // so what waits on this replica looks at its state again.
+    let mut reloaded = false;
+    while let Ok(ev) = learner_events.try_recv() {
+        reloaded |= ev.reloaded && ev.group == 0;
+    }
+    assert!(reloaded, "installing a snapshot announces that the state was replaced");
     drop((h1, h2));
 }
 

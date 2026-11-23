@@ -61,6 +61,51 @@ def test_the_archive_is_reproducible_skips_caches_and_refuses_huge_projects(monk
         _project.pack([root])
 
 
+def test_a_git_projects_ignored_files_stay_home():
+    import io
+    import shutil
+    import subprocess
+    import tarfile
+
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    root = tempfile.mkdtemp(prefix="chp")
+    files = {
+        ".gitignore": "data/\n.env\n*.ckpt\nscratch/\n",
+        "pkg/__init__.py": "",
+        "pkg/tracked.py": "X = 1\n",
+        "pkg/new.py": "Y = 2\n",  # untracked but not ignored: still the project's code
+        "pkg/model.ckpt": "weights",
+        "data/big.csv": "a,b\n",
+        ".env": "SECRET=1\n",
+        "scratch/run.py": "print(1)\n",
+    }
+    for name, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(root, name)), exist_ok=True)
+        with open(os.path.join(root, name), "w") as f:
+            f.write(text)
+    subprocess.run(["git", "init", "-q", root], check=True)
+    subprocess.run(["git", "-C", root, "add", ".gitignore", "pkg/__init__.py", "pkg/tracked.py"], check=True)
+    _, data = _project.pack([root])
+    names = sorted(tarfile.open(fileobj=io.BytesIO(data)).getnames())
+    assert names == ["r0/.gitignore", "r0/pkg/__init__.py", "r0/pkg/new.py", "r0/pkg/tracked.py"]
+    # A folder git ignores as a whole is still the code being run when it is the project.
+    _, data = _project.pack([os.path.join(root, "scratch")])
+    assert tarfile.open(fileobj=io.BytesIO(data)).getnames() == ["r0/run.py"]
+    # Asked for, ignored files ship too (an extension module built in place).
+    os.environ["CHIMAERA_PROJECT_GITIGNORE"] = "0"
+    try:
+        _, data = _project.pack([root])
+    finally:
+        del os.environ["CHIMAERA_PROJECT_GITIGNORE"]
+    assert "r0/pkg/model.ckpt" in tarfile.open(fileobj=io.BytesIO(data)).getnames()
+    # A source checkout of Chimaera on the path is never a project: the peers use their own.
+    checkout = tempfile.mkdtemp(prefix="chp")
+    os.makedirs(os.path.join(checkout, "chimaera"))
+    open(os.path.join(checkout, "chimaera", "_runtime.py"), "w").close()
+    assert _project.roots([root, checkout]) == [os.path.realpath(root)]
+
+
 def test_a_projects_uv_lock_is_installed_on_the_peers():
     import shutil
 

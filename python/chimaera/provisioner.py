@@ -35,9 +35,11 @@ import json
 import math
 import os
 import shlex
+import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -247,8 +249,11 @@ class SkySpares:
     drain, then runs ``sky down``. Both run in the background, so a slow cloud
     never stalls the loop. The spares' names live in the cluster's store, so a
     restarted provisioner knows them. Spares join with
-    ``CHIMAERA_CLUSTER_TOKEN``, which must be set where this runs.
-    shortcut: unverified against a real SkyPilot install here."""
+    ``CHIMAERA_CLUSTER_TOKEN``, which must be set where this runs (it goes to
+    SkyPilot as a secret, kept out of its logs). With ``CHIMAERA_TLS_CA`` (the
+    cluster's ``chimaera cluster init`` directory) here, each spare gets a
+    certificate of its own, issued here: the CA's key never leaves this
+    machine. shortcut: unverified against a real SkyPilot install here."""
 
     PREFIX = "chimaera-spare"
 
@@ -256,8 +261,35 @@ class SkySpares:
         if not os.environ.get("CHIMAERA_CLUSTER_TOKEN"):
             raise SystemExit("--sky needs CHIMAERA_CLUSTER_TOKEN set: spares join the cluster with it")
         self.base, self.launch_args, self.drain_s = base, launch_args, drain_s
+        self.ca = os.environ.get("CHIMAERA_TLS_CA") or None
+        if self.ca and not os.path.exists(os.path.join(self.ca, "ca.key")):
+            raise SystemExit(f"CHIMAERA_TLS_CA={self.ca} has no ca.key: name the `chimaera cluster init` directory")
+        self._work = tempfile.mkdtemp(prefix="chimaera-sky-")
         self._store = ch.coord.Store("provisioner/sky")
         self._children: list[subprocess.Popen[bytes]] = []
+
+    def _task(self, name: str, peer: str) -> str:
+        """A SkyPilot task file for spare `name`: its own certificate, issued
+        here from the cluster CA, uploaded with the CA certificate (never the
+        CA's key); its peer starts with them."""
+        from ._runtime import _peer_binary
+
+        certs = os.path.join(self._work, name)
+        shutil.rmtree(certs, ignore_errors=True)
+        subprocess.run(
+            [_peer_binary(), "cluster", "cert", "--ca", self.ca, "--name", name, "--out", certs],
+            check=True,
+            capture_output=True,
+        )
+        remote = "~/.chimaera/spare-tls"
+        mounts = "".join(f"  {remote}/{f}: {os.path.join(certs, f)}\n" for f in ("ca.pem", "peer.pem", "peer.key"))
+        path = os.path.join(self._work, f"{name}.yaml")
+        with open(path, "w") as f:
+            f.write(
+                f"name: {name}\nfile_mounts:\n{mounts}setup: chmod 600 {remote}/peer.key\n"
+                f"run: {peer} --tls-dir {remote}\n"
+            )
+        return path
 
     def _names(self) -> list[str]:
         return list(self._store.get("spares") or [])
@@ -280,8 +312,9 @@ class SkySpares:
             name = f"{self.PREFIX}-{max((int(x.rsplit('-', 1)[1]) for x in names), default=0) + 1}"
             names.append(name)
             self._store.put("spares", names)  # first: a launch that never comes up is shrunk away like any stuck peer
-            launch = ["sky", "launch", "-c", name, "-y", "-d", "--env", "CHIMAERA_CLUSTER_TOKEN"]
-            self._spawn([*launch, *self.launch_args, peer])
+            launch = ["sky", "launch", "-c", name, "-y", "-d", "--secret", "CHIMAERA_CLUSTER_TOKEN"]
+            task = self._task(name, peer) if self.ca else peer
+            self._spawn([*launch, *self.launch_args, task])
         while len(names) > want:
             name = names.pop()
             self._store.put("spares", names)

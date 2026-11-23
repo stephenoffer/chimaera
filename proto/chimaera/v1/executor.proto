@@ -79,6 +79,10 @@ message ExecBlocked {
   TaskKey task = 1;
   bool blocked = 2;
   repeated TaskKey waiting_on = 3;
+  // While it waits, this executor may run another call of the same run on a
+  // new thread (a wait on futures, not a poll, by a plain call alone in its
+  // batch). The peer decides whether one is sent.
+  bool host = 4;
 }
 
 // One item a generator call yielded, in order. The peer forwards it to the

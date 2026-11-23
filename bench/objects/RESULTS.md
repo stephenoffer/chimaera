@@ -86,20 +86,72 @@ objects; there Chimaera's base call is 1.9 ms against Ray's 0.37 ms.
 
 ## What Chimaera is not faster for, and why
 
-Every measured case where Chimaera is slower than Ray, or under 2x faster:
+Measured on 2026-11-22 on the same workspace, the same day for both
+runtimes: `/dev/shm` with 4 KiB pages, Ray as Anyscale runs it, medians.
+Every case where Chimaera is slower than Ray, or barely faster:
 
 | data, pattern | vs Ray | why | what helps |
 |---|---:|---|---|
-| Python `bytes`, get of 256 MB–1 GB on 4 KiB pages | 0.8x (1.2–1.3x up to 16 MB; 1.5–1.7x on huge pages) | Both runtimes copy into a new `bytes` object: Python's `bytes` cannot point at shared memory. The new object is now allocated in the arena, and first-touch faults on 4 KiB tmpfs pages cost more than on the heap. | Huge pages, or `bytearray`, NumPy or Arrow buffers, which are read in place. `CHIMAERA_ARENA=0` restores heap allocation (and copied puts). |
-| dicts, lists, pandas object columns, 1 MB+; `str` up to 16 MB | 0.5–1.8x | Pickling and unpickling (building Python objects one by one) is the whole cost in both runtimes. Plain dicts and lists already skip pickle's memo here (up to 6.9x less pickling time). A top-level `str` is encoded once and linked: from 256 MB it is 1.5–3.8x faster than Ray. | Columnar data (NumPy, Arrow) instead of Python objects. |
-| writing 3x the memory limit (spill) | 0.5–0.7x | In this loop each new array is allocated in shared memory, where first-touch page faults cost more than on Ray's heap. The reserve covers only part of it. | Larger memory limit, or reusing arrays. |
-| many 1 MB objects, get | 1.0x | One file and one copy per object, against Ray's copy into reused memory (puts are 12x faster: linked). | Batch small values into one array. |
-| Arrow tables on 4 KiB pages | about 1.2x | Arrow buffers are copied; the zero-copy allocator covers NumPy only. | Huge pages (6–9x). |
-| small values through `return` and `pipeline` | 0.1–1x | The call path, not objects: an actor call costs about 1.9 ms in Chimaera against 0.37 ms in Ray. | Outside the object store (the runtime's call journal). |
+| small results through `return` and `pipeline`, and 1 MiB `str`, `bytes` and list results | 0.35–0.4x for an empty call; 0.45–0.99x for 1 MiB results | The call path, not the objects: an empty call returns in 1.07 ms against Ray's 0.37 ms, and a two-call pipeline takes 2.0 ms against 0.80 ms. From 16 MiB the values' own speed wins. | Outside the object store (the runtime's call path). |
+| pandas with object columns, put of 1 MiB | 0.88x (return and pipeline of 1 MiB 1.0x; 1.08–1.74x from 16 MiB, and get 1.2x at 1 MiB) | At this size pandas' own pickling of the frame's structure and the call path cost more than the column's values, which the codec (below) now encodes. | NumPy or Arrow columns, or `category` dtype. |
+| `str` get of 16 MiB | 0.94–0.99x (1.4x at 1 MiB, 1.8x at 256 MiB) | Decoding the UTF-8 into a new `str` is the cost in both. | - |
+| writing 3x the memory limit (spill) | 0.5–0.7x (16 MB objects: 7.6 s against 5.0 s; 256 MB: 14.6 s against 8.1 s) | Each new array is allocated in shared memory. With shared-memory huge pages off (`shmem_enabled=never`, the usual default), first-touch faults there cost more than on Ray's heap, where NumPy gets huge pages through `madvise`. Writing such arrays to disk at birth once memory passes the spill line was slower (16 MB: 7.4 s → 11.2 s; 256 MB: 15.0 s → 18.6 s): the put then waits for a disk write the background spiller does off the critical path. Populating new blocks in parallel (below) did not change it. | Larger memory limit, reusing arrays, or a huge-page tmpfs. |
+| many 1 MB objects, get (not re-measured on 2026-11-22) | 1.0x | One file and one copy per object, against Ray's copy into reused memory (puts are 12x faster: linked). | Batch small values into one array. |
+| Arrow tables on 4 KiB pages (not re-measured on 2026-11-22) | about 1.2x | Arrow buffers are copied; the zero-copy allocator covers NumPy only. | Huge pages (6–9x). |
+
+A 1 MiB `str` put measured 1.2x in one run and 0.64x in another on the
+same build (the code it runs did not change between them): treat 1 MiB puts
+of `str` as level with Ray.
+
+Fixed on 2026-11-22: plain dicts and lists. A top-level dict, list or tuple
+of at least 1024 items made of `str`, `bytes`, `int` (to 64 bits), `float`,
+`bool` and `None`, with no container reachable twice, is encoded by a native
+codec (`crates/chimaera-py/src/plain.rs`) in one pass that checks and writes
+at once, and decoded natively; anything else is pickled as before. It skips
+the memo-free pickle's separate safety scan, which was a fifth of the time:
+
+| same day, 4 KiB pages | Ray | Chimaera before | Chimaera now |
+|---|---:|---:|---:|
+| dict put, 1 / 16 / 256 MiB | 0.94 / 11.6 / 268 ms | 1.49 / 16.3 / 274 ms (0.63–0.98x) | 0.62 / 9.3 / 174 ms (**1.5x / 1.2x / 1.5x**) |
+| list put, 1 / 16 / 256 MiB | 1.15 / 15.6 / 287 ms | 0.61 / 12.5 / 204 ms | 0.35 / 7.5 / 120 ms (**3.3x / 2.1x / 2.4x**) |
+| dict get, 1 / 16 / 256 MiB | 4.4 / 96 / 2,397 ms | 2.0 / 50 / 1,524 ms | 1.8 / 49 / 1,459 ms (**2.4x / 2.0x / 1.6x**) |
+| list pipeline, 256 MiB | 659 ms | 546 ms | 457 ms (**1.44x**) |
+| dict return, 16 / 256 MiB | 139 / 3,317 ms | 83 / 1,978 ms | 49 / 1,600 ms (**2.9x / 2.1x**) |
+
+The same codec takes object arrays of plain values, such as a pandas
+column of strings, with each repeated string object written once and read
+back as one object, as pickle's memo would (a low-cardinality column relies
+on that for its memory):
+
+| same day, 4 KiB pages | Ray | Chimaera before | Chimaera now |
+|---|---:|---:|---:|
+| pandas put, 16 / 256 MiB | 126 / 3,511 ms | 103 / 3,114 ms | 90 / 2,023 ms (**1.4x / 1.7x**) |
+| pandas get, 16 / 256 MiB | 39 / 836 ms | 47 / 802 ms (0.83x / 1.04x) | 36 / 740 ms (**1.08x / 1.13x**) |
+| pandas return, 16 / 256 MiB | 193 / 4,734 ms | 167 / 4,323 ms | 139 / 2,946 ms (**1.4x / 1.6x**) |
+| pandas pipeline, 16 / 256 MiB | 192 / 4,715 ms | 158 / 4,218 ms | 143 / 2,932 ms (**1.3x / 1.6x**) |
+
+Fixed on 2026-11-22: large `bytes` and `str`. New arena blocks of 8 MiB or
+more are now populated on several threads as they are handed out, so the
+code that fills them (a `str` encode, a read into a new `bytes`, a NumPy
+copy) no longer faults their tmpfs pages in one at a time on its own thread:
+
+| same day, 4 KiB pages | Ray | Chimaera before | Chimaera now |
+|---|---:|---:|---:|
+| `bytes` get, 256 MiB | 140 ms | 178 ms (0.79x) | 77 ms (**1.81x**) |
+| `bytes` return, 256 MiB | 157 ms | 207 ms (0.76x) | 113 ms (**1.39x**) |
+| `bytes` pipeline, 256 MiB | 172 ms | 213 ms (0.81x) | 114 ms (**1.51x**) |
+| `str` put, 16 / 256 MiB | 12.2 / 303 ms | 11.9 / 174 ms | 6.4 / 87 ms (**1.9x / 3.5x**) |
+| `str` return, 16 / 256 MiB | 16.6 / 489 ms | 17.1 / 365 ms | 10.3 / 201 ms (**1.6x / 2.4x**) |
+| pandas put, return, pipeline, 256 MiB | 3.5–4.7 s | 3.6–4.9 s (0.97–1.0x) | 3.2–4.4 s (**1.08–1.11x**) |
+
+A parallel read of a large `bytes` value into heap memory with huge pages
+was tried as well and dropped: no faster, and at 1 GiB slower (453 → 655 ms),
+most likely from the kernel compacting memory for the huge pages.
 
 Everything else, from 1 KB values to 1 GB arrays and tensors, on one host or
 across hosts, and spilled reads and recovery, is faster than Ray. Often it is
-far faster.
+far faster. The per-type tables below were measured before the populate
+change; for `bytes` and `str` of 16 MiB and up, the table above is current.
 
 ## Same host: put (driver)
 
@@ -187,8 +239,10 @@ still the slower one; the next section explains why.
 
 Three nodes on one host (Ray `cluster_utils`; three Chimaera peers). A value
 is made on node B, B is killed 3 s later, and the driver gets the value.
-The 3 s matter: Chimaera copies each object to the next peer about a second
-after it is written, and a node that dies sooner can lose it.
+The 3 s mattered for replicas when this was measured: Chimaera then copied
+each object to the next peer about a second after it was written (now at
+once, see below). A task result lost before its copy is rebuilt from
+lineage (the second table).
 
 | value | Ray | Chimaera |
 |---|---|---|
@@ -203,6 +257,26 @@ happens to be on the reader's own peer, so the read is a mapping. The high
 end is two separate runs where the replica sat on the third peer and had to
 be fetched (256 MB in about 140 ms). Either way it is 90x to 70,000x faster
 than Ray's rebuild, and Ray cannot recover the `put` values at all.
+
+With no replica at all (`CHIMAERA_OBJECT_REPLICAS=0`, and the holder killed
+the moment the call finished, before any copy could be made), the driver's
+read runs the call again on its own peer, under the same attempt, so the
+value comes back under the ids it was read by:
+
+| task result, holder killed at once, no replicas | Ray (lineage, above) | Chimaera (lineage) |
+|---|---:|---:|
+| `bytes`, 1 MiB | 13.7 s | 33.7 ms |
+| NumPy, 64 MiB | - | 47.5 ms |
+| NumPy, 512 MiB | - | 147 ms |
+
+The time includes running the call again. A `put` value lost before its
+replica exists stays lost (`DataLost`, which says why).
+Since 2026-11-22 each object is copied as soon as it is written
+(`CHIMAERA_REPLICA_DELAY_MS`, now 0 by default; it was a fixed 1 s), at the
+cost of a transfer even for objects a reader on another peer would have
+copied anyway. With the holder of a 64 MiB put killed 0.3 s after the put,
+the value was lost in 2 of 2 runs with the 1 s delay and read back from its
+replica in 2 of 2 runs at 0.
 
 ## Across nodes
 
@@ -242,6 +316,26 @@ What this shows:
   - parallel ranges from 1 MiB;
   - reading, hashing and writing each chunk on blocking threads, so they
     overlap the network instead of queueing behind it on the async workers.
+
+## Sharing on one machine (2026-11-22)
+
+**GPU.** One NVIDIA A10G (Anyscale g5.2xlarge, torch 2.15, CUDA 12). The
+driver puts a CUDA tensor; a call granted the same GPU reads it, sums a slice
+and writes to it (the write stays in the call: the driver's tensor is
+checked unchanged). End-to-end call time, median of 5 after a warm-up:
+
+| tensor | read from the owner's GPU memory (CUDA IPC) | read from the host copy (`CHIMAERA_CUDA_IPC=0`) | speedup |
+|---|---:|---:|---:|
+| 256 MiB float32 | 2.7 ms | 54.8 ms | **20x** |
+| 1 GiB float32 | 6.2 ms | 194.7 ms | **31x** |
+
+The worker's counter of direct reads confirms which path ran. Ray was not
+measured on this machine.
+
+**CPU, across peers.** Three peers on one machine: a value one peer needs
+from another is now a hard link of the holder's file (same inode, checked by
+`test_locality.py::test_a_peer_on_the_same_machine_takes_an_object_from_the_holders_store`)
+instead of a stream over loopback gRPC. Not timed.
 
 ## Usability
 

@@ -39,19 +39,33 @@ class Cluster:
         founders: int,
         spares: int = 0,
         data_groups: int = 4,
-        tls: bool = False,
+        tls: bool | str = False,  # True: a certificate per peer; "ca": peers issue their own (--tls-ca); "env": from the CA in their environment (slurm-launch)
         clients: bool = False,
         labels: dict[int, str] | None = None,
+        one_machine: bool = False,
     ) -> None:
         self.root = tempfile.mkdtemp(prefix="chc", dir="/tmp")
         self.labels = labels or {}  # peer index -> CHIMAERA_LABELS
+        # The peers stand for separate machines unless `one_machine`: on one,
+        # they take objects straight from each other's stores.
+        self.one_machine = one_machine
         self.addrs = [f"127.0.0.1:{p}" for p in free_ports(founders + spares)]
         # --client-listen addresses, for drivers that connect over TCP.
         self.client_addrs = [f"127.0.0.1:{p}" for p in free_ports(len(self.addrs))] if clients else []
         self.seeds = ",".join(self.addrs[:founders])
         self.data_groups = data_groups
         self.tls: dict[int, str] = {}
-        if tls:
+        self.ca: str | None = None
+        self.ca_env: dict[str, str] = {}
+        if tls == "ca":
+            self.ca = self.make_ca("ca")
+            self.token = os.path.join(self.ca, "token")
+        elif tls == "env":
+            ca = self.make_ca("ca")
+            self.token = os.path.join(ca, "token")
+            with open(os.path.join(ca, "ca.pem")) as pem, open(os.path.join(ca, "ca.key")) as key:
+                self.ca_env = {"CHIMAERA_TLS_CA_PEM": pem.read(), "CHIMAERA_TLS_CA_KEY": key.read()}
+        elif tls:
             ca = self.make_ca("ca")
             self.token = os.path.join(ca, "token")
             for i in range(len(self.addrs)):
@@ -94,12 +108,18 @@ class Cluster:
         log = open(os.path.join(self.root, f"p{i}.log"), "ab")
         cmd = [BIN, "--dir", self.dir(i), "peer", "start", "--listen", self.addrs[i], "--seeds", self.seeds]
         cmd += ["--cluster", "test", "--data-groups", str(self.data_groups), "--cpus", "4"]
-        cmd += ["--token-file", token or self.token]
+        if self.ca is not None:
+            cmd += ["--tls-ca", self.ca]  # the token comes from the CA directory too
+            if token:
+                cmd += ["--token-file", token]
+        else:
+            cmd += ["--token-file", token or self.token]
         if i in self.tls:
             cmd += ["--tls-dir", self.tls[i]]
         if self.client_addrs:
             cmd += ["--client-listen", self.client_addrs[i]]
-        env = dict(os.environ, CHIMAERA_LABELS=self.labels.get(i, ""))
+        machine = os.path.basename(self.root) + ("" if self.one_machine else f"-{i}")
+        env = dict(os.environ, CHIMAERA_LABELS=self.labels.get(i, ""), CHIMAERA_MACHINE_ID=machine, **self.ca_env)
         self.procs[i] = subprocess.Popen(cmd, stdout=log, stderr=log, start_new_session=True, env=env)
 
     def wait_ready(self, peers, timeout: float = 60) -> None:
@@ -136,18 +156,27 @@ class Cluster:
 
     def remote(self, i: int, code: str, *, token: bool = True, ca: str | None = None) -> subprocess.CompletedProcess:
         """Run a driver on "another machine": it reaches peer `i` over TCP only."""
-        env = {"CHIMAERA_ADDRESS": f"tcp://{self.client_addrs[i]}", "CHIMAERA_HOME": tempfile.mkdtemp(prefix="chr", dir="/tmp")}
+        home = tempfile.mkdtemp(prefix="chr", dir="/tmp")  # its cache of fetched values
+        env = {"CHIMAERA_ADDRESS": f"tcp://{self.client_addrs[i]}", "CHIMAERA_HOME": home}
         if token:
             env["CHIMAERA_TOKEN_FILE"] = self.token
         if ca:
             env["CHIMAERA_CA"] = ca
-        return run_script(code, timeout=180, env=env)
+        try:
+            return run_script(code, timeout=180, env=env)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
 
     def close(self) -> None:
         for p in self.procs.values():
             if p.poll() is None:
                 p.kill()
                 p.wait(timeout=10)
+        # The peers' data (raft logs, snapshots, values) runs to gigabytes over a
+        # suite; keep only their logs (p*.log) for looking into a failure.
+        for name in os.listdir(self.root):
+            if os.path.isdir(os.path.join(self.root, name)):
+                shutil.rmtree(os.path.join(self.root, name), ignore_errors=True)
 
 
 def lines(proc: subprocess.CompletedProcess, prefix: str) -> list[str]:
@@ -633,6 +662,44 @@ def test_a_peer_without_the_cluster_token_is_refused():
         c.close()
 
 
+@pytest.mark.parametrize("how", ["ca", "env"], ids=["tls-ca-dir", "ca-in-environment"])
+def test_peers_issue_their_own_certificates_from_the_cluster_ca(how):
+    # One directory per cluster (`cluster init`), shipped like the token, or
+    # the CA in the environment (slurm-launch): each peer issues itself a
+    # certificate from it.
+    c = Cluster(3, tls=how)
+    try:
+        out = c.run(0, WHERE + """
+@ch.remote
+def where(i):
+    time.sleep(0.05)
+    return peer_name()
+
+print("PEERS", len(set(ch.get((where.remote(i) for i in range(60)), timeout=60))))
+""")
+        assert int(lines(out, "PEERS")[0]) == 3, "work crosses peers over TLS"
+        assert all(os.path.exists(os.path.join(c.dir(i), "tls", "peer.pem")) for i in range(3))
+        # A peer issuing itself a certificate from another CA is refused.
+        home = os.path.join(c.root, "stranger")
+        path = os.path.join(c.root, "stranger.log")
+        stranger = subprocess.Popen(
+            [BIN, "--dir", home, "peer", "start", "--listen", f"127.0.0.1:{free_ports(1)[0]}", "--seeds", c.seeds,
+             "--cluster", "test", "--tls-ca", c.make_ca("other-ca"), "--token-file", c.token],
+            stdout=open(path, "ab"), stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 15
+            while "refused" not in open(path, errors="replace").read():
+                assert time.monotonic() < deadline, open(path, errors="replace").read()[-2000:]
+                time.sleep(0.25)
+            assert not os.path.exists(socket_path(home, "peer.sock")), "a peer with a foreign CA must never serve"
+        finally:
+            stranger.kill()
+            stranger.wait(timeout=10)
+    finally:
+        c.close()
+
+
 def test_mutual_tls_cluster_runs_and_refuses_a_peer_from_another_ca():
     c = Cluster(3, spares=1, tls=True)
     try:
@@ -831,6 +898,31 @@ print("RUN", run)
         c.close()
 
 
+def test_a_submitted_program_runs_on_the_cluster_and_its_output_is_the_runs_log(tcp):
+    project = tempfile.mkdtemp(prefix="chp", dir="/tmp")
+    with open(os.path.join(project, "helper.py"), "w") as f:
+        f.write("def square(x):\n    return x * x\n")
+    with open(os.path.join(project, "app.py"), "w") as f:
+        f.write(
+            "import os\nimport chimaera as ch\nfrom helper import square\n\n"
+            "@ch.remote\ndef sq(x):\n    return square(x)\n\n"
+            "print('SQUARES', sum(ch.get([sq.remote(i) for i in range(20)], timeout=60)), flush=True)\n"
+        )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CHIMAERA_")}
+    env.update(CHIMAERA_TOKEN_FILE=tcp.token, CHIMAERA_PYTHON=sys.executable, PYTHONPATH=os.path.join(REPO, "python"))
+    at = ["--cluster", f"tcp://{tcp.client_addrs[1]}"]
+    out = subprocess.run([BIN, "submit", *at, "--", "python", "app.py"], cwd=project, env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr[-2000:]
+    run_id = out.stdout.strip().splitlines()[-1]
+    deadline, text = time.monotonic() + 90, ""
+    while "SQUARES" not in text and time.monotonic() < deadline:
+        time.sleep(0.5)
+        text = subprocess.run([BIN, "logs", run_id, *at], env=env, capture_output=True, text=True, timeout=60).stdout
+    assert f"SQUARES {sum(i * i for i in range(20))}" in text, text[-2000:]
+    listed = subprocess.run([BIN, "runs", "--json", *at], env=env, capture_output=True, text=True, timeout=60)
+    assert any(r["run"] == run_id and r["detached"] for r in json.loads(listed.stdout)["runs"]), listed.stdout
+
+
 def test_a_driver_credential_reaches_only_its_tenants_work(tcp):
     def credential(tenant: str) -> str:
         cmd = [BIN, "cluster", "credential", "--tenant", tenant, "--token-file", tcp.token]
@@ -961,7 +1053,8 @@ def test_a_client_reaches_a_tls_cluster_only_with_its_ca():
         c.close()
 
 
-def test_a_durable_actor_survives_the_loss_of_its_peer():
+@pytest.mark.parametrize("sig", [signal.SIGKILL, signal.SIGTERM], ids=["lost", "drained"])
+def test_a_durable_actor_survives_the_loss_of_its_peer(sig):
     c = Cluster(3)
     try:
         out = c.run(
@@ -987,7 +1080,7 @@ print("HOST", ledger.where.remote().result(timeout=60)[0])
 """,
         )
         host = int(lines(out, "HOST")[0][1:])
-        c.signal(host, signal.SIGKILL)
+        c.signal(host, sig)
         other = next(i for i in range(3) if i != host)
         out = c.run(
             other,
@@ -1002,6 +1095,74 @@ print("AFTER", *ledger.where.remote().result(timeout=120))
         assert moved_to != f"p{host}"
     finally:
         c.close()
+
+
+MOVING = WHERE + """
+import sys
+GO = sys.argv[0] + ".go"
+
+@ch.remote(restart="fresh", max_restarts=1)
+class Counter:
+    def __init__(self):
+        self.n = 0
+
+    def bump(self):
+        self.n += 1
+        return peer_name(), self.n
+
+    def die(self):
+        os.kill(os.getpid(), 9)
+
+c = Counter.options(placement=ch.dist.Placement(require={"zone": "b"})).remote()
+for _ in range(3):
+    host, n = c.bump.remote().result(timeout=60)
+print("HOST", host, n, flush=True)
+while not os.path.exists(GO):
+    time.sleep(0.1)
+print("AFTER", *c.bump.remote().result(timeout=90), flush=True)
+try:
+    c.die.remote().result(timeout=60)
+except ch.ActorDied:
+    pass
+try:
+    print("THEN", *c.bump.remote().result(timeout=60), flush=True)
+except ch.ActorDied:
+    print("THEN dead", flush=True)
+"""
+
+
+def _lose_the_actors_host(sig: int) -> tuple[str, list[str]]:
+    """An actor's host is lost (SIGKILL) or drained (SIGTERM) while a driver
+    on another peer holds a handle that has made calls."""
+    c = Cluster(3, labels={0: "zone=a", 1: "zone=b", 2: "zone=b"})
+    try:
+        d = c.driver(0, MOVING)
+        line = d.stdout.readline().split()
+        assert line[:1] == ["HOST"], (line, d.stderr.read() if d.poll() is not None else "")
+        host = int(line[1][1:])
+        c.signal(host, sig)
+        c.procs[host].wait(timeout=90)  # a drain ends once its work has moved
+        open([a for a in d.args if a.endswith(".py")][0] + ".go", "w").close()
+        out, err = d.communicate(timeout=240)
+        assert d.returncode == 0, err[-3000:]
+        return f"p{host}", [ln for ln in out.splitlines() if ln.startswith(("AFTER", "THEN"))]
+    finally:
+        c.close()
+
+
+def test_an_actor_handle_keeps_its_order_after_the_actor_restarts_on_another_peer():
+    host, got = _lose_the_actors_host(signal.SIGKILL)
+    after = got[0].split()
+    assert after[1] != host and after[2] == "1", got  # a fresh instance, elsewhere
+    assert got[1] == "THEN dead", "losing its peer used its one restart"
+
+
+def test_draining_a_peer_moves_its_actors_without_using_a_restart():
+    host, got = _lose_the_actors_host(signal.SIGTERM)
+    after = got[0].split()
+    assert after[1] != host and after[2] == "1", got
+    then = got[1].split()
+    assert then[0] == "THEN" and then[1] != "dead" and then[2] == "1", f"the move is not a restart: {got}"
 
 
 PLACED = """
@@ -1245,5 +1406,60 @@ print("SUM", sum(ch.get([add.remote(i, i) for i in range(60)], timeout=120)))
         assert any("dropping its replica" in c.log(i) for i in range(3)), "no founder gave up a seat's replica"
         for i in range(6):
             assert lines(c.run(i, add), "SUM") == [str(sum(2 * i for i in range(60)))], f"a program on peer {i}"
+    finally:
+        c.close()
+
+
+def test_a_lost_result_a_driver_reads_is_made_again_and_a_lost_put_says_why(monkeypatch):
+    # No replicas: once its only holder dies, running the call again is the
+    # only way back for a result. A put has no call, so reading it says why.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    go = os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+import chimaera as ch
+
+def on(slot):
+    return ch.dist.Placement(require={{"slot": slot}})
+
+@ch.remote
+def make(n):
+    with open(os.path.join({marks!r}, "make"), "a") as f:
+        f.write("ran\\n")
+    return bytes(range(256)) * (n // 256)
+
+@ch.remote
+def stash(n):
+    return ch.put(bytes(range(256)) * (n // 256))
+
+a = make.options(placement=on("s1")).remote(1 << 20)
+p = stash.options(placement=on("s1")).remote(1 << 20)
+ch.wait([a, p], timeout=60)  # finished, not read: both values are only on s1
+handle = p.result(timeout=60)  # the put's handle (small); its value stays on s1
+print("READY", flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+v = a.result(timeout=120)
+print("READ", len(v), v[:3], flush=True)
+try:
+    handle.result(timeout=120)
+    print("PUT read")
+except ch.errors.DataLost as e:
+    print("PUT_LOST", e, flush=True)
+""",
+        )
+        assert driver.stdout.readline().strip() == "READY", driver.stderr.read()[-2000:]
+        c.signal(1, signal.SIGKILL)  # the only peer holding either value
+        open(go, "w").close()
+        out, err = driver.communicate(timeout=240)
+        assert f"READ {1 << 20} {bytes(range(3))!r}" in out, out + err[-3000:]
+        assert len(open(os.path.join(marks, "make")).read().splitlines()) == 2, "make ran again to remake its result"
+        lost = [ln for ln in out.splitlines() if ln.startswith("PUT_LOST")]
+        assert lost and "ch.put" in lost[0], out + err[-3000:]
     finally:
         c.close()

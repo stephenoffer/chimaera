@@ -332,6 +332,12 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
         memory_bytes: node.shape.memory_bytes,
         gpus: node.shape.gpus.iter().map(|g| g.uuid.clone()).collect(),
         labels: crate::labels::own(&node.identity.peer.0).into_iter().collect(),
+        host: std::env::var("CHIMAERA_MACHINE_ID")
+            .ok()
+            .filter(|m| !m.is_empty())
+            .or_else(crate::durability::boot_id)
+            .unwrap_or_default(),
+        object_dir: node.objects.dir().to_string_lossy().into_owned(),
     };
     let mesh = Arc::new(MeshClient::new(
         cfg.cluster.clone(),

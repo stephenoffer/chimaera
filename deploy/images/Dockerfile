@@ -22,12 +22,14 @@ RUN cargo build --release --locked -p chimaera-peer \
  && rm -rf target
 
 FROM python:3.12-slim-bookworm
-COPY --from=build /out/chimaera /usr/local/bin/chimaera
 # Peers install a remote driver's uv.lock with it (python/chimaera/_project.py).
 COPY --from=ghcr.io/astral-sh/uv:0.11.7 /uv /usr/local/bin/uv
 # The wheel stays in the image for derived images and shared installs.
 COPY --from=build /out/*.whl /opt/chimaera/
 RUN pip install --no-cache-dir /opt/chimaera/*.whl \
  && useradd --uid 1000 --user-group --create-home chimaera
+# After the wheel: its `chimaera` console script (python/chimaera/_cli.py)
+# would otherwise replace the peer binary on PATH.
+COPY --from=build /out/chimaera /usr/local/bin/chimaera
 USER 1000:1000
 WORKDIR /home/chimaera

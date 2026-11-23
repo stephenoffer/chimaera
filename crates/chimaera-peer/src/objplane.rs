@@ -164,6 +164,47 @@ pub fn sweep_arenas(objects: &Path) -> usize {
     n
 }
 
+/// Who owns an object directory in a shared root (/dev/shm, a huge-page
+/// tmpfs): `<pid>\n<data dir>\n`, rewritten at each start.
+const OWNER: &str = ".owner";
+
+/// Clear what dead peers left in the shared root that holds `objects`. A
+/// peer whose data directory is gone will not come back (a test cluster
+/// cleaned up, a node removed): its whole object directory goes. A peer
+/// that is only not running may restart and reclaim its objects, so only
+/// its pre-zeroed reserve, which is filler, goes. Directories with no owner
+/// record, or whose owner still runs, are left alone. Returns (directories
+/// removed, reserves freed).
+pub fn sweep_peers(objects: &Path) -> (usize, usize) {
+    let (Some(root), Some(own)) = (objects.parent(), objects.file_name()) else { return (0, 0) };
+    if !own.to_string_lossy().starts_with("chimaera-") {
+        return (0, 0); // in the peer's own data directory: no neighbours
+    }
+    let (mut dirs, mut reserves) = (0, 0);
+    for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let name = e.file_name();
+        if name == own || !name.to_string_lossy().starts_with("chimaera-") {
+            continue;
+        }
+        let Ok(owner) = std::fs::read_to_string(e.path().join(OWNER)) else { continue };
+        let mut lines = owner.lines();
+        let (Some(pid), Some(data)) = (lines.next().and_then(|p| p.parse::<i32>().ok()), lines.next()) else {
+            continue;
+        };
+        if pid_alive(pid) {
+            continue;
+        }
+        if !Path::new(data).exists() {
+            if std::fs::remove_dir_all(e.path()).is_ok() {
+                dirs += 1;
+            }
+        } else if std::fs::remove_dir_all(e.path().join(".reserve")).is_ok() {
+            reserves += 1;
+        }
+    }
+    (dirs, reserves)
+}
+
 /// Reserve classes: files of 2^class bytes (256 KiB .. 1 GiB), the same
 /// classes writers ask for (chimaera-py's objects.rs).
 const MIN_CLASS: u32 = 18;
@@ -366,9 +407,15 @@ pub fn publish_usage(objects: &Path, bytes: u64) {
 /// Start the object plane of an in-memory store at `objects` whose spill
 /// directories (on disk) are `spill`: tell writers where things are (the
 /// `.plane` file, read by chimaera-py's _objects), keep the page reserve
-/// filled, and sweep the arenas of exited processes. A store on disk
-/// (`spill` empty) only gets the sweeping.
-pub fn start(objects: PathBuf, spill: Vec<PathBuf>) {
+/// filled, and sweep the arenas of exited processes and what dead peers left
+/// beside it (see `sweep_peers`). A store on disk (`spill` empty) only gets
+/// the sweeping. `data` is this peer's data directory, recorded as the owner.
+pub fn start(objects: PathBuf, spill: Vec<PathBuf>, data: &Path) {
+    let data = std::fs::canonicalize(data).unwrap_or_else(|_| data.to_path_buf());
+    let owner = format!("{}\n{}\n", std::process::id(), data.display());
+    if let Err(e) = crate::stores::write_atomic(&objects.join(OWNER), owner.as_bytes()) {
+        tracing::warn!("object plane: cannot write {}: {e}", objects.join(OWNER).display());
+    }
     let mut reserve = None;
     if let Ok(spill) = std::env::join_paths(&spill)
         && !spill.is_empty()
@@ -392,6 +439,13 @@ pub fn start(objects: PathBuf, spill: Vec<PathBuf>) {
                 if n > 0 {
                     tracing::info!("removed the shared-memory arenas of {n} exited processes");
                 }
+                let (dirs, reserves) = sweep_peers(&objects);
+                if dirs + reserves > 0 {
+                    tracing::info!(
+                        "freed shared memory of dead peers: {dirs} object directories whose peer is gone, \
+                         {reserves} reserves of peers not running"
+                    );
+                }
             }
             if let Some(r) = reserve.as_mut() {
                 r.tick();
@@ -408,9 +462,19 @@ fn class_bytes(k: u32) -> u64 {
     (1u64 << k) + (1u64 << k >> 6).max(4096)
 }
 
-/// How long a new object waits before it is replicated (see watch).
+/// How long a new object waits before it is replicated (see watch):
+/// `CHIMAERA_REPLICA_DELAY_MS`, default 0. At once, there is no window in
+/// which a dead peer takes a `put` value with it (a call's result can be made
+/// again, a put cannot). A wait lets a reader on another peer fetch it first,
+/// which then counts as the copy and saves a transfer.
 #[cfg(target_os = "linux")]
-const REPLICA_DELAY: Duration = Duration::from_secs(1);
+fn replica_delay() -> Duration {
+    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let ms = std::env::var("CHIMAERA_REPLICA_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok());
+        Duration::from_millis(ms.filter(|&m| m <= 60_000).unwrap_or(0))
+    })
+}
 
 fn is_object_name(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
@@ -535,7 +599,7 @@ fn watch(
     }
 }
 
-/// Copy `<run_dir>/<name>` to this peer's successor after REPLICA_DELAY,
+/// Copy `<run_dir>/<name>` to this peer's successor after replica_delay(),
 /// unless another peer fetched it meanwhile (that copy suffices) or it was
 /// freed. The grace keeps a replica from competing with a reader on another
 /// peer for this peer's bandwidth.
@@ -559,7 +623,7 @@ fn replicate_one(
     }
     let mesh = mesh.clone();
     rt.spawn(async move {
-        tokio::time::sleep(REPLICA_DELAY).await;
+        tokio::time::sleep(replica_delay()).await;
         // At most REPLICAS_AT_ONCE objects being copied; the rest wait their turn.
         let Ok(_turn) = replica_turns().acquire().await else { return };
         if tokio::fs::metadata(&path).await.is_err() {
@@ -662,6 +726,33 @@ fn held_objects(dir: &Path) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_dead_peers_leave_in_a_shared_root_is_freed_but_a_restartable_peers_objects_stay() {
+        let (root, data) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let me = std::process::id();
+        let peer = |name: &str, owner: Option<String>| {
+            let d = root.path().join(name);
+            std::fs::create_dir_all(d.join(".reserve")).unwrap();
+            std::fs::create_dir_all(d.join("run")).unwrap();
+            std::fs::write(d.join("run/obj"), b"x").unwrap();
+            if let Some(o) = owner {
+                std::fs::write(d.join(OWNER), o).unwrap();
+            }
+            d
+        };
+        let own = peer("chimaera-own", Some("999999999\n/nonexistent\n".to_string()));
+        let gone = peer("chimaera-gone", Some("999999999\n/nonexistent/peer\n".into()));
+        let resting = peer("chimaera-resting", Some(format!("999999999\n{}\n", data.path().display())));
+        let live = peer("chimaera-live", Some(format!("{me}\n/nonexistent/peer\n")));
+        let unknown = peer("chimaera-unknown", None);
+        assert_eq!(sweep_peers(&own), (1, 1));
+        assert!(!gone.exists(), "its data directory is gone: it will not come back");
+        assert!(!resting.join(".reserve").exists() && resting.join("run/obj").exists(), "may restart: objects stay");
+        assert!(live.join(".reserve").exists() && unknown.join(".reserve").exists(), "running, or unknown: kept");
+        assert!(own.join(".reserve").exists(), "never its own");
+        assert_eq!(sweep_peers(&data.path().join("objects")), (0, 0), "a store in its own data dir has no neighbours");
+    }
 
     #[test]
     fn arenas_of_dead_processes_are_swept_and_live_ones_kept() {

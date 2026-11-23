@@ -57,6 +57,10 @@ impl SnapshotDue {
 pub struct GroupEvents {
     pub group: u32,
     pub events: Vec<Event>,
+    /// The group's state was replaced wholesale (a snapshot installed): the
+    /// commands it skipped produced no events, so anything waiting on this
+    /// replica must look at the state again.
+    pub reloaded: bool,
 }
 
 pub(crate) fn prefix(group: u32) -> [u8; 4] {
@@ -251,7 +255,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         }
         if !events.is_empty() {
             // A dropped receiver means the peer is shutting down; state is already committed.
-            let _ = self.events.send(GroupEvents { group: self.group, events }).await;
+            let _ = self.events.send(GroupEvents { group: self.group, events, reloaded: false }).await;
         }
         Ok(())
     }
@@ -310,6 +314,7 @@ impl RaftStateMachine<TypeConfig> for StateMachine {
         .await
         .map_err(io_err)??;
         self.since_checkpoint = 0;
+        let _ = self.events.send(GroupEvents { group: self.group, events: Vec::new(), reloaded: true }).await;
         Ok(())
     }
 

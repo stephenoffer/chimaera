@@ -52,6 +52,11 @@ def ones(n: int):
     return np.ones(n)
 
 
+@ch.remote
+def echo(x):
+    return x
+
+
 def _run_dir() -> str:
     rt = Runtime.get()
     return os.path.join(rt.object_dir, rt.run.hex())
@@ -93,6 +98,48 @@ def _stored_since(before: set[str], min_bytes: int = 2 << 20) -> int:
         if st.st_size >= min_bytes:
             inodes.add(st.st_ino)
     return len(inodes)
+
+
+def test_pickling_large_bytes_or_str_leaves_nothing_holding_them():
+    # A worker returning large bytes must not keep them: a class made per call
+    # sat in a reference cycle until the next garbage collection, and every
+    # returned value stayed in memory (on Linux, an arena file in /dev/shm).
+    import tracemalloc
+
+    b = b"x" * (4 << 20)
+    s = "y" * (4 << 20)
+    base = sys.getrefcount(b)
+    gc.disable()
+    tracemalloc.start()
+    try:
+        _serde.dumps_parts(b)
+        assert sys.getrefcount(b) == base, "something still holds the pickled bytes"
+        before = tracemalloc.get_traced_memory()[0]
+        _serde.dumps_parts(s)
+        kept = tracemalloc.get_traced_memory()[0] - before
+        assert kept < 1 << 20, f"{kept >> 20} MiB of the encoded str is still held"
+    finally:
+        tracemalloc.stop()
+        gc.enable()
+
+
+def test_a_worker_returning_large_bytes_keeps_none_of_them():
+    # On Linux each large bytes value is an arena file of its worker; kept
+    # alive after the call, one more stayed in /dev/shm per call. Freed
+    # allocations wait in a reuse cache of at most 256 MiB per worker, so 24
+    # calls of 64 MiB (more than six per worker) tell the two apart.
+    @ch.remote
+    def blob(i):
+        return bytes([i]) * (64 << 20)
+
+    for i in range(24):
+        assert len(blob.remote(i).result(timeout=60)) == 64 << 20
+    arena = os.path.join(Runtime.get().object_dir, ".arena")
+    held = {
+        d: sum(os.path.getsize(os.path.join(arena, d, f)) for f in os.listdir(os.path.join(arena, d)))
+        for d in (os.listdir(arena) if os.path.isdir(arena) else [])
+    }
+    assert all(n <= 320 << 20 for n in held.values()), {d: n >> 20 for d, n in held.items()}
 
 
 def test_large_results_released_mid_run_free_their_files():
@@ -222,9 +269,13 @@ def test_a_fetched_value_passed_straight_back_warns():
 def test_cpu_tensors_travel_out_of_band():
     torch = pytest.importorskip("torch")  # only where torch is installed
     t = torch.arange(1 << 20, dtype=torch.float64)
-    before = _files()
+    # Its 8 MiB are a blob named by their content, not bytes in the call frame.
+    # (Checked on the encoding: a call's argument blobs are freed when it ends.)
+    rt = Runtime.get()
+    enc = _values.encode_frame(((t,), {}), rt.run, rt.blob_sink, None)
+    assert enc.blobs == {bytes.fromhex(_blob_name(t.numpy())): t.numel() * 8}
+    assert enc.size < 4096, enc.size
     assert total.remote(t).result(timeout=60) == float(t.sum())
-    assert _files() - before == {_blob_name(t.numpy())}
 
 
 def test_a_large_python_collection_shared_with_calls_warns_once_per_site(monkeypatch):
@@ -562,3 +613,24 @@ def test_a_call_with_the_wrong_arguments_names_the_function():
         pair.remote(1)
     with pytest.raises(TypeError, match=r"unpack a list: ch.gather\(\*futures\)"):
         ch.gather([pair.remote(1, 2)])
+
+
+def test_a_shared_cuda_tensor_is_read_directly_only_on_its_own_machine():
+    # A put CUDA tensor carries an IPC handle for readers on its machine. One
+    # on another machine (another boot id), or its owner itself (which cannot
+    # open its own handle), reads the host copy instead; neither touches CUDA.
+    share = {"host": "another-machine", "pid": os.getpid() + 1, "gpu": "GPU-x", "args": ()}
+    assert _values._from_cuda_share(share, None) is None
+    here = _values._boot_id()
+    assert _values._from_cuda_share({**share, "host": here, "pid": os.getpid()}, None) is None
+    if here:  # Linux: a share from a process that is gone falls back too
+        assert _values._from_cuda_share({**share, "host": here}, None) is None
+
+
+def test_a_large_plain_dict_round_trips_through_put_an_argument_and_a_result():
+    # Encoded by the native plain-data codec (see test_plain) on every hop.
+    d = {f"k{i}": [i, float(i) / 3, str(i), None, i % 2 == 0, (i, b"x")] for i in range(20_000)}
+    assert ch.put(d).result() == d
+    assert length.remote(d).result(timeout=60) == len(d)
+    back = echo.remote(d).result(timeout=60)
+    assert back == d and type(back["k1"][4]) is bool and type(back["k1"][5]) is tuple

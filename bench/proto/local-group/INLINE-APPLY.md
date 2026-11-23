@@ -1,4 +1,4 @@
-# Design: apply ordinary calls inline in the local group (proposal, not applied)
+# Design: apply ordinary calls inline in the local group (applied 2026-11-22)
 
 **For:** chimaera-runtime-design-review, which owns `crates/chimaera-raft`.
 **From:** chimaera-8f, with the user's approval to propose it.
@@ -65,7 +65,9 @@ All existing local tests still pass: the randomized overlay test, the restart te
   - decrementing the counter before the events are sent;
   - skipping the counter check.
 
-## Status: built and measured in a scratch copy, not applied
+## Status: applied to the shared tree on 2026-11-22, with the user's approval
+
+It was built and measured in a scratch copy first; the results below are from that copy.
 
 `inline-apply.patch`, next to this note, is the change with its tests. `git apply --check` passes on the live tree.
 
@@ -92,6 +94,16 @@ All existing local tests still pass: the randomized overlay test, the restart te
 | Task call | 188 µs | 187 µs |
 
 Actor calls were faster in four of six rounds, equal in one and slower in one.
+
+**On the live tree after applying:** release build, interleaved with Ray 2.60, load 14–21, median of 4 runs.
+
+| p50 round trip | Chimaera | Ray 2.60 |
+|---|---:|---:|
+| Task call | 192.5 µs | 378 µs |
+| Actor call | 190.5 µs | 145 µs |
+
+Ray's actor round trip was lower in this run than in earlier ones (141–156 µs, against 163–185 µs before), so actor
+calls are still about 1.3× slower than Ray's, not level with them as expected.
 
 ## Expected effect (before measuring)
 

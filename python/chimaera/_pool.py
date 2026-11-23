@@ -21,7 +21,7 @@ from typing import Any, Generic, TypeVar
 
 from ._future import Future, Results
 from ._native import blake3_digest
-from ._options import Auto, Effective, signature_of
+from ._options import Auto, Effective, signature_of, validate
 
 C = TypeVar("C")
 
@@ -311,9 +311,17 @@ class _Routed:
 
 
 class _PoolMethod:
-    def __init__(self, pool: Pool[Any], name: str, pick: Any = None) -> None:
+    def __init__(self, pool: Pool[Any], name: str, pick: Any = None, opts: dict[str, Any] | None = None) -> None:
         self._pool, self._name = pool, name
         self._pick = pick or pool._pick  # the least busy replica, or a routed key's
+        self._opts = opts or {}
+
+    def options(self, **opts: Any) -> _PoolMethod:
+        """Settings for calls through this view, on whichever replica takes
+        each (``deadline``, ``max_attempts``, ``priority``...), as an actor
+        method's ``.options`` takes them."""
+        validate(opts, kind="view", target="function", source=f".options on pool method {self._name}")
+        return _PoolMethod(self._pool, self._name, self._pick, {**self._opts, **opts})
 
     def remote(self, *args: Any, **kwargs: Any) -> Future[Any]:
         lock = self._pool._lock
@@ -321,7 +329,10 @@ class _PoolMethod:
             r = self._pick()
             r.inflight += 1
         try:
-            f = getattr(r.actor, self._name).remote(*args, **kwargs)
+            method = getattr(r.actor, self._name)
+            if self._opts:
+                method = method.options(**self._opts)
+            f = method.remote(*args, **kwargs)
         except BaseException:
             with lock:
                 r.inflight -= 1

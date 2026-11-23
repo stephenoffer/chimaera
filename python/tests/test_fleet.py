@@ -48,15 +48,24 @@ def test_a_full_cell_runs_calls_in_another_and_survives_losing_it(monkeypatch):
     a = Cluster(3)
     try:
         b_peers, _ = peers(b)
-        # 1. 48 two-second calls on A's 12 CPUs take about 8 s; B takes some. (Each
-        # call waits 300 ms before it may leave, and B starts fresh workers.)
-        out = a.run(0, DRIVER.replace("SECS", "2.0").replace("N", "48"))
+        # Both cells' workers start before the timed run: this measures
+        # delegation. On a 4-CPU Linux container a peer's fresh workers took
+        # 2 s to start, and until they had, A had room of its own and sent
+        # nothing to B (B's calls began 2.5 s in, and the run took 8.1-8.5 s).
+        for cell in (a, b):
+            warm = cell.run(0, DRIVER.replace("SECS", "0.5").replace("N", "12"), timeout=120)
+            assert warm.returncode == 0, warm.stderr[-3000:]
+        # 1. 36 three-second calls: A's 12 CPUs alone can never do them in under
+        # 9 s (three rounds). B takes some, and the run beats that by 10%. (Each
+        # call waits 300 ms before it may leave, and B starts fresh workers: calls
+        # of a few seconds keep that from deciding the result on a small machine.)
+        out = a.run(0, DRIVER.replace("SECS", "3.0").replace("N", "36"))
         assert out.returncode == 0, out.stderr[-3000:]
         seconds, calls = result(out.stdout)
-        assert [i for i, _ in calls] == list(range(48))
+        assert [i for i, _ in calls] == list(range(36))
         in_b = sum(1 for _, node in calls if node in b_peers)
         assert in_b > 0, ("no call ran in cell B", seconds)
-        assert seconds < 6.5, (seconds, in_b)
+        assert seconds < 0.9 * 9.0, (seconds, in_b)
 
         # 2. Kill all of B while it runs A's calls: every call still returns, once.
         driver = a.driver(0, DRIVER.replace("SECS", "2.0").replace("N", "48"))

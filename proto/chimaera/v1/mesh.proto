@@ -86,6 +86,8 @@ message Member {
   uint64 memory_bytes = 6;
   repeated string gpus = 7;
   map<string, string> labels = 8;   // for Placement(require=, prefer=)
+  string host = 9;        // the machine (its boot id, or CHIMAERA_MACHINE_ID): peers with the same one share it
+  string object_dir = 10; // this peer's object store, which a peer on the same machine may read directly
 }
 
 message JoinRequest {
@@ -119,6 +121,9 @@ message RaftRequest {
   uint32 group = 2;
   uint32 kind = 3;
   bytes body = 4;
+  // The node it is for. A peer that restarted under a new identity at the
+  // old one's address refuses it (0: not stated).
+  uint64 target = 5;
 }
 
 message RaftReply {
@@ -131,6 +136,7 @@ message SnapshotChunk {
   bytes header = 3;    // first chunk only: postcard (vote, snapshot meta)
   uint64 size = 4;     // first chunk only: the file's length
   bytes data = 5;
+  uint64 target = 6;   // first chunk only: the node it is for (see RaftRequest)
 }
 
 message ProposeRequest {

@@ -12,6 +12,7 @@ from ._errors import (
     Infeasible,
     InfrastructureFailure,
     LeaseLost,
+    NonRetryable,
     NotFound,
     OptionsError,
     OutcomeUnknown,
@@ -30,7 +31,7 @@ from ._gang import GangFailed
 
 __all__ = [
     "ActorDied", "BudgetExceeded", "Cancelled", "ChimaeraError", "Closed", "CommandConflict", "DataLost",
-    "DeadlineExceeded", "GangFailed", "Infeasible", "InfrastructureFailure", "LeaseLost", "NotFound", "OptionsError",
+    "DeadlineExceeded", "GangFailed", "Infeasible", "InfrastructureFailure", "LeaseLost", "NonRetryable", "NotFound", "OptionsError",
     "OutOfMemory", "OutcomeUnknown", "Overloaded", "PreflightError", "QuorumLost", "RemoteError", "SerializationError",
     "StreamInterrupted", "VersionConflict", "WorkerCrashed", "WorkflowDivergence",
 ]

@@ -112,6 +112,16 @@ impl Router {
         self.groups.read().expect("lock").values().cloned().collect()
     }
 
+    /// Whether this peer's replica of the group owning `vshard` is current:
+    /// it leads the group, or heard from its leader within the last 2 s. A
+    /// replica that is catching up, or that the leader is backing off from,
+    /// may not apply a command for a long time.
+    pub fn current(&self, vshard: u16) -> bool {
+        let g = self.group_of(vshard);
+        self.leads(g)
+            || self.hosted(g).and_then(|grp| grp.since_leader_contact()).is_some_and(|d| d < Duration::from_secs(2))
+    }
+
     /// Whether this peer hosts a replica of the group owning `vshard`.
     pub fn hosts(&self, vshard: u16) -> bool {
         self.groups.read().expect("lock").contains_key(&self.group_of(vshard))

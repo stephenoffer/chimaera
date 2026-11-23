@@ -15,7 +15,14 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(60);
 /// stop the peers, and return the command's exit code. `dir` is each
 /// node's data directory (default `$TMPDIR/chimaera-$SLURM_JOB_ID`); it
 /// must be node-local.
-pub async fn launch(dir: Option<PathBuf>, port: Option<u16>, command: &[String]) -> Result<u8, String> {
+/// `ca`: a cluster CA the caller passed in (spares joining from another
+/// job); else one is made for the job.
+pub async fn launch(
+    dir: Option<PathBuf>,
+    port: Option<u16>,
+    command: &[String],
+    ca: Option<(String, String)>,
+) -> Result<u8, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     let Some(job) = env.get("SLURM_JOB_ID").cloned() else {
         return Err("slurm-launch runs inside a Slurm allocation (sbatch, or salloc then srun); \
@@ -42,6 +49,13 @@ pub async fn launch(dir: Option<PathBuf>, port: Option<u16>, command: &[String])
         Some(t) => t.clone(),
         None => super::new_token().map_err(|e| format!("cannot make a cluster token: {e}"))?,
     };
+    // Likewise the cluster CA: the peers issue themselves certificates from
+    // it (mutual TLS); it travels in the environment, as the token does.
+    use crate::tls::{CA_KEY_ENV, CA_PEM_ENV};
+    let (ca_pem, ca_key) = match ca {
+        Some(ca) => ca,
+        None => crate::tls::new_ca().map_err(|e| format!("cannot make the cluster CA: {e}"))?,
+    };
     let exe = std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?;
     let n = nodes.to_string();
     let mut srun = tokio::process::Command::new("srun");
@@ -52,6 +66,8 @@ pub async fn launch(dir: Option<PathBuf>, port: Option<u16>, command: &[String])
         .arg(&dir)
         .args(["peer", "start", "--provider", "slurm"])
         .env("CHIMAERA_CLUSTER_TOKEN", token)
+        .env(CA_PEM_ENV, &ca_pem)
+        .env(CA_KEY_ENV, &ca_key)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     if let Some(p) = port {
@@ -83,7 +99,9 @@ pub async fn launch(dir: Option<PathBuf>, port: Option<u16>, command: &[String])
         dir.display(),
         command.join(" ")
     );
-    let status = run_command(command, &dir).await;
+    // The command gets the CA too: spares it starts (`autoscale --slurm`,
+    // sbatch passes the environment on) join with it.
+    let status = run_command(command, &dir, &[(CA_PEM_ENV, &ca_pem), (CA_KEY_ENV, &ca_key)]).await;
     stop(&mut peers).await;
     // As `chimaera run`: the command's exit code, 1 if a signal ended it.
     status.map(|s| s.code().map_or(1, |c| c.clamp(0, 255) as u8))
@@ -93,10 +111,15 @@ pub async fn launch(dir: Option<PathBuf>, port: Option<u16>, command: &[String])
 /// first (SIGTERM from scancel or preemption, or SIGUSR1 from
 /// `sbatch --signal=B:USR1@SECONDS` before the time limit), pass SIGTERM on
 /// to the command and wait for it, so the peers stop only after it does.
-async fn run_command(command: &[String], dir: &std::path::Path) -> Result<std::process::ExitStatus, String> {
+async fn run_command(
+    command: &[String],
+    dir: &std::path::Path,
+    env: &[(&str, &str)],
+) -> Result<std::process::ExitStatus, String> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut child = tokio::process::Command::new(&command[0])
         .args(&command[1..])
+        .envs(env.iter().copied())
         .env("CHIMAERA_HOME", dir)
         .spawn()
         .map_err(|e| format!("cannot run {}: {e}", command[0]))?;

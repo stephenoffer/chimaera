@@ -198,7 +198,7 @@ fn write_synced(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 /// Identifies this boot of the machine: it changes on every reboot.
-fn boot_id() -> Option<String> {
+pub(crate) fn boot_id() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string())

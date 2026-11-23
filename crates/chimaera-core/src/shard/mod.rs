@@ -418,7 +418,7 @@ impl ShardState {
                     message: format!("host peer {} incarnation {} was retired", peer.0.hex(), peer.1),
                     ..Default::default()
                 };
-                self.actor_lost(cx, v, actor, rec, reason);
+                self.actor_lost(cx, v, actor, rec, reason, true);
                 affected += 1;
             }
         }
@@ -614,6 +614,22 @@ impl ShardState {
             };
             cx.kv.put(pins_key(tk), (1 + early).to_be_bytes().to_vec());
             rec.set_state(TState::Pending);
+            // A call the direct path already ran: done with its outcome, never
+            // placed. It could only run once its prerequisites (the actor's
+            // constructor) were met, so it waits on and pins none of them.
+            if let Some(spec) = rec.spec.as_mut()
+                && let Some(ran) = spec.ran.take()
+            {
+                spec.deps.clear();
+                rec.attempts.push(pb::Attempt { attempt: 1, peer: grant_to.map(peer_pb), ..Default::default() });
+                rec.next_attempt = 2;
+                let mut outcome = ran.outcome.unwrap_or_default();
+                outcome.attempt = 1;
+                outcome.peer = grant_to.map(peer_pb);
+                let rec = self.finish(cx, tk, rec, outcome);
+                acks.push(ack_rec(tk, Status::Accepted, &rec));
+                continue;
+            }
             // Cancelling a call cancels what it submitted, including calls a
             // cancelled body submits afterwards (cancellation is cooperative).
             let submitter = spec.parent.as_ref().and_then(Tk::parse);

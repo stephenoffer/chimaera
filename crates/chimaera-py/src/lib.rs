@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 mod objects;
+mod plain;
 
 const BATCH_MAX: usize = 64;
 const BATCH_WINDOW: Duration = Duration::from_micros(200);
@@ -383,6 +384,16 @@ struct CallSpec {
     /// A generator call: items stream back as they are yielded.
     #[pyo3(item, default)]
     stream: bool,
+    /// An actor call: the key of the previous call on the same handle.
+    #[pyo3(item, default)]
+    prev: Option<Vec<u8>>,
+    /// A call the direct path already ran: (outcome as an executor reports
+    /// it, entry ns, exit ns, executor CPU ns, executor id). Recorded as done.
+    #[pyo3(item, default)]
+    ran: Option<(Py<PyTuple>, u64, u64, u64, u32)>,
+    /// Sent straight to its actor's executor: the peer notes it in flight.
+    #[pyo3(item, default)]
+    direct: bool,
 }
 
 impl CallSpec {
@@ -424,6 +435,20 @@ impl CallSpec {
             command_id: self.command_id,
             command_fingerprint: self.command_fingerprint,
             stream: self.stream,
+            prev: self.prev.map(|p| task_key(&p)).transpose()?,
+            ran: self
+                .ran
+                .map(|(outcome, entry_unix_ns, exit_unix_ns, cpu_ns, executor)| {
+                    Ok::<_, PyErr>(pb::Ran {
+                        outcome: Some(outcome_from(outcome.bind(py))?),
+                        entry_unix_ns,
+                        exit_unix_ns,
+                        cpu_ns,
+                        executor,
+                    })
+                })
+                .transpose()?,
+            direct: self.direct,
         })
     }
 }
@@ -626,6 +651,7 @@ impl Client {
         d.set_item("memory_bytes", self.info.memory_bytes)?;
         d.set_item("version", &self.info.version)?;
         d.set_item("gpus", self.info.gpus.clone())?;
+        d.set_item("direct_actor_calls", self.info.direct_actor_calls)?;
         Ok(d)
     }
 
@@ -1040,13 +1066,23 @@ impl Client {
     }
 
     /// Copy an object from the connected peer (which fetches it first if another
-    /// peer holds it) into the file `path`, checking each chunk's checksum.
-    fn fetch_object(&self, py: Python<'_>, run: Vec<u8>, object_id: Vec<u8>, path: String) -> PyResult<()> {
+    /// peer holds it, or runs `task` again if every copy is lost) into the file
+    /// `path`, checking each chunk's checksum.
+    #[pyo3(signature = (run, object_id, path, task=None))]
+    fn fetch_object(
+        &self,
+        py: Python<'_>,
+        run: Vec<u8>,
+        object_id: Vec<u8>,
+        path: String,
+        task: Option<Vec<u8>>,
+    ) -> PyResult<()> {
         let mut peer = self.peer.clone();
+        let task = task.map(|t| task_key(&t)).transpose()?;
         py.detach(|| {
             runtime().block_on(async move {
                 let missing = |e: tonic::Status| PyFileNotFoundError::new_err(e.message().to_string());
-                peer.localize(pb::LocalizeRequest { run: run.clone(), object_id: object_id.clone() })
+                peer.localize(pb::LocalizeRequest { run: run.clone(), object_id: object_id.clone(), task })
                     .await
                     .map_err(missing)?;
                 let req = pb::GetObjectRequest { run, object_id, offset: 0, len: 0 };
@@ -1126,9 +1162,11 @@ impl Client {
     }
 
     /// Have the peer bring an object produced elsewhere into its store.
-    fn localize(&self, py: Python<'_>, run: Vec<u8>, object_id: Vec<u8>) -> PyResult<()> {
+    #[pyo3(signature = (run, object_id, task=None))]
+    fn localize(&self, py: Python<'_>, run: Vec<u8>, object_id: Vec<u8>, task: Option<Vec<u8>>) -> PyResult<()> {
         let mut peer = self.peer.clone();
-        let req = pb::LocalizeRequest { run, object_id };
+        let task = task.map(|t| task_key(&t)).transpose()?;
+        let req = pb::LocalizeRequest { run, object_id, task };
         py.detach(|| runtime().block_on(async move { peer.localize(req).await }))
             .map(|_| ())
             .map_err(|e| PyFileNotFoundError::new_err(e.message().to_string()))
@@ -1493,11 +1531,20 @@ impl ExecConn {
         py.detach(|| write_msg(&self.writer, pb::ExecToPeer { msg: Some(pb::exec_to_peer::Msg::Log(log)) }))
     }
 
-    fn send_blocked(&self, py: Python<'_>, key: Vec<u8>, blocked: bool, waiting_on: Vec<Vec<u8>>) -> PyResult<()> {
+    #[pyo3(signature = (key, blocked, waiting_on, host=false))]
+    fn send_blocked(
+        &self,
+        py: Python<'_>,
+        key: Vec<u8>,
+        blocked: bool,
+        waiting_on: Vec<Vec<u8>>,
+        host: bool,
+    ) -> PyResult<()> {
         let msg = pb::ExecBlocked {
             task: Some(task_key(&key)?),
             blocked,
             waiting_on: waiting_on.iter().map(|k| task_key(k)).collect::<PyResult<_>>()?,
+            host,
         };
         py.detach(|| write_msg(&self.writer, pb::ExecToPeer { msg: Some(pb::exec_to_peer::Msg::Blocked(msg)) }))
     }
@@ -1527,6 +1574,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hlc_of_ms, m)?)?;
     m.add_function(wrap_pyfunction!(timeout_error, m)?)?;
     objects::register(m)?;
+    plain::register(m)?;
     m.add("WIRE_VERSION", chimaera_proto::WIRE_VERSION)?;
     Ok(())
 }

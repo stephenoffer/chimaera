@@ -156,12 +156,19 @@ class Encoded:
 
 
 def store(
-    value: Any, run: bytes, sink: LocalBlobSink, inline_limit: int, prefix: bytes = b""
+    value: Any,
+    run: bytes,
+    sink: LocalBlobSink,
+    inline_limit: int,
+    prefix: bytes = b"",
+    device_holds: list[Any] | None = None,
 ) -> tuple[bytes, bytes | None, int, list[str]]:
     """Store one value (``ch.put``): (object id, inline bytes or None, size,
     files that only this value uses). Local ids start with `prefix`: a put
     made inside a call passes its run's prefix, so its files are named like
     results and outlive the run's values (the call may return the handle).
+    With `device_holds`, large CUDA tensors are also shared with readers on
+    this machine (see _cuda_share) and added to it, for the caller to keep.
 
     Locally nothing is hashed: arena arrays are linked in place (no copy, see
     _objects), everything else is written once by the native writer, and the
@@ -177,7 +184,13 @@ def store(
                 owned.append(os.path.join(rdir, got[0].hex()))
             return got
 
-        parts, size, _ = _serde.dumps_parts(value, external=claim)
+        if device_holds is not None:
+            _put_holds.list = device_holds
+        try:
+            parts, size, _ = _serde.dumps_parts(value, external=claim)
+        finally:
+            if device_holds is not None:
+                del _put_holds.list
         object_id = prefix + os.urandom(16 - len(prefix))
         if size <= inline_limit:
             return object_id, b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts), size, owned
@@ -557,7 +570,8 @@ def torch_reducers() -> dict[type, Callable[[Any], Any]]:
                 payload: Any = host.contiguous().numpy()
             except (TypeError, RuntimeError):  # dtypes NumPy lacks: torch pickles the host copy
                 payload = host
-            return (tensor_on_device, (payload, "cuda"))
+            share = _cuda_share(t)
+            return (tensor_on_device, (payload, "cuda", share) if share else (payload, "cuda"))
         if t.device.type != "cpu" or t.requires_grad or t.is_sparse or not t.is_contiguous():
             return t.__reduce_ex__(5)
         try:
@@ -572,16 +586,99 @@ def torch_reducers() -> dict[type, Callable[[Any], Any]]:
 _device_warned: set[str] = set()
 
 
-def tensor_on_device(payload: Any, kind: str) -> Any:
+# While ch.put stores a value: CUDA tensors shared with readers on this
+# machine (see _cuda_share), which the put's future then keeps alive.
+_put_holds = threading.local()
+# Shared tensors whose future was passed on: kept for this process's life.
+_kept_device: list[Any] = []
+_SHARE_MIN = 1 << 20
+# Tensors this process read straight from another process's GPU memory.
+cuda_shared_reads = 0
+
+
+def _boot_id() -> str:
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""  # CUDA IPC is Linux's: no sharing elsewhere
+
+
+def _cuda_share(t: Any) -> dict[str, Any] | None:
+    """A CUDA IPC handle to `t` that a process on this machine can open to
+    read it straight from this GPU, without the host copy. Only while a
+    ch.put stores it: the put's future then holds `t`, so the memory a handle
+    names is never freed and reused while a reader may still open it.
+    ``CHIMAERA_CUDA_IPC=0`` turns this off."""
+    holds = getattr(_put_holds, "list", None)
+    host = _boot_id()
+    if holds is None or not host or os.environ.get("CHIMAERA_CUDA_IPC", "1") == "0":
+        return None
+    if t.numel() * t.element_size() < _SHARE_MIN:
+        return None  # small: the host copy costs less than the handle
+    try:
+        import torch
+        from torch.multiprocessing.reductions import reduce_tensor as torch_reduce
+
+        t = t.detach().contiguous()
+        _, args = torch_reduce(t)
+        gpu = str(torch.cuda.get_device_properties(t.device).uuid)
+    except Exception:  # noqa: BLE001 -- sharing is an optimization; the host copy is always there
+        return None
+    holds.append(t)
+    return {"host": host, "pid": os.getpid(), "gpu": gpu, "args": args}
+
+
+def _from_cuda_share(share: dict[str, Any], target: str | None) -> Any:
+    """The tensor read from its owner's GPU memory when this process is on
+    the same machine and sees that GPU, copied device to device onto `target`
+    (or that GPU), so a write stays in the reader as for every value. None
+    when it cannot be: the caller uses the host copy."""
+    if share.get("host") != _boot_id() or share.get("pid") == os.getpid():
+        return None  # another machine, or the owner itself (it cannot open its own handle)
+    try:
+        import torch
+        from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
+        n = torch.cuda.device_count()
+        index = next((i for i in range(n) if str(torch.cuda.get_device_properties(i).uuid) == share["gpu"]), None)
+        if index is None:
+            return None  # that GPU is not visible to this process
+        args = list(share["args"])
+        args[6] = index  # the owner's device index, as this process numbers its GPUs
+        src = rebuild_cuda_tensor(*args)
+        out = src.to(target or src.device, copy=True)
+        del src
+        global cuda_shared_reads
+        cuda_shared_reads += 1
+        return out
+    except Exception:  # noqa: BLE001 -- the owner exited, or IPC is unavailable: the host copy
+        return None
+
+
+def keep_device_holds(holds: list[Any]) -> None:
+    """A put future holding shared CUDA tensors was passed on: copies of it
+    may be read for as long as this process lives, so the tensors stay."""
+    _kept_device.extend(holds)
+    holds.clear()
+
+
+def tensor_on_device(payload: Any, kind: str, share: dict[str, Any] | None = None) -> Any:
     """A tensor sent from a `kind` device: on this call's granted device of
     that kind; in the driver, on its current one if it has one; else on the
-    CPU, with a warning (CH112) instead of torch's load failure."""
+    CPU, with a warning (CH112) instead of torch's load failure. A CUDA tensor
+    put on this machine is read from its owner's GPU memory when this process
+    can see that GPU (`share`), else from the host copy."""
     import torch
 
     from ._devices import device, devices
 
-    t = payload if isinstance(payload, torch.Tensor) else torch.from_numpy(payload)
     granted = device()
+    if share is not None and kind == "cuda" and torch.cuda.is_available():
+        direct = _from_cuda_share(share, granted if granted.startswith("cuda") else None)
+        if direct is not None:
+            return direct
+    t = payload if isinstance(payload, torch.Tensor) else torch.from_numpy(payload)
     if granted.split(":")[0] == kind:
         return t.to(granted)
     if not devices() and kind == "cuda" and torch.cuda.is_available():

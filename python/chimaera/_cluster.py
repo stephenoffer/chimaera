@@ -261,3 +261,18 @@ class ClusterView:
 
 def cluster() -> ClusterView:
     return ClusterView()
+
+
+def on_every_peer(fn: Any, /, *args: Any, timeout: float | None = None, **kwargs: Any) -> dict[str, Any]:
+    """Run ``fn(*args, **kwargs)`` once on every live peer that is not
+    draining, and return ``{peer id: result}`` (ids as ``cluster().nodes()``
+    names them). It is for operations work, such as checking a version,
+    clearing a cache or trimming memory, not for computation. Each call waits
+    for room on its peer as any call does. An error on any peer is raised."""
+    from ._options import Placement
+    from ._remote import RemoteFunction, remote
+
+    f = fn if isinstance(fn, RemoteFunction) else remote(fn)
+    peers = [n.peer for n in cluster().nodes() if n.alive and not n.draining]
+    futures = {p: f.options(placement=Placement(require={"node": p})).remote(*args, **kwargs) for p in peers}
+    return {p: fut.result(timeout=timeout) for p, fut in futures.items()}

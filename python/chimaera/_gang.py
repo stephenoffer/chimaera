@@ -50,9 +50,9 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
 from ._errors import InfrastructureFailure
 from ._future import Future
@@ -276,6 +276,22 @@ def _fits(opts: dict[str, Any]) -> int:
     return total
 
 
+# How long a supervisor waits for its peer to see the peer of a lost rank go.
+PEER_LOSS_WAIT = 15.0
+
+
+def _await_peer_loss(node: str | None) -> None:
+    """A rank was lost on `node`. If its peer died, another peer may have
+    noticed first: wait (up to PEER_LOSS_WAIT) until this one counts it gone
+    too, so the next generation is not sized to fit on it. A worker that
+    died on a healthy peer costs the wait, and the peer still counts."""
+    from ._cluster import cluster
+
+    deadline = time.monotonic() + PEER_LOSS_WAIT
+    while node and time.monotonic() < deadline and any(n.peer == node and n.alive for n in cluster().nodes()):
+        time.sleep(0.25)
+
+
 def _size(want: int | Auto, opts: dict[str, Any], first: bool) -> tuple[int, str]:
     """This generation's rank count, and why (empty for a fixed count)."""
     if not isinstance(want, Auto):
@@ -385,11 +401,14 @@ def _supervise(fn: Any, args: tuple, kwargs: dict, want: int | Auto, attempts: i
         report = {"gang": gang, "generation": generation, "size": size, "ranks": [f.key.hex() for f in futures]}
         ctx.report(**report, **({"decision": f"generation {generation}: {why}"} if why else {}))
         lost: BaseException | None = None
+        lost_rank = -1
         try:
             for f in as_completed(futures):
+                lost_rank = futures.index(f)
                 f.result()  # raises the rank's error
         except InfrastructureFailure as e:
             lost = e
+            _await_peer_loss(store.get(f"{generation}/node/{lost_rank}"))
         except BaseException:
             for f in futures:
                 f.cancel(force=True)  # the others may be blocked in a collective with it
@@ -471,9 +490,15 @@ def start(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Gang[Any]:
     rank_opts = {k: v for k, v in eff.values.items() if k in _RANK_OPTIONS and eff.sources.get(k) != "default"}
     held = tuple(opaque(a) for a in args), {k: opaque(v) for k, v in kwargs.items()}
     supervisor = (fn, *held, _wanted(eff.get("ranks")), int(eff.get("max_attempts") or 3), rank_opts)
-    return submit_call(
-        Runtime.get(), _supervise._fn, supervisor, {}, kind=CALL_FUNCTION, eff=_supervise.policy(), site=_site(3), future_cls=Gang
-    )
+    rt = Runtime.get()
+    # The supervisor runs on this program's own peer. Elsewhere, losing its
+    # peer would leave its retry queued behind the ranks it has to cancel,
+    # which hold every CPU of a full cluster; this peer lives as long as the
+    # program that waits for the gang.
+    from ._options import Placement
+
+    here = _supervise.options(placement=Placement(require={"node": bytes(rt.info["peer"]).hex()}))
+    return submit_call(rt, _supervise._fn, supervisor, {}, kind=CALL_FUNCTION, eff=here.policy(), site=_site(3), future_cls=Gang)
 
 
 @remote

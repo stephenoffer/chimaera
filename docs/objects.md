@@ -59,7 +59,10 @@ that is still exact:
   rewrites, shares the first page with its data). pandas numeric columns,
   NumPy-backed torch tensors and nested structures of arrays take this path
   too. A growing arena block (a `bytearray` being extended) grows its file
-  and remaps in place, with no copy, until it is stored.
+  and remaps in place, with no copy, until it is stored. A new block of
+  8 MiB or more is populated on several threads as it is handed out, so the
+  code that fills it (a `str` encode, a read into a new `bytes`, a NumPy
+  copy) does not fault its pages in one 4 KiB page at a time.
 - **Other buffers: copied once, in parallel, onto warm pages.** The native
   writer fills the object file on up to 16 threads. It takes its pages from
   a reserve of pre-zeroed files that the peer keeps topped up in the
@@ -97,7 +100,19 @@ Reading maps the object's file copy-on-write. Arrays come back **writable**,
 and a write stays private to the reader. Ray returns read-only arrays, so
 `arr[0] = 1` raises there. A read costs about the same at 1 KB and at 1 GB
 (roughly 80 µs for a 1 GiB array), because pages fault in as they are
-touched.
+touched. On macOS a copy-on-write mapping costs more to set up (20 to 30 ms
+for 512 MiB, against 2 ms read-only), so large reads on a laptop are slower
+than on Linux.
+
+Three kinds of value are read rather than mapped:
+- a small object file, read whole: up to 1 MiB on Linux and 16 MiB on macOS,
+  where a first mapping costs about 2.5 ms;
+- a large `bytes` value, read with one `pread` from its file or linked blob
+  into the new `bytes` object (it must be copied anyway, and copying out of a
+  fresh mapping would pay a page fault per page as well);
+- one value of a stored tuple (a call with `returns=N`), which reads the
+  tuple's table and that value's bytes only (a shuffle's gather wants one
+  bucket of each scatter's file).
 
 ## Across hosts
 
@@ -109,6 +124,26 @@ blake3. On both ends a blocking thread does the file work and the hashing
 network. A reader that names an object without knowing its size first asks
 for one byte, which returns the size. HTTP/2 flow-control windows are fixed
 for bulk transfer: 8 MiB per stream and 32 MiB per connection.
+
+**Peers on the same machine** take an object straight from the holder's
+store instead of streaming it: each peer advertises its machine (the boot
+id) and its object directory, and when the holder shares this machine and
+its file is visible here, the fetch is a hard link (no bytes move, when the
+two stores share a filesystem) or a kernel copy. Anything else (another
+machine, a store this peer cannot see or read, a size that does not match)
+falls back to the network path. Processes under one peer always shared
+pages directly: they map the same object file.
+
+**CUDA tensors.** A tensor on a GPU is stored as a host copy (readable
+anywhere, and replicated like any object). A `ch.put` of a CUDA tensor of
+1 MiB or more also carries a CUDA IPC handle: a process on the same machine
+that can see that GPU copies the tensor device to device from the owner's
+memory, without the host round trip, onto its own device (a write stays in
+the reader). The putting process keeps the tensor alive while the put's
+future lives, and for its whole life once the future is passed on, so the
+memory a handle names is never freed while a reader may open it. Readers
+on other machines, readers that cannot see that GPU, and the owner itself
+use the host copy. `CHIMAERA_CUDA_IPC=0` turns the handle off.
 
 `ch.wait(fs, fetch_local=True)` also copies each finished value (its file
 and any blobs it names) to this host before returning, as Ray's
@@ -182,8 +217,16 @@ and any blobs it names) to this host before returning, as Ray's
 - **Dead processes.** A process that dies leaves its arena behind; the peer
   sweeps it every 10 s. Stored objects keep their own links, so sweeping
   never loses one.
+- **Dead peers.** A peer's object directory in a shared root (`/dev/shm`, a
+  huge-page tmpfs) names its owner (`.owner`: pid and data directory). Every
+  peer sweeps its neighbours every 10 s: a dead peer whose data directory is
+  gone loses its whole object directory; one that may restart (its data
+  directory is still there) keeps its objects and loses only its pre-zeroed
+  reserve.
 
 ## Settings
+
+A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or pod spec) takes its default.
 
 | variable | default | effect |
 |---|---|---|
@@ -193,7 +236,11 @@ and any blobs it names) to this host before returning, as Ray's
 | `CHIMAERA_SPILL_DIR` | the peer's `spill/` | where objects go past the memory limit: one directory or several, colon-separated |
 | `CHIMAERA_SPILL_THRESHOLD` | `0.8` | share of the memory pool past which the oldest objects move to disk |
 | `CHIMAERA_SPILL_THREADS` | `4` | objects copied to disk at once |
+| `CHIMAERA_SPILL_URL` | unset | spill to object storage (`s3://bucket/prefix`, `gs://`, `az://`, `file://`) instead of disk; needs a peer built with the `object-store-spill` cargo feature (off by default) |
+| `CHIMAERA_MACHINE_ID` | the boot id | peers with the same id take objects from each other's stores (tests set one per peer to stand for separate machines) |
+| `CHIMAERA_CUDA_IPC` | `1` | `0`: a put CUDA tensor carries no IPC handle; same-machine readers use the host copy |
 | `CHIMAERA_OBJECT_REPLICAS` | `1` | copies of each object on other peers; `0`: none |
+| `CHIMAERA_REPLICA_DELAY_MS` | `0` | how long a new object waits before it is copied to another peer. At `0` a `put` value is protected as soon as it is written. A wait (say `1000`) lets a reader on another peer make that copy instead, saving a transfer for objects read elsewhere soon after they are written, but a peer that dies within the wait takes the object with it |
 
 ## Compared with Ray's object store
 
@@ -206,26 +253,25 @@ and any blobs it names) to this host before returning, as Ray's
 | `object_store_memory` | `CHIMAERA_MEMORY_POOL` |
 | huge pages (`_plasma_directory` plus a flag) | a mounted huge-page tmpfs is found and used; `CHIMAERA_OBJECT_DIR` |
 | spill to local disk, `object_spilling_config` directories (one or several) | `spill/`, or the directories in `CHIMAERA_SPILL_DIR`, each in turn; past the hard cap, new objects are written to disk directly |
+| spill to S3 through `smart_open` (marked not for production) | `CHIMAERA_SPILL_URL`: S3, GCS, Azure or `file://`, uploaded in 16 MiB parts several at a time. A spilled object is downloaded on its first read (or when another peer fetches it), and its remote copy is deleted with its run. Credentials and region come from the usual `AWS_*`/`GOOGLE_*`/`AZURE_*` variables or the machine's role. An S3 bucket's region is looked up when none is set |
 | `object_spilling_threshold`, `max_io_workers` | `CHIMAERA_SPILL_THRESHOLD`, `CHIMAERA_SPILL_THREADS` |
 | restore: a copy back into the store | a mapping of the disk file: no copy |
 | `ObjectStoreFullError` after the fallback allocator fills | no store-full error: memory, then disk; a full disk is an `OSError` naming it |
 | `ray memory` | `chimaera objects`, `chimaera objects --cluster` (every live peer) |
 | store metrics in the dashboard | Prometheus `object_bytes`, `memory_used_bytes`, `replication_failures_total` |
 | chunked pull between nodes | parallel ranges over four connections, every chunk checked with blake3 (Ray checks nothing) |
-| lineage reconstruction of task outputs | replicas on the next peer, for task outputs *and* `put` values; lineage is in progress (review plan P5.2) |
+| lineage reconstruction of task outputs | both: replicas on the next peer, for task outputs *and* `put` values. When every copy of a call's result is lost, the call runs again on the reader's peer, under the same attempt, so it writes the same object and blob ids. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again; the chain is rebuilt depth first, three levels at most. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
 | `OwnerDiedError` when a `put`'s owner dies | the value is read from its replica |
 | ref counting, `free` | a `put` handle dropped without escaping is freed at once; a released value is deleted on every peer that fetched it; the rest go when their run ends |
 
 Not matched yet:
 
-- Spilling to S3 through `smart_open` (Ray marks it as not for production).
-  A network filesystem works as a spill directory today; object storage is
-  M3.
 - `min_spilling_size`: Ray packs small objects into larger spill files;
   Chimaera spills one file per object.
-- Device tensors moved between GPUs without the object store (Ray Direct
-  Transport, `_tensor_transport`): not part of either object store; P5 of
-  the layered-API plan.
+- Device tensors moved between GPUs on different machines without the
+  host copy (Ray Direct Transport over NCCL/NIXL, `_tensor_transport`): P5
+  of the layered-API plan. On one machine, a put CUDA tensor is read device
+  to device through CUDA IPC.
 
 ## Limits
 
@@ -234,15 +280,26 @@ Not matched yet:
   `str`, lists). Tensors from torch's own allocator, Arrow buffers, and
   values made before `ch.init` or while `tracemalloc` traces are copied
   once (in parallel, onto warm pages).
-- `str`, dicts of strings and object columns are pickled. Pickling bounds
-  their speed in both runtimes.
+- Large top-level dicts, lists and tuples of plain data (str, bytes, int to
+  64 bits, float, bool, None; no container reachable twice) go through a
+  native codec, faster than pickle both ways, and so do object arrays of
+  plain values (a pandas column of strings), with repeated strings kept as
+  one object. Nested containers and other types are pickled, which bounds
+  their speed in both runtimes. The codec does not share repeated strings the way pickle's memo
+  does: a plain list holding one string object a million times reads back as
+  a million strings (pickle already did this for such lists, which skipped
+  the memo when they were plain).
 - Before a fork, the parent's arena mappings become copy-on-write, so the
   child gets the usual private copy (Python object headers in the arena
   included). The parent's later writes to those blocks then copy pages, as
   after any fork.
-- Replicas cost one extra network transfer per object that no other peer
-  read. A peer that dies within about a second of writing an object can
-  lose that object, and so can losing a peer together with every peer
-  holding a copy (one by default: `CHIMAERA_OBJECT_REPLICAS`).
+- Replicas cost one extra network transfer per object. Each object is
+  copied as soon as it is written, so the window in which a dead peer takes
+  it along is the copy itself (64 MiB in well under 0.3 s on one host);
+  `CHIMAERA_REPLICA_DELAY_MS` trades that window for fewer transfers.
+  Losing a peer together with every peer holding a copy (one by default:
+  `CHIMAERA_OBJECT_REPLICAS`) loses the object too. A call's
+  result lost that way is made again by running its call (see the table
+  above); a `put` value is not.
   Replicas are made on Linux only (the replicator watches the store with
   inotify).

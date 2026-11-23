@@ -141,14 +141,16 @@ class _NumpyHook(importlib.abc.MetaPathFinder):
         return spec
 
 
-def claim(view: memoryview, run_dir: str, prefix: bytes = b"") -> tuple[bytes, int] | None:
+def claim(view: memoryview, run_dir: str, prefix: bytes = b"", blob: bytes | None = None) -> tuple[bytes, int] | None:
     """Store the arena allocation holding `view` as a blob of the run, by
     hard link: (blob id, offset of `view` in it), or None (not in the arena,
-    or changed since stored; the caller copies it). `prefix` starts the blob id
-    (results use their run's prefix so they outlive the run's values)."""
+    or changed since stored; the caller copies it). `prefix` starts a random
+    blob id (results use their run's prefix so they outlive the run's values);
+    `blob` names it instead."""
     if not _state["installed"]:
         return None
-    blob = prefix + os.urandom(16 - len(prefix))
+    if blob is None:
+        blob = prefix + os.urandom(16 - len(prefix))
     off = _native.arena_claim(view, os.path.join(run_dir, blob.hex()))
     return None if off is None else (blob, off)
 

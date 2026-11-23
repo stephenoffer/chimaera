@@ -180,6 +180,59 @@ def test_an_actor_is_charged_its_memory_once_while_a_call_runs(home):
     assert 300 <= used_mib < 600, f"{used_mib} MiB charged for one 300 MiB actor"
 
 
+def test_actors_wait_to_start_while_live_actors_fill_the_pool(home):
+    # Tiny-CPU actors each keeping 150 MiB: twelve of them would need about
+    # 2 GiB of a 1 GiB pool (Ray starts them all and the node runs out of
+    # memory). Here a few start, the rest wait with a reason, and closing
+    # finished ones lets the others start in turn.
+    r = run_script(
+        f"""
+        import json, os, subprocess, time
+        import numpy as np
+        import chimaera as ch
+
+        @ch.remote(cpus=0.01)
+        class Holder:
+            def __init__(self):
+                self.a = np.ones(150 * 2**20 // 8)
+
+            def pid(self):
+                return os.getpid()
+
+        actors = [Holder.remote() for _ in range(12)]
+        calls = [a.pid.remote() for a in actors]
+        ch.wait(calls, num_returns=1, timeout=120)
+        time.sleep(5)  # the first ones are measured; no more fit
+        started = [i for i, f in enumerate(calls) if f.done()]
+        waiting = [i for i, f in enumerate(calls) if not f.done()]
+        reason = calls[waiting[0]].explain()["pending_reason"] if waiting else ""
+        status = json.loads(subprocess.run(
+            [{BIN!r}, "--dir", {home!r}, "status", "--json"], capture_output=True, text=True, timeout=30
+        ).stdout)
+        left, deadline = set(range(12)), time.time() + 180
+        while left and time.time() < deadline:
+            for i in sorted(left):
+                if calls[i].done():
+                    calls[i].result()
+                    actors[i].close()
+                    left.discard(i)
+            time.sleep(0.2)
+        print(json.dumps({{"started": len(started), "used": status["memory_used"] >> 20, "reason": reason,
+                          "status": status["pending_reasons"], "never_ran": len(left)}}))
+        """,
+        home=home,
+        env={"CHIMAERA_MEMORY_POOL": "1GiB"},
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout.splitlines()[-1])
+    assert 1 <= out["started"] <= 6, out
+    assert out["used"] <= 1100, out
+    assert "its actor has not started" in out["reason"] and "handle.close()" in out["reason"], out
+    assert any("actor(s) waiting to start" in s for s in out["status"]), out
+    assert out["never_ran"] == 0, out
+
+
 def test_a_call_killed_for_memory_whose_retry_cannot_fit_is_out_of_memory(home):
     # Killed at its 150 MB limit, its retry needs at least 1.5× that, more
     # than the 200 MiB pool: the caller learns it ran out of memory.

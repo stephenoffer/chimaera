@@ -187,8 +187,16 @@ impl Profile {
         self.run(host, r#"chmod 755 "$B.new" && mv -f "$B.new" "$B""#, None).map(drop)
     }
 
-    fn start(&self, host: &str, seeds: &str, token: &str) -> Result<(), String> {
-        self.run(host, r#"umask 077 && mkdir -p "$D" && cat > "$D/token""#, Some(token))?;
+    fn start(&self, host: &str, seeds: &str, token: &str, ca: &Path) -> Result<(), String> {
+        // The cluster CA and token, in the directory `--tls-ca` reads: the
+        // peer issues itself a certificate from it (mutual TLS between peers,
+        // and TLS for drivers on the client port).
+        let read = |f: &str| std::fs::read_to_string(ca.join(f)).map_err(|e| format!("{}: {e}", ca.join(f).display()));
+        for (file, body) in [("token", format!("{token}\n")), ("ca.pem", read("ca.pem")?), ("ca.key", read("ca.key")?)]
+        {
+            let script = format!(r#"umask 077 && mkdir -p "$D/tls-ca" && cat > "$D/tls-ca/{file}""#);
+            self.run(host, &script, Some(&body))?;
+        }
         let args = [
             "--cluster",
             &self.name,
@@ -208,7 +216,7 @@ impl Profile {
         // holds ssh's stdout open and whose pid `$!` would name.
         let script = format!(
             r#"cd "$D" || exit 1
-               nohup "$B" --dir "$D" peer start --provider static --token-file "$D/token" {args} >> "$D/peer.log" 2>&1 < /dev/null &
+               nohup "$B" --dir "$D" peer start --provider static --tls-ca "$D/tls-ca" {args} >> "$D/peer.log" 2>&1 < /dev/null &
                echo $! > "$D/launch.pid""#
         );
         self.run(host, &script, None).map(drop)
@@ -244,17 +252,31 @@ fn token(path: &Path) -> Result<String, String> {
 pub fn up(name: &str) -> Result<u8, String> {
     let p = load(name)?;
     let token = token(&p.token_file)?;
+    // The cluster CA sits with the profile's credentials, where drivers look
+    // for `ca.pem` (python/chimaera/_cluster.py).
+    let ca = home().join(".chimaera/clusters").join(name);
+    let new_ca =
+        crate::tls::init_ca(&ca).map_err(|e| format!("cannot make the cluster CA in {}: {e}", ca.display()))?;
+    if new_ca {
+        eprintln!("chimaera: new cluster CA in {} (peers and drivers use TLS)", ca.display());
+    }
     let seeds = p.hosts.iter().take(MAX_FOUNDERS).map(|h| format!("{h}:{}", p.port)).collect::<Vec<_>>().join(",");
     let exe = std::env::current_exe().map_err(|e| format!("cannot find this binary: {e}"))?;
     for host in &p.hosts {
         if p.probe(host)? != "down" {
             eprintln!("chimaera: {host}: a peer is already running");
+            if new_ca {
+                eprintln!(
+                    "chimaera: {host}: it started before the cluster had a CA, so new peers cannot \
+                     talk to it; run `chimaera down {name}` and `chimaera up {name}` to restart all with TLS"
+                );
+            }
             continue;
         }
         if p.remote_bin.is_none() {
             p.copy_binary(host, &exe)?;
         }
-        p.start(host, &seeds, &token)?;
+        p.start(host, &seeds, &token, &ca)?;
         eprintln!("chimaera: {host}: started");
     }
     let started = Instant::now();

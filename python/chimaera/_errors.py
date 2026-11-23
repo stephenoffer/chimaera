@@ -26,6 +26,12 @@ class RemoteError(ChimaeraError):
         self.remote_traceback = remote_traceback
 
 
+class NonRetryable(Exception):
+    """Raise it, or an exception class that also derives from it, for a failure
+    that retrying cannot fix (bad input, a permission refused). Such an error is
+    never retried, whatever the call's ``retry_exceptions`` says."""
+
+
 class OutcomeUnknown(ChimaeraError):
     """A call with external effects may or may not have taken effect."""
 

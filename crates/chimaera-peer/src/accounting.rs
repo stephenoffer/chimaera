@@ -2,7 +2,8 @@
 //!
 //! An executor runs one attempt at a time, so the difference between two
 //! readings of its process is that attempt's CPU time (scope `process`, exact
-//! for the interval). The peak resident size the OS reports is a high-water
+//! for the interval). While one waits beside another (`sharing`), the readings
+//! are taken at each change and each interval goes to the attempt running. The peak resident size the OS reports is a high-water
 //! mark for the whole process lifetime, so it is labelled `process_lifetime`:
 //! reporting it as the attempt's own peak would misattribute an earlier
 //! attempt's allocation (the design doc's 8/64/8 MiB example).

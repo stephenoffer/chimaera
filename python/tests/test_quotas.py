@@ -103,6 +103,8 @@ def test_a_cluster_share_caps_a_tenant_across_peers(monkeypatch):
         # hear each other's report may overshoot briefly, never for the whole run.
         assert seconds >= 4.5, (seconds, peak)
         open_seconds, open_peak = run("web")  # no share: uses the whole cluster
-        assert open_seconds < 3.5 and open_peak > 2, (open_seconds, open_peak)
+        # Measured against the capped run, not a fixed time: on a 4-CPU Linux
+        # container a peer's fresh workers took 2 s to start (3.7 s in all).
+        assert open_peak > 2 and open_seconds < 0.8 * seconds, (open_seconds, open_peak, seconds)
     finally:
         cluster.close()

@@ -169,6 +169,39 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 | `replicas` | Pool size, or `ch.auto(...)` (P4 controller). |
 | `latency="interactive"` | Never batch these calls. |
 | `adaptive` | `"on"` (default: learned reservations apply), `"observe"` (record proposals only) or `"frozen"` (no learning). See [resources](guides/resources.md). |
+| `cache` | `True` (keep results 7 days) or a time to live (`"30d"`): a repeat of a call returns its stored result. See [Caching results](#caching-results). |
+
+### Caching results
+
+`cache=True` reuses a function's earlier result when its code, its arguments and
+the environment (the installed packages and the project's Python files) are the
+same. A hit is a finished future, and nothing runs. **Runs today:**
+
+```python run
+@ch.remote(cache=True)                     # cache="30d" keeps results longer than the default 7 days
+def features(path: str, version: int) -> int:
+    return len(path) * version             # stands in for an expensive step
+
+assert features.remote("data/a.csv", 1).result() == 10
+again = features.remote("data/a.csv", 1)
+assert again.result() == 10 and again.explain()["cache"] == "hit"   # nothing ran
+```
+
+- Only functions with `effects="none"` that are deterministic can be cached;
+  anything else is an `OptionsError`.
+- Arguments are keyed by value when they are plain data (None, bool, int, float,
+  str, bytes, and lists, tuples or dicts with str keys of these), futures of other
+  cached calls (so a pipeline of cached calls hits from end to end), or small
+  `ch.put` values. Any other argument runs the call uncached, with one warning
+  per function.
+- Results up to 1 MiB pickled are stored in the cluster's replicated store,
+  scoped to your tenant. Errors are not stored.
+- Files and services the function reads are not part of the key. Pass what
+  identifies them, such as a modification time or a dataset version, as an
+  argument.
+- A function from a script or notebook is keyed by its own code, so editing
+  other cells keeps its results. Adding lines above it in the same file moves
+  its line numbers, which is a miss.
 
 ### Waiting on many futures
 

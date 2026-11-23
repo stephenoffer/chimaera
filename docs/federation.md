@@ -53,7 +53,8 @@ outcome or reported a failure, exactly as for local work. P does the rest:
    and submits X's spec under the shadow run. The shadow run gets the owning
    run's interpreter, working directory and import path. P then watches X's
    outcome, fetching large results with `GetObject` (a result stored in parts
-   comes with its parts), and publishes it in its own cell as the attempt's
+   comes with its parts, and a result's buffers stored apart from it, its
+   `blobs`, come too), and publishes it in its own cell as the attempt's
    outcome.
 4. **Failure.** If the other cell is unreachable, loses the call, or fails it
    for an infrastructure reason, X goes back to P's own queue, and P marks
@@ -113,8 +114,10 @@ CHIMAERA_CELL=a@10.0.0.5:7710            # this cell's name and the endpoint oth
 
 `python/tests/test_fleet.py` runs two cells of three 4-CPU peers on one
 machine:
-1. 48 two-second calls in a run of A, which alone needs about 8 s. Some run in
-   B, and the run takes under 6.5 s.
+1. 36 three-second calls in a run of A, which alone can never take under 9 s
+   (three rounds on its 12 CPUs). Some run in B, and the run takes under 90%
+   of that. (It was 48 two-second calls under 6.5 s, which failed on a 4-core
+   Linux container: there B's fresh workers started too slowly to matter.)
 2. Every peer of B is killed mid-run. All 48 calls return, each exactly once,
    within A's own time plus one retry of what B held.
 3. B's peers restart from their directories, and B serves a new run.
@@ -123,7 +126,9 @@ More tests run 48 calls that each read the same 4 MiB array, passed directly
 or as a `ch.put` value: some run in B, which got the array once, and every call
 reads all of it. Another returns three values per call, stored in parts in B
 (see `docs/api.md`, multiple returns): every value comes back,
-whole and one at a time.
+whole and one at a time. A last one returns an 8 MiB array per call, which on
+Linux is linked from B's arena as a buffer of its own; every array arrives
+whole (Linux run pending; it passes on macOS, where there is no arena).
 
 It passes. Against a build without delegation it fails at step 1 ("no call ran
 in cell B", 4.21 s).

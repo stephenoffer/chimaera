@@ -1073,5 +1073,104 @@
   "core bookkeeping before notify (now moved after)": 12,
   "notify -> driver result()": 33,
   "total": 202
- }
+ },
+ "live_tree_vs_ray_after_inline_apply": [
+  {
+   "bin": "live-rel",
+   "task": [
+    195.2,
+    498.3
+   ],
+   "actor": [
+    190.6,
+    304.4
+   ],
+   "load": 16.88671875
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    371.4,
+    917.4
+   ],
+   "actor": [
+    141.3,
+    276.2
+   ],
+   "load": 14.8310546875
+  },
+  {
+   "bin": "live-rel",
+   "task": [
+    209.9,
+    2466.9
+   ],
+   "actor": [
+    186.4,
+    291.9
+   ],
+   "load": 14.12353515625
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    384.8,
+    787.8
+   ],
+   "actor": [
+    155.8,
+    377.2
+   ],
+   "load": 15.1640625
+  },
+  {
+   "bin": "live-rel",
+   "task": [
+    184.0,
+    302.5
+   ],
+   "actor": [
+    190.4,
+    291.4
+   ],
+   "load": 14.27001953125
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    337.5,
+    763.0
+   ],
+   "actor": [
+    147.5,
+    1186.4
+   ],
+   "load": 17.130859375
+  },
+  {
+   "bin": "live-rel",
+   "task": [
+    189.8,
+    355.4
+   ],
+   "actor": [
+    204.0,
+    1817.7
+   ],
+   "load": 16.1591796875
+  },
+  {
+   "bin": "ray-2.60",
+   "task": [
+    1653.6,
+    5940.0
+   ],
+   "actor": [
+    142.3,
+    453.3
+   ],
+   "load": 20.90966796875
+  }
+ ],
+ "python_suite_live_inline": "397 passed, 7 skipped, 0 failed (debug build of the live tree, test_docs excluded)"
 }

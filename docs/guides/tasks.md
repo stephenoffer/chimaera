@@ -90,6 +90,15 @@ Submit everything before you wait, or use `fn.map`. Wait on each call before
 making the next, 200 times in a row from one line, and you'll see warning
 CH101.
 
+A call can wait on calls it started. While it waits, its worker gives back its
+CPU and can run other calls of the same run on another thread, so a deep tree
+of calls waiting on their children needs about one process per CPU. Those
+calls share the interpreter: module-level state is shared, as it already is
+between calls that run one after another in a worker, and a lock held across
+`.result()` that one of those calls also takes deadlocks. Set
+`CHIMAERA_HOST_WHILE_WAITING=0` on the peers to give each waiting call a
+process of its own.
+
 </details>
 
 ## Cancel a call
@@ -120,8 +129,9 @@ by itself.
 
 A running call gets a grace period for that. After 2 s Chimaera interrupts it
 (a `time.sleep` or a pure-Python loop on its main thread raises
-`ch.Cancelled`). After 5 s it kills the worker process, though never an
-actor's, whose state lives there.
+`ch.Cancelled`; a call running beside a waiting one, on another thread, gets it
+at its next Python step). After 5 s it kills the worker process, though never
+an actor's, whose state lives there, nor one that other calls still use.
 
 Need it gone now? `cancel(force=True)` kills the call's process immediately,
 an actor's included, and later calls on that actor raise `ch.ActorDied`.

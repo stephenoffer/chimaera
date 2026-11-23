@@ -113,7 +113,9 @@ and no custom resource: peers already replace failed voters themselves, and
 the only thing to reconcile is the replica count.
 
 ```sh
-kubectl create secret generic chimaera-token --from-literal=token="$(chimaera cluster token)"
+chimaera cluster init --out ca     # the cluster CA and token; keep this directory safe
+kubectl create secret generic chimaera-token --from-file=token=ca/token
+kubectl create secret generic chimaera-tls --from-file=ca/ca.pem --from-file=ca/ca.key
 chimaera k8s render --image registry.example.com/chimaera:0.1 --replicas 5 | kubectl apply -f -
 ```
 
@@ -123,11 +125,17 @@ The other flags are `--name` (default `chimaera`; pods are `NAME-0`,
 `NAME-1`, ...), `--namespace`, `--replicas` (3), `--founders` (min(3,
 replicas)), `--port` (7700), `--client-port` (7710), `--cpus` and `--memory`
 (each set as both request and limit, so the peer offers what the pod may
-use), `--storage` (10Gi per pod) and `--token-secret` (default
-`NAME-token`, key `token`). `deploy/k8s/example.yaml` is the output of
+use), `--storage` (10Gi per pod), `--token-secret` (default
+`NAME-token`, key `token`) and `--tls-secret` (default `NAME-tls`, keys
+`ca.pem` and `ca.key`). `deploy/k8s/example.yaml` is the output of
 `chimaera k8s render --image chimaera:dev`.
 
-Each pod runs `chimaera --dir /data peer start --provider k8s`. The manifest
+Each pod runs `chimaera --dir /data peer start --provider k8s --tls-ca
+/etc/chimaera/tls`, with the TLS Secret mounted read-only there: the peer
+issues itself a certificate from the CA, so peers talk mutual TLS and drivers
+reach the client port over TLS (outside the cluster, with
+`CHIMAERA_CA=ca/ca.pem`). The provisioner Deployment (`--provisioner`) gets
+only `ca.pem` from that Secret, never the key. The manifest
 sets the variables the `k8s` provider reads (`CHIMAERA_K8S_SERVICE`,
 `POD_NAMESPACE`, `CHIMAERA_FOUNDERS`, `CHIMAERA_PORT`, `CHIMAERA_POOL`), plus
 `CHIMAERA_CLIENT_PORT`, and `CHIMAERA_CLUSTER_TOKEN` from the Secret. It also
@@ -154,7 +162,7 @@ elsewhere connects to the `NAME` Service on the client port with the token.
 
 Inside an allocation, `chimaera slurm-launch -- python3 app.py` does this:
 
-1. It runs `srun --nodes=N --ntasks=N --ntasks-per-node=1 --kill-on-bad-exit=1 --overlap chimaera --dir DIR peer start --provider slurm` in the background, with a new cluster token for the job (or `CHIMAERA_CLUSTER_TOKEN`, if set).
+1. It runs `srun --nodes=N --ntasks=N --ntasks-per-node=1 --kill-on-bad-exit=1 --overlap chimaera --dir DIR peer start --provider slurm` in the background, with a new cluster token and CA for the job (or `CHIMAERA_CLUSTER_TOKEN`, and `CHIMAERA_TLS_CA_PEM` with `CHIMAERA_TLS_CA_KEY`, if set). Both travel in srun's environment, since each node's data directory is its own; each peer issues itself a certificate from the CA, so the peers talk mutual TLS. Your command gets the CA variables too, so spares it starts (`--slurm`, below) join with it. Each peer takes them out of its own environment at start, so calls never see them. Slurm itself keeps a job's exported environment, token and CA key included, in its state (`scontrol show job -dd` shows it to administrators): on a cluster whose administrators you do not trust with the cluster, run peers with `--tls-dir` certificates you issue instead.
 2. It waits until the peer on this node is serving.
 3. It runs your command with `CHIMAERA_HOME=DIR`, so the driver uses this node's peer.
 4. When the command exits, it sends SIGUSR1 to `srun`, which forwards it to the peers (they drain, then exit), and returns the command's exit code. Not SIGTERM: `srun` answers SIGTERM by killing its tasks outright.
@@ -202,10 +210,13 @@ does the following:
 The founders are the first min(5, n) hosts. `up` then waits until every peer
 serves, and shows a peer's log if it stops. The token is
 `~/.chimaera/clusters/NAME/token` (or the profile's `token_file`), created
-on the first `up`. The Python client reads the same file. `chimaera down NAME`
-stops the peers and keeps their data directories, so the next `up` resumes
-the same cluster. `up` sets up token authentication only; TLS is not wired
-into it yet.
+on the first `up`. The Python client reads the same file. The first `up` also
+makes the cluster CA there (`ca.pem`, `ca.key`), copies it with the token to
+each host (`DIR/tls-ca`, mode 0600), and starts each peer with `--tls-ca`, so
+peers talk mutual TLS and drivers verify the peers with `ca.pem` from the same
+directory. A cluster that ran before it had a CA must be restarted (`down`,
+then `up`), and `up` says so. `chimaera down NAME` stops the peers and keeps
+their data directories, so the next `up` resumes the same cluster.
 
 If you already provision VMs with something else, start the peer with
 `--listen … --seeds …` (or `--provider static`) from your own tooling.
@@ -350,9 +361,15 @@ the running cluster. Shrinking sends the newest spare's peer SIGUSR1 over
 `ssh` (SkyPilot writes a host alias per cluster), waits for it to drain, then
 runs `sky down`. `--base N` counts the peers that are not spares (default 1),
 and the spares' names are kept in the cluster's store, so a restarted
-provisioner knows them. Run it with `CHIMAERA_CLUSTER_TOKEN` set. The calls
-it makes are checked against stand-in `sky` and `ssh` commands; it has not
-run against a real SkyPilot install.
+provisioner knows them. Run it with `CHIMAERA_CLUSTER_TOKEN` set; it goes to
+SkyPilot with `--secret`, so SkyPilot keeps it out of its logs. With
+`CHIMAERA_TLS_CA` set to the cluster's `chimaera cluster init` directory, each
+spare gets a certificate of its own, issued where the provisioner runs: a task
+file uploads that certificate, its key and `ca.pem` (never the CA's key) and
+starts the spare's peer with `--tls-dir`. Without it, spares join a cluster
+that does not use TLS. The calls it makes are checked against stand-in `sky`
+and `ssh` commands; it has not run against a real SkyPilot install, so TLS
+stays opt-in for spares until one has.
 
 ### Several clusters (federation)
 
@@ -422,16 +439,26 @@ use_spot = true
 ```
 
 - `chimaera run --cluster NAME -- python app.py` keeps the driver on your machine.
-- Running the driver itself on the cluster (`chimaera submit`) isn't in this release yet. `logs`, `inspect` and `cancel` take `--cluster` too, and `ch.runs.attach(run_id)` reattaches to a run from Python.
+- `chimaera submit --cluster NAME -- python app.py` runs the driver on the cluster, detached, and prints the run id. `logs`, `inspect`, `attach` and `cancel` take `--cluster` too.
 - Run history lives in the long-lived cluster, so it is still there after the job ends.
 
 A peer uses two ports: the peer port (7700) for other peers, and the client
 port (`--client-listen`; 7710 under the k8s, slurm, hpc and sky providers
 and with `chimaera up`) for drivers on other machines. Both demand the cluster
-token (unless `--insecure`). With `--tls-dir`, both use TLS from the cluster's CA:
-`chimaera cluster init --out DIR` creates the CA and a token, and
-`chimaera cluster cert` issues each peer's certificate. A profile's `peers`
-lists client addresses, and the client tries them in order.
+token (unless `--insecure`). TLS uses the cluster's CA: `chimaera cluster
+init --out DIR` creates the CA and a token. Give every peer the same `DIR` with
+`--tls-ca DIR`, and each issues itself a certificate from it at start and reads
+the token from `DIR/token`. Or issue a certificate per peer with `chimaera
+cluster cert` and start each with `--tls-dir`. Either way, both ports then use
+TLS, and a peer whose certificate another CA signed is refused. Drivers need
+just `ca.pem` (`CHIMAERA_CA`). The trade-off: `--tls-ca` puts the CA's
+private key on every peer, so any one peer can mint certificates until the CA
+is replaced. That adds little to what the cluster token already lets a peer
+do, but where nodes are less trusted (spot machines on other clouds, shared
+hosts), keep the key where you provision and issue each node its own
+certificate with `chimaera cluster cert`, shipping only that pair and
+`ca.pem`. A profile's `peers` lists client addresses, and
+the client tries them in order.
 
 ## Accelerators
 
@@ -530,7 +557,10 @@ directories that aren't the interpreter's, a virtualenv's or Chimaera's, as
 one archive named by its content, at most `CHIMAERA_PROJECT_MAX_BYTES`
 (100 MiB). Inside a git work tree it holds only what git would track, so
 files your `.gitignore` excludes (data, checkpoints, `.env`) stay home; a
-directory git ignores as a whole still ships when it is the project itself.
+directory git ignores as a whole still ships when it is the project itself,
+and `CHIMAERA_PROJECT_GITIGNORE=0` ships ignored files too (an extension
+module built in place, say). A directory holding a copy of Chimaera (a source
+checkout on the path) is never shipped: the peers use their own.
 Each peer unpacks it once and puts it on the workers' `sys.path`.
 When the project has a `uv.lock`, each peer also installs the locked packages
 once, with its own Python (`uv sync --frozen`), and the workers put them

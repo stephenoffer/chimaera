@@ -15,6 +15,7 @@ use crate::executor::{ExecEnv, ExecEvent, Supervisor};
 use crate::mesh::MeshClient;
 use crate::profiles::{self, FnKey, Profiles, Request, Source};
 use crate::router::{Router, now_ns};
+use crate::sharing;
 use crate::stores::{CodeStore, ObjectStore, hex};
 use chimaera_core::hlc;
 use chimaera_core::ids::Id;
@@ -42,6 +43,10 @@ const PROBE_FOR: Duration = Duration::from_secs(2);
 /// the base probe width: a first wave of calls up to this size cannot
 /// overcommit the pool.
 const PROBE_SLOT: u64 = 4 << 30;
+/// Memory taken as the least a call (or actor) not yet measured may need, to
+/// bound how many probe at once in a small pool: a quarter of 32 CPUs is 8,
+/// which a 1 GiB pool cannot hold at 300 MiB each.
+const PROBE_MEM: u64 = 512 << 20;
 /// Memory pressure (R1): below PAUSE_BELOW of usable memory available (or PSI
 /// `some avg10` above PSI_PAUSE) stop admitting until RESUME_ABOVE; below
 /// KILL_BELOW stop the attempt furthest over its reservation.
@@ -88,6 +93,12 @@ const EVENT_LOG_CAP: usize = 10_000;
 const SPILL_AFTER: Duration = Duration::from_secs(1);
 /// Executors started for a run's environment when it registers.
 const PRESTART: usize = 4;
+/// Calls waiting on calls they started before the run's driver is told (and at
+/// least 4 per CPU): each keeps a worker process.
+const NESTED_NOTE_AT: usize = 32;
+/// How long a closed actor's process has for its own cleanup before it is
+/// stopped outright.
+const ACTOR_CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Calls of a one-at-a-time actor sent to its executor in one Execute.
 const ACTOR_BATCH: usize = 64;
 /// Inputs of one call fetched from other peers at once.
@@ -127,6 +138,10 @@ pub enum CoreMsg {
         session: u64,
         tasks: Vec<Tk>,
     },
+    /// Calls a driver sent straight to their actors' executors.
+    DirectInflight(Vec<(Tk, crate::direct::Call)>),
+    /// Calls the direct path ran: their attempts, and samples to learn from.
+    DirectAttempts(Vec<crate::direct::Ran>),
     Cancel {
         task: Tk,
         force: bool,
@@ -209,6 +224,28 @@ pub enum CoreMsg {
     /// watched there is watched on the group's members instead.
     GroupDropped {
         group: u32,
+    },
+    /// A program reads a call's result that was lost with every peer that
+    /// held it: run the call again here, then answer `reply` (Ok once the
+    /// value is in this peer's store, else why not).
+    RebuildRead {
+        producer: Tk,
+        attempt: u32,
+        spec: Box<pb::TaskSpec>,
+        deps: Vec<pb::Outcome>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Where a handle's order stands, for an actor host that had not seen it
+    /// (see `handle_floor`): `None` while an earlier call is unfinished.
+    HandleFloor {
+        actor: Id,
+        handle: u64,
+        floor: Option<(u64, Vec<u64>)>,
+    },
+    /// An actor's move off this draining peer committed (or failed).
+    ActorMoved {
+        actor: Id,
+        ok: bool,
     },
     /// A call run again by `Rebuild` finished here.
     Rebuilt {
@@ -325,11 +362,24 @@ async fn rebuild_plan(
     w: &Work,
     object: &[u8],
 ) -> Result<(Tk, u32, pb::TaskSpec, Vec<pb::Outcome>), String> {
-    let made = |o: &pb::Outcome| matches!(&o.value, Some(pb::outcome::Value::Ok(obj)) if obj.object_id == object);
-    let Some(key) = w.spec.deps.iter().zip(&w.deps).find(|(_, o)| made(o)).map(|(k, _)| k) else {
+    let Some(key) = w.spec.deps.iter().zip(&w.deps).find(|(_, o)| made(o, object)).map(|(k, _)| k) else {
         return Err("it is a value the program stored (ch.put, or an argument), not one a call returned".into());
     };
     let producer = Tk::parse(key).ok_or("malformed task key")?;
+    let (attempt, spec, deps) = producer_plan(router, mesh, producer, object).await?;
+    Ok((producer, attempt, spec, deps))
+}
+
+/// How to make `object` again by running `producer`, the call that returned
+/// it: the attempt that made it (the same attempt writes the same object id),
+/// its spec and its own inputs' outcomes. Only a plain function or map item
+/// without external effects runs again; the error says why another cannot.
+pub(crate) async fn producer_plan(
+    router: &Router,
+    mesh: &crate::mesh::MeshClient,
+    producer: Tk,
+    object: &[u8],
+) -> Result<(u32, pb::TaskSpec, Vec<pb::Outcome>), String> {
     let record = task_record(router, mesh, producer).await?.ok_or("its call's record is gone (its run ended)")?;
     let spec = record.spec.ok_or("its call's record holds no spec")?;
     if !matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem) {
@@ -338,7 +388,7 @@ async fn rebuild_plan(
     if spec.effects() == pb::Effects::External {
         return Err("its call has external effects, which run at most once".into());
     }
-    let Some(outcome) = record.outcome.filter(|o| made(o)) else {
+    let Some(outcome) = record.outcome.filter(|o| made(o, object)) else {
         return Err("its call's recorded outcome is another value".into());
     };
     let mut deps = Vec::with_capacity(spec.deps.len());
@@ -347,7 +397,57 @@ async fn rebuild_plan(
         let rec = task_record(router, mesh, dep).await?.ok_or("an input of its call has no record")?;
         deps.push(rec.outcome.ok_or("an input of its call has no outcome")?);
     }
-    Ok((producer, outcome.attempt, spec, deps))
+    Ok((outcome.attempt, spec, deps))
+}
+
+/// How far back `handle_floor` walks a handle's calls before assuming the
+/// rest finished.
+const HANDLE_WALK: usize = 64;
+/// How often a handle waiting on an earlier, unfinished call is looked up again.
+const HANDLE_RECHECK: Duration = Duration::from_millis(500);
+
+/// Where a handle's order stands for an actor host that has not run any of
+/// its calls (the actor restarted or moved here): walk back from `prev`, the
+/// call before the lowest one waiting. One that finished by running ran in
+/// order wherever it was, so every call before it had finished: the handle
+/// resumes after it. One cancelled (or past its deadline) may have ended out
+/// of order: keep walking. Returns the next seq and the finished seqs above
+/// it, or None while a call is unfinished (it reaches this host, or ends).
+async fn handle_floor(
+    router: &Router,
+    mesh: Option<&crate::mesh::MeshClient>,
+    mut prev: Tk,
+    seq: u64,
+) -> Result<Option<(u64, Vec<u64>)>, String> {
+    let mut done = Vec::new();
+    let mut at = seq.saturating_sub(1); // `prev`'s seq
+    for _ in 0..HANDLE_WALK {
+        let rec = match mesh {
+            Some(mesh) => task_record(router, mesh, prev).await?,
+            None => router.read(prev.v(), |kv| read::task(kv, prev)).flatten(),
+        };
+        // Never committed: nothing to wait for (and nothing earlier to read).
+        let Some(rec) = rec else { return Ok(Some((at + 1, done))) };
+        let Some(outcome) = rec.outcome else { return Ok(None) };
+        let out_of_order = matches!(&outcome.value, Some(pb::outcome::Value::Err(e))
+            if matches!(e.kind(), Kind::Cancelled | Kind::Deadline));
+        match rec.spec.and_then(|s| s.prev).as_ref().and_then(Tk::parse) {
+            Some(earlier) if out_of_order && at > 0 => {
+                done.push(at);
+                at -= 1;
+                prev = earlier;
+            }
+            _ => return Ok(Some((at + 1, done))),
+        }
+    }
+    Ok(Some((at + 1, done))) // assume the calls before these finished
+}
+
+/// Whether `o` is a value stored as `object`: its own file, or one of the
+/// blobs its frame links (a result's large buffers, stored apart from it).
+fn made(o: &pb::Outcome, object: &[u8]) -> bool {
+    matches!(&o.value, Some(pb::outcome::Value::Ok(obj))
+        if obj.object_id == object || obj.blobs.iter().any(|b| b.object_id == object))
 }
 
 /// `tk`'s record, from this peer's replica of its group or another's.
@@ -441,6 +541,16 @@ impl Work {
         }
     }
 
+    /// May run as a guest beside waiting calls (sharing): a plain call with no
+    /// external effects and not a gang's (a rank sets process-wide variables
+    /// and torch's per-process group). shortcut: gang calls are known by their
+    /// module's name; give Policy a flag if `chimaera._gang` moves.
+    fn guest_ok(&self) -> bool {
+        matches!(self.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem)
+            && self.spec.effects() != pb::Effects::External
+            && !self.policy.fn_name.starts_with("chimaera._gang.")
+    }
+
     fn batches_with(&self, other: &Work) -> bool {
         other.batchable()
             && other.kind() == self.kind()
@@ -456,6 +566,29 @@ impl Work {
 /// `obj` and the files its frame refers to (`blobs`, a result's large buffers
 /// stored apart), each naming where it is: a blob without locations is where
 /// its object is.
+/// Fetch a call's inputs into the store, INPUT_FETCHES at once: a call reading
+/// many small values (a shuffle's gather reads one per scatter) would otherwise
+/// pay one round trip per input, one after another. On failure, the first input
+/// that could not be fetched, and why.
+async fn fetch_inputs(
+    mesh: &Arc<MeshClient>,
+    store: &ObjectStore,
+    objs: Vec<pb::ObjectRef>,
+) -> Result<(), (Vec<u8>, String)> {
+    use futures_util::StreamExt;
+    let fetches = objs.into_iter().map(|obj| async move {
+        let holders = mesh.holders(&obj);
+        mesh.localize(store, &obj.run, &obj.object_id, obj.size, &holders)
+            .await
+            .map_err(|e| (obj.object_id.clone(), format!("cannot fetch input object {}: {e}", hex(&obj.object_id))))
+    });
+    let mut fetches = futures_util::stream::iter(fetches).buffer_unordered(INPUT_FETCHES);
+    while let Some(r) = fetches.next().await {
+        r?;
+    }
+    Ok(())
+}
+
 fn with_blobs(obj: &pb::ObjectRef) -> Vec<pb::ObjectRef> {
     let mut all = Vec::with_capacity(1 + obj.blobs.len());
     for b in &obj.blobs {
@@ -480,7 +613,7 @@ fn pids_full(current: u64, max: u64) -> String {
     )
 }
 
-fn profile_key(spec: &pb::TaskSpec, policy: &pb::Policy) -> FnKey {
+pub(crate) fn profile_key(spec: &pb::TaskSpec, policy: &pb::Policy) -> FnKey {
     let digest = if policy.profile_digest.is_empty() { &spec.fn_digest } else { &policy.profile_digest };
     FnKey::new(digest, &spec.method)
 }
@@ -488,6 +621,10 @@ fn profile_key(spec: &pb::TaskSpec, policy: &pb::Policy) -> FnKey {
 /// What a call's placement weighs besides load (see `Core::extra_cost`).
 struct PlaceCost {
     inputs: Vec<pb::ObjectRef>,
+    /// The live peers holding each input (as `inputs`), looked up once per
+    /// placement rather than once per candidate peer; empty below
+    /// LOCALITY_MIN_BYTES, where locality is not weighed.
+    held: Vec<Vec<u64>>,
     total: u64,
     est_s: f64,
     need: u64,
@@ -568,6 +705,11 @@ struct Exec {
     /// loaded a function's code (and its imports) is preferred for it.
     last_fn: Vec<u8>,
     last_run: Option<Id>,
+    /// Process CPU at the last change while it held several calls (sharing).
+    cpu_mark: u64,
+    /// A memory kill of a process holding several calls, for this one's
+    /// memory: the others are retried as infra failures, with no memory hint.
+    killed_for: Option<Tk>,
 }
 
 struct Running {
@@ -591,12 +733,26 @@ struct Running {
     /// Calls of this batch that finished before its CPU could be measured
     /// (that takes the whole batch): learned from when it ends.
     unlearned: Vec<(Work, pb::ExecDone, u64)>,
+    /// Its latest wait offered to host a guest, and what it waits on (sharing).
+    host: bool,
+    waiting_on: Vec<Tk>,
+    /// Once its process held another call beside it, its CPU is measured in
+    /// slices (`cpu_own`: None when two ran at once), and its memory from
+    /// `baseline`, what the process held when it started (0 if alone).
+    sliced: bool,
+    cpu_own: Option<u64>,
+    baseline: u64,
 }
 
 #[derive(Default)]
 struct ActorHost {
     generation: u64,
     exec: Option<u32>,
+    /// Its process has not started: live actors and running calls fill the
+    /// memory pool (see start_actor).
+    waiting_memory: Option<String>,
+    /// When its current process was started.
+    started: Option<Instant>,
     run: Option<Id>,
     /// Constructor finished on the current executor.
     constructed: bool,
@@ -618,6 +774,18 @@ struct ActorHost {
     class_digest: Vec<u8>,
     /// A call's commit is in flight: the next call waits for it.
     committing: bool,
+    /// Handles whose place in their order this host knows: it ran one of
+    /// their calls, or learned it (`handle_floor`). Another handle's calls
+    /// may follow calls that ran on another host.
+    known_handles: HashSet<u64>,
+    /// Handles being looked up (`handle_floor`), and when last asked.
+    resolving: HashMap<u64, Instant>,
+    /// This peer drains: the actor starts no new call here and moves once
+    /// its running ones finish (`try_move_actor`).
+    moving: bool,
+    /// It moved away: calls that reach this peer are given back to the shard,
+    /// which grants them again at its new host.
+    moved: bool,
 }
 
 struct RunInfo {
@@ -658,6 +826,14 @@ pub struct Core {
     attempts: HashMap<Tk, Vec<pb::AttemptRecord>>,
     /// Encoded size of everything in `attempts`.
     attempt_bytes: usize,
+    /// Calls drivers sent straight to actors here, until their records land.
+    direct: crate::direct::Inflight,
+    /// Actors placed here whose process waits for memory (see start_actor).
+    actors_waiting_memory: VecDeque<(Id, Option<Id>, pb::ActorSpec)>,
+    /// Runs told that many of their calls wait on calls they started (see note_nested_waits).
+    nested_noted: VecDeque<Id>,
+    /// What waiting calls of one-at-a-time actors wait for, by (executor, call) (see note_actor_wait).
+    actor_waits: HashMap<(u32, Tk), Vec<Tk>>,
     /// Why no more executors start: the cgroup task limit is reached (see
     /// topology::pids_room). Shown as the wait reason; cleared by a start.
     pids_note: Option<String>,
@@ -710,6 +886,8 @@ pub struct Core {
     /// Calls being run again here because a value they made was lost, and
     /// the attempts waiting for that value.
     rebuilding: HashMap<Tk, Vec<Work>>,
+    /// Programs waiting for a call to be run again (`RebuildRead`), by call.
+    rebuild_readers: HashMap<Tk, Vec<oneshot::Sender<Result<(), String>>>>,
     /// Tasks watched through another peer's replica.
     remote_watched: HashSet<Tk>,
     /// Hosts of actors whose records live in groups not hosted here.
@@ -816,6 +994,10 @@ impl Core {
             publishing: BTreeMap::new(),
             attempts: HashMap::new(),
             attempt_bytes: 0,
+            direct: Default::default(),
+            actors_waiting_memory: VecDeque::new(),
+            nested_noted: VecDeque::new(),
+            actor_waits: HashMap::new(),
             pids_note: None,
             attempt_order: VecDeque::new(),
             profiles,
@@ -846,6 +1028,7 @@ impl Core {
             pending_dispatch: BTreeMap::new(),
             localizing: HashSet::new(),
             rebuilding: HashMap::new(),
+            rebuild_readers: HashMap::new(),
             remote_watched: HashSet::new(),
             actor_hosts: HashMap::new(),
             waiting_actor: HashMap::new(),
@@ -1009,6 +1192,9 @@ impl Core {
                 for e in ev.events {
                     self.on_event(ev.group, e);
                 }
+                if ev.reloaded {
+                    self.recheck_watches(ev.group);
+                }
                 self.dispatch();
             }
             CoreMsg::Leading { group, leading } => {
@@ -1060,6 +1246,8 @@ impl Core {
                 }
                 self.dispatch();
             }
+            CoreMsg::HandleFloor { actor, handle, floor } => self.on_handle_floor(actor, handle, floor),
+            CoreMsg::ActorMoved { actor, ok } => self.on_actor_moved(actor, ok),
             CoreMsg::Rebuilt { work, outcome } => {
                 self.rebuilt(&work, outcome.as_ref());
                 self.dispatch();
@@ -1069,22 +1257,27 @@ impl Core {
                 let mut consumer = *consumer;
                 consumer.rebuilds += 1;
                 let depth = consumer.rebuilds;
+                let running = self.rebuild_readers.contains_key(&producer);
                 let waiting = self.rebuilding.entry(producer).or_default();
                 waiting.push(consumer);
-                if waiting.len() == 1 {
+                if waiting.len() == 1 && !running {
                     tracing::info!(
                         task = %producer.task.hex(),
                         "an input was lost with every peer that held it: running the call that made it again"
                     );
-                    let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-                    let mut work = Work::new(producer, attempt, *spec, policy, deps);
-                    // Its outcome is committed: this run only remakes the value, under
-                    // the same id (the same attempt), and has nothing to start or publish.
-                    work.publish = false;
-                    work.start_consumed = true;
-                    work.rebuilds = depth;
-                    self.reserve(&mut work, 0, 0.0, 0);
-                    self.admit(work);
+                    self.start_rebuild(producer, attempt, *spec, deps, depth);
+                }
+                self.dispatch();
+            }
+            CoreMsg::RebuildRead { producer, attempt, spec, deps, reply } => {
+                let running = self.rebuilding.contains_key(&producer) || self.rebuild_readers.contains_key(&producer);
+                self.rebuild_readers.entry(producer).or_default().push(reply);
+                if !running {
+                    tracing::info!(
+                        task = %producer.task.hex(),
+                        "a result a program reads was lost with every peer that held it: running its call again"
+                    );
+                    self.start_rebuild(producer, attempt, *spec, deps, 1);
                 }
                 self.dispatch();
             }
@@ -1118,6 +1311,7 @@ impl Core {
             CoreMsg::Place { task } => self.place(task),
             CoreMsg::Drain => {
                 self.draining = true;
+                self.move_actors();
                 let node = self.router.identity.peer.to_vec();
                 self.record(pb::ClusterEvent {
                     kind: "drain".into(),
@@ -1158,7 +1352,7 @@ impl Core {
                     cpu_used: self.cpu_used,
                     queued: self.queue.len() as u32,
                     running: self.running.len() as u32,
-                    actors: self.execs.values().filter(|e| e.actor.is_some()).count() as u32,
+                    actors: self.hosted_actors() as u32,
                     draining: self.draining,
                     stopping: self.draining,
                     memory_pool: self.budget.pool,
@@ -1190,9 +1384,17 @@ impl Core {
                 self.runs.entry(run).or_insert(RunInfo { env, detached, sessions: BTreeSet::new() });
             }
             CoreMsg::Watch { session, tasks } => self.watch(session, tasks),
+            CoreMsg::DirectInflight(calls) => self.direct.note(calls),
+            CoreMsg::DirectAttempts(records) => {
+                for r in records {
+                    self.learn_direct(&r);
+                    self.push_attempt(r.tk, r.attempt);
+                }
+            }
             CoreMsg::Cancel { task, force } => self.cancel(task, force),
             CoreMsg::StreamCredit { task, up_to } => self.on_stream_credit(task, up_to),
             CoreMsg::EndRun { run, cancel } => {
+                self.direct.end_run(run);
                 let body = if cancel {
                     pb::shard_cmd::Body::CancelRun(pb::CancelRun {
                         run: run.to_vec(),
@@ -1612,22 +1814,23 @@ impl Core {
         let bonus = |m: &pb::Member| 0.5 * crate::labels::preferred(&m.labels, &policy.prefer) as f64;
         let fits_here = !self.draining && self.capacity + 1e-9 >= cpus && allowed(&mesh.me);
         let mut best = fits_here.then(|| (mine - bonus(&mesh.me), self.router.identity.pb()));
-        let others: Vec<_> =
-            mesh.live_others().into_iter().filter(|p| p.member.cpus + 1e-9 >= cpus && allowed(&p.member)).collect();
+        // Node ids only: copying every member's view for each call placed
+        // cost a 64-peer leader 63 copies per call.
+        let others = mesh.live_other_ids(|m| m.cpus + 1e-9 >= cpus && allowed(m));
         if !others.is_empty() {
             // Two random choices (near-least-loaded without a global view),
             // plus the peers that hold the call's largest input.
             let seed = (tk.task.0[0] as usize) ^ (now_ns() as usize);
             let mut picks: Vec<usize> = (0..2.min(others.len())).map(|i| (seed + i * 7919) % others.len()).collect();
             for h in &cost.holders {
-                if let Some(i) = others.iter().position(|p| p.member.node_id == *h)
+                if let Some(i) = others.iter().position(|n| n == h)
                     && !picks.contains(&i)
                 {
                     picks.push(i);
                 }
             }
             for i in picks {
-                let p = &others[i];
+                let Some(p) = mesh.member(others[i]) else { continue };
                 let reported = p.load.as_ref().map_or(0.0, |l| l.cpu_used + l.queued as f64);
                 let (used, pool) = p.load.as_ref().map_or((0, 0), |l| (l.memory_used, l.memory_pool));
                 let score = self.pressure(p.member.node_id, reported, p.last_ok, p.member.cpus)
@@ -1641,15 +1844,7 @@ impl Core {
         tracing::trace!(
             task = %tk.task.hex(),
             mine,
-            others = ?others
-                .iter()
-                .map(|p| (
-                    p.member.node_id % 1000,
-                    p.load.as_ref().map(|l| (l.cpu_used, l.queued)),
-                    p.last_ok.map(|t| t.elapsed().as_millis()),
-                    self.outstanding.get(&p.member.node_id).copied(),
-                ))
-                .collect::<Vec<_>>(),
+            others = ?others.iter().map(|n| (n % 1000, self.outstanding.get(n).copied())).collect::<Vec<_>>(),
 
             chosen = ?best.as_ref().map(|(s, p)| (*s, hex(&p.peer[12..]))),
             "placement"
@@ -1678,8 +1873,14 @@ impl Core {
         let key = profile_key(spec, policy);
         let est_s = self.profiles.summary(&key).map(|s| s.wall_p50_s).filter(|s| *s > 0.0).unwrap_or(1.0);
         let need = self.profiles.memory_estimate(&key, total).map_or(0, |m| m.bytes).max(hint);
-        let holders = inputs.iter().max_by_key(|o| o.size).map(|o| mesh.holders(o)).unwrap_or_default();
-        PlaceCost { inputs, total, est_s, need, holders }
+        let held: Vec<Vec<u64>> =
+            if total >= LOCALITY_MIN_BYTES { inputs.iter().map(|o| mesh.holders(o)).collect() } else { Vec::new() };
+        let holders = if held.is_empty() {
+            inputs.iter().max_by_key(|o| o.size).map(|o| mesh.holders(o)).unwrap_or_default()
+        } else {
+            inputs.iter().zip(&held).max_by_key(|(o, _)| o.size).map(|(_, h)| h.clone()).unwrap_or_default()
+        };
+        PlaceCost { inputs, held, total, est_s, need, holders }
     }
 
     /// Cost beyond load of running the call on `node`: inputs it lacks (only
@@ -1688,7 +1889,8 @@ impl Core {
     fn extra_cost(&self, mesh: &MeshClient, c: &PlaceCost, node: u64, mem_used: u64, mem_pool: u64) -> f64 {
         let mut extra = 0.0;
         if c.total >= LOCALITY_MIN_BYTES {
-            let missing: u64 = c.inputs.iter().filter(|o| !self.holds(mesh, node, o)).map(|o| o.size).sum();
+            let missing: u64 =
+                c.inputs.iter().zip(&c.held).filter(|(o, h)| !self.holds(mesh, node, o, h)).map(|(o, _)| o.size).sum();
             if missing as f64 > 0.3 * c.total as f64 {
                 // A peer holding the input wins unless it is saturated (the
                 // missing share costs up to one full core's queue), plus the
@@ -1704,11 +1906,12 @@ impl Core {
         extra
     }
 
-    fn holds(&self, mesh: &MeshClient, node: u64, o: &pb::ObjectRef) -> bool {
+    /// Whether `node` has input `o`, held by the peers `held` (mesh.holders).
+    fn holds(&self, mesh: &MeshClient, node: u64, o: &pb::ObjectRef, held: &[u64]) -> bool {
         if node == mesh.me.node_id {
             return self.objects.path(&o.run, &o.object_id).exists();
         }
-        mesh.holders(o).contains(&node) || mesh.member(node).is_some_and(|p| p.recently_has(&o.object_id))
+        held.contains(&node) || mesh.recently_has(node, &o.object_id)
     }
 
     /// Where `actor` lives, if known. Unknown hosts are resolved in the
@@ -1869,15 +2072,25 @@ impl Core {
         };
         let mut missing: Vec<pb::ObjectRef> = Vec::new();
         let args = w.spec.args.iter().chain(w.spec.blobs.iter());
-        let deps: Vec<pb::ObjectRef> = w
-            .deps
-            .iter()
-            .filter_map(|o| match &o.value {
-                Some(pb::outcome::Value::Ok(obj)) => Some(with_blobs(obj)),
-                _ => None,
-            })
-            .flatten()
-            .collect();
+        // A dependency stored in a file of its own whose buffers are not all
+        // here: its buffers wait for that file. A result stored in parts
+        // (returns=N) leaves its parts' buffers to the callee, which reads
+        // only the value it was given and fetches what it touches (see parts).
+        let mut later: Vec<(pb::ObjectRef, Vec<pb::ObjectRef>)> = Vec::new();
+        let mut deps: Vec<pb::ObjectRef> = Vec::new();
+        for o in &w.deps {
+            let Some(pb::outcome::Value::Ok(obj)) = &o.value else { continue };
+            let mut all = with_blobs(obj);
+            let head = all.remove(0);
+            if head.inline_data.is_empty() && !head.run.is_empty() {
+                all.retain(|b| !self.objects.path(&b.run, &b.object_id).exists());
+                if !all.is_empty() {
+                    later.push((head.clone(), std::mem::take(&mut all)));
+                }
+            }
+            deps.push(head);
+            deps.extend(all);
+        }
         for obj in args.chain(deps.iter()) {
             if obj.inline_data.is_empty()
                 && !obj.run.is_empty()
@@ -1888,7 +2101,7 @@ impl Core {
         }
         let digest = w.spec.fn_digest.clone();
         let need_code = !digest.is_empty() && !self.code.has(&digest);
-        if missing.is_empty() && !need_code {
+        if missing.is_empty() && later.is_empty() && !need_code {
             self.enqueue(w);
             return;
         }
@@ -1902,32 +2115,24 @@ impl Core {
                 error = Some(format!("cannot fetch the function's code {}: {e}", hex(&digest)));
             }
             if error.is_none() {
-                // Inputs arrive concurrently: a call reading many small values
-                // (a shuffle's gather reads one per scatter) would otherwise
-                // pay one round trip per input, one after another.
-                use futures_util::StreamExt;
-                let fetches: Vec<_> = missing
-                    .into_iter()
-                    .map(|obj| {
-                        let (mesh, store) = (mesh.clone(), store.clone());
-                        async move {
-                            let holders = mesh.holders(&obj);
-                            mesh.localize(&store, &obj.run, &obj.object_id, obj.size, &holders).await.map_err(|e| {
-                                (
-                                    obj.object_id.clone(),
-                                    format!("cannot fetch input object {}: {e}", hex(&obj.object_id)),
-                                )
-                            })
-                        }
+                let mut fetched = fetch_inputs(&mesh, &store, missing).await;
+                if fetched.is_ok() && !later.is_empty() {
+                    let s = store.clone();
+                    // Off the async workers: reads each file's header.
+                    let blobs = tokio::task::spawn_blocking(move || {
+                        later
+                            .into_iter()
+                            .filter(|(head, _)| crate::parts::file_ids(&s.path(&head.run, &head.object_id)).is_empty())
+                            .flat_map(|(_, blobs)| blobs)
+                            .collect::<Vec<_>>()
                     })
-                    .collect();
-                let mut fetches = futures_util::stream::iter(fetches).buffer_unordered(INPUT_FETCHES);
-                while let Some(r) = fetches.next().await {
-                    if let Err((object, e)) = r {
-                        error = Some(e);
-                        lost = Some(object);
-                        break;
-                    }
+                    .await
+                    .unwrap_or_default();
+                    fetched = fetch_inputs(&mesh, &store, blobs).await;
+                }
+                if let Err((object, e)) = fetched {
+                    error = Some(e);
+                    lost = Some(object);
                 }
             }
             if let (Some(object), Some(why)) = (lost, error.as_mut())
@@ -2055,7 +2260,12 @@ impl Core {
     fn give_up(&mut self, w: &Work, why: &str) {
         if w.publish {
             self.fail_attempt(w, pb::record_failure::Kind::Infra, why);
-        } else if let Some(waiting) = self.rebuilding.remove(&w.tk) {
+            return;
+        }
+        for reader in self.rebuild_readers.remove(&w.tk).unwrap_or_default() {
+            let _ = reader.send(Err(why.to_string()));
+        }
+        if let Some(waiting) = self.rebuilding.remove(&w.tk) {
             let why = format!("an input was lost with its peer, and running the call that made it again failed: {why}");
             for c in waiting {
                 self.give_up(&c, &why);
@@ -2063,20 +2273,33 @@ impl Core {
         }
     }
 
+    /// Run `producer` again here to remake a lost value: its outcome is
+    /// committed, so this run only rewrites the value under the same id (the
+    /// same attempt) and has nothing to start or publish.
+    fn start_rebuild(&mut self, producer: Tk, attempt: u32, spec: pb::TaskSpec, deps: Vec<pb::Outcome>, depth: u32) {
+        let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
+        let mut work = Work::new(producer, attempt, spec, policy, deps);
+        work.publish = false;
+        work.start_consumed = true;
+        work.rebuilds = depth;
+        self.reserve(&mut work, 0, 0.0, 0);
+        self.admit(work);
+    }
+
     /// A call run again to remake a lost value finished: the attempts waiting
     /// for that value go on (it is in this peer's store now), or fail with it.
     fn rebuilt(&mut self, w: &Work, outcome: Option<&pb::Outcome>) {
-        let Some(waiting) = self.rebuilding.remove(&w.tk) else { return };
         match outcome.and_then(|o| o.value.as_ref()) {
-            Some(pb::outcome::Value::Ok(_)) => waiting.into_iter().for_each(|c| self.admit(c)),
-            other => {
-                let why = match other {
-                    Some(pb::outcome::Value::Err(e)) => format!("it raised {}: {}", e.type_name, e.message),
-                    _ => "it produced no value".to_string(),
-                };
-                self.rebuilding.insert(w.tk, waiting);
-                self.give_up(w, &why);
+            Some(pb::outcome::Value::Ok(_)) => {
+                for reader in self.rebuild_readers.remove(&w.tk).unwrap_or_default() {
+                    let _ = reader.send(Ok(()));
+                }
+                for c in self.rebuilding.remove(&w.tk).unwrap_or_default() {
+                    self.admit(c);
+                }
             }
+            Some(pb::outcome::Value::Err(e)) => self.give_up(w, &format!("it raised {}: {}", e.type_name, e.message)),
+            None => self.give_up(w, "it produced no value"),
         }
     }
 
@@ -2124,6 +2347,20 @@ impl Core {
             && self.runs.get(&tk.run).is_some_and(|r| !r.detached)
             && !self.queue.iter().any(other)
             && !self.running.iter().any(|r| r.items.iter().any(other))
+    }
+
+    /// A replica here installed a snapshot: outcomes it skipped over raised no
+    /// events, so tell the watchers of its tasks that are done now.
+    fn recheck_watches(&mut self, group: u32) {
+        let done: Vec<(Tk, pb::Outcome)> = self
+            .watchers
+            .keys()
+            .filter(|tk| self.router.group_of(tk.v()) == group && !self.remote_watched.contains(tk))
+            .filter_map(|tk| Some((*tk, self.router.read(tk.v(), |kv| read::task(kv, *tk)).flatten()?.outcome?)))
+            .collect();
+        for (tk, outcome) in done {
+            self.notify_watchers(tk, &outcome);
+        }
     }
 
     fn notify_watchers(&mut self, tk: Tk, outcome: &pb::Outcome) {
@@ -2208,6 +2445,7 @@ impl Core {
     }
 
     fn on_done(&mut self, tk: Tk, outcome: pb::Outcome, leader: bool) {
+        self.direct.done(tk);
         self.unplace_as(tk, true);
         if leader && let Some(pb::outcome::Value::Err(e)) = &outcome.value {
             self.record(pb::ClusterEvent {
@@ -2274,7 +2512,9 @@ impl Core {
     fn watch(&mut self, session: u64, tasks: Vec<Tk>) {
         let mut remote: BTreeMap<u32, Vec<Tk>> = BTreeMap::new();
         for tk in tasks {
-            if !self.router.hosts(tk.v()) {
+            // Watched where the outcome surely arrives: here only if this
+            // peer's replica keeps up with the group, else on its members.
+            if !self.router.current(tk.v()) {
                 self.watchers.entry(tk).or_default().push(session);
                 if self.remote_watched.insert(tk) {
                     remote.entry(self.router.group_of(tk.v())).or_default().push(tk);
@@ -2668,7 +2908,7 @@ impl Core {
                 }
             };
             let (digest, run) = (self.queue[i].spec.fn_digest.clone(), self.queue[i].tk.run);
-            let Some(exec) = self.idle_exec(&key, &digest, run) else {
+            let Some(exec) = self.idle_exec(&key, &digest, run).or_else(|| self.host_exec(&key, &self.queue[i])) else {
                 // Other pools need not wait for this one's executor to start.
                 self.ensure_executor(&env, threads, &key, cpus);
                 i += 1;
@@ -2775,11 +3015,14 @@ impl Core {
                     // charged the estimate once there is one: a just-started
                     // executor reads 0 until its first sample.
                     let w = &r.items[0];
-                    if r.mem > 0 {
+                    let mem = if r.mem > 0 {
                         r.mem
                     } else {
                         self.profiles.memory_estimate(&w.key(), w.read_bytes).map_or(0, |m| m.bytes)
-                    }
+                    };
+                    // A guest's reservation comes on top of what its process
+                    // held when it started (its waiting host's memory).
+                    r.baseline + mem
                 })
                 .max()
                 .unwrap_or(0);
@@ -2797,6 +3040,14 @@ impl Core {
         }
         let m = if w.mem > 0 { w.mem } else { self.live_floor.get(&w.key()).map_or(0, |f| f.saturating_mul(2)) };
         m.min(self.budget.pool)
+    }
+
+    /// How many calls of a function (or actors of a class) not yet measured
+    /// start at once: a quarter of the CPUs, but no more than the free pool
+    /// holds at PROBE_MEM each.
+    fn probe_width(&self) -> usize {
+        let free = self.budget.pool.saturating_sub(self.memory_used());
+        ((self.capacity / 4.0) as usize).min((free / PROBE_MEM) as usize).max(1)
     }
 
     /// Why `w` cannot start yet for lack of memory, or None.
@@ -2821,7 +3072,7 @@ impl Core {
             // Beyond that, any function's probes may use the free pool at
             // PROBE_SLOT each.
             let key = w.key();
-            let limit = ((self.capacity / 4.0) as usize).max(1);
+            let limit = self.probe_width();
             let probes = self.running.iter().filter(|r| r.mem == 0);
             let (mine, all) = probes.fold((0, 0), |(m, a), r| (m + usize::from(r.items[0].key() == key), a + 1));
             let slots = (self.budget.pool.saturating_sub(self.memory_used()) / PROBE_SLOT) as usize;
@@ -2831,8 +3082,22 @@ impl Core {
         }
         let used = self.memory_used();
         if used + need > self.budget.pool {
+            // Live actors hold their memory between calls: say so, since the
+            // usual fix is closing the ones no longer needed.
+            let actors: Vec<u64> =
+                self.execs.values().filter(|e| e.actor.is_some()).map(|e| e.private + e.arena).collect();
+            let held: u64 = actors.iter().sum();
+            let by_actors = if held > 0 {
+                format!(
+                    ", {} MiB of it held by {} live actor(s); closing ones you are done with (handle.close()) frees it",
+                    held / MIB,
+                    actors.len()
+                )
+            } else {
+                String::new()
+            };
             return Some(format!(
-                "needs {} MiB of memory ({}); {} of {} MiB in use",
+                "needs {} MiB of memory ({}); {} of {} MiB in use{by_actors}",
                 need / MIB,
                 w.reservation(),
                 used / MIB,
@@ -2947,6 +3212,8 @@ impl Core {
                         private: 0,
                         arena: 0,
                         leak: LeakWatch::default(),
+                        cpu_mark: 0,
+                        killed_for: None,
                     },
                 );
                 self.iso_waiting.insert(id, w);
@@ -2967,6 +3234,83 @@ impl Core {
             .filter(|(_, e)| e.actor.is_none() && e.state == ExecState::Idle && e.env_key == key)
             .min_by_key(|(id, e)| (e.last_fn.as_slice() != fn_digest, e.last_run != Some(run), **id))
             .map(|(id, _)| *id)
+    }
+
+    /// A pooled executor of `key` whose calls, all of `w`'s run, wait on
+    /// futures and offered to host: `w` runs there as a guest, on a thread
+    /// beside them, instead of in a process of its own (sharing). Prefers one
+    /// waiting on `w` itself: the parent runs its own child. (A device-holding
+    /// executor never matches: a key names free devices, and its are held.)
+    fn host_exec(&self, key: &str, w: &Work) -> Option<u32> {
+        if !sharing::enabled() || !w.guest_ok() || !self.running.iter().any(|r| r.blocked && r.host) {
+            return None;
+        }
+        let mut found: Option<(bool, u32)> = None;
+        for (id, e) in &self.execs {
+            if e.actor.is_some() || e.cgroup.is_some() || e.state != ExecState::Busy || e.env_key != key {
+                continue;
+            }
+            let on: Vec<&Running> = self.running.iter().filter(|r| r.exec == *id).collect();
+            let entries: Vec<sharing::Entry> =
+                on.iter().map(|r| sharing::Entry { blocked: r.blocked, host: r.host, items: r.items.len() }).collect();
+            if !sharing::can_host(&entries) || on.iter().any(|r| r.items[0].tk.run != w.tk.run) {
+                continue;
+            }
+            let rank = (!on.iter().any(|r| r.waiting_on.contains(&w.tk)), *id);
+            found = Some(found.map_or(rank, |f| f.min(rank)));
+        }
+        found.map(|(_, id)| id)
+    }
+
+    /// A guest starts on `exec`: from now its process is measured in slices.
+    /// The calls there ran alone until now, so each gets what the process
+    /// used since its start reading, and what it holds now. Returns the
+    /// guest's memory baseline: that, read fresh (a host may have allocated
+    /// just before it waited, after the last sample).
+    fn begin_sharing(&mut self, exec: u32) -> u64 {
+        self.slice(exec);
+        let Some((pid, arena, last)) = self.execs.get(&exec).map(|e| (e.pid, e.arena, e.private)) else { return 0 };
+        let held = budget::private_bytes(pid).unwrap_or(last) + arena;
+        let now = accounting::read(pid).map(|r| r.cpu_ns);
+        for r in self.running.iter_mut().filter(|r| r.exec == exec && !r.sliced) {
+            r.sliced = true;
+            r.cpu_own = r.start.zip(now).map(|(s, n)| n.saturating_sub(s.cpu_ns));
+            r.peak = r.peak.max(held);
+        }
+        if let (Some(n), Some(e)) = (now, self.execs.get_mut(&exec)) {
+            e.cpu_mark = n;
+        }
+        held
+    }
+
+    /// Before the calls on a shared executor change (one starts, ends, waits
+    /// or resumes): the CPU the process used since the last change, and the
+    /// memory it holds now, go to the one call that ran meanwhile
+    /// (`sharing::attribute_cpu`, `attribute_memory`).
+    fn slice(&mut self, exec: u32) {
+        if !self.running.iter().any(|r| r.exec == exec && r.sliced) {
+            return;
+        }
+        let Some((pid, mark, arena)) = self.execs.get(&exec).map(|e| (e.pid, e.cpu_mark, e.arena)) else { return };
+        let now = accounting::read(pid).map(|r| r.cpu_ns);
+        let held = budget::private_bytes(pid).map(|p| p + arena);
+        let mut on: Vec<&mut Running> = self.running.iter_mut().filter(|r| r.exec == exec && r.sliced).collect();
+        let active: Vec<bool> = on.iter().map(|r| !r.blocked).collect();
+        let mut own: Vec<Option<u64>> = on.iter().map(|r| r.cpu_own).collect();
+        match now {
+            Some(n) => sharing::attribute_cpu(n.saturating_sub(mark), &active, &mut own),
+            None => own.iter_mut().for_each(|o| *o = None),
+        }
+        for (r, o) in on.iter_mut().zip(own) {
+            r.cpu_own = o;
+        }
+        let baselines: Vec<u64> = on.iter().map(|r| r.baseline).collect();
+        if let Some((i, mem)) = held.and_then(|h| sharing::attribute_memory(h, &active, &baselines)) {
+            on[i].peak = on[i].peak.max(mem);
+        }
+        if let (Some(n), Some(e)) = (now, self.execs.get_mut(&exec)) {
+            e.cpu_mark = n;
+        }
     }
 
     /// A new run's first calls should find warm executors: start a few
@@ -3041,6 +3385,8 @@ impl Core {
                         private: 0,
                         arena: 0,
                         leak: LeakWatch::default(),
+                        cpu_mark: 0,
+                        killed_for: None,
                     },
                 );
                 self.pids_note = None;
@@ -3154,8 +3500,11 @@ impl Core {
         }
         let remaining = items.len();
         // Overlapping calls on one process share its CPU counters, so a delta
-        // is only exact when the call runs alone.
+        // is only exact when the call runs alone; a guest beside waiting calls
+        // is measured in slices instead (sharing).
         let start = if alone { accounting::read(pid) } else { None };
+        let guest = !alone && self.execs.get(&exec).is_some_and(|e| e.actor.is_none() && e.cgroup.is_none());
+        let baseline = if guest { self.begin_sharing(exec) } else { 0 };
         // Charged from the start: calls admitted on a live floor read 0
         // until their first sample, and one pass may admit many.
         let mem = items.iter().map(|w| self.need(w)).max().unwrap_or(0);
@@ -3176,6 +3525,11 @@ impl Core {
             started: Instant::now(),
             hwm_reset,
             unlearned: Vec::new(),
+            host: false,
+            waiting_on: Vec::new(),
+            sliced: guest,
+            cpu_own: guest.then_some(0),
+            baseline,
         });
         let inflight = self.running.iter().filter(|r| r.exec == exec).count();
         if let Some(e) = self.execs.get_mut(&exec)
@@ -3215,6 +3569,22 @@ impl Core {
             ExecEvent::Done { exec, done } => self.on_exec_done(exec, *done),
             ExecEvent::Blocked { exec, msg } => {
                 let task = msg.task.as_ref().and_then(Tk::parse);
+                if let Some(tk) = task {
+                    self.note_actor_wait(exec, tk, &msg.waiting_on, msg.blocked);
+                }
+                if let Some(i) =
+                    self.running.iter().position(|r| r.exec == exec && r.items.iter().any(|w| Some(w.tk) == task))
+                {
+                    // Waiting or resuming changes which call the process's CPU is
+                    // charged to; a wait that offers to host lets a guest in (sharing).
+                    if self.running[i].blocked != msg.blocked {
+                        self.slice(exec);
+                    }
+                    let r = &mut self.running[i];
+                    r.host = msg.blocked && msg.host;
+                    r.waiting_on =
+                        if msg.blocked { msg.waiting_on.iter().filter_map(Tk::parse).collect() } else { Vec::new() };
+                }
                 if let Some(r) =
                     self.running.iter_mut().find(|r| r.exec == exec && r.items.iter().any(|w| Some(w.tk) == task))
                     && r.blocked != msg.blocked
@@ -3234,6 +3604,11 @@ impl Core {
                         } else {
                             self.quotas.resume(call);
                         }
+                    }
+                    if msg.blocked
+                        && let Some(tk) = task
+                    {
+                        self.note_nested_waits(exec, tk);
                     }
                 }
             }
@@ -3295,6 +3670,106 @@ impl Core {
         }
     }
 
+    /// Track what a call of a one-at-a-time actor waits for. Waiting for a
+    /// call to the same actor that has not started is waiting forever: that
+    /// call can start only after this one ends (Ray hangs). Such a call is
+    /// failed at once, saying why, so the waiting `.result()` raises instead;
+    /// the awaited calls are kept while it waits, as they may reach the
+    /// actor's queue only after it said it waits.
+    fn note_actor_wait(&mut self, exec: u32, task: Tk, waiting: &[pb::TaskKey], blocked: bool) {
+        if !blocked {
+            self.actor_waits.remove(&(exec, task));
+            return;
+        }
+        if self.execs.get(&exec).is_some_and(|e| e.actor.is_some() && e.concurrency <= 1) {
+            self.actor_waits.insert((exec, task), waiting.iter().filter_map(Tk::parse).collect());
+            self.fail_self_waits(exec);
+        }
+    }
+
+    /// Fail the queued calls of `exec`'s actor that its own waiting calls
+    /// wait for (see note_actor_wait).
+    fn fail_self_waits(&mut self, exec: u32) {
+        let Some(host) = self.execs.get(&exec).and_then(|e| e.actor).and_then(|a| self.actors.get(&a)) else { return };
+        let short = |w: &Work| {
+            let parts: Vec<&str> = w.policy.fn_name.rsplit('.').take(2).collect();
+            parts.into_iter().rev().collect::<Vec<_>>().join(".")
+        };
+        let mut fail = Vec::new();
+        for ((e, task), waits) in &self.actor_waits {
+            if *e != exec {
+                continue;
+            }
+            for w in host.mailbox.values().filter(|w| waits.contains(&w.tk)) {
+                let waiter = self
+                    .running
+                    .iter()
+                    .filter(|r| r.exec == exec)
+                    .flat_map(|r| r.items.iter())
+                    .find(|x| x.tk == *task)
+                    .map(short)
+                    .or_else(|| self.direct.get(task).map(|c| c.name.clone())) // sent to it directly
+                    .unwrap_or_else(|| "a call".to_string());
+                fail.push((*task, w.tk, waiter, short(w)));
+            }
+        }
+        for (task, tk, waiter, name) in fail {
+            if let Some(waits) = self.actor_waits.get_mut(&(exec, task)) {
+                waits.retain(|t| *t != tk); // proposed once
+            }
+            self.propose(
+                tk.v(),
+                pb::shard_cmd::Body::Cancel(pb::Cancel {
+                    task: Some(tk.pb()),
+                    reason: Kind::Infeasible as i32,
+                    message: format!(
+                        "deadlock: {waiter} waits for {name}, a call to the same actor, which runs one call at a \
+                         time, so {name} could start only after {waiter} ends. Call the method directly \
+                         (self.method(...)), or let the actor run calls at once (concurrency=)"
+                    ),
+                }),
+            );
+        }
+    }
+
+    /// How many calls here wait on calls they started, and what their worker
+    /// processes hold, once there are many: each keeps its process.
+    fn nested_waits(&self) -> Option<(usize, u64)> {
+        // Processes, not calls: a waiting call's process may run others
+        // meanwhile (a guest), so several waits can share one.
+        let mut procs: Vec<u32> = self.running.iter().filter(|r| r.blocked).map(|r| r.exec).collect();
+        procs.sort_unstable();
+        procs.dedup();
+        if procs.len() < NESTED_NOTE_AT.max(4 * self.capacity.ceil() as usize) {
+            return None;
+        }
+        let held = procs.iter().filter_map(|x| self.execs.get(x)).map(|e| e.private + e.arena).sum();
+        Some((procs.len(), held))
+    }
+
+    /// Say once per run, to its driver, when many of its calls wait inside a
+    /// call for calls they started: nothing deadlocks (a waiting call lends out
+    /// its CPU), but each keeps a worker process, which costs memory and start
+    /// time. Ray prints only a count of worker processes.
+    fn note_nested_waits(&mut self, exec: u32, tk: Tk) {
+        if self.nested_noted.contains(&tk.run) {
+            return;
+        }
+        let Some((n, held)) = self.nested_waits() else { return };
+        if self.nested_noted.len() >= 256 {
+            self.nested_noted.pop_front();
+        }
+        self.nested_noted.push_back(tk.run);
+        let text = format!(
+            "chimaera: {n} worker processes here are held by calls waiting inside a call for calls they started \
+             ({} MiB in all; the memory pool is {} MiB). Nothing deadlocks, but each costs memory and start time: \
+             return the futures, or pass them to the next call, instead of calling .result() inside a call\n",
+            held / MIB,
+            self.budget.pool / MIB
+        );
+        self.forward_log(exec, pb::ExecLog { task: Some(tk.pb()), stream: "stderr".into(), text });
+    }
+
     /// Keep a run's output for `chimaera logs` and pass it to its drivers here.
     fn deliver_log(&mut self, tk: Tk, ev: &pb::LogEvent) {
         if let Err(e) = self.run_logs.append(&self.code, &tk.run.0, &tk.task.0, &ev.stream, &ev.text) {
@@ -3338,8 +3813,9 @@ impl Core {
             self.item_ended(tk);
         }
         let run = &mut self.running[idx];
-        if !work.publish && self.rebuilding.contains_key(&tk) {
-            // After this call's bookkeeping: the waiting attempts change the queue.
+        if !work.publish && (self.rebuilding.contains_key(&tk) || self.rebuild_readers.contains_key(&tk)) {
+            // After this call's bookkeeping: the waiting attempts change the queue,
+            // and the programs reading its value go on.
             let (tx, work, outcome) = (self.me_tx.clone(), Box::new(work.clone()), done.outcome.clone());
             tokio::spawn(async move { tx.send(CoreMsg::Rebuilt { work, outcome }).await });
         }
@@ -3376,18 +3852,31 @@ impl Core {
             // group and is the record (on_done finds no watchers left).
             self.notify_watchers(tk, outcome);
         }
+        let sliced = self.running[idx].sliced;
+        if finished && sliced {
+            self.slice(exec); // its last slice, before it leaves
+        }
         let alone = self.running.iter().filter(|r| r.exec == exec).count() == 1;
-        let end = if finished && alone { accounting::read(pid) } else { None };
+        let end = if finished && (alone || sliced) { accounting::read(pid) } else { None };
         let end_memory = if finished && alone { budget::private_and_held(pid) } else { None };
-        let end_private = end_memory.map(|(p, _)| p);
-        let start = self.running[idx].start;
+        let end_private = end_memory.map(|(p, _)| p.saturating_sub(self.running[idx].baseline));
+        let (start, end) = if sliced {
+            // Its process ran other calls beside it: its own CPU is the sum of
+            // its slices (none when two ran at once), read as a delta from 0.
+            match (self.running[idx].cpu_own, end) {
+                (Some(c), Some(b)) => (Some(Reading { cpu_ns: 0, ..b }), Some(Reading { cpu_ns: c, ..b })),
+                _ => (None, None),
+            }
+        } else {
+            (self.running[idx].start, end)
+        };
         let dispatched_ns = self.running[idx].dispatched_ns;
         let started = (start.map(|r| r.cpu_ns), self.running[idx].started);
         let share = self.running[idx].cpus / batch_len as f64;
         let measured = end.filter(|_| batch_len == 1).map(|r| r.cpu_ns);
         self.budgets.charge(exec, tk, done.attempt, &work.policy, started, measured, share, true);
         let sampled_peak = self.running[idx].peak;
-        let hwm_reset = self.running[idx].hwm_reset && finished && alone;
+        let hwm_reset = self.running[idx].hwm_reset && finished && alone && !sliced;
         let mut unlearned = Vec::new();
         if finished {
             let mut r = self.running.remove(idx);
@@ -3398,7 +3887,11 @@ impl Core {
             if let Some(w) = r.items.first() {
                 self.quotas.give((w.tk.run, w.tk.task));
             }
-            if let Some(x) = self.execs.get_mut(&exec) {
+            // A pooled executor stays busy while a guest, or its host, still runs there.
+            let empty = !self.running.iter().any(|r| r.exec == exec);
+            if let Some(x) = self.execs.get_mut(&exec)
+                && (x.actor.is_some() || empty)
+            {
                 x.state = ExecState::Idle;
                 x.idle_since = Instant::now();
                 if x.actor.is_none() {
@@ -3860,6 +4353,7 @@ impl Core {
 
     fn on_exec_exit(&mut self, exec: u32, detail: String, signal: Option<i32>) {
         let info = self.execs.remove(&exec);
+        self.actor_waits.retain(|(e, _), _| *e != exec);
         self.sup.forget(exec);
         self.devices.release(exec);
         if let Some(e) = &info {
@@ -3868,6 +4362,7 @@ impl Core {
         self.iso_waiting.remove(&exec);
         let mut oom = info.as_ref().and_then(|e| e.killed_for_memory);
         let note = info.as_ref().and_then(|e| e.kill_note.clone());
+        let culprit = info.as_ref().and_then(|e| e.killed_for);
         if let Some(group) = info.as_ref().and_then(|e| e.cgroup.clone()) {
             // The kernel enforces memory.max: an OOM kill shows in memory.events.
             if let Some(u) = Isolation::read(&group)
@@ -3894,6 +4389,10 @@ impl Core {
             crate::counters::OOM_KILLS.add(1);
         }
         for r in lost {
+            // A process killed for the memory of one of the calls it held: the
+            // others lost their worker (infra, retried with no memory hint).
+            let bystander = oom.is_some() && culprit.is_some_and(|c| !r.items.iter().any(|w| w.tk == c));
+            let oom = if bystander { None } else { oom };
             for (w, _) in r.items.iter().zip(&r.finished).filter(|(_, f)| !**f) {
                 self.item_ended(w.tk);
             }
@@ -3909,6 +4408,7 @@ impl Core {
             }
             for w in r.items.iter().filter(|w| w.publish) {
                 let reason = match (oom, signal) {
+                    _ if bystander => "its worker was killed for the memory of another call running beside it".into(),
                     (Some(_), _) if note.is_some() => note.clone().unwrap_or_default(),
                     (Some((peak, limit)), _) => {
                         format!("killed for exceeding its memory limit: peak {peak} > limit {limit} bytes")
@@ -4085,6 +4585,7 @@ impl Core {
                                 ..Default::default()
                             }),
                             terminal: true,
+                            moved: false,
                         }),
                     ),
                 }
@@ -4185,13 +4686,18 @@ impl Core {
         }
         let recent = |peer: &[u8]| self.actor_recent.iter().filter(|(p, _)| p.as_slice() == peer).count() as f64;
         // Actors placed here lately count too: their executors may not exist yet.
-        let hosted = self.execs.values().filter(|e| e.actor.is_some()).count() as f64 + recent(&me.peer);
+        let hosted = self.hosted_actors() as f64 + recent(&me.peer);
         let mine = (self.cpu_used + self.queue.len() as f64 + 0.25 * hosted) / self.capacity.max(1e-9);
         let fits_here = !self.draining && self.capacity + 1e-9 >= cpus && allowed(&mesh.me);
         let mut best = (fits_here && free_here + 1e-9 >= cpus).then(|| (mine - bonus(&mesh.me), me.clone()));
-        let others: Vec<_> =
+        let able: Vec<_> =
             mesh.live_others().into_iter().filter(|p| p.member.cpus + 1e-9 >= cpus && allowed(&p.member)).collect();
-        let ever = fits_here || !others.is_empty();
+        // A draining peer could hold it but takes no new actor: it waits.
+        let ever =
+            fits_here || !able.is_empty() || (self.draining && self.capacity + 1e-9 >= cpus && allowed(&mesh.me));
+        // `stopping`, not `draining`: a busy peer whose core answered a ping
+        // late also reports `draining` (mesh.rs ping handler).
+        let others: Vec<_> = able.into_iter().filter(|p| !p.load.as_ref().is_some_and(|l| l.stopping)).collect();
         // Free CPUs as each peer last reported them, less actors placed there since.
         let free: Vec<_> = others
             .iter()
@@ -4211,7 +4717,12 @@ impl Core {
         }
         match best {
             Some((_, p)) => {
-                if let Some(v) = mesh.member_by_peer(&p.peer) {
+                // CPU pressure until the peer's next report. An actor with no
+                // CPUs adds none: it counts through `recent` alone, or a peer
+                // whose report just reset this would soak up a burst.
+                if cpus > 0.0
+                    && let Some(v) = mesh.member_by_peer(&p.peer)
+                {
                     mesh.note_placed(v.member.node_id);
                 }
                 self.hold_actor_cpus(actor, &p, cpus);
@@ -4226,6 +4737,123 @@ impl Core {
     fn hold_actor_cpus(&mut self, actor: Id, peer: &pb::PeerInc, cpus: f64) {
         if cpus > 0.0 {
             self.actor_holds.push((actor, peer.peer.clone(), cpus, Instant::now()));
+        }
+    }
+
+    /// Start the process of an actor placed here, unless live actors and
+    /// running calls already fill the memory pool: an actor keeps what its
+    /// constructor allocates, so hundreds of tiny-CPU actors would otherwise
+    /// exhaust the machine. It then waits (retried from housekeeping) with a
+    /// reason naming what holds the pool.
+    fn start_actor(&mut self, actor: Id, run: Option<Id>, spec: &pb::ActorSpec) {
+        if let Some(why) = self.actor_memory_wait(actor) {
+            if let Some(h) = self.actors.get_mut(&actor) {
+                h.waiting_memory = Some(why);
+            }
+            if !self.actors_waiting_memory.iter().any(|(a, ..)| *a == actor) {
+                self.actors_waiting_memory.push_back((actor, run, spec.clone()));
+            }
+            return;
+        }
+        if let Some(h) = self.actors.get_mut(&actor) {
+            h.waiting_memory = None;
+        }
+        let env = run.and_then(|r| self.env_of(&r));
+        let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
+        let threads = if policy.cpus > 0.0 { policy.cpus.ceil() as u32 } else { 1 };
+        if let Some(env) = env {
+            // An actor holds its devices for its life (as the CPU it asked for).
+            let key = match self.devices.key_for_actor(policy.gpus, &policy.device, &env.key(threads)) {
+                Want::Key(key) => key,
+                Want::None | Want::Wait | Want::Infeasible(_) => env.key(threads),
+            };
+            let exec = self.spawn_exec(&env, threads, &key, Some(actor));
+            if let Some(id) = exec {
+                self.devices.hold(id, &key);
+            }
+            // An actor holds only the CPU it asked for: idle actors
+            // must not starve tasks (Ray's default is the same).
+            let cpus = policy.cpus.max(0.0);
+            if let Some(e) = exec.and_then(|id| self.execs.get_mut(&id)) {
+                e.held_cpus = cpus;
+                e.concurrency = (policy.concurrency as usize).max(1);
+                self.cpu_used += cpus;
+            }
+            if let Some(h) = self.actors.get_mut(&actor) {
+                h.exec = exec;
+                h.started = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Why an actor's process cannot start yet for lack of memory, or None.
+    /// One actor of a class is taken to hold what the most a started one of
+    /// that class here holds (once its constructor finished or it has run
+    /// PROBE_FOR), or its constructor's learned memory; until either is known,
+    /// a few start at a time. Siblings started but not yet measured are
+    /// charged that much, so a burst of creations cannot overshoot the pool
+    /// between memory samples.
+    fn actor_memory_wait(&self, actor: Id) -> Option<String> {
+        let host = self.actors.get(&actor)?;
+        if host.class_digest.is_empty() {
+            return None;
+        }
+        let mut one = host.ctor.as_ref().map_or(0, |w| w.mem);
+        let mut probing: Vec<u64> = Vec::new(); // what each unmeasured sibling holds so far
+        for (a, h) in &self.actors {
+            if *a == actor || h.dead || h.class_digest != host.class_digest {
+                continue;
+            }
+            let Some(e) = h.exec.and_then(|x| self.execs.get(&x)) else { continue };
+            if h.constructed || h.started.is_some_and(|t| t.elapsed() >= PROBE_FOR) {
+                one = one.max(e.private + e.arena);
+            } else {
+                probing.push(e.private + e.arena);
+            }
+        }
+        if one == 0 {
+            let limit = self.probe_width();
+            return (probing.len() >= limit).then(|| {
+                format!(
+                    "an actor class not yet measured starts {limit} actor(s) at a time until the memory one holds is known"
+                )
+            });
+        }
+        let held: Vec<u64> = self.execs.values().filter(|e| e.actor.is_some()).map(|e| e.private + e.arena).collect();
+        if held.is_empty() && !self.running.iter().any(|r| !r.blocked) {
+            return None; // nothing here would free memory by waiting: start it alone
+        }
+        let used = self.memory_used() + probing.iter().map(|p| one.saturating_sub(*p)).sum::<u64>();
+        (used + one > self.budget.pool).then(|| {
+            format!(
+                "the actor needs {} MiB of memory to start (what one of its class holds here); {} of {} MiB in use, \
+                 {} MiB of it held by {} live actor(s); closing ones you are done with (handle.close()) frees it",
+                one / MIB,
+                used / MIB,
+                self.budget.pool / MIB,
+                held.iter().sum::<u64>() / MIB,
+                held.len()
+            )
+        })
+    }
+
+    /// Actors this peer hosts: running, and placed here but waiting for memory
+    /// to start (placement must count those too, or a peer whose actors wait
+    /// looks empty and gets more).
+    fn hosted_actors(&self) -> usize {
+        self.execs.values().filter(|e| e.actor.is_some()).count() + self.actors_waiting_memory.len()
+    }
+
+    /// Actors waiting for memory to start, oldest first, as room frees.
+    fn start_waiting_actors(&mut self) {
+        while let Some((actor, run, spec)) = self.actors_waiting_memory.front().cloned() {
+            if self.actors.get(&actor).is_some_and(|h| !h.dead && h.exec.is_none() && h.waiting_memory.is_some()) {
+                self.start_actor(actor, run, &spec);
+                if self.actors.get(&actor).is_some_and(|h| h.waiting_memory.is_some()) {
+                    break; // still no room: later ones wait their turn
+                }
+            }
+            self.actors_waiting_memory.pop_front();
         }
     }
 
@@ -4261,41 +4889,43 @@ impl Core {
                     h.peer == self.router.identity.peer.to_vec() && h.inc == self.router.identity.incarnation
                 });
                 if mine && rec.generation > host.generation {
+                    if rec.generation != host.generation + 1 {
+                        // It ran elsewhere since it was last here: where its
+                        // handles stand is learned again (resolve_handles).
+                        host.next_seq.clear();
+                        host.done_seqs.clear();
+                        host.known_handles.clear();
+                        host.resolving.clear();
+                    }
                     host.generation = rec.generation;
                     host.constructed = false;
                     host.dead = false;
-                    let env = run.and_then(|r| self.env_of(&r));
-                    let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-                    let threads = if policy.cpus > 0.0 { policy.cpus.ceil() as u32 } else { 1 };
-                    if let Some(env) = env {
-                        // An actor holds its devices for its life (as the CPU it asked for).
-                        let key = match self.devices.key_for_actor(policy.gpus, &policy.device, &env.key(threads)) {
-                            Want::Key(key) => key,
-                            Want::None | Want::Wait | Want::Infeasible(_) => env.key(threads),
-                        };
-                        let exec = self.spawn_exec(&env, threads, &key, Some(actor));
-                        if let Some(id) = exec {
-                            self.devices.hold(id, &key);
-                        }
-                        // An actor holds only the CPU it asked for: idle actors
-                        // must not starve tasks (Ray's default is the same).
-                        let cpus = policy.cpus.max(0.0);
-                        if let Some(e) = exec.and_then(|id| self.execs.get_mut(&id)) {
-                            e.held_cpus = cpus;
-                            e.concurrency = (policy.concurrency as usize).max(1);
-                            self.cpu_used += cpus;
-                        }
-                        if let Some(h) = self.actors.get_mut(&actor) {
-                            h.exec = exec;
-                        }
+                    host.moving = false;
+                    host.moved = false;
+                    if self.draining && (host.restart != pb::actor_spec::Restart::Never || host.durable) {
+                        // Placed here by a leader that had not yet heard this
+                        // peer drains: send it on rather than start it.
+                        host.moving = true;
+                        self.try_move_actor(actor);
+                    } else {
+                        self.start_actor(actor, run, &spec);
                     }
                 }
             }
             pb::actor_record::State::Dead => {
                 host.dead = true;
-                // Its process ends now; the exit releases the CPU it held.
+                host.waiting_memory = None;
+                // Its process ends now; the exit releases the CPU it held. An
+                // idle one runs its own cleanup first (Ray's kill skips
+                // `__del__` and `atexit`). A busy one stops outright, as a call
+                // still running would otherwise finish in the grace period and
+                // succeed although the actor was closed.
                 if let Some(exec) = host.exec.take() {
-                    self.sup.kill(exec);
+                    if self.running.iter().any(|r| r.exec == exec) {
+                        self.sup.kill(exec);
+                    } else {
+                        self.sup.close(exec, ACTOR_CLOSE_GRACE);
+                    }
                 }
                 let host = self.actors.get_mut(&actor).expect("present");
                 let calls: Vec<Tk> = host.mailbox.values().map(|w| w.tk).collect();
@@ -4342,6 +4972,7 @@ impl Core {
                         ..Default::default()
                     }),
                     terminal: true,
+                    moved: false,
                 });
                 match router.propose(actor.vshard(), body).await {
                     // A follower's copy can lag a restart: read again.
@@ -4378,11 +5009,215 @@ impl Core {
             self.cancel_actor_call(w.tk, "the actor is dead");
             return;
         }
+        if host.moved {
+            self.give_back_actor_call(w);
+            return;
+        }
+        let handle = w.spec.handle;
         if w.kind() == pb::CallKind::CallActorCtor {
             host.ctor = Some(w);
         } else {
             host.mailbox.insert((w.spec.handle, w.spec.seq), w);
+            if !host.known_handles.contains(&handle) {
+                self.resolve_handles(actor, Some(&[handle]));
+            }
         }
+        if let Some(exec) = self.actors.get(&actor).and_then(|h| h.exec)
+            && self.actor_waits.keys().any(|(e, _)| *e == exec)
+        {
+            self.fail_self_waits(exec); // a call its running call already waits for
+        }
+        self.actor_pump(actor);
+    }
+
+    /// `handles` (or, from housekeeping, those already being looked up) that
+    /// this host has not run a call of and whose lowest waiting call is not
+    /// their first: look up where their order stands (`handle_floor`). Asked
+    /// again at most every HANDLE_RECHECK while an earlier call is unfinished.
+    /// Costs a lookup per handle, not a pass over the mailbox: it runs for
+    /// every call routed here.
+    fn resolve_handles(&mut self, actor: Id, handles: Option<&[u64]>) {
+        let Some(host) = self.actors.get_mut(&actor) else { return };
+        let handles: Vec<u64> = match handles {
+            Some(h) => h.to_vec(),
+            None => host.resolving.keys().copied().collect(),
+        };
+        let mut ask = Vec::new();
+        for handle in handles {
+            if host.known_handles.contains(&handle) {
+                host.resolving.remove(&handle);
+                continue;
+            }
+            // The mailbox is ordered by (handle, seq): its first entry for
+            // the handle is the lowest call waiting.
+            let Some(w) = host.mailbox.range((handle, 0)..=(handle, u64::MAX)).next().map(|(_, w)| w) else {
+                host.resolving.remove(&handle);
+                continue;
+            };
+            let Some(prev) = w.spec.prev.as_ref().and_then(Tk::parse) else { continue };
+            if w.spec.seq == 0 || host.resolving.get(&handle).is_some_and(|at| at.elapsed() < HANDLE_RECHECK) {
+                continue;
+            }
+            host.resolving.insert(handle, Instant::now());
+            ask.push((handle, prev, w.spec.seq));
+        }
+        for (handle, prev, seq) in ask {
+            let (router, tx) = (self.router.clone(), self.me_tx.clone());
+            tokio::spawn(async move {
+                let floor = match handle_floor(&router, router.mesh.as_deref(), prev, seq).await {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::debug!("where actor handle {handle} stands: {e}");
+                        None
+                    }
+                };
+                let _ = tx.send(CoreMsg::HandleFloor { actor, handle, floor }).await;
+            });
+        }
+    }
+
+    /// Draining: move the actors that may restart elsewhere, so they do
+    /// without using up a restart (their peer did not fail). Ones that never
+    /// restart stay until the peer stops.
+    fn move_actors(&mut self) {
+        let me = self.router.identity.pb();
+        let movable: Vec<Id> = self
+            .actors
+            .iter()
+            .filter(|(a, h)| {
+                h.generation > 0
+                    && !h.dead
+                    && !h.moved
+                    && (h.restart != pb::actor_spec::Restart::Never || h.durable)
+                    && self.actor_hosts.get(*a) == Some(&me)
+            })
+            .map(|(a, _)| *a)
+            .collect();
+        for actor in movable {
+            if let Some(h) = self.actors.get_mut(&actor) {
+                h.moving = true;
+            }
+            self.try_move_actor(actor);
+        }
+    }
+
+    /// Move a draining peer's actor once its running calls have finished:
+    /// stop its process and commit the move; the shard restarts it elsewhere
+    /// without counting a restart. Its waiting calls go back once that commits.
+    fn try_move_actor(&mut self, actor: Id) {
+        let Some(host) = self.actors.get(&actor) else { return };
+        let running = host.exec.is_some_and(|exec| self.running.iter().any(|r| r.exec == exec));
+        if !host.moving || host.committing || !host.inflight.is_empty() || running {
+            return;
+        }
+        let host = self.actors.get_mut(&actor).expect("present");
+        host.moving = false;
+        host.moved = true;
+        host.constructed = false;
+        let generation = host.generation;
+        // Taken first, so its exit is not reported as a crash (actor_exec_lost).
+        if let Some(exec) = host.exec.take() {
+            self.sup.kill(exec);
+        }
+        let body = pb::shard_cmd::Body::ActorDied(pb::ActorDied {
+            actor: actor.to_vec(),
+            generation,
+            reason: Some(pb::ErrorRecord {
+                kind: Kind::ActorDied as i32,
+                message: "moved: its peer is draining".into(),
+                ..Default::default()
+            }),
+            terminal: false,
+            moved: true,
+        });
+        use std::sync::atomic::Ordering::Relaxed;
+        let (router, tx, in_flight) = (self.router.clone(), self.me_tx.clone(), self.in_flight.clone());
+        in_flight.fetch_add(1, Relaxed);
+        tokio::spawn(async move {
+            let ok = match router.propose(actor.vshard(), body).await {
+                Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Actor(ack)) }) => {
+                    ack.status() == pb::actor_ack::Status::Ok
+                }
+                Ok(_) => false,
+                Err(e) => {
+                    tracing::warn!("moving actor {}: {e}", actor.hex());
+                    false
+                }
+            };
+            in_flight.fetch_sub(1, Relaxed);
+            let _ = tx.send(CoreMsg::ActorMoved { actor, ok }).await;
+        });
+    }
+
+    /// The move committed: the record no longer names this peer, so calls
+    /// given back now are granted again to the actor's next host. If it did
+    /// not commit, the calls stay; they are retried elsewhere once this
+    /// peer's incarnation is retired.
+    fn on_actor_moved(&mut self, actor: Id, ok: bool) {
+        self.record(pb::ClusterEvent {
+            kind: "actor".into(),
+            actor: actor.to_vec(),
+            node: self.router.identity.peer.to_vec(),
+            message: if ok {
+                "moved off this draining peer".into()
+            } else {
+                "could not move off this draining peer".into()
+            },
+            ..Default::default()
+        });
+        if !ok {
+            return;
+        }
+        let Some(host) = self.actors.get_mut(&actor) else { return };
+        let mut calls: Vec<Work> = std::mem::take(&mut host.mailbox).into_values().collect();
+        calls.extend(host.ctor.take().filter(|w| w.publish)); // a replayed constructor has its outcome
+        host.next_seq.clear();
+        host.done_seqs.clear();
+        host.known_handles.clear();
+        host.resolving.clear();
+        for w in calls {
+            self.give_back_actor_call(w);
+        }
+    }
+
+    /// Return an unstarted actor call's attempt to the shard, which grants it
+    /// again wherever its actor now lives. Nothing is counted against it.
+    fn give_back_actor_call(&mut self, w: Work) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let body = pb::shard_cmd::Body::RecordFailure(pb::RecordFailure {
+            task: Some(w.tk.pb()),
+            attempt: w.attempt,
+            peer: Some(self.router.identity.pb()),
+            kind: pb::record_failure::Kind::Requeued as i32,
+            error: Some(pb::ErrorRecord {
+                message: "given back unstarted: its actor moved to another peer".into(),
+                attempt: w.attempt,
+                ..Default::default()
+            }),
+            fingerprint: Vec::new(),
+            memory_peak: 0,
+        });
+        let (router, in_flight, tk) = (self.router.clone(), self.in_flight.clone(), w.tk);
+        in_flight.fetch_add(1, Relaxed);
+        tokio::spawn(async move {
+            let reply = router.propose(tk.v(), body).await;
+            if !give_back_taken(&reply) {
+                tracing::warn!("give-back of actor call {tk:?} not taken; it is retried when this peer stops");
+            }
+            in_flight.fetch_sub(1, Relaxed);
+        });
+    }
+
+    fn on_handle_floor(&mut self, actor: Id, handle: u64, floor: Option<(u64, Vec<u64>)>) {
+        let Some(host) = self.actors.get_mut(&actor) else { return };
+        let Some((next, done)) = floor else { return }; // asked again later (housekeeping)
+        host.resolving.remove(&handle);
+        if !host.known_handles.insert(handle) {
+            return; // one of its calls started here meanwhile
+        }
+        host.next_seq.insert(handle, next);
+        host.done_seqs.entry(handle).or_default().extend(done.into_iter().filter(|s| *s >= next));
+        advance(host, handle);
         self.actor_pump(actor);
     }
 
@@ -4438,6 +5273,10 @@ impl Core {
     /// first, then the lowest pending sequence number of any handle whose
     /// earlier calls have all started or finished.
     fn actor_pump(&mut self, actor: Id) {
+        if self.actors.get(&actor).is_some_and(|h| h.moving) {
+            self.try_move_actor(actor);
+            return;
+        }
         loop {
             if self.actors.get(&actor).is_some_and(|h| h.committing) {
                 return;
@@ -4485,6 +5324,7 @@ impl Core {
                 }
                 let w = host.mailbox.remove(&key).expect("key found above");
                 host.next_seq.insert(w.spec.handle, w.spec.seq + 1);
+                host.known_handles.insert(w.spec.handle);
                 host.inflight.insert((w.spec.handle, w.spec.seq));
                 advance(host, w.spec.handle);
                 batch.push(w);
@@ -4506,7 +5346,7 @@ impl Core {
             }
         }
         if finished {
-            self.actor_pump(actor);
+            self.actor_pump(actor); // a moving actor moves once idle
         }
     }
 
@@ -4549,6 +5389,7 @@ impl Core {
                     ..Default::default()
                 }),
                 terminal: false,
+                moved: false,
             }),
         );
     }
@@ -4561,6 +5402,11 @@ impl Core {
         // Actors that waited for CPUs: try again (each re-reads its record).
         for actor in std::mem::take(&mut self.actors_waiting) {
             self.on_actor_changed(actor);
+        }
+        // Handles still waiting on an earlier call that ran elsewhere.
+        let waiting: Vec<Id> = self.actors.iter().filter(|(_, h)| !h.resolving.is_empty()).map(|(a, _)| *a).collect();
+        for actor in waiting {
+            self.resolve_handles(actor, None);
         }
         if let Some(mesh) = &self.router.mesh {
             self.log_ship.flush(mesh);
@@ -4585,27 +5431,34 @@ impl Core {
         }
         self.kill_stuck_cancelled();
         // Memory limits: kill an attempt's executor when it exceeds its cap.
-        let mut kill = Vec::new();
+        let mut kill: Vec<(u32, u64, u64, Option<Tk>)> = Vec::new();
         for r in &self.running {
             let limit = r.items[0].policy.memory_limit;
-            if limit == 0 || kill.iter().any(|(e, _, _)| *e == r.exec) {
+            // Beside a guest, a waiting call holds what it held when it began
+            // waiting; the running call is judged on its own memory (sharing).
+            if limit == 0 || (r.sliced && r.blocked) || kill.iter().any(|(e, ..)| *e == r.exec) {
                 continue;
             }
             if let Some(e) = self.execs.get(&r.exec)
                 && let Some(reading) = accounting::read(e.pid)
-                && reading.rss_bytes > limit
+                && reading.rss_bytes.saturating_sub(r.baseline) > limit
             {
-                kill.push((r.exec, reading.peak_rss_bytes.max(reading.rss_bytes), limit));
+                let peak = reading.peak_rss_bytes.max(reading.rss_bytes).saturating_sub(r.baseline);
+                kill.push((r.exec, peak, limit, r.sliced.then(|| r.items[0].tk)));
             }
         }
-        for (exec, peak, limit) in kill {
+        for (exec, peak, limit, culprit) in kill {
             if let Some(e) = self.execs.get_mut(&exec) {
                 e.killed_for_memory = Some((peak, limit));
+                e.killed_for = culprit;
             }
             self.mem_kills.push_back(Instant::now());
             self.sup.kill(exec);
         }
         self.sample_memory();
+        if !self.actors_waiting_memory.is_empty() {
+            self.start_waiting_actors();
+        }
         if let Some(mesh) = self.router.mesh.clone() {
             for (node, p) in mesh.take_profiles() {
                 self.profiles.merge_remote(node, &p);
@@ -4639,8 +5492,20 @@ impl Core {
                 e.private = p;
             }
             e.arena = crate::stores::dir_bytes(&arenas.join(e.pid.to_string()));
-            for r in self.running.iter_mut().filter(|r| r.exec == *id) {
-                r.peak = r.peak.max(e.private + e.arena);
+            let sample = e.private + e.arena;
+            let mut on: Vec<&mut Running> = self.running.iter_mut().filter(|r| r.exec == *id).collect();
+            if on.iter().any(|r| r.sliced) {
+                // A guest beside waiting calls: the sample is the running call's,
+                // beyond what the process held when it started (sharing).
+                let active: Vec<bool> = on.iter().map(|r| !r.blocked).collect();
+                let baselines: Vec<u64> = on.iter().map(|r| r.baseline).collect();
+                if let Some((i, own)) = sharing::attribute_memory(sample, &active, &baselines) {
+                    on[i].peak = on[i].peak.max(own);
+                }
+            } else {
+                for r in on {
+                    r.peak = r.peak.max(sample);
+                }
             }
         }
         for r in &self.running {
@@ -4649,7 +5514,7 @@ impl Core {
                 && let Some(e) = self.execs.get(&r.exec)
             {
                 let floor = self.live_floor.entry(r.items[0].key()).or_default();
-                *floor = (*floor).max(e.private);
+                *floor = (*floor).max(if r.sliced { r.peak } else { e.private });
             }
         }
         if self.objects_scanned.elapsed() >= OBJECTS_SCAN_EVERY {
@@ -4674,14 +5539,15 @@ impl Core {
             if over > 0 && self.object_bytes > 0 && !self.spilling.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 let (objects, flag) = (self.objects.clone(), self.spilling.clone());
                 tokio::task::spawn_blocking(move || {
+                    let to = objects.spill_target();
                     match objects.spill_oldest(over) {
                         Ok(n) if n > 0 => {
                             tracing::info!(
-                                "objects past the memory pool's or their filesystem's room: moved {n} bytes to disk"
+                                "objects past the memory pool's or their filesystem's room: moved {n} bytes to {to}"
                             )
                         }
                         Ok(_) => {}
-                        Err(e) => tracing::warn!("cannot spill objects to disk: {e}"),
+                        Err(e) => tracing::warn!("cannot spill objects to {to}: {e}"),
                     }
                     flag.store(false, std::sync::atomic::Ordering::Release);
                 });
@@ -4720,15 +5586,19 @@ impl Core {
             .filter(|r| !r.blocked)
             .filter_map(|r| {
                 let e = self.execs.get(&r.exec)?;
-                let over = (e.private + e.arena).saturating_sub(r.mem);
+                // A guest is judged on its own memory, beyond its baseline (sharing).
+                let held = (e.private + e.arena).saturating_sub(r.baseline);
+                let over = held.saturating_sub(r.mem);
                 let last = e.actor.is_some() || r.items.iter().any(|w| w.spec.effects() == pb::Effects::External);
-                (over > 0).then_some((last, std::cmp::Reverse(over), r.exec, e.private, r.mem))
+                let culprit = r.sliced.then(|| r.items[0].tk);
+                (over > 0).then_some((last, std::cmp::Reverse(over), r.exec, held, r.mem, culprit))
             })
             .min();
-        let Some((_, _, exec, private, reserved)) = victim else { return };
+        let Some((_, _, exec, private, reserved, culprit)) = victim else { return };
         let available = self.available.unwrap_or(0) / MIB;
         if let Some(e) = self.execs.get_mut(&exec) {
             e.killed_for_memory = Some((private, reserved));
+            e.killed_for = culprit;
             e.kill_note = Some(format!(
                 "killed under host memory pressure ({available} MiB available): it held {} MiB with {} MiB reserved, \
                  the most over its reservation; the retry waits until 1.5x that fits",
@@ -4754,6 +5624,21 @@ impl Core {
             reply.attempts = self.attempts.get(&tk).cloned().unwrap_or_default();
             reply.pending_reason = self.pending_reason(tk, rec.as_ref());
             reply.task = rec;
+            if reply.task.is_none()
+                && let Some(call) = self.direct.get(&tk)
+            {
+                // Sent straight to its actor: running or queued there.
+                let spec = pb::TaskSpec {
+                    key: Some(tk.pb()),
+                    actor: call.actor.to_vec(),
+                    method: call.method.clone(),
+                    ..Default::default()
+                };
+                let mut task = pb::TaskRecord { spec: Some(spec), ..Default::default() };
+                task.set_state(pb::task_record::State::Running);
+                reply.task = Some(task);
+                reply.pending_reason = self.direct_reason(tk);
+            }
         }
         if req.decisions {
             reply.decisions = self.decisions.iter().cloned().collect();
@@ -4765,10 +5650,19 @@ impl Core {
         let Some(rec) = rec else { return "unknown task".into() };
         match rec.state() {
             pb::task_record::State::Done => String::new(),
-            pb::task_record::State::Pending => format!(
-                "waiting on {} prerequisite(s)",
-                self.router.read(tk.v(), |kv| read::deps_left(kv, tk)).flatten().unwrap_or(rec.deps_remaining)
-            ),
+            pb::task_record::State::Pending => {
+                let mut why = format!(
+                    "waiting on {} prerequisite(s)",
+                    self.router.read(tk.v(), |kv| read::deps_left(kv, tk)).flatten().unwrap_or(rec.deps_remaining)
+                );
+                // A call to an actor whose process waits for memory waits on
+                // its constructor, which waits on that.
+                let actor = rec.spec.as_ref().and_then(|s| Id::from_slice(&s.actor).ok());
+                if let Some(wait) = actor.and_then(|a| self.actors.get(&a)).and_then(|h| h.waiting_memory.as_ref()) {
+                    why += &format!("; its actor has not started: {wait}");
+                }
+                why
+            }
             pb::task_record::State::Ready => "ready; waiting to be granted".into(),
             pb::task_record::State::Running => {
                 if let Some(pos) = self.queue.iter().position(|w| w.tk == tk) {
@@ -4784,6 +5678,13 @@ impl Core {
                     } else {
                         "running".into()
                     }
+                } else if let Some(why) = self
+                    .actors
+                    .values()
+                    .find(|h| h.ctor.as_ref().is_some_and(|w| w.tk == tk) || h.mailbox.values().any(|w| w.tk == tk))
+                    .and_then(|h| h.waiting_memory.clone())
+                {
+                    why
                 } else if let Some(w) = self.actors.values().flat_map(|h| h.mailbox.values()).find(|w| w.tk == tk) {
                     let host = self.actors.values().find(|h| h.mailbox.values().any(|x| x.tk == tk)).expect("found");
                     let running =
@@ -4800,17 +5701,58 @@ impl Core {
     /// method's calls mostly wait on I/O, how to let them overlap (an actor
     /// runs one call at a time unless its method declares concurrency).
     fn actor_queue_reason(&self, w: &Work, ahead: usize) -> String {
+        self.queue_reason(&w.key(), &w.spec.method, ahead)
+    }
+
+    fn queue_reason(&self, key: &FnKey, method: &str, ahead: usize) -> String {
         let mut why = format!("queued at its actor behind {ahead} call(s); an actor runs its calls in order");
         if ahead >= ACTOR_HINT_QUEUE
-            && let Some(s) = self.profiles.summary(&w.key()).filter(|s| s.io_bound())
+            && let Some(s) = self.profiles.summary(key).filter(|s| s.io_bound())
         {
             why += &format!(
                 ". Its {} calls mostly wait ({:.2} cores over {:.2} s on average): \
                  @ch.method(concurrency=N) on {} lets N of them overlap",
-                w.spec.method, s.cores_mean, s.wall_p50_s, w.spec.method
+                method, s.cores_mean, s.wall_p50_s, method
             );
         }
         why
+    }
+
+    /// A direct call in flight: running if its actor has a free lane for it,
+    /// else queued behind the direct calls sent before it.
+    fn direct_reason(&self, tk: Tk) -> String {
+        let (Some(call), Some(ahead)) = (self.direct.get(&tk), self.direct.ahead(tk)) else {
+            return "unknown task".into();
+        };
+        let exec = self.actors.get(&call.actor).and_then(|h| h.exec).and_then(|e| self.execs.get(&e));
+        if ahead < exec.map_or(1, |e| e.concurrency.max(1)) {
+            return "running at its actor (its caller sent it there directly)".into();
+        }
+        self.queue_reason(&call.key, &call.method, ahead)
+    }
+
+    /// Learn from a call the direct path ran, as `learn` does for one run here.
+    fn learn_direct(&mut self, r: &crate::direct::Ran) {
+        if r.attempt.end_reason != "ok" {
+            return;
+        }
+        let policy = r.attempt.granted.clone().unwrap_or_default();
+        let m = |k: &str| r.attempt.measures.get(k).map_or(0.0, |m| m.value);
+        let sample = Sample {
+            wall_s: m("wall_seconds"),
+            cpu_s: m("cpu_seconds"),
+            peak: 0,
+            arg_bytes: r.arg_bytes,
+            out_bytes: r.out_bytes,
+            cpus: policy.cpus,
+            oom: false,
+        };
+        let req = Request { cpus: policy.cpus, memory: policy.memory, adaptive: policy.adaptive() };
+        let kills = self.mem_kills.back().is_some_and(|t| t.elapsed() < KILLS_RECENT);
+        let now = self.epoch.elapsed().as_secs_f64();
+        for d in self.profiles.record(&r.key, &policy.fn_name, sample, None, req, kills, now, now_ns()) {
+            self.decide(d);
+        }
     }
 
     /// What this peer knows of the cluster's members, itself included.
@@ -4826,7 +5768,7 @@ impl Core {
             queued: self.queue.len() as u64,
             this_peer: true,
             leading: self.router.leading(),
-            actors: self.execs.values().filter(|e| e.actor.is_some()).count() as u32,
+            actors: self.hosted_actors() as u32,
             object_bytes: self.objects.bytes_used(),
             draining: self.draining,
             ..Default::default()
@@ -4894,6 +5836,20 @@ impl Core {
         let mut reasons = Vec::new();
         if let Some(w) = self.queue.front() {
             reasons.push(format!("{} attempt(s) queued; the first {}", self.queue.len(), self.wait_reason(w)));
+        }
+        if let Some(why) = self
+            .actors_waiting_memory
+            .front()
+            .and_then(|(a, ..)| self.actors.get(a))
+            .and_then(|h| h.waiting_memory.as_ref())
+        {
+            reasons.push(format!("{} actor(s) waiting to start; the first: {why}", self.actors_waiting_memory.len()));
+        }
+        if let Some((n, held)) = self.nested_waits() {
+            reasons.push(format!(
+                "{n} worker processes held by calls waiting on calls they started ({} MiB in all)",
+                held / MIB
+            ));
         }
         pb::StatusReply {
             peer: None,

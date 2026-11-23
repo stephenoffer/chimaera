@@ -8,6 +8,7 @@ import operator
 import os
 import random
 import tempfile
+import time
 
 import pytest
 
@@ -25,8 +26,9 @@ def count_words(partition):
 def test_word_count_matches_a_serial_count():
     totals = count_words.map(ch.data.partitions(LINES, n=7)).reduce_by_key(operator.add, partitions=3)
     assert isinstance(totals, ch.data.Partitioned) and len(totals) == 3
-    parts = list(totals)  # one list of (key, value) pairs per partition
-    assert len(parts) == 3 and sum(len(p) for p in parts) == len(totals.to_dict())
+    parts = list(totals)  # one dict per partition
+    assert len(parts) == 3 and all(type(p) is dict for p in parts)
+    assert sum(len(p) for p in parts) == len(totals.to_dict())
     assert totals.to_dict() == collections.Counter(w for line in LINES for w in line.split())
 
 
@@ -45,7 +47,7 @@ def test_a_larger_shuffle_matches_the_serial_reference():
     got = pairs.map(seeds).reduce_by_key(operator.add, partitions=8)
     assert got.to_dict() == dict(expected)
     # Every key lands in exactly one partition.
-    seen = [k for f in got.futures for k, _ in f.result()]
+    seen = [k for f in got.futures for k in f.result()]
     assert len(seen) == len(set(seen)) == len(expected)
 
 
@@ -183,3 +185,57 @@ def test_shuffle_buckets_agree_across_processes_whatever_their_hash_seed():
         for s in ("0", "1", "random", "4242")
     }
     assert len(outs) == 1, outs
+
+
+@ch.remote
+def marked(i, marks):
+    with open(os.path.join(marks, f"ran-{i}"), "w"):
+        pass
+    return [(i % 3, 1)]
+
+
+@ch.remote
+def plus_one(x):
+    return x + 1
+
+
+def test_reduce_by_key_on_an_unread_map_runs_the_function_inside_its_scatters():
+    run = ch.runs.current_run()
+    before = {key for key, _ in run.tasks()}
+    marks = tempfile.mkdtemp()
+    totals = marked.map(range(8), [marks] * 8).reduce_by_key(operator.add, partitions=2).to_dict()
+    assert totals == {0: 3, 1: 3, 2: 2}
+    assert sorted(os.listdir(marks)) == sorted(f"ran-{i}" for i in range(8)), "each item ran once"
+    new = {key for key, _ in run.tasks()} - before
+    assert len(new) == 8 + 2, "8 calls that map and scatter and 2 gathers: the pairs were never stored between"
+
+
+def test_a_map_kept_unread_starts_once_the_driver_moves_on():
+    marks = tempfile.mkdtemp()
+    kept = marked.map(range(4), [marks] * 4)
+    assert plus_one.remote(1).result(timeout=60) == 2  # the driver submits and waits on something else
+    deadline = time.monotonic() + 30
+    while len(os.listdir(marks)) < 4 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(os.listdir(marks)) == 4, "the map ran before anything read it"
+    assert list(kept) == [[(i % 3, 1)] for i in range(4)]
+
+
+def test_a_script_that_makes_a_map_and_never_reads_it_still_runs_it():
+    from conftest import run_script
+
+    marks = tempfile.mkdtemp()
+    out = run_script(
+        f"""
+        import os
+        import chimaera as ch
+
+        @ch.remote
+        def mark(i):
+            open(os.path.join({marks!r}, f"ran-{{i}}"), "w").close()
+
+        mark.map(range(3))
+        """
+    )
+    assert out.returncode == 0, out.stderr
+    assert sorted(os.listdir(marks)) == ["ran-0", "ran-1", "ran-2"], "the script's map ran at exit"

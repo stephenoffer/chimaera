@@ -164,19 +164,35 @@ def _ensure_local_peer(home: str) -> None:
         time.sleep(0.02)
 
 
-def read_object(object_dir: str, run: bytes, obj: bytes) -> Any:
+# The call whose result this thread is loading (`Runtime.read_value`): blobs
+# its frame links are fetched in its name, so a lost one is made again.
+_reading = threading.local()
+
+# Why a lost value that no call returned stays lost.
+_NO_CALL = "the program stored it (ch.put, or an argument), and no call can make it again"
+
+
+def read_object(object_dir: str, run: bytes, obj: bytes, task: bytes | None = None, *, decode: bool = True) -> Any:
     """Load an object from this peer's store, asking the peer to fetch it
-    first when another peer produced it."""
+    first when another peer produced it. `task` is the call whose result it
+    is: when every copy is lost, the peer runs that call again if it can.
+    With ``decode=False`` it is only made local (and None returned)."""
     path = _serde.object_path(object_dir, run, obj)
+    if not decode and os.path.exists(path):
+        return None
     try:
-        return _serde.read_file(path)
+        return _serde.read_file(path) if decode else None
     except FileNotFoundError:
         pass
     try:
-        Runtime.get().localize(run, obj)
+        Runtime.get().localize(run, obj, task)
     except FileNotFoundError as e:
-        # The peer that held it is gone (or freed it); nothing rebuilds it.
-        raise DataLost(f"value {obj.hex()} of run {run.hex()} is no longer stored on any live peer") from e
+        # Every peer that held it is gone (or freed it), and its call could
+        # not run again (the peer's message says why).
+        why = e if task is not None else _NO_CALL
+        raise DataLost(f"value {obj.hex()} of run {run.hex()} is no longer stored on any live peer: {why}") from e
+    if not decode:
+        return None
     try:
         return _serde.read_file(path)
     except FileNotFoundError as e:  # a part or buffer it links, stored apart from it
@@ -210,6 +226,23 @@ def run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
             raise TypeError(f"env must map str to str; got {k!r}: {type(v).__name__}")
         env[k] = v
     return env
+
+
+def machine_digest() -> str:
+    """A short digest of this machine's identity (CHIMAERA_MACHINE_ID, else
+    its host name): a call that fails on a missing file can tell whether it
+    ran on another machine (CH123)."""
+    import socket
+
+    return blake3_digest((os.environ.get("CHIMAERA_MACHINE_ID") or socket.gethostname()).encode()).hex()[:8]
+
+
+def env_digests(shipped: dict[str, str]) -> str:
+    """Short digests of the names of the program's environment variables that
+    a run does not ship (names and values never travel): a call that fails
+    reading one can then say how to pass it (CH122)."""
+    names = (k for k in os.environ if k not in shipped and not k.startswith("CHIMAERA_"))
+    return ",".join(sorted({blake3_digest(k.encode()).hex()[:8] for k in names}))
 
 
 def code_fingerprint() -> str:
@@ -353,6 +386,7 @@ class Runtime:
         self._unfinished: dict[bytes, Any] = {}
         # Call key -> the function's name, for labelling what calls print.
         self._names: collections.OrderedDict[bytes, str] = collections.OrderedDict()
+        self.unread_errors = 0  # failed calls whose errors nothing read (see _future._note_unread)
         self._open_maps: set[Any] = set()
         self._stream_keys: set[bytes] = set()
         self._room_warned: set[str | None] = set()
@@ -376,9 +410,14 @@ class Runtime:
                 "CHIMAERA_DRIVER_PYTHON": f"{sys.version_info.major}.{sys.version_info.minor}",
                 "CHIMAERA_TENANT": self.tenant,
             }
+            ship["CHIMAERA_DRIVER_ENV"] = env_digests(ship)
+            ship["CHIMAERA_DRIVER_MACHINE"] = machine_digest()
             sys_path = [p or os.getcwd() for p in sys.path]
             # A remote peer has no copy of the project's own modules: ship them.
-            project = _project.pack(sys_path) if self.remote else None
+            # A program `chimaera submit` started also ships its project: its
+            # calls run on other peers, where the project was never unpacked.
+            shipping = self.remote or os.environ.get("CHIMAERA_SHIP_PROJECT") == "1"
+            project = _project.pack(sys_path) if shipping else None
             if project is not None:
                 ship[_project.ENV] = project[0].hex()
             try:
@@ -490,7 +529,10 @@ class Runtime:
             self._rewraps = collections.Counter(dict(self._rewraps.most_common(CODE_CACHE_MAX // 2)))
 
     def _connect_local(self, client_name: str) -> Client:
-        socket = os.environ.get("CHIMAERA_PEER_SOCKET") if self.in_executor else None
+        # Workers, and programs a call starts (``chimaera submit``), use the
+        # peer that runs them rather than starting one of their own.
+        socket = os.environ.get("CHIMAERA_PEER_SOCKET")
+        given = socket is not None
         if socket is None:
             _ensure_local_peer(self.home)
             socket = peer_socket(self.home)
@@ -498,7 +540,7 @@ class Runtime:
             return Client(socket, client_name)
         except ConnectionError:
             # A stale socket from a peer that died: remove it and start fresh.
-            if self.in_executor:
+            if given:
                 raise
             try:
                 os.unlink(socket)
@@ -507,13 +549,18 @@ class Runtime:
             _ensure_local_peer(self.home)
             return Client(socket, client_name)
 
-    def localize(self, run: bytes, obj: bytes) -> None:
+    def localize(self, run: bytes, obj: bytes, task: bytes | None = None) -> None:
         """Make an object readable at its path under ``object_dir``: the local peer
-        fetches it into its store; a remote client downloads it into its cache."""
+        fetches it into its store (running `task` again if it is the result of
+        that call and every copy is lost); a remote client downloads it into
+        its cache. Without `task`, the call whose result this thread is
+        loading (`read_value`) is named: a blob its frame links is part of it."""
+        if task is None:
+            task = getattr(_reading, "task", None)
         if self.remote:
-            self.client.fetch_object(run, obj, _serde.object_path(self.object_dir, run, obj))
+            self.client.fetch_object(run, obj, _serde.object_path(self.object_dir, run, obj), task)
         else:
-            self.client.localize(run, obj)
+            self.client.localize(run, obj, task)
 
     def pack(self, key: bytes, value: Any, site: str | None = None, holds: list[Any] | None = None) -> dict[str, Any]:
         """Encode a call frame by size: inline when small, else a file for this
@@ -561,7 +608,7 @@ class Runtime:
         self._futures[key] = future
         self.client.watch([key])
 
-    def submit(self, specs: list[dict[str, Any]], futures: list[Any]) -> None:
+    def submit(self, specs: list[dict[str, Any]], futures: list[Any], send: bool = True) -> None:
         for s, f in zip(specs, futures):
             self._futures[s["key"]] = f
             if not self.in_executor:
@@ -574,7 +621,8 @@ class Runtime:
                     self._pending_calls += 1
                     self._unfinished[s["key"]] = f
                 f._on_done(self._release_room)
-        self.client.submit(specs)
+        if send:  # else the direct path sends them (_direct.take)
+            self.client.submit(specs)
 
     def _release_room(self, f: Any) -> None:
         with self.cond:
@@ -632,6 +680,7 @@ class Runtime:
         while True:
             if self._releases:
                 batch, self._releases = self._releases, []
+                self.client.flush()  # a direct call's record goes before its release
                 self.client.release(batch)
             events = self.client.next_events(0.5, 4096)
             if events is None:
@@ -696,17 +745,29 @@ class Runtime:
         with self.cond:
             self.cond.notify_all()
 
-    def read_value(self, outcome: tuple[Any, ...]) -> Any:
+    def read_value(self, outcome: tuple[Any, ...], task: bytes | None = None) -> Any:
+        """Load a stored value. `task` is the call that returned it: when its
+        file, or a blob its frame links, is lost with every peer that held it,
+        the peer runs that call again (see ``localize``)."""
         _, inline, run, obj, _size, _oob = outcome
-        if inline is not None:
-            return _serde.loads(inline, _serde.run_dir(self.object_dir, run))
-        return read_object(self.object_dir, run, obj)
+        outer, _reading.task = getattr(_reading, "task", None), task
+        try:
+            if inline is not None:
+                try:
+                    return _serde.loads(inline, _serde.run_dir(self.object_dir, run))
+                except FileNotFoundError as e:  # a blob it links, and its call could not run again
+                    where, why = f"part of value {obj.hex()} of run {run.hex()}", e if task is not None else _NO_CALL
+                    raise DataLost(f"{where} is no longer stored on any live peer: {why}") from e
+            return read_object(self.object_dir, run, obj, task)
+        finally:
+            _reading.task = outer
 
     def _finish(self, cancel: bool = False) -> None:
         try:
             if not self.detached:
                 if not cancel:
                     self._wait_for_work()
+                    self._report_unread()
                 self.client.finish_run()
             else:
                 self.client.flush()
@@ -722,6 +783,16 @@ class Runtime:
         atexit.unregister(self._finish)
         self._finish(cancel)
 
+    def _report_unread(self) -> None:
+        """At exit, the calls that failed while nothing read their errors: the
+        ones still referenced now, and a count of those not shown before."""
+        from ._future import UNREAD_SHOWN, _note_unread, _unread_failure
+
+        _note_unread(self, [f for f in list(self._futures.values()) if _unread_failure(f)])
+        if self.unread_errors > UNREAD_SHOWN:
+            more = self.unread_errors - UNREAD_SHOWN
+            sys.stderr.write(f"chimaera: {more} more failed call{'s' * (more != 1)} whose errors nothing read\n")
+
     def _wait_for_work(self) -> None:
         """At exit, finish the script's work, as concurrent.futures waits for
         its pool: calls it never waited on, and maps it did not read to the
@@ -731,6 +802,10 @@ class Runtime:
         for key in list(self._stream_keys):
             if key in self._unfinished:
                 self.client.cancel(key, False)
+        if getattr(sys, "last_exc", None) is None and getattr(sys, "last_value", None) is None:
+            from ._future import start_pending
+
+            start_pending()  # maps made but never read run now, as they would have
         maps = list(self._open_maps)
         calls = sum(1 for k in self._unfinished if k not in self._stream_keys)
         if not calls and not maps:

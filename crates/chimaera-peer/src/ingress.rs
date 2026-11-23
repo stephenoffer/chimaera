@@ -22,6 +22,21 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
+/// Make an object's file readable here, downloading it from object storage
+/// if it was spilled there: whether it is here now. A failed download is
+/// logged and reads as absent, so the caller looks elsewhere.
+pub async fn restore(objects: &ObjectStore, run: &[u8], object: &[u8]) -> bool {
+    let (objects, run, object) = (objects.clone(), run.to_vec(), object.to_vec());
+    match tokio::task::spawn_blocking(move || objects.ensure_local(&run, &object)).await {
+        Ok(Ok(here)) => here,
+        Ok(Err(e)) => {
+            tracing::warn!("cannot restore an object from the spill store: {e}");
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 pub struct Ingress {
     pub core: mpsc::Sender<CoreMsg>,
     pub router: Arc<Router>,
@@ -198,6 +213,14 @@ impl Ingress {
                     reason: format!("no answer within {}s", SUBMIT_PATIENCE.as_secs()),
                 }),
             };
+            // No leader known: an election, or no majority to hold one. Wait as
+            // for an unavailable group, and report a lost majority the same way.
+            let attempt = attempt.map_err(|e| match e {
+                chimaera_raft::ProposeError::NotLeader { group, leader: None } => {
+                    chimaera_raft::ProposeError::Unavailable { group, reason: "no leader".into() }
+                }
+                e => e,
+            });
             match attempt {
                 Err(chimaera_raft::ProposeError::Unavailable { .. }) if started.elapsed() < SUBMIT_PATIENCE => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -261,7 +284,7 @@ impl Ingress {
         // nowhere else to place work: grant it here in the submission's own
         // commit, as a local peer does, instead of a placement round and a
         // second commit per batch.
-        let alone = self.router.mesh.as_ref().is_some_and(|m| m.live_others().is_empty());
+        let alone = self.router.mesh.as_ref().is_some_and(|m| !m.has_live_others());
         // Local first: plain calls go to this peer's idle CPUs in the
         // submission's own commit (nested calls whose parent waits here, a
         // driver's burst on its own machine). The rest are placed by the
@@ -502,7 +525,12 @@ impl pb::peer_server::Peer for Service {
                     continue;
                 }
                 match msg.msg {
-                    Some(pb::client_msg::Msg::Submit(s)) => {
+                    Some(pb::client_msg::Msg::Submit(mut s)) => {
+                        let inflight = crate::direct::inflight(&mut s);
+                        if !inflight.is_empty() {
+                            let _ = this.core.send(CoreMsg::DirectInflight(inflight)).await;
+                        }
+                        let mut ran = crate::direct::attempts(&s, &this.router.identity.pb());
                         let acks = this.submit(s).await;
                         let accepted: Vec<Tk> = acks
                             .acks
@@ -510,6 +538,17 @@ impl pb::peer_server::Peer for Service {
                             .filter(|a| a.status() != pb::task_ack::Status::Rejected)
                             .filter_map(|a| a.task.as_ref().and_then(Tk::parse))
                             .collect();
+                        if !ran.is_empty() {
+                            // A resubmission of one already recorded is a Duplicate: no second attempt.
+                            let fresh: BTreeSet<Tk> = acks
+                                .acks
+                                .iter()
+                                .filter(|a| a.status() == pb::task_ack::Status::Accepted)
+                                .filter_map(|a| a.task.as_ref().and_then(Tk::parse))
+                                .collect();
+                            ran.retain(|r| fresh.contains(&r.tk));
+                            let _ = this.core.send(CoreMsg::DirectAttempts(ran)).await;
+                        }
                         let _ = tx.send(ev(seq, pb::session_event::Event::Acks(acks)));
                         let _ = this.core.send(CoreMsg::Watch { session: id, tasks: accepted }).await;
                     }
@@ -581,11 +620,18 @@ impl pb::peer_server::Peer for Service {
         let caller = Caller::of(&req);
         let tk = Tk::parse(&req.into_inner()).ok_or_else(|| Status::invalid_argument("malformed task key"))?;
         self.0.may_run(&caller, &tk.run.0).await?;
-        let rec = match self.0.router.read(tk.v(), |kv| read::task(kv, tk)) {
-            Some(rec) => rec,
+        // A replica here may still be catching up (a voter just added): only
+        // the group's leader may say there is no such task.
+        let rec = match self.0.router.read(tk.v(), |kv| read::task(kv, tk)).flatten() {
+            Some(rec) => Some(rec),
             None => {
-                let req = pb::ReadRequest { tasks: vec![tk.pb()], ..Default::default() };
-                self.0.remote_read(tk.v(), req).await?.tasks.pop().filter(|r| r.spec.is_some())
+                let req = pb::ReadRequest { tasks: vec![tk.pb()], linearizable: true, ..Default::default() };
+                let local = self.0.router.hosted(self.0.router.group_of(tk.v())).is_some();
+                match self.0.remote_read(tk.v(), req).await {
+                    Ok(mut reply) => reply.tasks.pop().filter(|r| r.spec.is_some()),
+                    Err(_) if local => None, // no other replica answered: what this one has
+                    Err(e) => return Err(e),
+                }
             }
         };
         rec.map(Response::new).ok_or_else(|| Status::not_found("unknown task"))
@@ -774,16 +820,37 @@ impl pb::peer_server::Peer for Service {
         let caller = Caller::of(&req);
         let r = req.into_inner();
         self.0.may_run(&caller, &r.run).await?;
-        if self.0.objects.path(&r.run, &r.object_id).exists() {
+        if restore(&self.0.objects, &r.run, &r.object_id).await {
             return Ok(Response::new(pb::LocalizeReply {}));
         }
         let Some(mesh) = &self.0.router.mesh else {
             return Err(Status::not_found("object not in this peer's store"));
         };
-        mesh.localize(&self.0.objects, &r.run, &r.object_id, 0, &[])
+        let Err(e) = mesh.localize(&self.0.objects, &r.run, &r.object_id, 0, &[]).await else {
+            return Ok(Response::new(pb::LocalizeReply {}));
+        };
+        // Every copy is lost. A call's result can be made again by running
+        // the call (lineage); anything else fails here with the reason.
+        let Some(producer) = r.task.as_ref().and_then(Tk::parse) else {
+            return Err(Status::not_found(format!("object not found on any live peer: {e}")));
+        };
+        let (attempt, spec, deps) = crate::core::producer_plan(&self.0.router, mesh, producer, &r.object_id)
             .await
-            .map_err(|e| Status::not_found(format!("object not found on any live peer: {e}")))?;
-        Ok(Response::new(pb::LocalizeReply {}))
+            .map_err(|why| Status::not_found(format!("every copy is lost, and it cannot be made again: {why}")))?;
+        let (reply, rx) = oneshot::channel();
+        let msg = CoreMsg::RebuildRead { producer, attempt, spec: Box::new(spec), deps, reply };
+        self.0.core.send(msg).await.map_err(|_| Status::unavailable("peer is stopping"))?;
+        match rx.await {
+            // Remade here; a large value may have gone straight to a spill store.
+            Ok(Ok(())) if restore(&self.0.objects, &r.run, &r.object_id).await => {
+                Ok(Response::new(pb::LocalizeReply {}))
+            }
+            Ok(Ok(())) => Err(Status::not_found("every copy is lost, and running its call again did not remake it")),
+            Ok(Err(why)) => {
+                Err(Status::not_found(format!("every copy is lost, and running its call again failed: {why}")))
+            }
+            Err(_) => Err(Status::unavailable("peer is stopping")),
+        }
     }
 
     async fn has_blobs(&self, req: Request<pb::HasBlobsRequest>) -> Result<Response<pb::HasBlobsReply>, Status> {
@@ -875,6 +942,7 @@ impl pb::peer_server::Peer for Service {
         let caller = Caller::of(&req);
         let r = req.into_inner();
         self.0.may_run(&caller, &r.run).await?;
+        restore(&self.0.objects, &r.run, &r.object_id).await; // spilled to object storage
         let path = self.0.objects.path(&r.run, &r.object_id);
         let chunks = crate::stores::read_chunks(&path, r.offset, r.len, 1 << 20).await.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => Status::not_found(format!("object not in this peer's store: {e}")),

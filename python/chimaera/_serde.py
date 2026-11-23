@@ -102,6 +102,8 @@ class _CloudPickler(cloudpickle.Pickler):
 _FAST_MIN = 1024
 _ATOMS = (bytes, bytearray, str, int, float, bool, type(None))
 _plain = getattr(_native, "plain_tree", lambda _: False)  # absent from older builds
+_plain_encode = getattr(_native, "plain_encode", None)  # absent from older builds
+_plain_column = getattr(_native, "plain_encode_column", None)  # absent from older builds
 
 
 def _pickle(value: Any, pickler_cls: type, buffer_callback: Callable[[pickle.PickleBuffer], bool]) -> bytes:
@@ -109,7 +111,7 @@ def _pickle(value: Any, pickler_cls: type, buffer_callback: Callable[[pickle.Pic
 
     f = io.BytesIO()
     p = pickler_cls(f, protocol=5, buffer_callback=buffer_callback)
-    extra = torch_reducers()
+    extra = {**torch_reducers(), **_numpy_reducers()}
     if extra:
         p.dispatch_table = {**copyreg.dispatch_table, **getattr(p, "dispatch_table", {}), **extra}
     if (
@@ -125,15 +127,65 @@ def _pickle(value: Any, pickler_cls: type, buffer_callback: Callable[[pickle.Pic
     return f.getvalue()
 
 
+class _OutOfBand:
+    """A large top-level value pickled out of band: `rebuild(buffer)`. A plain
+    instance, freed as soon as pickling ends. (A class made per call sits in a
+    reference cycle, so it kept its buffer, hundreds of MiB of heap or arena,
+    until the next garbage collection: an idle worker returning large bytes
+    kept every one, and filled /dev/shm.)"""
+
+    __slots__ = ("rebuild", "buf")
+
+    def __init__(self, rebuild: Callable[[Any], Any], buf: Any) -> None:
+        self.rebuild, self.buf = rebuild, buf
+
+    def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
+        return (self.rebuild, (pickle.PickleBuffer(self.buf),))
+
+
+def _plain_from(buf: Any) -> Any:
+    """A large plain container, encoded natively (see _native.plain_encode).
+    Pickle names this function in every such value it writes, so it stays a
+    plain function of this module, whatever the native module calls its own."""
+    return _native.plain_decode(buf)
+
+
+def _object_array_from(buf: Any, shape: tuple[int, ...], order: str) -> Any:
+    """An object array of plain values (see _numpy_reducers)."""
+    import numpy as np
+
+    items = _native.plain_decode(buf)
+    try:  # fills the array directly: no shape discovery over the items
+        out = np.fromiter(items, dtype=object, count=len(items))
+    except ValueError:  # NumPy before 1.23 builds no object array from an iterator
+        out = np.array(items, dtype=object)
+    return out.reshape(shape, order=order)
+
+
+def _numpy_reducers() -> dict[type, Callable[[Any], Any]]:
+    """Object arrays of plain values, such as a pandas column of strings,
+    through the native codec instead of pickle, each repeated str object
+    still written once, as pickle's memo would; any other array reduces as
+    NumPy's own. Only when NumPy is already imported (never imports it)."""
+    np = sys.modules.get("numpy")
+    if np is None or _plain_column is None:
+        return {}
+
+    def reduce_array(a: Any) -> Any:
+        if a.dtype == object and a.size >= _FAST_MIN:
+            order = "F" if a.flags.f_contiguous and not a.flags.c_contiguous else "C"
+            encoded = _plain_column(a.ravel(order=order).tolist())
+            if encoded is not None:  # None: not all plain values
+                return (_object_array_from, (pickle.PickleBuffer(encoded), a.shape, order))
+        return a.__reduce_ex__(5)
+
+    return {np.ndarray: reduce_array}
+
+
 def _big_bytes(b: bytes | bytearray) -> Any:
     """A large top-level bytes value pickled out of band (pickle always copies
     bytes into the stream): its buffer goes straight into the object file."""
-
-    class Reduced:
-        def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
-            return (type(b), (pickle.PickleBuffer(b),))
-
-    return Reduced()
+    return _OutOfBand(type(b), b)
 
 
 def _big_str(s: str) -> Any:
@@ -142,13 +194,7 @@ def _big_str(s: str) -> Any:
     into the object file as they are, instead of being encoded into pickle's
     stream and copied from there. `surrogatepass` is what pickle uses, so the
     string comes back exactly, lone surrogates included."""
-    data = s.encode("utf-8", "surrogatepass")
-
-    class Reduced:
-        def __reduce_ex__(self, protocol: int) -> tuple[Any, ...]:
-            return (_str_from_utf8, (pickle.PickleBuffer(data),))
-
-    return Reduced()
+    return _OutOfBand(_str_from_utf8, s.encode("utf-8", "surrogatepass"))
 
 
 def _str_from_utf8(buf: Any) -> str:
@@ -173,12 +219,16 @@ def dumps_parts(
             head = _HEAD.pack(MAGIC, 0, 0, 0, len(main))
             return [head, b"\0" * _pad(len(head)), main], len(head) + _pad(len(head)) + len(main), 0
     buffers: list[tuple[memoryview, bytes, int]] = []
+    plain: bytes | None = None
 
     def keep(buf: pickle.PickleBuffer) -> bool:
         raw = buf.raw()
         if raw.nbytes < _OOB_MIN:
             return True
-        blob = external(raw) if external is not None else None
+        # The plain codec's bytes stay in this value's own file: they are its
+        # size (what promotes an argument, what CH118 measures), and no other
+        # value shares them.
+        blob = external(raw) if external is not None and raw.obj is not plain else None
         if isinstance(blob, tuple):
             buffers.append((raw, blob[0], blob[1]))
         else:
@@ -189,6 +239,12 @@ def dumps_parts(
         value = _big_bytes(value)
     elif type(value) is str and len(value) >= _OOB_MIN:
         value = _big_str(value)
+    elif t in (dict, list, tuple) and len(value) >= _FAST_MIN and _plain_encode is not None:
+        # Plain data, encoded natively in one pass and sent out of band like
+        # a large bytes value; None (not plain data) is pickled below.
+        plain = _plain_encode(value)
+        if plain is not None:
+            value = _OutOfBand(_plain_from, plain)
     try:
         main = _pickle(value, _Pickler, keep)
     except (pickle.PicklingError, AttributeError, TypeError):
@@ -340,6 +396,36 @@ def loads_part(data: bytes | memoryview | mmap.mmap, index: int, count: int, blo
     return _element(view, spans[index], blob_dir)
 
 
+def read_part(path: str, index: int, count: int, blob_dir: str | None = None) -> Any:
+    """``loads_part`` of the object file at `path`, reading only the stored
+    tuple's table and that element's bytes: a shuffle's gather wants one
+    bucket of each of many 64-bucket files, and reading whole files read 64
+    times the data it decoded. A file too large to read whole is mapped
+    instead (pages are read when touched), and so is anything that is not a
+    stored tuple of `count` values."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        # Either layout's table fits in table_size(count) bytes (a small file
+        # may be shorter: then it is read whole).
+        table = os.pread(fd, min(size, table_size(count)), 0) if size <= _READ_MAX else b""
+        if len(table) >= _SEQ_HEAD.size and _SEQ_HEAD.unpack_from(table, 0)[2] == count:
+            spans = _seq_spans(memoryview(table))
+            if spans is not None:
+                part, off, n = spans[index]
+                if part != _NO_BLOB:
+                    return _element(memoryview(table), spans[index], blob_dir)
+                # Out-of-band buffers (64 KiB and up) keep their alignment
+                # in page-aligned memory; anything smaller has none.
+                buf: bytearray | mmap.mmap = bytearray(n) if n < _OOB_MIN else mmap.mmap(-1, n)
+                if os.preadv(fd, [buf], off) != n:
+                    raise ValueError(f"object file {path} changed while it was read")
+                return loads(buf, blob_dir)
+    finally:
+        os.close(fd)
+    return loads_part(_map(path), index, count, blob_dir)
+
+
 def loads(data: bytes | memoryview | mmap.mmap, blob_dir: str | None = None) -> Any:
     """Decode an object. `blob_dir` is the run's object directory, where any
     external buffers, promoted arguments and parts live."""
@@ -462,9 +548,78 @@ def write_file(path: str, parts: list[bytes | memoryview]) -> None:
         ) from e
 
 
+@functools.cache
+def _bytes_main() -> bytes:
+    """The pickle of a large top-level bytes value (see _big_bytes): the same
+    few bytes whatever the value, as its buffer travels out of band."""
+    return _pickle(_big_bytes(b"\0" * _OOB_MIN), _Pickler, lambda buf: False)
+
+
+def _plain_bytes(head: bytes, fd: int, run_dir: str) -> bytes | None:
+    """A stored top-level bytes value, read with one ``pread`` from wherever
+    its buffer lives (this file, or the blob it links); None for any other
+    object. Decoding through a mapping would copy from freshly mapped pages,
+    and on a VM their page faults cost about as much as the copy (170 to 390
+    ms per GB): a call taking a 256 MiB value would spend half its time there."""
+    if len(head) < _HEAD.size:
+        return None
+    magic, flags, n, _, main_len = _HEAD.unpack_from(head, 0)
+    if magic != MAGIC or n != 1 or flags & ~(EXTERNAL | OFFSETS):
+        return None
+    main = _bytes_main()
+    if main_len != len(main):
+        return None
+    off = _HEAD.size
+    (length,) = struct.unpack_from("<Q", head, off)
+    off += 8
+    blob = None
+    if flags & EXTERNAL:
+        blob = head[off : off + 16]
+        off += 16
+    start = 0
+    if flags & OFFSETS:
+        (start,) = struct.unpack_from("<Q", head, off)
+        off += 8
+    off += _pad(off)
+    if head[off : off + main_len] != main:
+        return None
+    if blob is None:
+        start = off + main_len + _pad(off + main_len)
+        data = os.pread(fd, length, start)
+    else:
+        try:
+            src = os.open(os.path.join(run_dir, blob.hex()), os.O_RDONLY)
+        except FileNotFoundError:
+            return None  # held by another peer: the mapped path fetches it
+        try:
+            data = os.pread(src, length, start)
+        finally:
+            os.close(src)
+    return data if len(data) == length else None
+
+
+
 def read_file(path: str) -> Any:
-    """Map an object file and decode it; out-of-band buffers stay mapped."""
-    return loads(_map(path), os.path.dirname(path))
+    """Map an object file and decode it; out-of-band buffers stay mapped
+    (except a large bytes value's, read in one copy: see _plain_bytes)."""
+    run_dir = os.path.dirname(path)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        if 0 < size <= 512:
+            # Whole, in one read: most small results, and the head of a large
+            # bytes value whose buffer is stored apart.
+            head = bytearray(size)  # writable, as _map's read would be
+            if os.preadv(fd, [head], 0) == size:
+                data = _plain_bytes(head, fd, run_dir)
+                return data if data is not None else loads(head, run_dir)
+        elif size > _READ_MAX:
+            data = _plain_bytes(os.pread(fd, 512, 0), fd, run_dir)
+            if data is not None:
+                return data
+    finally:
+        os.close(fd)
+    return loads(_map(path), run_dir)
 
 
 def object_path(object_dir: str, run: bytes, object_id: bytes) -> str:

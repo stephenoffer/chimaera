@@ -17,9 +17,9 @@ import weakref
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, ParamSpec, Protocol, TypeVar, Unpack, overload
 
-from . import _context, _serde, _values
-from ._errors import ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
-from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part
+from . import _context, _direct, _serde, _values
+from ._errors import ActorDied, ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
+from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part, start_pending
 from ._native import blake3_digest, child_id, derive_id
 from ._options import Effective, Layer, Options, resolve, resolve_cached, signature_of, validate
 from ._batch import Batch
@@ -169,6 +169,7 @@ def build_call(
                 return _values.BlobRef(object_id, size)
             if reads is not None:
                 reads.append(x)  # lineage: its call's inputs stay while this call may need it rebuilt
+            x._seen = True  # its error, if any, becomes this call's
             return Dep(dep(x.key))
         return x
 
@@ -253,6 +254,18 @@ def _unsendable(
             break
     where = _fn_name(target, method) + (f" ({site})" if site else "")
     what = f"argument {culprit!r}" if culprit else "its arguments"
+    if "cyfunction" in str(err) and "pydantic" in str(err):
+        return SerializationError(
+            f"{where}: {what} cannot be sent to a worker: {err}. A pydantic v1 model defined in the program's main "
+            "script travels by value, and v1's compiled validators cannot: define the model in a module the program "
+            "imports (it then travels by name), or use pydantic 2."
+        )
+    if isinstance(err, RecursionError):
+        return SerializationError(
+            f"{where}: {what} nests too deeply to pickle ({err}). Pickling goes one level deeper per nested "
+            "object, so a linked list or tree thousands of levels deep runs out of stack: send it flat (its nodes "
+            "in a list, links as indices) and rebuild it inside the call."
+        )
     return SerializationError(
         f"{where}: {what} cannot be sent to a worker: {err}. Pass what the call needs to rebuild it "
         "(a path rather than an open file, settings rather than a client) and create it inside the call."
@@ -279,8 +292,10 @@ def _release_reads(held: list[Any]) -> None:
 
 
 def submit_call(rt: Runtime, target: Any, args: tuple[Any, ...], kwargs: dict[str, Any], **kw: Any) -> Future[Any]:
+    start_pending()  # maps made earlier and not read yet go first, in order
     site = kw.pop("site", None)
     future_cls = kw.pop("future_cls", Future)
+    ordered: Actor | None = kw.pop("ordered", None)
     reads: list[Any] = []
     spec, key = build_call(rt, target, args, kwargs, site=site, reads=reads, **kw)
     if reads:
@@ -297,7 +312,18 @@ def submit_call(rt: Runtime, target: Any, args: tuple[Any, ...], kwargs: dict[st
         fut._escaped = True  # a durable workflow's replay reads this step again: never release it
     fut._arg_bytes = spec["read_bytes"]
     fut._returns = kw["eff"].get("returns")
-    rt.submit([spec], [fut])
+    if ordered is None:
+        rt.submit([spec], [fut])
+        return fut
+    # An actor call takes its place in its handle's order only once it is
+    # built: a call that fails to build leaves no gap for later ones to wait on.
+    with ordered._order:
+        if _direct.take(rt, ordered, spec, fut):  # straight to the actor's executor
+            return fut
+        spec["seq"], spec["prev"] = next(ordered._seq), ordered._prev
+        ordered._calls[0] += 1
+        rt.submit([spec], [fut])
+        ordered._prev = key
     return fut
 
 
@@ -357,6 +383,10 @@ class RemoteFunction(Generic[P, R]):
         eff = self.policy()
         if eff.get("ranks") is not None:
             raise OptionsError(f"ranks= makes a gang: run it with .gang(...), not .remote() ({eff.sources['ranks']})")
+        if eff.get("cache"):
+            from . import _cache
+
+            return _cache.submit(rt, self, args, kwargs, eff, site=_site())
         if eff.get("within") is not None:
             from ._reserve import call_within
 
@@ -381,6 +411,10 @@ class RemoteFunction(Generic[P, R]):
 
         def submit(i: int, item: Any) -> Future[R]:
             args = (item,) if single else tuple(item)
+            if eff.get("cache"):  # each item is looked up and stored on its own
+                from . import _cache
+
+                return _cache.submit(rt, self, args, {}, eff, kind=CALL_MAP_ITEM, item_index=i)
             return submit_call(rt, self._fn, args, {}, kind=CALL_MAP_ITEM, eff=eff, item_index=i)
 
         # Fast items go several to a call (what hand batching does), each
@@ -393,6 +427,7 @@ class RemoteFunction(Generic[P, R]):
             and not inspect.iscoroutinefunction(self._fn)
             and not inspect.isgeneratorfunction(self._fn)
             and not inspect.isasyncgenfunction(self._fn)
+            and not eff.get("cache")
         )
         runner = _MapChunk(self._fn, star=not single)
 
@@ -412,6 +447,8 @@ class RemoteFunction(Generic[P, R]):
             chunk=submit_chunk if chunkable else None,
             parallel=int(rt.info["usable_cores"]),
             grow_window=eff.get("max_in_flight") is None,
+            # reduce_by_key may run the function in its scatter (Results.claim).
+            origin=None if rt.in_executor else (self._fn, eff, single),
         )
 
 
@@ -488,7 +525,10 @@ class ActorClass(Generic[C]):
             from ._reserve import HostedActor
 
             return HostedActor(eff.get("within"), self._cls, args, kwargs)  # type: ignore[return-value]
-        return _create_actor(Runtime.get(), self._cls, eff, args, kwargs)
+        actor = _create_actor(Runtime.get(), self._cls, eff, args, kwargs)
+        if eff.get("name") is None:  # by name, each handle may be the same actor
+            _watch_churn(actor, self._cls, _site())
+        return actor
 
     def pool(self, *args: Any, **kwargs: Any) -> Pool[C]:
         """Independent replicas, each constructed with these arguments. With
@@ -624,7 +664,14 @@ class Actor(Generic[C]):
         self._eff = eff
         self._handle = int.from_bytes(os.urandom(8), "little") >> 1
         self._seq = itertools.count()
+        # The key of this handle's last call: each call names it (`prev`), so a
+        # host the actor restarted or moved to can tell where the handle's
+        # sequence stands. Stamped with `seq` under `_order`, at submission.
+        self._prev: bytes | None = None
+        self._order = threading.Lock()
         self._methods: dict[str, RemoteMethod[..., Any]] = {}
+        self._calls = [0]  # calls made through this handle (CH121)
+        self._ended: Any = None  # see _watch_churn
 
     @property
     def id(self) -> str:
@@ -650,13 +697,72 @@ class Actor(Generic[C]):
         self._methods[name] = method
         return method
 
-    def close(self) -> None:
+    def close(self, *, drain: bool = False, timeout: float = 30.0) -> None:
         """End the actor: its process exits, pending calls raise ActorDied, and
-        it is not restarted. Non-detached actors also end with their run."""
+        it is not restarted. Non-detached actors also end with their run.
+
+        With ``drain=True`` the calls this handle already made finish first
+        (with ``concurrency`` above 1 they may still be running), then the
+        actor's ``__exit__(None, None, None)`` runs if it defines one. If that
+        takes longer than ``timeout`` seconds the actor is ended anyway, with
+        a warning; an error raised by ``__exit__`` is raised here, after the
+        actor has ended."""
+        if self._ended is not None:
+            self._ended()
+        if not drain:
+            _direct.forget(self)
+            self._rt.client.close_actor(self._actor)
+            return
+        error: BaseException | None = None
+        try:
+            RemoteMethod(self, _context.SHUTDOWN_METHOD, None).remote().result(timeout=timeout)
+        except TimeoutError:
+            warnings.warn(f"the actor did not finish draining within {timeout} s; it was ended", stacklevel=2)
+        except ActorDied:
+            pass  # already ended
+        except Exception as e:  # __exit__ raised: end the actor, then report it
+            error = e
+        _direct.forget(self)
         self._rt.client.close_actor(self._actor)
+        if error is not None:
+            raise error
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (_rebuild_actor, (self._actor, self._ctor, self._cls, self._digest))
+
+
+# CH121: actors of one class made at one call site that ended after at most
+# CHURN_CALLS calls, within CHURN_LIFE_S of being made, before the warning.
+CHURN_WARN_AT = 20
+CHURN_CALLS = 2
+CHURN_LIFE_S = 60.0
+_churn: dict[tuple[str, str], int] = {}
+
+
+def _watch_churn(actor: Actor[Any], cls: type[Any], site: str) -> None:
+    """Count actors that end soon after a call or two (CH121): each was a new
+    worker process, which reusing an actor, or a plain function, avoids."""
+    actor._ended = weakref.finalize(actor, _actor_ended, (cls.__qualname__, site), actor._calls, time.monotonic())
+    actor._ended.atexit = False
+
+
+def _actor_ended(key: tuple[str, str], calls: list[int], made: float) -> None:
+    if calls[0] > CHURN_CALLS or time.monotonic() - made > CHURN_LIFE_S:
+        return
+    n = _churn[key] = _churn.get(key, 0) + 1
+    if n == CHURN_WARN_AT:
+        cls, site = key
+        path, _, line = site.rpartition(":")
+        # Shown at the call site that makes them (this runs when one ends).
+        warnings.warn_explicit(
+            f"CH121: {cls} actors made here ended after a call or two, {n} times so far. Each actor is a new "
+            f"worker process, far slower to start than a call to one that is running: make a few once and reuse "
+            f"them ({cls}.pool(n) spreads calls over replicas), or make it a function (@ch.remote def) if it keeps "
+            "nothing between calls.",
+            UserWarning,
+            path or site,
+            int(line) if line.isdigit() else 0,
+        )
 
 
 def _rebuild_actor(actor: bytes, ctor: bytes, cls: type[Any] | None, digest: bytes = b"") -> Actor[Any]:
@@ -672,6 +778,15 @@ class RemoteMethod(Generic[P, R]):
         self._view = view
         self._resolved: tuple[tuple[Layer, ...], Effective] | None = None
 
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Calling an actor method like a local one is the usual first mistake:
+        say what to call instead (Python's own message named only the type)."""
+        owner = getattr(self._actor._cls, "__name__", "actor")
+        raise TypeError(
+            f"{owner}.{self._name} runs in the actor, not here: call it with .{self._name}.remote(...), which "
+            "returns a future (.result() waits for the value)"
+        )
+
     def options(self, **opts: Unpack[Options]) -> RemoteMethod[P, R]:
         """Settings for calls through this view (``deadline``, ``returns``,
         ``max_attempts``, ``priority``, a stricter ``effects``...)."""
@@ -684,7 +799,12 @@ class RemoteMethod(Generic[P, R]):
         a = self._actor
         declared = {k: v for k, v in (getattr(self._fn, "__chimaera_method__", None) or {}).items() if k != "group"}
         layers = self._view + ((Layer(declared, f"@ch.method on {self._name}", "view"),) if declared else ())
-        return resolve_cached(self, layers, Layer(a._eff.values, "actor", "decorator"))
+        eff = resolve_cached(self, layers, Layer(a._eff.values, "actor", "decorator"))
+        if eff.get("cache"):
+            raise OptionsError(
+                f"cache= is for functions: an actor method's result depends on its actor's state ({eff.sources['cache']})"
+            )
+        return eff
 
     def _check(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
         if self._fn is not None:
@@ -702,7 +822,7 @@ class RemoteMethod(Generic[P, R]):
             eff=self._policy(),
             actor=a._actor,
             handle=a._handle,
-            seq=next(a._seq),
+            ordered=a,
             method=self._name,
             extra_deps=(a._ctor,),
             site=_site(),
@@ -725,7 +845,7 @@ class RemoteMethod(Generic[P, R]):
                 eff=eff,
                 actor=a._actor,
                 handle=a._handle,
-                seq=next(a._seq),
+                ordered=a,
                 method=self._name,
                 extra_deps=(a._ctor,),
                 item_index=i,

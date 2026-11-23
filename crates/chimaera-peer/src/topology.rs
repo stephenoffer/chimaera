@@ -34,8 +34,34 @@ fn read(path: impl AsRef<Path>) -> Option<String> {
 
 /// This process's cgroup v2 directory, if the unified hierarchy is mounted.
 pub fn own_cgroup_dir() -> Option<PathBuf> {
-    let rel = t::parse_proc_cgroup(&read("/proc/self/cgroup")?)?;
-    let dir = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    cgroup_dir_in(&read("/proc/self/cgroup")?, &read("/proc/self/mountinfo").unwrap_or_default())
+}
+
+/// The directory of the cgroup named in `/proc/self/cgroup`. That path is
+/// relative to the hierarchy's root, and the cgroup2 mount may show only a
+/// subtree of it (a container without its own cgroup namespace mounts its
+/// own cgroup at /sys/fs/cgroup): strip the mount's root (field 4 of its
+/// mountinfo line) and join the rest to where it is mounted (field 5).
+/// Joined as it is, the path names nothing, and limits there (pids.max,
+/// memory.max) go unseen.
+fn cgroup_dir_in(proc_cgroup: &str, mountinfo: &str) -> Option<PathBuf> {
+    let rel = t::parse_proc_cgroup(proc_cgroup)?;
+    let mounts: Vec<(String, PathBuf)> = mountinfo
+        .lines()
+        .filter_map(|l| {
+            let (fields, fs) = l.split_once(" - ")?;
+            let f: Vec<&str> = fields.split_whitespace().collect();
+            fs.starts_with("cgroup2 ").then(|| Some((f.get(3)?.to_string(), PathBuf::from(f.get(4)?))))?
+        })
+        .collect();
+    let (root, mount) = mounts
+        .iter()
+        .find(|(_, at)| at == Path::new("/sys/fs/cgroup"))
+        .or_else(|| mounts.first())
+        .cloned()
+        .unwrap_or_else(|| ("/".into(), PathBuf::from("/sys/fs/cgroup")));
+    let inner = Path::new(&rel).strip_prefix(&root).ok()?; // outside the mounted subtree: unseen
+    let dir = mount.join(inner);
     dir.join("cgroup.controllers").exists().then_some(dir)
 }
 
@@ -246,5 +272,22 @@ mod chain_tests {
         assert_eq!(pids_room_in(&[own, parent]), Some((5, 8)), "3 left beats 10 left");
         assert_eq!(pids_room_in(&[]), None, "no cgroup: no limit");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_cgroup_path_is_found_under_a_mount_of_part_of_the_hierarchy() {
+        let mnt = tempfile::tempdir().unwrap();
+        let own = mnt.path().join("test-cg");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("cgroup.controllers"), "pids memory\n").unwrap();
+        let at = mnt.path().display();
+        // A container without its own cgroup namespace: its cgroup is mounted.
+        let sub = format!("2416 2382 0:29 /anyscale/ctr_x {at} rw,nosuid - cgroup2 cgroup2 rw,nsdelegate\n");
+        assert_eq!(cgroup_dir_in("0::/anyscale/ctr_x/test-cg\n", &sub), Some(own.clone()));
+        // Its own namespace: the mount shows the root, and the path joins as it is.
+        let ns = format!("30 25 0:26 / {at} rw - cgroup2 cgroup2 rw\n");
+        assert_eq!(cgroup_dir_in("0::/test-cg\n", &ns), Some(own.clone()));
+        // Outside the mounted subtree (whole components, not a text prefix).
+        assert_eq!(cgroup_dir_in("0::/anyscale/ctr_xy/test-cg\n", &sub), None);
     }
 }

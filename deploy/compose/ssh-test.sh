@@ -72,6 +72,12 @@ if [ -z "$n" ] || [ "$n" -le 1 ] || ! echo "$out" | grep -qx "REMOTE True"; then
   exit 1
 fi
 
+# Peers and drivers use TLS: `up` made the cluster CA beside the token, and
+# each peer issued itself a certificate from it.
+lap sh -c 'test -f ~/.chimaera/clusters/lab/ca.pem' || { echo "FAIL: no cluster CA on the laptop" >&2; exit 1; }
+docker exec -u chimaera "$net-host1" sh -c 'test -f ~/.chimaera/peers/lab/tls/peer.pem' ||
+  { echo "FAIL: host1's peer has no certificate of its own" >&2; exit 1; }
+
 echo "--- chimaera down lab"
 lap chimaera down lab
 for h in "${hosts[@]}"; do

@@ -144,6 +144,9 @@ message PeerInfo {
   uint64 memory_bytes = 8;
   string version = 9;
   repeated string gpus = 10;
+  // Records actor calls a driver ran directly (TaskSpec.ran, .direct): a
+  // driver sends calls straight to actors here only when this is set.
+  bool direct_actor_calls = 11;
 }
 
 message CreateRunRequest {
@@ -393,6 +396,9 @@ message ShutdownReply {}
 message LocalizeRequest {
   bytes run = 1;
   bytes object_id = 2;
+  // The call whose result this is: when every copy is lost, the peer runs it
+  // again (lineage) if it can be, else the reply says why not.
+  TaskKey task = 3;
 }
 
 message LocalizeReply {}

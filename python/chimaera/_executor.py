@@ -12,6 +12,8 @@ import argparse
 import asyncio
 import collections
 import concurrent.futures
+import ctypes
+import gc
 import inspect
 import io
 import logging
@@ -28,12 +30,14 @@ from typing import Any
 
 import cloudpickle
 
-from . import _batch, _context, _future, _objects, _project, _serde
-from ._errors import ActorDied
+from . import _batch, _direct, _context, _future, _objects, _project, _serde
+from ._errors import ActorDied, NonRetryable
 from ._native import ExecConn, blake3_digest, child_id
 from ._serde import Dep
 
 CODE_CACHE = 256
+# Threads that start and finish an actor's async calls (their awaiting holds none).
+ASYNC_STEP_THREADS = 4
 # Growth in a worker's anonymous memory after which freed memory glibc keeps
 # in its arenas is handed back (malloc_trim) before the call is reported, so
 # the peer's leak check (R4) sees only memory that is really held.
@@ -214,6 +218,45 @@ def _gpu_hint(exc: BaseException) -> None:
     )
 
 
+def _env_hint(exc: BaseException) -> None:
+    """CH122: a call failing on ``os.environ[name]`` for a variable the
+    program has (a run ships only the ones it names) is told how to pass it;
+    the bare KeyError says only the name."""
+    if not isinstance(exc, KeyError) or len(exc.args) != 1 or not isinstance(exc.args[0], str):
+        return
+    name, tb = exc.args[0], exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    if name in os.environ or tb is None or tb.tb_frame.f_locals.get("self") is not os.environ:
+        return  # not raised by os.environ (whose module is frozen: no file to match)
+    if blake3_digest(name.encode()).hex()[:8] not in os.environ.get("CHIMAERA_DRIVER_ENV", "").split(","):
+        return
+    exc.add_note(
+        f"CH122: {name} is set where the program runs, but calls see only the environment variables it passes: "
+        f"ch.init(env={{{name!r}: os.environ[{name!r}]}}), or CHIMAERA_ENV_PASSTHROUGH={name} when starting it"
+    )
+
+
+def _path_hint(exc: BaseException) -> None:
+    """CH123: a call that ran on another machine than the program and failed
+    on a missing file is told so: the program's files are not copied to the
+    peers (its project's code is), which "works on my machine" hides."""
+    if not isinstance(exc, FileNotFoundError) or not exc.filename:
+        return
+    from ._runtime import machine_digest
+
+    theirs = os.environ.get("CHIMAERA_DRIVER_MACHINE", "")
+    if not theirs or theirs == machine_digest():
+        return
+    import socket
+
+    exc.add_note(
+        f"CH123: this call ran on {socket.gethostname()}, not on the machine the program runs on, and that "
+        "machine's files are not copied here. Read the file where the program runs and pass its contents (large "
+        "ones go through ch.put), or keep it on storage every machine sees (a shared mount, object storage)"
+    )
+
+
 def python_mismatch(e: Exception) -> RuntimeError | None:
     """Why a call's function would not load, when the program runs another
     Python than this worker (a remote peer's workers run the peer's own):
@@ -249,17 +292,30 @@ class Executor:
         self.credit: dict[bytes, int] = {}
         self.credit_cond = threading.Condition()
         self.lanes: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+        self.async_pool: concurrent.futures.ThreadPoolExecutor | None = None  # see async_steps
         self.batchers: dict[str, _batch.Batcher | None] = {}  # @ch.method(batch=...) methods
         # The actor class's lane limits, computed once: scanning the class costs
         # more than the rest of a small call (see lane).
         self.lane_limits: dict[type, dict[str, int]] = {}
-        # While a batch runs: starts its next call when the current one waits.
-        self.on_block: Any = None
+        # Per thread: `on_block`, which starts a batch's next call when the
+        # current one waits (see run_batch), and `guest` (see read_loop).
+        self.local = threading.local()
         # The call whose own code runs on the main thread, if any: the only
         # one a signal can interrupt (see interrupt).
         self.main_call: _context.TaskContext | None = None
+        # True while the main thread runs a call or a restore. An execute that
+        # arrives meanwhile is a guest: the peer sends one only while every
+        # call here waits on futures, and it runs on a thread of its own.
+        self.main_busy = False
+        # Calls waiting on futures (keys), and guests' threads while their code
+        # runs (the ones a cancel can interrupt, see interrupt).
+        self.waiting: set[bytes] = set()
+        self.guests: dict[bytes, int] = {}
+        self.guest_lock = threading.Lock()
+        self.code_lock = threading.Lock()  # a guest may load code beside its host
         # exit_actor() ran in this worker's actor: later calls fail at once.
         self.exited = False
+        self.terminating = False  # on_terminate ran: the peer is closing this worker
         self.stdout: _Stdout | None = None  # set by main()
         self.running: dict[bytes, _context.TaskContext] = {}
         self.inbox: queue.SimpleQueue[tuple[Any, ...] | None] = queue.SimpleQueue()
@@ -269,23 +325,24 @@ class Executor:
     # ---- inputs -----------------------------------------------------------
 
     def load(self, digest: bytes) -> Any:
-        fn = self.code.get(digest)
-        if fn is None:
-            with open(os.path.join(self.code_dir, digest.hex()), "rb") as f:
-                data = f.read()
-            try:
-                fn = _serde.load_code(data)
-            except Exception as e:
-                mismatch = python_mismatch(e)
-                if mismatch is None:
-                    raise
-                raise mismatch from e
-            self.code[digest] = fn
-            if len(self.code) > CODE_CACHE:
-                self.code.popitem(last=False)
-        else:
-            self.code.move_to_end(digest)
-        return fn
+        with self.code_lock:
+            fn = self.code.get(digest)
+            if fn is None:
+                with open(os.path.join(self.code_dir, digest.hex()), "rb") as f:
+                    data = f.read()
+                try:
+                    fn = _serde.load_code(data)
+                except Exception as e:
+                    mismatch = python_mismatch(e)
+                    if mismatch is None:
+                        raise
+                    raise mismatch from e
+                self.code[digest] = fn
+                if len(self.code) > CODE_CACHE:
+                    self.code.popitem(last=False)
+            else:
+                self.code.move_to_end(digest)
+            return fn
 
     def value(self, outcome: tuple[Any, ...]) -> Any:
         if outcome[0] != "ok":
@@ -311,9 +368,10 @@ class Executor:
 
             path = _serde.object_path(self.object_dir, run, obj)
             if not os.path.exists(path):
-                read_object(self.object_dir, run, obj)  # fetches it from the peer that holds it
+                # Fetched from the peer that holds it, not decoded: only one value is read.
+                read_object(self.object_dir, run, obj, decode=False)
             try:
-                v = _serde.loads_part(_serde._map(path), index, count, rdir)
+                v = _serde.read_part(path, index, count, rdir)
             except FileNotFoundError as e:  # a part stored on its own, by a peer that is gone
                 from ._errors import DataLost
 
@@ -323,26 +381,43 @@ class Executor:
             raise _future.from_outcome(v.err)
         return v
 
-    def fetch_parts(self, wanted: list[_future.PartDep], deps: list[tuple[Any, ...]]) -> None:
-        """Bring the parts these placeholders read into this peer's store, several
-        at once: a shuffle's gather reads one part of every scatter, which one
-        after another costs a round trip each. A part that cannot be fetched
-        here fails when it is read (see part)."""
-        missing = []
+    def fetch_parts(self, wanted: list[Any], deps: list[tuple[Any, ...]]) -> None:
+        """Bring the values these placeholders read into this peer's store,
+        several at once: a shuffle's gather reads one part of every scatter (and
+        a merge every input), which one after another costs a round trip each.
+        A value that cannot be fetched here fails when it is read (see part)."""
+        if _serde.localize_hook is None:
+            return
+        results: dict[tuple[bytes, bytes], list[_future.PartDep]] = {}
         for x in wanted:
-            outcome = deps[x.dep]
-            if outcome[0] != "ok" or outcome[1] is not None:
-                continue
-            run, obj = outcome[2], outcome[3]
+            outcome = deps[x.dep if isinstance(x, _future.PartDep) else x.index]
+            if outcome[0] == "ok" and outcome[1] is None:
+                xs = results.setdefault((outcome[2], outcome[3]), [])
+                if isinstance(x, _future.PartDep):
+                    xs.append(x)
+        # First the results held elsewhere (a gather's scatters ran on other
+        # peers), then the parts that those stored apart.
+        self.localize_all([k for k in results if not os.path.exists(_serde.object_path(self.object_dir, *k))])
+        missing = []
+        for (run, obj), xs in results.items():
+            if not xs:
+                continue  # read whole
             try:
                 with open(_serde.object_path(self.object_dir, run, obj), "rb") as f:
-                    head = f.read(_serde.table_size(x.count))  # the table alone, not the values
+                    head = f.read(_serde.table_size(max(x.count for x in xs)))  # the table alone, not the values
             except FileNotFoundError:
-                continue
-            part = _serde.part_id(head, x.index, x.count)
-            if part is not None and not os.path.exists(_serde.object_path(self.object_dir, run, part)):
-                missing.append((run, part))
-        if len(missing) < 2 or _serde.localize_hook is None:
+                continue  # fails when read (see part)
+            for x in xs:
+                part = _serde.part_id(head, x.index, x.count)
+                if part is not None and not os.path.exists(_serde.object_path(self.object_dir, run, part)):
+                    missing.append((run, part))
+        self.localize_all(missing)
+
+    def localize_all(self, objects: list[tuple[bytes, bytes]]) -> None:
+        """Fetch these (run, object) into this peer's store, several at once;
+        one that cannot be fetched fails when it is read."""
+        objects = list(dict.fromkeys(objects))
+        if len(objects) < 2 or _serde.localize_hook is None:
             return
         if self.fetcher is None:
             self.fetcher = concurrent.futures.ThreadPoolExecutor(PART_FETCHES, thread_name_prefix="chimaera-parts")
@@ -354,7 +429,7 @@ class Executor:
             except FileNotFoundError:
                 pass
 
-        list(self.fetcher.map(one, set(missing)))
+        list(self.fetcher.map(one, objects))
 
     def call_args(self, args_ref: tuple[Any, ...], deps: list[tuple[Any, ...]]) -> tuple[tuple[Any, ...], dict[str, Any]]:
         frame_args, frame_kwargs = self.value(args_ref)
@@ -383,10 +458,10 @@ class Executor:
             return f(x)
 
         if len(deps) > 1:
-            wanted: list[_future.PartDep] = []
+            wanted: list[Any] = []
 
             def note(x: Any) -> None:
-                if isinstance(x, _future.PartDep):
+                if isinstance(x, placeholder):
                     wanted.append(x)
 
             for a in (*frame_args, *frame_kwargs.values()):
@@ -421,12 +496,21 @@ class Executor:
         the run's prefix, so they live as long as the result itself, and the
         outcome names them (with their sizes): the peer places calls by them,
         fetches them before a call reads them, and frees them with the result
-        (the frame alone may be a few inline bytes)."""
+        (the frame alone may be a few inline bytes). Blobs are named from
+        `obj` in order, so running the call again (lineage, the same attempt)
+        writes the same ids the frame of the first run names; they keep the
+        run's prefix (`obj` has it)."""
         rdir = _serde.run_dir(self.object_dir, run)
         blobs: list[tuple[bytes, int]] = []
+        tried = 0
 
         def claim(view: memoryview) -> tuple[bytes, int] | None:
-            got = _objects.claim(view, rdir, run[:4]) if view.nbytes >= _objects.ARENA_MIN else None
+            nonlocal tried
+            if view.nbytes < _objects.ARENA_MIN:
+                return None
+            name = child_id(obj, [b"blob", tried.to_bytes(4, "little")])
+            tried += 1
+            got = _objects.claim(view, rdir, blob=name)
             if got is not None:
                 try:
                     blobs.append((got[0], os.stat(os.path.join(rdir, got[0].hex())).st_size))
@@ -436,15 +520,20 @@ class Executor:
 
         if type(value) is tuple and 2 <= len(value) <= SEQ_MAX:
             # Possibly several values (returns=N): each readable on its own.
-            encoded = [_serde.dumps_parts(v, external=claim) for v in value]
+            encoded, weights = [], []
+            for v in value:
+                linked = len(blobs)
+                encoded.append(_serde.dumps_parts(v, external=claim))
+                # Its frame and the arena buffers it links (blobs of their own).
+                weights.append(encoded[-1][1] + sum(n for _, n in blobs[linked:]))
             ids = None
-            total = sum(n for _, n, _ in encoded)
+            total = sum(weights)
             if total > self.inline_limit and self.splits(len(encoded), total):
                 # Large values in files of their own, written before the file that
                 # names them: a consumer of one value fetches only that one.
                 ids = [
-                    child_id(obj, [i.to_bytes(4, "little")]) if n >= PART_FILE_MIN else None
-                    for i, (_, n, _) in enumerate(encoded)
+                    child_id(obj, [i.to_bytes(4, "little")]) if w >= PART_FILE_MIN else None
+                    for i, w in enumerate(weights)
                 ]
                 for part, (p, _, _) in zip(ids, encoded):
                     if part is not None:
@@ -464,6 +553,8 @@ class Executor:
     @staticmethod
     def err(exc: BaseException) -> tuple[Any, ...]:
         _gpu_hint(exc)
+        _env_hint(exc)
+        _path_hint(exc)
         try:
             blob = pickle.dumps(exc)
         except Exception:
@@ -477,9 +568,9 @@ class Executor:
 
     # ---- execution --------------------------------------------------------
 
-    def run_one(self, msg: dict[str, Any], item: tuple[Any, ...]) -> None:
-        key, attempt, args_ref, deps, item_index = item
-        ctx = _context.TaskContext(
+    def task_context(self, msg: dict[str, Any], item: tuple[Any, ...]) -> _context.TaskContext:
+        key, attempt, _, _, item_index = item
+        return _context.TaskContext(
             run=key[:16],
             task=key[16:],
             attempt=attempt,
@@ -488,15 +579,24 @@ class Executor:
             deadline_unix_ms=msg["deadline_unix_ms"],
             actor=msg["actor"],
         )
+
+    def run_one(self, msg: dict[str, Any], item: tuple[Any, ...]) -> None:
+        key, _, args_ref, deps, _ = item
+        ctx = self.task_context(msg, item)
         self.running[key] = ctx
         token = _context.set_task(ctx)
         entry = time.time_ns()
         seen = self.stdout.seen if self.stdout is not None else 0
-        retryable, fingerprint, state = False, b"", b""
         on_main = threading.current_thread() is threading.main_thread()
+        guest = not on_main and getattr(self.local, "guest", False)
+        result: Any = None
+        error: BaseException | None = None
         try:
             if on_main:
                 self.main_call = ctx
+            elif guest:
+                with self.guest_lock:
+                    self.guests[key] = threading.get_ident()
             try:
                 if self.exited:  # exit_actor() ran; the close that ends this process is on its way
                     raise ActorDied("the actor ended itself with ch.context().exit_actor()")
@@ -504,32 +604,111 @@ class Executor:
             finally:
                 if on_main:
                     self.main_call = None
-            if isinstance(result, _future.Future) and result._put is None:
-                # Returning a future forwards it: this call resolves to that
-                # call's outcome, and this worker is free meanwhile. A ch.put
-                # handle is no call to forward to: it is stored as the value.
-                result._escaped = True  # the shard now pins it for the run
-                result._rt.client.flush()
-                outcome = ("forward", result.key)
-            else:
-                outcome = self.ok(key, attempt, result)
-                if msg.get("durable"):
-                    state = _durable_state(self.instance)
+                elif guest:
+                    self.end_guest(key)
         except BaseException as exc:  # user code may raise anything, including SystemExit
-            outcome = self.err(exc)
-            retryable = _matches(exc, msg["retry_exception_types"])
-            if retryable:
-                frames = "|".join(f"{f.filename}:{f.lineno}" for f in traceback.extract_tb(exc.__traceback__))
-                fingerprint = blake3_digest(f"{outcome[2]}|{outcome[3]}|{frames}".encode())
+            error = exc  # a guest's cancel interrupt lands here even if it fired in end_guest
+        self.finish(msg, item, ctx, entry, seen, result, error, token)
+        if self.terminating and on_main:
+            raise SystemExit(0)  # its outcome is out: carry on exiting, as on_terminate began
+
+    def end_guest(self, key: bytes) -> None:
+        """A guest's code has returned: take back an interrupt not yet raised,
+        so none can land while its outcome is sent."""
+        with self.guest_lock:
+            ident = self.guests.pop(key, None)
+            if ident is not None:
+                _async_raise(ident, None)
+
+    def start_async(self, msg: dict[str, Any], item: tuple[Any, ...]) -> None:
+        """An async actor method in a lane: its arguments are read here (they
+        may be fetched), its coroutine runs on the actor's loop holding no
+        thread while it awaits, and its outcome is sent from a lane thread. A
+        thread held per awaiting call meant thousands of threads for an I/O
+        actor given concurrency in the thousands."""
+        key, _, args_ref, deps, _ = item
+        ctx = self.task_context(msg, item)
+        self.running[key] = ctx
+        token = _context.set_task(ctx)
+        entry = time.time_ns()
+        seen = self.stdout.seen if self.stdout is not None else 0
+        try:
+            if self.exited:
+                raise ActorDied("the actor ended itself with ch.context().exit_actor()")
+            args, kwargs = self.call_args(args_ref, deps)
+            coro = getattr(self.instance, msg["method"])(*args, **kwargs)
+        except BaseException as exc:
+            self.finish(msg, item, ctx, entry, seen, None, exc, token)
+            return
+        steps = self.async_steps()
+
+        async def run() -> None:
+            # The task runs in a copy of this thread's context: the call's own.
+            result: Any = None
+            error: BaseException | None = None
+            try:
+                result = await coro
+            except BaseException as exc:
+                error = exc
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(steps, self.finish, msg, item, ctx, entry, seen, result, error, None)
+
+        asyncio.run_coroutine_threadsafe(run(), self._actor_loop()).add_done_callback(_report_failure)
+        _context.reset(token)
+
+    def finish(
+        self,
+        msg: dict[str, Any],
+        item: tuple[Any, ...],
+        ctx: _context.TaskContext,
+        entry: int,
+        seen: int,
+        result: Any,
+        error: BaseException | None,
+        token: Any,
+    ) -> None:
+        """Encode and send a call's outcome (its value or its error)."""
+        key, attempt = item[0], item[1]
+        retryable, fingerprint, state = False, b"", b""
+        try:
+            if error is None:
+                try:
+                    if isinstance(result, _future.Future) and result._put is None:
+                        # Returning a future forwards it: this call resolves to that
+                        # call's outcome, and this worker is free meanwhile. A ch.put
+                        # handle is no call to forward to: it is stored as the value.
+                        result._escaped = True  # the shard now pins it for the run
+                        result._rt.client.flush()
+                        outcome = ("forward", result.key)
+                    else:
+                        outcome = self.ok(key, attempt, result)
+                        if msg.get("durable"):
+                            state = _durable_state(self.instance)
+                except BaseException as exc:  # an unpicklable value, a failing durable state
+                    error = exc
+            if isinstance(error, SystemExit) and self.terminating:
+                # on_terminate stopped it: the actor was closed, not a failure of the call
+                error = ActorDied("the actor was closed while this call ran")
+            if error is not None:
+                outcome = self.err(error)
+                retryable = _matches(error, msg["retry_exception_types"]) and not isinstance(error, NonRetryable)
+                if retryable:
+                    frames = "|".join(f"{f.filename}:{f.lineno}" for f in traceback.extract_tb(error.__traceback__))
+                    fingerprint = blake3_digest(f"{outcome[2]}|{outcome[3]}|{frames}".encode())
         finally:
             sys.stdout.flush()
             sys.stderr.flush()
-            if self.stdout is not None and len(self.running) == 1:
+            if self.stdout is not None and not self.active(besides=key):
                 self.stdout.drain(seen)
-            _context.reset(token)
+            if token is not None:
+                _context.reset(token)
             self.running.pop(key, None)
+            self.waiting.discard(key)
         self.trimmer((time.time_ns() - entry) / 1e9)
-        self.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
+        if "direct" in msg:  # straight back to the caller, who records it with the peer
+            msg["direct"].done(key, outcome, entry, msg["cpu0"])
+        else:
+            self.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
         if ctx.exiting and not self.exited:
             # After this call's outcome went out: closing the actor ends this process.
             from ._runtime import Runtime
@@ -537,16 +716,31 @@ class Executor:
             self.exited = True
             Runtime.get().client.close_actor(ctx.actor)
 
+    def shut_down(self) -> None:
+        """``close(drain=True)``'s last call: run the actor's ``__exit__`` if
+        it has one, then end the actor once this call's outcome is out."""
+        ctx = _context.current_task()
+        try:
+            hook = getattr(type(self.instance), "__exit__", None)
+            if hook is not None:
+                hook(self.instance, None, None, None)
+        finally:
+            if ctx is not None:
+                ctx.exiting = True
+
     def invoke(self, msg: dict[str, Any], args_ref: tuple[Any, ...], deps: list[tuple[Any, ...]]) -> Any:
         kind = msg["kind"]
         args, kwargs = self.call_args(args_ref, deps)
         if kind == CALL_ACTOR_CTOR:
             cls = self.load(msg["fn_digest"])
             self.instance = cls(*args, **kwargs)
+            _direct.listen(self, msg)  # callers on this machine may now call it directly
             return None
         if kind == CALL_ACTOR_METHOD:
             if self.instance is None:
                 raise RuntimeError("actor method called before its constructor ran")
+            if msg["method"] == _context.SHUTDOWN_METHOD:
+                return self.shut_down()
             result = getattr(self.instance, msg["method"])(*args, **kwargs)
             # A returned future is forwarded by run_one, never awaited here:
             # awaiting would hold this worker until the other call finishes.
@@ -617,17 +811,28 @@ class Executor:
                 self.credit.pop(key, None)
         return sent
 
+    def async_steps(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The few threads that start and finish async actor calls."""
+        with self.loop_lock:
+            if self.async_pool is None:
+                self.async_pool = concurrent.futures.ThreadPoolExecutor(ASYNC_STEP_THREADS, thread_name_prefix="actor-async")
+            return self.async_pool
+
     def _actor_loop(self) -> asyncio.AbstractEventLoop:
         # Calls in several lanes arrive at once: create the one loop under a lock,
         # or two threads could each make one and split the actor's coroutines.
         with self.loop_lock:
             if self.actor_loop is None:
                 loop = asyncio.new_event_loop()
-                threading.Thread(target=loop.run_forever, name="actor-loop", daemon=True).start()
+                thread = threading.Thread(target=loop.run_forever, name="actor-loop", daemon=True)
+                thread.start()
+                threading.Thread(target=_watch_loop, args=(loop, thread), name="actor-loop-watch", daemon=True).start()
                 self.actor_loop = loop
             return self.actor_loop
 
     def handle(self, msg: dict[str, Any]) -> None:
+        if "direct" in msg and _direct.starting(self, msg):
+            return
         # A remote driver's project modules, before any of its code loads.
         _project.ensure(self.object_dir, msg["items"][0][0][:16], os.path.join(os.path.dirname(self.code_dir), "projects"))
         batcher = self.batcher(msg["method"]) if msg["kind"] == CALL_ACTOR_METHOD else None
@@ -637,8 +842,15 @@ class Executor:
             return
         lane = self.lane(msg) if msg["kind"] == CALL_ACTOR_METHOD else None
         if lane is not None:
+            if inspect.iscoroutinefunction(getattr(type(self.instance), msg["method"], None)):
+                # Starting and finishing an async call is brief, and the peer
+                # sends at most `concurrency` at once: a few threads do it (a
+                # lane's pool grows toward its size under a burst).
+                lane, run = self.async_steps(), self.start_async
+            else:
+                run = self.run_one
             for item in msg["items"]:
-                lane.submit(self.run_one, msg, item).add_done_callback(_report_failure)
+                lane.submit(run, msg, item).add_done_callback(_report_failure)
             return
         self.run_batch(msg)
 
@@ -656,24 +868,41 @@ class Executor:
                 return pending.popleft() if pending else None
 
         def work() -> None:
-            while (item := take()) is not None:
-                self.run_one(msg, item)
+            self.local.on_block = on_block
+            try:
+                while (item := take()) is not None:
+                    self.run_one(msg, item)
+            finally:
+                self.local.on_block = None
 
-        def on_block() -> None:
+        def on_block() -> bool:
+            """Start the next call on a helper thread; False if none is left."""
             with lock:
                 if not pending:
-                    return
+                    return False
             t = threading.Thread(target=work, name="batch-item", daemon=True)
             helpers.append(t)
             t.start()
+            return True
 
-        self.on_block = on_block
+        work()
+        for t in helpers:  # the list only grows while items still run
+            t.join()
+
+    def active(self, besides: bytes | None = None) -> list[_context.TaskContext]:
+        """Running calls that are not waiting on futures, other than `besides`."""
+        return [c for k, c in list(self.running.items()) if k != besides and k not in self.waiting]
+
+    def guest(self, msg: dict[str, Any]) -> None:
+        """Run a guest's Execute on this thread (see read_loop)."""
+        self.local.guest = True
         try:
-            work()
-            for t in helpers:  # the list only grows while items still run
-                t.join()
-        finally:
-            self.on_block = None
+            self.handle(msg)
+        except BaseException:
+            # As on the main thread, a failure outside any call ends the
+            # process; the peer then retries or fails every call it ran.
+            traceback.print_exc(file=sys.__stderr__)
+            os._exit(1)
 
     def batcher(self, method: str) -> _batch.Batcher | None:
         if method not in self.batchers:
@@ -708,10 +937,21 @@ class Executor:
         return pool
 
     def read_loop(self) -> None:
+        """The peer's messages, on their own thread: calls go to the inbox in
+        order, cancels and credit act at once. When the connection ends the
+        executor stops, and leaves soon after if the peer is gone."""
         while True:
             m = self.conn.recv()
             if m is None or m[0] == "shutdown":
                 self.inbox.put(None)
+                if m is None:
+                    # The peer is gone (killed, crashed): nothing this process
+                    # runs can report back, and its calls are retried
+                    # elsewhere. A call still sleeping or looping would keep
+                    # it alive for good, so leave after a moment either way.
+                    t = threading.Timer(PEER_GONE_EXIT_S, os._exit, (1,))
+                    t.daemon = True
+                    t.start()
                 return
             if m[0] == "cancel":
                 ctx = self.running.get(m[1])
@@ -724,6 +964,20 @@ class Executor:
                 with self.credit_cond:
                     self.credit[m[1]] = max(self.credit.get(m[1], 0), m[2])
                     self.credit_cond.notify_all()
+            elif (
+                m[0] == "execute"
+                and self.main_busy
+                and self.instance is None
+                and m[1]["kind"] not in (CALL_ACTOR_CTOR, CALL_ACTOR_METHOD)
+            ):
+                # A guest: every call here waits on futures (the peer sends one
+                # only after this executor said so, which happens after
+                # main_busy is set), so it runs beside them on its own thread.
+                # Started from here, it does not inherit the host's context.
+                # Never an actor's call: a restarted actor's executor has no
+                # instance while its main thread restores one, and the method
+                # that follows the Restore must wait for it in the inbox.
+                threading.Thread(target=self.guest, args=(m[1],), name="guest", daemon=True).start()
             elif m[0] in ("execute", "restore"):
                 # In order: a restore lands between the calls it separates.
                 self.inbox.put(m)
@@ -732,9 +986,18 @@ class Executor:
         """A cancelled call that has not stopped by itself: interrupt it with
         SIGUSR2 if its code runs on the main thread (a sleep or a Python loop
         then raises ch.Cancelled). Anything else is killed by the peer a
-        little later, unless it is an actor's."""
+        little later, unless it is an actor's. A guest's code is interrupted
+        with an exception raised in its thread (at its next Python step: a
+        sleep or C code it is in runs to the end)."""
         if self.main_call is ctx:
             signal.pthread_kill(threading.main_thread().ident, signal.SIGUSR2)
+            return
+        with self.guest_lock:
+            ident = self.guests.get(ctx.run + ctx.task)
+            if ident is not None:
+                from ._errors import Cancelled
+
+                _async_raise(ident, Cancelled)
 
     def serve(self) -> None:
         threading.Thread(target=self.read_loop, name="executor-reader", daemon=True).start()
@@ -742,10 +1005,14 @@ class Executor:
             m = self.inbox.get()
             if m is None:
                 return
-            if m[0] == "restore":
-                self.restore(m[1])
-            else:
-                self.handle(m[1])
+            self.main_busy = True
+            try:
+                if m[0] == "restore":
+                    self.restore(m[1])
+                else:
+                    self.handle(m[1])
+            finally:
+                self.main_busy = False
 
     def restore(self, msg: dict[str, Any]) -> None:
         """Make the actor instance equal to its committed state, without
@@ -765,6 +1032,65 @@ class Executor:
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 # How long a cancelled call has to stop by itself before it is interrupted.
 CANCEL_INTERRUPT_S = 2.0
+# How long an executor outlives its peer's connection (time to exit by itself).
+PEER_GONE_EXIT_S = 2.0
+
+
+# A step of an async method that holds the actor's event loop this long warns.
+LOOP_STALL_S = 1.0
+_NOT_USER = tuple(
+    os.path.dirname(m.__file__) + os.sep for m in (asyncio, concurrent.futures) if m.__file__
+) + (threading.__file__, _PACKAGE_DIR + os.sep)
+
+
+def _watch_loop(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
+    """Say, once per method, when a step of an async method blocks its actor's
+    event loop: every other call on the actor waits behind it (blocking I/O or
+    CPU work in an ``async def``; Ray says nothing)."""
+    warned: set[str] = set()
+    while thread.is_alive():
+        ran = threading.Event()
+        try:
+            loop.call_soon_threadsafe(ran.set)
+        except RuntimeError:
+            return  # the loop is closed
+        if ran.wait(LOOP_STALL_S):
+            time.sleep(0.25)
+            continue
+        # One step holding the loop, not a loop busy with many short ones: the
+        # same coroutine frame is running a moment later.
+        first = _loop_culprit(sys._current_frames().get(thread.ident or 0))
+        if ran.wait(0.2):
+            continue
+        method, where, frame = _loop_culprit(sys._current_frames().get(thread.ident or 0))
+        if method and frame == first[2] and method not in warned:
+            warned.add(method)
+            sys.stderr.write(
+                f"chimaera: {method} has held its actor's event loop for over {LOOP_STALL_S:.0f} s at {where}, and no "
+                "other call on the actor runs meanwhile. Await non-blocking calls, move blocking work off the loop "
+                "(await asyncio.to_thread(fn, ...)), or make the method a plain def (it then runs on a thread)\n"
+            )
+        ran.wait()
+
+
+def _loop_culprit(frame: Any) -> tuple[str, str, int]:
+    """The async method running on the loop's thread, its current line, and
+    the identity of its frame."""
+    outer = None
+    while frame is not None:
+        if not os.path.abspath(frame.f_code.co_filename).startswith(_NOT_USER):
+            outer = frame  # the outermost user frame is the method the loop is running
+        frame = frame.f_back
+    if outer is None:
+        return "", "", 0
+    method = getattr(outer.f_code, "co_qualname", outer.f_code.co_name)
+    return method, f"{outer.f_code.co_filename}:{outer.f_lineno}", id(outer)
+
+
+def _async_raise(ident: int, exc: type[BaseException] | None) -> None:
+    """Raise `exc` in thread `ident` at its next Python step; None takes back
+    one not yet raised. (A signal reaches only the main thread.)"""
+    ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), ctypes.py_object(exc) if exc is not None else None)
 
 
 def _user_frames(tb: Any) -> Any:
@@ -804,9 +1130,16 @@ def main() -> None:
     abi = f"cp{sys.version_info.major}{sys.version_info.minor}-{sysconfig.get_platform()}"
     conn = ExecConn(a.socket, a.id, sys.version, abi)
     ex = Executor(conn)
+    ex.executor_id = a.id
     def owner() -> _context.TaskContext | None:
+        """The call output without a call of its own (a thread it started, a
+        subprocess, C code) belongs to: the one running, else the one running
+        that is not waiting on futures (a guest beside its waiting host)."""
         running = list(ex.running.values())
-        return running[0] if len(running) == 1 else None
+        if len(running) == 1:
+            return running[0]
+        active = ex.active()
+        return active[0] if len(active) == 1 else None
 
     ex.stdout = _Stdout(conn, owner)
     log_out = open(ex.stdout.log, "w", buffering=1, closefd=False)  # noqa: SIM115 -- lives as long as the process
@@ -819,9 +1152,18 @@ def main() -> None:
         logging.basicConfig(level=level, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 
     def blocked(ctx: _context.TaskContext, is_blocked: bool, waiting: list[bytes]) -> None:
-        conn.send_blocked(ctx.run + ctx.task, is_blocked, waiting)
-        if is_blocked and ex.on_block is not None:
-            ex.on_block()
+        key = ctx.run + ctx.task
+        on_block = getattr(ex.local, "on_block", None) if is_blocked else None
+        helper = on_block is not None and on_block()
+        # Offer to host a guest only for a wait on futures (polls of a store or
+        # queue name none) by a plain call: not an actor's, not a gang rank,
+        # and not one whose batch already goes on beside it.
+        host = is_blocked and bool(waiting) and ex.instance is None and ctx.gang is None and not helper
+        if is_blocked:
+            ex.waiting.add(key)
+        else:
+            ex.waiting.discard(key)
+        conn.send_blocked(key, is_blocked, waiting, host)
 
     _future._executor_hook = blocked
 
@@ -837,6 +1179,18 @@ def main() -> None:
             previous(signum, frame)
 
     signal.signal(signal.SIGUSR2, on_interrupt)
+
+    def on_terminate(signum: int, frame: Any) -> None:
+        # The peer is closing this worker (its actor was closed, or its run
+        # ended): exit as a program does, so the actor's __del__ and atexit
+        # handlers run (Ray's kill skips both). The peer stops it outright if
+        # this takes longer than its grace period.
+        ex.instance = None
+        ex.terminating = True
+        gc.collect()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, on_terminate)
 
     def localize(run: bytes, obj: bytes) -> None:
         from ._runtime import Runtime

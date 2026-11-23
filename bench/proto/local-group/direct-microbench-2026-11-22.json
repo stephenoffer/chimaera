@@ -1,0 +1,646 @@
+{
+ "date": "2026-11-22",
+ "machine": {
+  "cpu": "Apple M3 Pro",
+  "hw.ncpu": "12",
+  "memory_gib": 36.0,
+  "os": "macOS 14.5 (arm64)",
+  "python_ray": "3.12.13",
+  "python_chimaera": "3.12.13",
+  "ray": "2.60.0",
+  "chimaera_git_head": "95a3b9e",
+  "chimaera_tree_dirty_files": 95,
+  "chimaera_bin_sha256": "dec07849ace1e931"
+ },
+ "args": {
+  "rounds": 2,
+  "sleep": 3.0,
+  "timeout": 3600.0,
+  "chimaera_bin": "bins/direct-rel",
+  "chimaera_path": "relpy",
+  "workdir": "mb-direct",
+  "only": null,
+  "min_free_gb": 3.0,
+  "append": false
+ },
+ "runs": [
+  {
+   "runtime": "ray",
+   "round": 0,
+   "load_before": "8.79 19.46 24.31",
+   "log": "mb-direct/ray-round0.log",
+   "returncode": 0,
+   "seconds": 275.8,
+   "load_after": "33.25 28.05 26.65",
+   "rows": [
+    {
+     "name": "1:1 actor calls sync",
+     "value": 3559.652036874217,
+     "sd": 1098.418629360965,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 15465.477992047658,
+     "sd": 2521.6785774282516,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 8417.38781481781,
+     "sd": 2542.9525805737203,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 14262.72185569054,
+     "sd": 1878.0405427494202,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 16609.212961532012,
+     "sd": 1297.6788604715068,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 7085.2536412527825,
+     "sd": 734.9169585165922,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 1009.4383266858576,
+     "sd": 676.8695230099311,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 4994.226587135344,
+     "sd": 1107.5089413450034,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 2109.7175683248906,
+     "sd": 476.5770752298782,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 9604.812590497511,
+     "sd": 966.9506810405123,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 16067.327373342172,
+     "sd": 624.7404102377545,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls sync",
+     "value": 575.9046819668175,
+     "sd": 69.53502110922757,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls async",
+     "value": 1299.2482497881967,
+     "sd": 264.87553112563694,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls concurrent",
+     "value": 2080.895123923591,
+     "sd": 291.802500605407,
+     "unit": "ops/s"
+    }
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "round": 0,
+   "load_before": "33.25 28.05 26.65",
+   "log": "mb-direct/chimaera-round0.log",
+   "snapshot_bytes_pruned": 0,
+   "returncode": 0,
+   "seconds": 218.3,
+   "load_after": "14.16 20.39 23.56",
+   "rows": [
+    {
+     "name": "1:1 actor calls sync",
+     "value": 4081.0321773555524,
+     "sd": 230.50987745296507,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 13540.223166466218,
+     "sd": 1232.5264524406123,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 11813.604591008616,
+     "sd": 802.8165046724935,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 8372.639701520646,
+     "sd": 2468.8506019678,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 8572.763864669327,
+     "sd": 1148.3213980366831,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 9814.063583931962,
+     "sd": 803.7430100075214,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 3212.593067861363,
+     "sd": 77.76542514616516,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 8900.675687585197,
+     "sd": 674.2829617948786,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 4468.342540241567,
+     "sd": 484.23659263356194,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 6411.570951854859,
+     "sd": 490.8036776980588,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 4831.413490297361,
+     "sd": 1028.7588564078649,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "client: 1:1 actor calls sync",
+     "value": 1100.3046911308593,
+     "sd": 32.19049660674221,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls async",
+     "value": 13401.831909572064,
+     "sd": 565.2118661225685,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls concurrent",
+     "value": 10977.32546131029,
+     "sd": 387.58103725243683,
+     "unit": "ops/s"
+    }
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "round": 1,
+   "load_before": "13.11 20.07 23.43",
+   "log": "mb-direct/chimaera-round1.log",
+   "snapshot_bytes_pruned": 0,
+   "returncode": 0,
+   "seconds": 295.5,
+   "load_after": "33.43 36.69 30.30",
+   "rows": [
+    {
+     "name": "1:1 actor calls sync",
+     "value": 3765.9770913154844,
+     "sd": 583.4510429121901,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 12264.171753214914,
+     "sd": 424.2483017418769,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 11065.186712611796,
+     "sd": 181.84150161101965,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 8657.715106331478,
+     "sd": 1440.0588581554373,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 8384.51922704848,
+     "sd": 1125.0972024955333,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 6293.095261997645,
+     "sd": 1016.9841674640395,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 734.9077191111112,
+     "sd": 43.928591445064264,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 4865.863236538992,
+     "sd": 467.7391393905314,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 4867.280009320782,
+     "sd": 382.05228029114943,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 2072.548742748382,
+     "sd": 750.5755670844115,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 2319.4849092835193,
+     "sd": 714.1715172572615,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "client: 1:1 actor calls sync",
+     "value": 442.9431759422169,
+     "sd": 119.0829812037063,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls async",
+     "value": 7694.178321526151,
+     "sd": 469.13766870291465,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls concurrent",
+     "value": 7264.01993225734,
+     "sd": 1148.3956517937554,
+     "unit": "ops/s"
+    }
+   ]
+  },
+  {
+   "runtime": "ray",
+   "round": 1,
+   "load_before": "31.31 36.19 30.17",
+   "log": "mb-direct/ray-round1.log",
+   "returncode": 0,
+   "seconds": 257.0,
+   "load_after": "11.07 24.96 27.05",
+   "rows": [
+    {
+     "name": "1:1 actor calls sync",
+     "value": 885.211866989423,
+     "sd": 96.44510309715004,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 9359.612038032912,
+     "sd": 1846.687928353656,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 8404.750279723627,
+     "sd": 444.84312520625815,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 9685.30589341224,
+     "sd": 1183.9663521323462,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 20428.160379143184,
+     "sd": 1586.659151805787,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 9626.808408914243,
+     "sd": 777.1578003188639,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 3520.4087493929374,
+     "sd": 397.31226796967803,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 9083.140143035427,
+     "sd": 1029.0829834328124,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 7045.415669563971,
+     "sd": 319.3339653361808,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 12587.01584381891,
+     "sd": 1030.728567451367,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 17467.934261133665,
+     "sd": 473.01242933198984,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls sync",
+     "value": 1562.6594655970239,
+     "sd": 87.64718857645921,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls async",
+     "value": 2843.030285439755,
+     "sd": 261.22409127537827,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls concurrent",
+     "value": 3014.893901489272,
+     "sd": 112.32091977553131,
+     "unit": "ops/s"
+    }
+   ]
+  }
+ ],
+ "table": [
+  {
+   "name": "1:1 actor calls sync",
+   "unit": "ops/s",
+   "ray": [
+    3559.652036874217,
+    885.211866989423
+   ],
+   "chimaera": [
+    4081.0321773555524,
+    3765.9770913154844
+   ],
+   "ray_median": 2222.43195193182,
+   "chimaera_median": 3923.5046343355184,
+   "ratio": 1.7654104688897507,
+   "note": ""
+  },
+  {
+   "name": "1:1 actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    15465.477992047658,
+    9359.612038032912
+   ],
+   "chimaera": [
+    13540.223166466218,
+    12264.171753214914
+   ],
+   "ray_median": 12412.545015040285,
+   "chimaera_median": 12902.197459840565,
+   "ratio": 1.039448190859084,
+   "note": ""
+  },
+  {
+   "name": "1:1 actor calls concurrent",
+   "unit": "ops/s",
+   "ray": [
+    8417.38781481781,
+    8404.750279723627
+   ],
+   "chimaera": [
+    11813.604591008616,
+    11065.186712611796
+   ],
+   "ray_median": 8411.069047270717,
+   "chimaera_median": 11439.395651810206,
+   "ratio": 1.360040630687979,
+   "note": ""
+  },
+  {
+   "name": "1:n actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    14262.72185569054,
+    9685.30589341224
+   ],
+   "chimaera": [
+    8372.639701520646,
+    8657.715106331478
+   ],
+   "ray_median": 11974.01387455139,
+   "chimaera_median": 8515.177403926062,
+   "ratio": 0.7111380939706056,
+   "note": ""
+  },
+  {
+   "name": "n:n actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    16609.212961532012,
+    20428.160379143184
+   ],
+   "chimaera": [
+    8572.763864669327,
+    8384.51922704848
+   ],
+   "ray_median": 18518.6866703376,
+   "chimaera_median": 8478.641545858904,
+   "ratio": 0.457842486175848,
+   "note": ""
+  },
+  {
+   "name": "n:n actor calls with arg async",
+   "unit": "ops/s",
+   "ray": [
+    7085.2536412527825,
+    9626.808408914243
+   ],
+   "chimaera": [
+    9814.063583931962,
+    6293.095261997645
+   ],
+   "ray_median": 8356.031025083514,
+   "chimaera_median": 8053.579422964804,
+   "ratio": 0.9638043945491829,
+   "note": ""
+  },
+  {
+   "name": "1:1 async-actor calls sync",
+   "unit": "ops/s",
+   "ray": [
+    1009.4383266858576,
+    3520.4087493929374
+   ],
+   "chimaera": [
+    3212.593067861363,
+    734.9077191111112
+   ],
+   "ray_median": 2264.9235380393975,
+   "chimaera_median": 1973.750393486237,
+   "ratio": 0.8714423954438608,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "1:1 async-actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    4994.226587135344,
+    9083.140143035427
+   ],
+   "chimaera": [
+    8900.675687585197,
+    4865.863236538992
+   ],
+   "ray_median": 7038.683365085386,
+   "chimaera_median": 6883.269462062095,
+   "ratio": 0.9779200320625013,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "1:1 async-actor calls with args async",
+   "unit": "ops/s",
+   "ray": [
+    2109.7175683248906,
+    7045.415669563971
+   ],
+   "chimaera": [
+    4468.342540241567,
+    4867.280009320782
+   ],
+   "ray_median": 4577.566618944431,
+   "chimaera_median": 4667.811274781174,
+   "ratio": 1.019714547782497,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "1:n async-actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    9604.812590497511,
+    12587.01584381891
+   ],
+   "chimaera": [
+    6411.570951854859,
+    2072.548742748382
+   ],
+   "ray_median": 11095.91421715821,
+   "chimaera_median": 4242.059847301621,
+   "ratio": 0.38230827710815346,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "n:n async-actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    16067.327373342172,
+    17467.934261133665
+   ],
+   "chimaera": [
+    4831.413490297361,
+    2319.4849092835193
+   ],
+   "ray_median": 16767.630817237918,
+   "chimaera_median": 3575.44919979044,
+   "ratio": 0.2132352053048967,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "client: 1:1 actor calls sync",
+   "unit": "ops/s",
+   "ray": [
+    575.9046819668175,
+    1562.6594655970239
+   ],
+   "chimaera": [
+    1100.3046911308593,
+    442.9431759422169
+   ],
+   "ray_median": 1069.2820737819206,
+   "chimaera_median": 771.6239335365381,
+   "ratio": 0.7216280460097849,
+   "note": ""
+  },
+  {
+   "name": "client: 1:1 actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    1299.2482497881967,
+    2843.030285439755
+   ],
+   "chimaera": [
+    13401.831909572064,
+    7694.178321526151
+   ],
+   "ray_median": 2071.139267613976,
+   "chimaera_median": 10548.005115549107,
+   "ratio": 5.092851688192255,
+   "note": ""
+  },
+  {
+   "name": "client: 1:1 actor calls concurrent",
+   "unit": "ops/s",
+   "ray": [
+    2080.895123923591,
+    3014.893901489272
+   ],
+   "chimaera": [
+    10977.32546131029,
+    7264.01993225734
+   ],
+   "ray_median": 2547.8945127064317,
+   "chimaera_median": 9120.672696783815,
+   "ratio": 3.5796900740194415,
+   "note": ""
+  }
+ ]
+}

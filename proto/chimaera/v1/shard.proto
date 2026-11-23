@@ -46,6 +46,26 @@ message TaskSpec {
   // A generator call: items stream to the caller as they are yielded; the
   // outcome is the item count. Runs on the caller's peer.
   bool stream = 22;
+  // An actor call: the previous call on the same handle (seq - 1). A host that
+  // has not seen this handle (the actor restarted or moved there) runs this
+  // call once that one is finished, rather than waiting for seq 0.
+  TaskKey prev = 23;
+  // A call that already ran on the direct path (an actor's executor answered
+  // its caller itself): recorded as done with this outcome, never placed.
+  Ran ran = 24;
+  // Sent straight to its actor's executor: the peer only notes it as in
+  // flight there (explain, deadlock messages) until its `ran` record
+  // arrives. Never submitted to a shard.
+  bool direct = 25;
+}
+
+// What the direct path reports for a call it ran (TaskSpec.ran).
+message Ran {
+  Outcome outcome = 1;
+  uint64 entry_unix_ns = 2;
+  uint64 exit_unix_ns = 3;
+  uint64 cpu_ns = 4;      // the executor process's CPU time during the call
+  uint32 executor = 5;
 }
 
 message Attempt {
@@ -345,6 +365,9 @@ message ActorDied {
   ErrorRecord reason = 3;
   // Ended on purpose (closed by its owner, or its run ended): never restarted.
   bool terminal = 4;
+  // Its host is draining: a restartable actor starts elsewhere without the
+  // move counting against its max_restarts.
+  bool moved = 5;
 }
 
 message ActorCommandCommit {

@@ -110,7 +110,8 @@ def partitions(
 
 @remote
 def _write(sink: Sink, part_id: int, items: Iterable[Any]) -> Any:
-    return sink.write(part_id, list(items))
+    # A reduce_by_key partition is a dict: its rows are its (key, value) pairs.
+    return sink.write(part_id, list(items.items()) if isinstance(items, dict) else list(items))
 
 
 @remote
@@ -129,17 +130,18 @@ def write(futures: list[Future[Any]], sink: Sink) -> Future[Any]:
 
 class Partitioned:
     """Results split into partitions that stay on the workers: the output of
-    ``reduce_by_key``. Each partition is a list of ``(key, value)`` pairs."""
+    ``reduce_by_key``. Each partition is a dict from key to its value (to the
+    list of its values without a combine); a key is in one partition only."""
 
-    def __init__(self, futures: list[Future[list[tuple[Any, Any]]]]) -> None:
+    def __init__(self, futures: list[Future[dict[Any, Any]]]) -> None:
         self.futures = futures
 
     def __len__(self) -> int:
         return len(self.futures)
 
-    def __iter__(self) -> Iterator[list[tuple[Any, Any]]]:
-        """Each partition's list of (key, value) pairs, in partition order
-        (brings them to the driver, one partition at a time)."""
+    def __iter__(self) -> Iterator[dict[Any, Any]]:
+        """Each partition's dict, in partition order (brings them to the
+        driver, one partition at a time)."""
         for f in self.futures:
             yield f.result()
 
@@ -149,13 +151,16 @@ class Partitioned:
     def items(self) -> Iterator[tuple[Any, Any]]:
         """Every (key, value), partition by partition (brings them to the driver)."""
         for f in self.futures:
-            yield from f.result()
+            yield from f.result().items()
 
     def to_dict(self) -> dict[Any, Any]:
-        return dict(self.items())
+        out: dict[Any, Any] = {}
+        for part in self:
+            out.update(part)
+        return out
 
     def map(self, fn: Any, *, ordered: bool = True) -> Results[Any]:
-        """Apply a remote function to each partition's list of pairs."""
+        """Apply a remote function to each partition's dict."""
         return fn.map(iter(self.futures), ordered=ordered)
 
     def write(self, sink: Sink) -> Future[Any]:
@@ -173,9 +178,17 @@ def reduce_by_key(
 ) -> Partitioned:
     """Group the (key, value) pairs that each result yields by key, folding each
     key's values with `combine` (associative; without it, values become lists)."""
-    futures = list(results.futures()) if isinstance(results, Results) else list(results)
-    if partitions is None:
-        from ._runtime import Runtime
+    from ._runtime import Runtime
 
-        partitions = max(1, min(len(futures), int(Runtime.get().info["usable_cores"])))
-    return Partitioned(_shuffle.shuffle(futures, partitions, combine))
+    def parts(n: int) -> int:
+        return max(1, min(n, int(Runtime.get().info["usable_cores"]))) if partitions is None else partitions
+
+    # A function's map nobody has read: its function runs inside the scatter
+    # calls, and the pairs it returns are never stored in between.
+    claimed = results.claim() if isinstance(results, Results) else None
+    if claimed is not None:
+        (fn, eff, single), source = claimed
+        items = list(source)
+        return Partitioned(_shuffle.shuffle_mapped(fn, eff, single, items, parts(len(items)), combine))
+    futures = list(results.futures()) if isinstance(results, Results) else list(results)
+    return Partitioned(_shuffle.shuffle(futures, parts(len(futures)), combine))

@@ -162,8 +162,10 @@ floor the real path builds on, not Chimaera's.
   has passed.
 - **Snapshots:** local peers no longer write Raft snapshots.
 - **Early outcome** (direct path, stage 1): an attached run's caller gets the outcome when the executor returns,
-  before the publication, which still follows, and before the peer's accounting. Local actor calls are now
-  190–200 µs, against Ray's 163–185 µs.
+  before the publication, which still follows, and before the peer's accounting.
+- **Inline apply:** an attached run's calls apply in the proposing task, with no hop to the group's thread
+  ([design](../bench/proto/local-group/INLINE-APPLY.md)). On the live tree, interleaved with Ray: local actor calls
+  190.5 µs against Ray's 145 µs, and local task calls 192.5 µs against Ray's 378 µs.
 
 The journal reuses the shard state machine that exists today (`crates/chimaera-core/src/shard`). The transitions,
 fencing and exactly-one-winner rules are the same; only the replication changes. Raft groups apply commands from a
@@ -213,8 +215,8 @@ and peers refuse retired ones.
 
 ### Why the journal is safe
 
-Invariants, each to be checked by the deterministic simulation planned in §15. It is not built yet:
-`crates/chimaera-sim` is empty. Today the shard state machine's property tests and the local group's crash tests
+Invariants, each to be checked by the deterministic simulation planned in §15. It is not built yet, and there is no
+simulation crate. Today the shard state machine's property tests and the local group's crash tests
 (`crates/chimaera-raft/src/local.rs`) cover part of 2 and, on one peer, part of 4.
 
 1. **One owner per call at a time.** Ownership changes only by a directory commit that retires the old owner's
@@ -803,7 +805,7 @@ What the numbers say:
 
 | Risk | Check | Gate |
 |---|---|---|
-| The journal protocol loses or duplicates a call | Property tests over the shared state machine (exist), plus a deterministic simulation (turmoil) of owner, backup and executor crashes and partitions over 10,000 seeds, with a history checker (planned; `crates/chimaera-sim` is empty) | No duplicate publication, no lost acknowledged call, every failing seed reproduces |
+| The journal protocol loses or duplicates a call | Property tests over the shared state machine (exist), plus a deterministic simulation (turmoil) of owner, backup and executor crashes and partitions over 10,000 seeds, with a history checker (planned; no simulation crate exists yet) | No duplicate publication, no lost acknowledged call, every failing seed reproduces |
 | Owner failover is slow or wrong | Kill owners, backups, both backups, and owner + one backup during 100k-call runs on a compose cluster | Exactly-once results; successor resumes in < 5 s p99 |
 | The hot path is not faster | `bench/microbench/` ports Ray's own microbenchmark suite; run both on the same machine | Targets in §3 on Linux and macOS |
 | Placement degrades at scale | `placement_sim.py` now; M6 emulator with real code at 100k–262k peers | p99 queueing ≤ 2% of mean service at 90% load |

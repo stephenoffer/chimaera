@@ -14,8 +14,11 @@ peer installs them once (``uv sync --frozen``, with the peer's own Python) into
 an environment named by the lock, and workers put that environment's
 packages ahead of the peer's. ``uv`` must be on the peers' PATH.
 
-Skipped: ``.git``, ``__pycache__``, virtualenvs, ``node_modules``, build output
-and other caches. The archive may hold at most ``CHIMAERA_PROJECT_MAX_BYTES``
+Inside a git work tree, only the files git would track are shipped (tracked
+ones, and untracked ones your ``.gitignore`` rules let through), so data,
+checkpoints and ``.env`` files you ignore stay home. Always skipped: ``.git``,
+``__pycache__``, virtualenvs, ``node_modules``, build output and other caches.
+The archive may hold at most ``CHIMAERA_PROJECT_MAX_BYTES``
 (default 100 MiB) of files; past that, ``ch.init`` fails and names the largest.
 """
 
@@ -25,6 +28,7 @@ import io
 import os
 import shutil
 import site
+import subprocess
 import sys
 import sysconfig
 import tarfile
@@ -64,21 +68,67 @@ def roots(paths: list[str]) -> list[str]:
             continue
         if real == os.path.realpath(os.path.expanduser("~")) or real == os.sep:
             continue  # a home or root directory is not a project
+        if os.path.isfile(os.path.join(real, "chimaera", "_runtime.py")):
+            continue  # another copy of Chimaera (a source checkout): it would shadow the peers' own
         out.append(real)
     return out
 
 
-def _files(root: str) -> list[tuple[str, str, int]]:
-    """(path, name in the archive, size) for every file under `root`, sorted."""
+def _skipped_dir(name: str) -> bool:
+    return name in SKIP_DIRS or name.endswith(".egg-info")
+
+
+def _walk(root: str, top: str) -> list[str]:
+    """Every file under `top`, as paths relative to `root`."""
     out = []
-    for d, dirs, names in os.walk(root):
-        dirs[:] = sorted(x for x in dirs if x not in SKIP_DIRS and not x.endswith(".egg-info"))
-        for n in sorted(names):
-            if n.endswith((".pyc", ".pyo")):
-                continue
-            path = os.path.join(d, n)
-            if os.path.isfile(path) and not os.path.islink(path):
-                out.append((path, os.path.relpath(path, root), os.path.getsize(path)))
+    for d, dirs, names in os.walk(top):
+        dirs[:] = [x for x in dirs if not _skipped_dir(x)]
+        out += [os.path.relpath(os.path.join(d, n), root) for n in names]
+    return out
+
+
+def _git_listed(root: str) -> list[str] | None:
+    """The files under `root` that git tracks or would track (its ignore rules,
+    nested and global, applied by git itself), relative to `root`; None when
+    `root` is not in a git work tree, git is not installed, or
+    ``CHIMAERA_PROJECT_GITIGNORE=0`` asks for every file. Submodules come back
+    as directories, walked like any other."""
+    if os.environ.get("CHIMAERA_PROJECT_GITIGNORE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        p = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    out = []
+    for name in os.fsdecode(p.stdout).split("\0"):
+        if not name:
+            continue
+        name = name.rstrip("/")
+        out += _walk(root, os.path.join(root, name)) if os.path.isdir(os.path.join(root, name)) else [name]
+    # A directory git ignores as a whole (a scratch folder of scripts) is still
+    # the code being run: ship it as if git were not there.
+    return out or None
+
+
+def _files(root: str) -> list[tuple[str, str, int]]:
+    """(path, name in the archive, size) for every file under `root` to ship, sorted."""
+    names = _git_listed(root)
+    if names is None:
+        names = _walk(root, root)
+    out = []
+    for name in sorted(set(names)):
+        parts = name.split(os.sep)
+        if any(_skipped_dir(x) for x in parts[:-1]) or parts[-1].endswith((".pyc", ".pyo")):
+            continue
+        path = os.path.join(root, name)
+        if os.path.isfile(path) and not os.path.islink(path):
+            out.append((path, name, os.path.getsize(path)))
     return out
 
 
