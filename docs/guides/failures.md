@@ -1,8 +1,9 @@
 # When things go wrong: errors, retries and recovery
 
-Calls fail, workers die, peers go away. This page shows how to tell those
-failures apart, what Chimaera retries for you, and how to make side effects,
-long runs and multi-step workflows survive the rest.
+Calls fail, workers die, peers go away. Chimaera retries lost workers and
+peers for you, but not your own exceptions unless you list them, and it never
+reruns an `effects="external"` call that may already have started. Detached
+runs and durable workflows survive the rest.
 
 ## Catch your own exceptions
 
@@ -24,7 +25,7 @@ except ValueError as e:
 ```
 
 <details>
-<summary>More: failed dependencies, custom exception types, uncaught errors and maps</summary>
+<summary>Failed inputs and custom exceptions</summary>
 
 A call that depends on a failed one never runs. Instead, it raises the root
 cause's type, with a note naming the failed call:
@@ -73,7 +74,7 @@ assert isinstance(err, PaymentDeclined) and err.code == "insufficient_funds"
 
 ## Know which error you got
 
-Every error Chimaera raises derives from `ch.ChimaeraError`, except a wait's
+Every error Chimaera itself raises derives from `ch.ChimaeraError`, except a wait's
 built-in `TimeoutError`.
 
 | Error | Raised when | What it carries |
@@ -91,7 +92,7 @@ built-in `TimeoutError`.
 | `TimeoutError` | your wait ran out; the call is still running | |
 
 <details>
-<summary>More: where errors live, the base classes that catch whole families, and the other errors from streams and gangs to stores and options</summary>
+<summary>Base classes and other errors</summary>
 
 The common ones are on `ch`, all of them in `ch.errors`. The table above holds
 only the ones this page covers.
@@ -126,7 +127,8 @@ three).
 
 Lost workers and peers are retried for you. Your own exceptions are retried
 only if you list them in `retry_exceptions` (a class or a tuple; subclasses
-match):
+match). Retries start at once, with no backoff, and stop early if an attempt
+fails exactly like the one before:
 
 ```python run
 class Throttled(Exception):
@@ -143,11 +145,10 @@ assert fetch.remote(1).result() == "page 1"
 ```
 
 <details>
-<summary>More: how max_attempts counts, why a repeated failure stops retrying, and memory's own allowance</summary>
+<summary>How retries count</summary>
 
 `max_attempts` (default 3) counts every attempt, the first included, and
-worker losses share it with listed exceptions. Retries start immediately,
-with no backoff.
+worker losses share it with listed exceptions.
 
 When an attempt fails exactly like the one before (type, message and
 traceback lines), Chimaera stops retrying and raises it. A failure that
@@ -206,7 +207,7 @@ assert os.listdir(GATEWAY) == ["order-17"]               # charged once
 ```
 
 <details>
-<summary>More: the effects table, idempotency keys, when an external call counts as started, and who may change effects</summary>
+<summary>Effects table and idempotency keys</summary>
 
 Retrying is safe only if running twice is harmless. `effects` tells
 Chimaera how careful to be:
@@ -227,7 +228,8 @@ key, and the worker dies right after the money moves.
 
 Before your code runs, an `"external"` call's start is written to the run's
 replicated record. Lost before that point, it runs again, up to 3 attempts in
-all. Asking for more than one attempt is an error: `max_attempts=3` on an
+all; that allowance is separate from `max_attempts`, which an external call
+doesn't use. Setting it yourself is an error: `max_attempts=3` on an
 external call raises `ch.OptionsError` at `.remote()`.
 
 - Only the decorator can weaken `effects`. `.options(effects=...)` and
@@ -261,7 +263,7 @@ assert [a["end_reason"] for a in f.explain()["attempts"]] == ["oom"] * 3
 ```
 
 <details>
-<summary>More: how often memory is checked, how a retry reserves memory, and calls with no limit</summary>
+<summary>Memory checks and retry reservations</summary>
 
 The peer checks memory every 100 ms, stops the worker of anything over its
 limit, and runs it up to twice more. The limit stays where you set it, so a
@@ -289,7 +291,7 @@ assert isinstance(err, ch.Infeasible) and "cpus=10000" in str(err)
 ```
 
 <details>
-<summary>More: requests that are only too big for now</summary>
+<summary>Requests that wait instead</summary>
 
 A request that's only too big for now (all CPUs busy, memory in use) waits;
 `future.explain()["pending_reason"]` says what for
@@ -299,7 +301,7 @@ A request that's only too big for now (all CPUs busy, memory in use) waits;
 
 ## Put a deadline on a call
 
-When a call's deadline passes, it's canceled, queued or running:
+When a call's deadline passes, it's canceled, whether it's queued or running:
 
 ```python run
 import datetime
@@ -321,7 +323,7 @@ assert isinstance(nap.options(deadline=soon).remote(30).exception(), ch.Deadline
 ```
 
 <details>
-<summary>More: deadline formats, wait timeouts, and deadlines on nested calls</summary>
+<summary>Deadline formats and nested calls</summary>
 
 A deadline is relative (`"500ms"`, `"30s"`, a number of seconds, a
 `timedelta`) or a `datetime`, counted from `.remote()`, so waiting for a
@@ -338,7 +340,7 @@ none).
 
 ## Cancel work
 
-`future.cancel()` cancels a call and, in turn, every call below it:
+`future.cancel()` cancels a call and every call it started:
 
 ```python run
 @ch.remote
@@ -363,7 +365,7 @@ assert len(trials) == 3 and all(isinstance(e, ch.Cancelled) for e in trials)
 ```
 
 <details>
-<summary>More: what cancel() returns, canceling a whole run, and how a running call stops, step by step</summary>
+<summary>How a running call stops</summary>
 
 `future.cancel()` returns at once: `True` if the call hadn't finished (its
 result now raises `ch.Cancelled`), `False` if it had (it keeps its outcome). To
@@ -372,8 +374,8 @@ stop early, your code can watch `ch.context().cancelled()`.
 `run.cancel()` cancels every unfinished call in the run; `chimaera cancel RUN`
 does it from a shell.
 
-Each trial's error names its parent: "the call that submitted it (...) was
-cancelled". A running call stops in steps:
+Each trial's error names its parent:
+`the call that submitted it (...) was cancelled`. A running call stops in steps:
 
 1. Right away, `ch.context().cancelled()` turns true inside it, and anything
    it returns after that is dropped: its outcome is already `ch.Cancelled`.
@@ -418,11 +420,11 @@ assert str(err).startswith("3 attempts lost to infrastructure failures")
 ```
 
 <details>
-<summary>More: when an actor's process dies, and reading each attempt's end reason</summary>
+<summary>Actor deaths and end reasons</summary>
 
 Actors are different: when an actor's process dies, the method call it was
-running raises `ch.ActorDied` and is not replayed. Its `restart` policy
-decides what happens next ([actors.md](actors.md)).
+running raises `ch.ActorDied` and is not replayed. Its
+[`restart` policy](actors.md) decides what happens next.
 
 `future.explain()["attempts"]` lists each attempt's `end_reason` (`"ok"`,
 `"killed"`, `"oom"`...) and `detail`; `chimaera explain RUN --task TASK`
@@ -437,7 +439,7 @@ machine: calls run again elsewhere, actors follow their `restart` policy, and
 values are read from a copy or remade.
 
 <details>
-<summary>More: what is retried, copied and remade, on a cluster and on one machine</summary>
+<summary>What survives a lost peer</summary>
 
 Runs, calls and their outcomes live in groups replicated with Raft, so losing
 a peer doesn't take the record with it. What was running on it is lost:
@@ -496,7 +498,7 @@ run.finish()
 ```
 
 <details>
-<summary>More: when a detached run ends, detaching from a shell, waiting on a run, and runs that aren't detached</summary>
+<summary>When a detached run ends</summary>
 
 A detached run stays open until `run.finish()`, `run.cancel()` or
 `chimaera cancel RUN`, and its records are kept for 24 hours after it ends.
@@ -557,7 +559,7 @@ assert open(STEPS).read().split() == ["extract", "load"]   # extract ran once
 ```
 
 <details>
-<summary>More: the ch.durable helpers table, replayed steps, divergence and retry limits</summary>
+<summary>Durable helpers and replay rules</summary>
 
 When its worker or peer is lost, the workflow restarts from the top, and
 each call it already made is answered from the run's record. So it must
@@ -590,7 +592,7 @@ assert isinstance(careless.remote().exception(), ch.errors.WorkflowDivergence)
 A durable workflow is retried for lost workers up to 100 times by default,
 but your exceptions still fail it unless listed in `retry_exceptions`.
 The helpers raise `RuntimeError` outside a durable workflow. For an actor
-whose state survives crashes, see [actors.md](actors.md).
+whose state survives crashes, see [durable actors](actors.md).
 
 </details>
 

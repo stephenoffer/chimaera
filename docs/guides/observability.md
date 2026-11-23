@@ -57,7 +57,7 @@ chimaera logs 0000027da0522d95e30e656fd7268a93
 ```
 
 <details>
-<summary>More: how workers get your log level, the line format, following, where output is kept</summary>
+<summary>Log levels and where output goes</summary>
 
 Workers log at your script's level. The run carries your root logger's
 level, and a worker with no logging handlers of its own calls
@@ -93,7 +93,7 @@ assert "wall_seconds" in attempt["measures"]
 ```
 
 <details>
-<summary>More: every key in the dict</summary>
+<summary>Every key explain returns</summary>
 
 | Key | What it holds |
 |---|---|
@@ -133,7 +133,7 @@ You don't always have to ask. After `result()` waits 60 seconds on a call
 that hasn't started, your script prints the reason to stderr.
 
 <details>
-<summary>More: the stall notice, and what a failed call looks like</summary>
+<summary>Stall notices and failed calls</summary>
 
 The notice is printed once and reads
 `chimaera: waited 60 s on call <id>: <reason>`. `CHIMAERA_STALL_NOTICE_S`
@@ -173,7 +173,7 @@ task Done
 ```
 
 <details>
-<summary>More: where TASK comes from, JSON output, tuning decisions</summary>
+<summary>Task ids and tuning decisions</summary>
 
 `TASK` is the second half of `future.id`, which is the run id and then the
 task id, 32 hex digits each. Add `--json` to `inspect` or `explain` for the
@@ -219,7 +219,7 @@ assert total["nodes"] >= 1 and total["cpus"] >= 1
 ```
 
 <details>
-<summary>More: the fields of a node and of resources()</summary>
+<summary>Node and resources() fields</summary>
 
 Each node is a named tuple: `peer`, `address`, `cpus`, `memory_bytes`, `gpus`,
 `alive`, `cpu_used`, `queued`, `this_peer`, `labels`, `actors`,
@@ -238,7 +238,7 @@ assert any(e.task == bad.id and "bad row 17" in e.message for e in failed)
 ```
 
 <details>
-<summary>More: event kinds, start and follow, where events come from</summary>
+<summary>Event kinds and sources</summary>
 
 The kinds are `member` (peers joining and leaving), `actor` (actors
 starting, restarting and dying), `task_failed` (calls that failed for
@@ -273,7 +273,7 @@ peer 0000000024e6 (incarnation 1) · 0.00/12.00 CPU in use · 16 executors (0 bu
 ```
 
 <details>
-<summary>More: a table of the other commands, and --cluster</summary>
+<summary>The other CLI commands</summary>
 
 The other commands:
 
@@ -297,7 +297,7 @@ The other commands:
 </details>
 
 <details>
-<summary>More: cluster status, sample runs, profiles and doctor output, peer and worker logs</summary>
+<summary>Sample output and log files</summary>
 
 On a cluster, `status` also lists every peer, marking the ones it can't
 reach `unreachable`, and each Raft group's leader and voters.
@@ -375,7 +375,7 @@ The endpoint has no token. It serves counts only, never run names or
 values, but bind it where only your scraper can reach it.
 
 <details>
-<summary>More: every metric, other paths, a script's own peer, Kubernetes</summary>
+<summary>Exported metrics and Kubernetes</summary>
 
 - Gauges: calls queued and running, CPUs in use, workers, object and memory bytes, connected drivers, proposals in flight, and dispatch latency (p50 and p99).
 - Counters since startup: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a canceled call, and failed object replicas.

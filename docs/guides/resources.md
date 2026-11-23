@@ -22,7 +22,7 @@ assert threads.remote().result() == "2"
 The call starts only where both are free and keeps them while it runs.
 
 <details>
-<summary>More: reserving vs. limiting, where to set options, every option, impossible requests</summary>
+<summary>Options table and impossible requests</summary>
 
 That's admission, not a fence: touching 2 GiB after reserving 512 MiB
 doesn't get it stopped (`memory_limit=` below is the fence).
@@ -76,7 +76,7 @@ except ch.OptionsError as e:
 ```
 
 <details>
-<summary>More: why a bare suffix is refused, every unit, letter case and fractional sizes</summary>
+<summary>Size units and bare suffixes</summary>
 
 It's refused because Docker reads `m` as MiB and Kubernetes as millibytes.
 `"2 GB"` is 2,000,000,000 bytes and `"2 GiB"` is 2,147,483,648, about 7%
@@ -113,7 +113,7 @@ except ch.OutOfMemory as e:
 ```
 
 <details>
-<summary>More: retries past the limit, and kernel limits on Linux</summary>
+<summary>Retries and cgroup enforcement</summary>
 
 Past the limit, the call is stopped and retried twice more under it, then
 fails with `ch.OutOfMemory`, giving its peak and its limit.
@@ -148,7 +148,7 @@ assert "learned" in reserved
 ```
 
 <details>
-<summary>More: what beats a learned value, and the sizing rules step by step</summary>
+<summary>How learned sizing works</summary>
 
 Measurements are keyed by the function's code. An edited function is a new
 one that starts from the old one's numbers. Values you set always win over
@@ -201,7 +201,7 @@ assert "memory not known yet" in frozen.explain()["attempts"][-1]["reservation"]
 ```
 
 <details>
-<summary>More: why ch.auto takes only min and max, and the three adaptive modes</summary>
+<summary>Adaptive modes and ch.auto</summary>
 
 Pass only `min=` and `max=` to `ch.auto` for `cpus` and `memory`. Today an
 initial value (`cpus=ch.auto(2, max=4)`) is sent as if you had set `cpus=2`,
@@ -226,7 +226,7 @@ $ chimaera profiles --fn load
 ```
 
 <details>
-<summary>More: what explain() reports per attempt, pending calls, the decision log</summary>
+<summary>Reading reservations and decisions</summary>
 
 Each attempt in `future.explain()["attempts"]` has a `reservation` string,
 such as `cpus 1 (default); memory 175 MiB (learned: ...)` or
@@ -282,7 +282,7 @@ print(matmul.remote(4096).result())
 ```
 
 <details>
-<summary>More: fractional GPUs, device kinds, visibility variables and tested hardware</summary>
+<summary>Device kinds and visibility</summary>
 
 A fractional `gpus=0.5` takes a whole device today; sharing a device between
 calls is not built yet.
@@ -331,7 +331,7 @@ with ch.dist.reserve([{"cpus": 1}, {"cpus": 1}], strategy="pack") as res:
 ```
 
 <details>
-<summary>More: what a bundle holds, sharing one, placement strategies, timeouts and all-or-nothing holds</summary>
+<summary>Bundles and placement strategies</summary>
 
 `ch.dist.reserve(bundles, strategy=)` holds one bundle per dict (`cpus`,
 which defaults to 1, `gpus`, `memory`, `device`) from `ready()` until
@@ -375,7 +375,7 @@ except ch.Infeasible as e:
 ```
 
 <details>
-<summary>More: the labels every peer has, how require and prefer match, custom capabilities</summary>
+<summary>Built-in labels and matching</summary>
 
 Every peer carries the labels `node` (its id), `host`, `os` and `arch`, plus
 any set in its environment as `CHIMAERA_LABELS="zone=us-east1-b,rack=r7"`.
@@ -410,7 +410,7 @@ except ch.errors.BudgetExceeded as e:
 ```
 
 <details>
-<summary>More: duration strings, how usage is charged, and nested budgets</summary>
+<summary>How budgets are charged</summary>
 
 `budget={"cpu_seconds": ..., "gpu_seconds": ...}` takes seconds or duration
 strings (`"250ms"`, `"30s"`, `"5m"`, `"8h"`). Past either limit, the whole
@@ -434,7 +434,7 @@ back a tenant's new calls while its running calls there already use its CPU
 quota. Other tenants' work goes ahead meanwhile.
 
 <details>
-<summary>More: cluster-wide shares, oversized calls, picking a tenant</summary>
+<summary>Cluster shares and tenants</summary>
 
 `CHIMAERA_TENANT_SHARES` does the same across the cluster. Calls larger
 than a whole quota are `ch.Infeasible`. A run belongs to a tenant

@@ -28,7 +28,7 @@ chimaera stop
 ```
 
 <details>
-<summary>More: where it keeps data, when it exits by itself, upgrades</summary>
+<summary>Data directory and idle exit</summary>
 
 That peer keeps its data and `peer.log` in `~/.chimaera/local` (or
 `$CHIMAERA_HOME`). Started with `--idle-timeout 600`, it exits after ten
@@ -73,7 +73,7 @@ chimaera peer start \
 | `--cpus` | CPUs to offer (default: what this process is allowed to use) |
 
 <details>
-<summary>More: how many founders you need, other flags, tokens without TLS</summary>
+<summary>How many founders you need</summary>
 
 Founders hold the Raft groups from the start; spares add capacity and
 replace lost voters. Use at least three founders, or one machine going down
@@ -89,7 +89,7 @@ none, so use it only on a network you trust.
 </details>
 
 <details>
-<summary>More: try a four-peer cluster on one machine</summary>
+<summary>Four peers on one machine</summary>
 
 Start three founders and a spare with TLS, each with its own ports and data
 directory (`--dir`):
@@ -129,7 +129,7 @@ peers = ["10.0.0.1:7710", "10.0.0.2:7710", "10.0.0.3:7710"]   # the peers' --cli
 ```
 
 <details>
-<summary>More: which setting wins, where the token and CA go, switching, connection errors</summary>
+<summary>Cluster choice and connection errors</summary>
 
 A script picks its cluster from the first of these that is set:
 
@@ -243,7 +243,7 @@ live peers 4
 ```
 
 <details>
-<summary>More: how the program finds the cluster, keeping a run going with --detach</summary>
+<summary>Keeping a run going</summary>
 
 `chimaera run` starts your program with `CHIMAERA_CLUSTER` set.
 `helper.py` reaches the workers as part of your project (next section).
@@ -261,7 +261,7 @@ Your script uploads its project, and with a `uv.lock` each peer also
 installs your third-party packages.
 
 <details>
-<summary>More: what counts as the project, its size limit, package installs, Python versions</summary>
+<summary>Project limits and packages</summary>
 
 The project is the `sys.path` directories that aren't the interpreter's, a
 virtualenv's or Chimaera's own, and never your home directory or `/`. It
@@ -308,7 +308,7 @@ Never ship secrets this way: a run's variables are stored with its record,
 which is replicated across peers.
 
 <details>
-<summary>More: where secrets go, variables every run carries, passthrough patterns, what workers never see</summary>
+<summary>Secrets and passed-through variables</summary>
 
 Put secrets in the peers' own environment (a Kubernetes Secret, the Slurm
 job's environment). Workers take everything else from their peer's
@@ -346,7 +346,7 @@ chimaera: tenant team-a has no run 000001994bf57c4e7d950c570c16c8e7
 ```
 
 <details>
-<summary>More: why a credential is not a sandbox, picking a tenant, revoking credentials, quotas</summary>
+<summary>Why a credential isn't a sandbox</summary>
 
 The limit holds for a script or CLI command presenting the credential over
 the client port.
@@ -378,7 +378,7 @@ INFO chimaera_peer::runtime: drained: values handed to other peers copied=0 left
 ```
 
 <details>
-<summary>More: what a drain waits for and hands over, Slurm, actors, cloud preemption</summary>
+<summary>What a drain does</summary>
 
 A draining peer stops taking new work, and the other peers stop sending it
 any. It waits up to `CHIMAERA_DRAIN_SECONDS` (default 30) for its queued
@@ -418,7 +418,7 @@ $ chimaera status --cluster lab
 ```
 
 <details>
-<summary>More: what happens to its calls and actors, bringing a peer back, rebuilding a group</summary>
+<summary>After a peer is killed</summary>
 
 The survivors notice the dead peer, stop sending it work and retire it.
 Its calls are retried elsewhere within their `max_attempts`, and its
@@ -441,7 +441,7 @@ Past a few machines, you won't type `peer start` by hand.
 PBS, LSF and SkyPilot environments to find the founders and its own address.
 
 <details>
-<summary>More: the launcher for Kubernetes, Slurm, SSH and clouds (table), and where each was tested</summary>
+<summary>Launchers by platform</summary>
 
 Each platform has a launcher:
 

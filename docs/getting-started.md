@@ -2,8 +2,7 @@
 
 Ten minutes from here, you'll have run functions in parallel, chained them
 without waiting, kept state in an actor and looked at what the runtime did.
-Every example runs on a laptop as written, and the same code runs on a
-cluster without changes.
+Every example runs on a laptop as written.
 
 You need Chimaera installed: build it from source as the
 [README](../README.md#install) shows, or `pip install` a wheel from
@@ -144,7 +143,7 @@ with ch.defaults(deadline="30s"):                          # or for a block
 
 Sizes need a unit: `"512 MiB"` or `"2 GB"`, and each means what it says. A
 misspelled option fails on the line where you wrote it. GPUs, memory limits
-and the tuning you can watch are in
+and how to see what the runtime picked are in
 [Resources and GPUs](guides/resources.md).
 
 ## When something fails

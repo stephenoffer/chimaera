@@ -1,6 +1,6 @@
 # Data: large values, pipelines and shared state
 
-Pass a large NumPy array to a thousand calls and it's stored once. Further down are pipelines that regroup data by key and write it out, and the queues and stores that let calls share state.
+Pass a large NumPy array to a thousand calls and it's stored once. Regroup results by key and write them out, worker to worker, and share state between calls with queues and stores.
 
 ## Pass a large value to many calls
 
@@ -21,7 +21,7 @@ assert means == [199998.0, 199999.0, 200000.0, 200001.0]
 ```
 
 <details>
-<summary>More: what each call sees, how arguments travel by size, and the warnings that catch waste</summary>
+<summary>How arguments travel by size</summary>
 
 Each call receives the value, read from the stored copy, and `table.result()` hands it back to you. Arguments are captured at `.remote()`, so changing the array afterward doesn't affect calls already made.
 
@@ -63,7 +63,7 @@ assert zeros[0] == 0.0                         # and so is your array
 ```
 
 <details>
-<summary>More: copy-on-write mapping, and the difference from Ray</summary>
+<summary>Why arrays here are writable</summary>
 
 A stored value's file is mapped copy-on-write (small files are read instead). Ray hands out read-only arrays; here `a[0] = value` works.
 
@@ -82,7 +82,7 @@ for task_id, value, error in run.outcomes():
 ```
 
 <details>
-<summary>More: the deletion schedule table, and its exceptions</summary>
+<summary>When stored values are deleted</summary>
 
 Chimaera deletes what it stored on this schedule:
 
@@ -115,7 +115,7 @@ objects in .../objects (huge pages: false)
 ```
 
 <details>
-<summary>More: JSON output, and every peer's store</summary>
+<summary>JSON and cluster-wide output</summary>
 
 `--json` prints it as JSON, and `--cluster` asks every live peer for its store.
 
@@ -126,7 +126,7 @@ objects in .../objects (huge pages: false)
 On Linux the peer keeps objects in memory when it can, and as memory fills it moves the oldest ones to disk in the background.
 
 <details>
-<summary>More: reading spilled objects, full disks, macOS, where objects live, when they spill, and the variables that tune it</summary>
+<summary>Spilling and its settings</summary>
 
 A spilled object is read by mapping its disk file, so there's no restore step. Nor is there a store-full error: a full disk raises `OSError` naming the directory. On macOS, or when the object directory is already on disk, nothing spills.
 
@@ -184,7 +184,7 @@ assert sorted(os.listdir(out)) == ["_manifest.json", "part-00000.jsonl", "part-0
 ```
 
 <details>
-<summary>More: what your function receives, and what comes back</summary>
+<summary>What your function receives</summary>
 
 `fn.map(partitions)` runs your function on every partition, spread across the peers, and hands it a `ch.data.Partition` to iterate for rows. Only what you ask for comes back to the script: here, the `to_dict()` and the manifest.
 
@@ -200,7 +200,7 @@ assert count_words.map(info_only).reduce_by_key(operator.add).to_dict()["cat"] =
 ```
 
 <details>
-<summary>More: the source table, paths on a cluster, filter operators, missing files and two parquet filter bugs</summary>
+<summary>Source kinds and parquet bugs</summary>
 
 `ch.data.partitions(source, *, n=None, columns=None, filter=None)` takes three kinds of source:
 
@@ -223,7 +223,7 @@ Only `.parquet` pushes the filter and columns down into the reader; other format
 `results.reduce_by_key(combine=None, *, partitions=None)` regroups results that are iterables of `(key, value)` pairs by key, moving the pairs between workers, never through your script.
 
 <details>
-<summary>More: combine, output partitions, key rules and how the shuffle runs</summary>
+<summary>How the shuffle runs</summary>
 
 `combine` folds two values for the same key and must be associative (`operator.add`); without it, each key maps to the list of its values.
 
@@ -247,7 +247,7 @@ assert totals.to_dict() == counts
 ```
 
 <details>
-<summary>More: reading in the script or on the workers, and what each partition holds</summary>
+<summary>Reading the shuffled pairs</summary>
 
 `items()` and `to_dict()` bring every pair to the script. `totals.map(fn)` instead runs a remote function on every partition, where the data already is.
 
@@ -266,7 +266,7 @@ assert manifest["parts"][0]["part"] == 0 and sum(p["rows"] for p in manifest["pa
 ```
 
 <details>
-<summary>More: FileSink's files, cluster storage, what write accepts, the file format, retries and parquet</summary>
+<summary>FileSink files and retries</summary>
 
 `ext.FileSink(directory, format="jsonl")` writes `part-00000.jsonl` and so on, then `_manifest.json`. On a cluster, put the directory on storage every peer can write.
 
@@ -306,7 +306,7 @@ assert squared.map(ch.data.partitions(Ranges(25))).write(SumSink()).result() == 
 ```
 
 <details>
-<summary>More: receipts, retries, what a source or sink may hold, and where one-time steps go</summary>
+<summary>Receipts and idempotent writes</summary>
 
 A sink's `write` returns a receipt per partition, and `commit` gets every receipt once, in partition order. A retry runs `write` again for its partition, so `write` must be idempotent (overwrite a part, never append to it).
 
@@ -343,7 +343,7 @@ assert bump.remote(Tally(41)).result() == 42
 ```
 
 <details>
-<summary>More: where loads and the registration must live</summary>
+<summary>Where to register a type</summary>
 
 `loads` must be a module-level function, not a lambda. Every process that sends the type must register it, including a worker whose result is a `Tally`, so register it in a module that both your script and your functions import.
 
@@ -365,7 +365,7 @@ assert sum(1 for _ in stream) == 99
 ```
 
 <details>
-<summary>More: how far ahead it runs, stopping a stream, async iteration and actor generators</summary>
+<summary>Backpressure and closing streams</summary>
 
 The generator runs at most `max_in_flight` items ahead of you (default 64), so a slow consumer holds back the producer instead of filling memory.
 
@@ -402,7 +402,7 @@ assert total.result() == 45
 `put` and `get` return futures.
 
 <details>
-<summary>More: sharing by name, bounded queues, timeouts and closing</summary>
+<summary>Bounded queues and timeouts</summary>
 
 `name="jobs"` shares one queue among everyone who names it.
 
@@ -424,7 +424,7 @@ assert list(sub) == [0, 1, 2]
 Every subscriber gets every item, at its own pace, from a bounded log of the newest items.
 
 <details>
-<summary>More: how much a topic keeps, where subscribers start, and falling behind</summary>
+<summary>Retention and subscriber offsets</summary>
 
 `retain=1024` (the default) counts items, `retain="1 GiB"` counts bytes. `subscribe("latest")` starts at items published from now on, `"earliest"` at everything retained, and an integer at that offset. A subscriber that falls behind the log skips ahead, and `sub.skipped` says how many items it missed.
 
@@ -463,7 +463,7 @@ assert ch.get([meet.remote(store, 2) for _ in range(2)]) == [1, 1]
 ```
 
 <details>
-<summary>More: what it survives, heavy traffic, versions, value size, expiry, leases, watches and barriers</summary>
+<summary>Versions, leases and watches</summary>
 
 A namespace survives the loss of any process and a minority of peers. Keys outlive your run, so the example takes a fresh namespace. Each namespace is one Raft group, so spread heavy traffic over several.
 
@@ -495,7 +495,7 @@ assert jobs.qsize() == 0
 ```
 
 <details>
-<summary>More: claims and leases, sharing it, and how WorkQueue differs from Queue</summary>
+<summary>How WorkQueue differs from Queue</summary>
 
 A consumer claims an item under a lease. The item is removed when the `with` block finishes, and delivered again if the block raises, or if the consumer's process dies and the lease lapses. Pass the queue to calls, or open it by name from any process.
 

@@ -46,7 +46,7 @@ unchanged, with no Ray installed.
 | `RayActorError`, `ActorDiedError` | `ch.ActorDied` |
 | `GetTimeoutError` | `TimeoutError` (the call keeps running) |
 | `TaskCancelledError` | `ch.Cancelled` |
-| `OutOfMemoryError`, `ObjectLostError`, `WorkerCrashedError` | `ch.OutOfMemory`, `ch.errors.DataLost`, `ch.errors.WorkerCrashed` |
+| `OutOfMemoryError`, `ObjectLostError`, `WorkerCrashedError` | `ch.OutOfMemory`, `ch.errors.DataLost`, `ch.InfrastructureFailure` |
 | Ray Data, Train, Tune, Serve, RLlib | Not provided. `ch.data` covers partitioned data ([data.md](data.md)). |
 
 ## Port a program
@@ -129,7 +129,7 @@ Every machine runs the same `chimaera` peer; there's no head node to size or
 to lose.
 
 <details>
-<summary>More: replicated state, laptops and clusters</summary>
+<summary>Where the state lives</summary>
 
 Peers replicate the state that matters with Raft. On a laptop, your script
 starts a local peer the first time it needs one; to use a cluster, point the
@@ -150,12 +150,12 @@ except ch.OptionsError as e:
 ```
 
 <details>
-<summary>More: the max_retries trap, conflicting options, and asking for zero CPUs</summary>
+<summary>The max_retries trap</summary>
 
 One trap: for `max_retries` the error suggests `max_restarts`, which is for
 actors. A function wants `max_attempts`.
 
-Conflicting options, such as `effects="external"` with `max_attempts=3`, raise
+Conflicting options, such as `effects="external"` with an explicit `max_attempts=3`, raise
 later, when you make the call. `cpus` must be above zero, so Ray's
 `num_cpus=0` has no direct equivalent; an actor holds no CPU unless you ask
 ([actors.md](actors.md)).
@@ -165,7 +165,8 @@ later, when you make the call. `cpus` must be above zero, so Ray's
 ### Your exceptions are not retried
 
 As in Ray, an exception your code raises fails the call at once; only a lost
-worker or peer triggers a retry. Name the exceptions worth retrying as types:
+worker or peer triggers a retry. The difference: `retry_exceptions=True` is
+rejected, so name the exceptions worth retrying as types:
 
 ```python run
 import os
@@ -182,9 +183,9 @@ assert flaky.remote(tempfile.mktemp()).result() == "ok"     # retried once
 ```
 
 <details>
-<summary>More: retry_exceptions=True, and how many attempts by default</summary>
+<summary>How many attempts by default</summary>
 
-`retry_exceptions=True` is rejected. Retries stop at `max_attempts`, which
+Retries stop at `max_attempts`, which
 counts every attempt and defaults to 3; Ray's default `max_retries=3` gives 4.
 
 </details>
@@ -209,7 +210,7 @@ except ch.OutcomeUnknown as e:
 ```
 
 <details>
-<summary>More: how Ray differs, and the idempotent level</summary>
+<summary>How Ray's retries differ</summary>
 
 Ray retries a task whose worker died, whatever the task did. Chimaera asks what
 a call does to the outside world. `effects="idempotent"` says a repeat is
@@ -236,7 +237,7 @@ assert bump.remote(zeros).result() == 1.0     # the stored array is unchanged
 ```
 
 <details>
-<summary>More: Ray's read-only arrays, and hosts with strict memory overcommit</summary>
+<summary>Read-only arrays and overcommit</summary>
 
 Ray hands a task read-only NumPy arrays, so `arr[0] = 1` raises there.
 
@@ -251,7 +252,7 @@ The peer measures each function's memory peak and reserves that for its later
 calls, so you rarely need `memory=`.
 
 <details>
-<summary>More: waiting for memory, your own values, hard caps and learned profiles</summary>
+<summary>Memory waits and hard caps</summary>
 
 Calls wait for memory instead of overcommitting a machine. A value you set
 still wins, and `memory_limit=` enforces a hard cap. `chimaera profiles` shows
@@ -280,7 +281,7 @@ assert first_done.remote(ch.handles(futures)).result() in (["cat", "sat"], ["cat
 ```
 
 <details>
-<summary>More: how Ray treats refs in a list</summary>
+<summary>Ray refs inside lists</summary>
 
 Ray resolves only refs passed directly as arguments; refs inside a list stay
 refs for the task to `ray.get`.
@@ -293,7 +294,7 @@ A Chimaera actor lives until you call `close()` or its run ends, handle or no
 handle, so `Vocabulary.remote().add.remote(["x"])` works.
 
 <details>
-<summary>More: when a Ray actor dies, and giving back CPUs</summary>
+<summary>When a Ray actor dies</summary>
 
 A Ray actor dies when its last handle goes away. Close actors you're done with
 to give back the CPUs they hold.
@@ -306,7 +307,7 @@ An `async def` method still runs one call at a time until you set
 `concurrency=` on the class.
 
 <details>
-<summary>More: Ray's concurrent async actors, and out-of-order execution</summary>
+<summary>Ray's concurrent async actors</summary>
 
 Ray runs an async actor's calls concurrently (up to 1,000 by default). Ray's
 `allow_out_of_order_execution` has no equivalent.
@@ -319,7 +320,7 @@ Ray runs an async actor's calls concurrently (up to 1,000 by default). Ray's
 default raises.
 
 <details>
-<summary>More: namespaces, lookup errors and names that stay taken</summary>
+<summary>Namespaces and taken names</summary>
 
 A name covers your whole tenant on the cluster, not one job's namespace, so
 put the namespace in the name (`"ns/name"`).
@@ -336,7 +337,7 @@ raises `ValueError`. A name stays taken after its actor ends
 pass `num_returns`.
 
 <details>
-<summary>More: the size of done, and fetching values</summary>
+<summary>Why done can exceed num_returns</summary>
 
 `ray.wait` caps its ready list at `num_returns`. `ch.wait` doesn't: its `done`
 list holds every finished future, which can be more than `num_returns`. It
@@ -408,7 +409,7 @@ except KeyError as e:                               # also a ray.exceptions.RayT
 The full option-by-option table is in [../compat-ray.md](../compat-ray.md).
 
 <details>
-<summary>More: the -m form, submodules, clusters, warnings and Ray's defaults</summary>
+<summary>Shim scope, warnings and defaults</summary>
 
 The shim covers Ray Core only and keeps Ray's defaults where they differ. Run
 a whole program with `-m`, which installs it as `ray`, along with

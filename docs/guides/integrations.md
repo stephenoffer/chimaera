@@ -45,7 +45,7 @@ except ch.OptionsError as e:
 ```
 
 <details>
-<summary>More: callbacks, decorated functions, canceling and two rough edges</summary>
+<summary>Callbacks and two rough edges</summary>
 
 `concurrent.futures.wait`, `as_completed`, `add_done_callback` and
 `asyncio.wrap_future` all accept these futures. Done-callbacks run on a
@@ -88,7 +88,7 @@ assert squares == [i * i for i in range(100)]
 ```
 
 <details>
-<summary>More: how batches run, errors, n_jobs and generator output</summary>
+<summary>How joblib batches run</summary>
 
 Each batch joblib dispatches becomes one Chimaera call, placed on whichever
 peers have room. joblib sizes its batches by how long they take, so many small
@@ -172,7 +172,7 @@ set `concurrency`. With `concurrency=4`, up to four calls overlap at their
 `await` points.
 
 <details>
-<summary>More: where the methods run</summary>
+<summary>Where async methods run</summary>
 
 An actor's async methods run on one event loop in its process.
 [actors.md](actors.md) has the rest.
@@ -240,7 +240,7 @@ Found 4 errors in 1 file (checked 1 source file)
 ```
 
 <details>
-<summary>More: inferred types, life without the plugin, and known gaps</summary>
+<summary>Inferred types and known gaps</summary>
 
 Those calls get real types: `Counter.remote(...)` is an `Actor[Counter]`, and
 a method call is a `Future` of the method's return type.
@@ -300,7 +300,7 @@ anything that doesn't map raises `Unsupported` naming the Chimaera
 alternative. [from-ray.md](from-ray.md) walks through a port.
 
 <details>
-<summary>More: which Ray APIs map</summary>
+<summary>Which Ray APIs map</summary>
 
 The mapping covers `remote`, `get`, `put`, `wait`, `cancel`, `kill`, named
 and detached actors, and `ActorPool`. [../compat-ray.md](../compat-ray.md)

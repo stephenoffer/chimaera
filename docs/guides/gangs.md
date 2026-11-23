@@ -28,7 +28,7 @@ arguments and returns a `Gang`, a future of all their return values in rank
 order.
 
 <details>
-<summary>More: using the Gang, per-rank resources, retries and misuse errors</summary>
+<summary>Per-rank resources and retries</summary>
 
 Wait on the `Gang`, `await` it, pass it to another call, or `cancel()` it to
 stop them all.
@@ -68,7 +68,7 @@ assert envs[0]["MASTER_ADDR"] == envs[1]["MASTER_ADDR"]
 | `CHIMAERA_GANG`, `CHIMAERA_GANG_GENERATION` | The gang's id and its current generation |
 
 <details>
-<summary>More: the Group's fields, and reused workers</summary>
+<summary>Group fields and reused workers</summary>
 
 In Python, `ch.context().gang` carries this as a `Group`: `rank`,
 `size`, `local_rank`, `local_size`, `generation`, `id` and `master` (an
@@ -97,7 +97,7 @@ assert exchange.options(ranks=3).gang().result() == [(["worker-0", "worker-1", "
 ```
 
 <details>
-<summary>More: the 1 MiB limit, what each collective returns, timeouts and mismatches</summary>
+<summary>What each collective returns</summary>
 
 They go through the cluster's replicated store, so they suit configs,
 seeds, metrics and file lists that pickle to at most 1 MiB each. Move
@@ -172,7 +172,7 @@ losses = train.options(ranks=8, max_attempts=5).gang(20, "/mnt/shared/ckpt.pt").
 ```
 
 <details>
-<summary>More: which backend you get, and how long the group lasts</summary>
+<summary>Backends and group lifetime</summary>
 
 The backend follows the rank's devices: `nccl` for CUDA and ROCm, `xla` for
 TPU and Neuron, `hccl` for Gaudi, `xccl` for Intel, and `gloo` on CPU or
@@ -211,7 +211,7 @@ with Worker.options(ranks=3).gang(100) as workers:
 ```
 
 <details>
-<summary>More: lost ranks, calling one rank or all of them, resizing and closing</summary>
+<summary>Lost ranks and gang methods</summary>
 
 A lost rank breaks a class gang. Its calls raise `ch.ActorDied`, and nothing
 restarts until you call `workers.restart()`. Restore your checkpoint in
@@ -244,7 +244,7 @@ assert elastic.decisions[0].startswith("generation 1: 2 ranks")
 ```
 
 <details>
-<summary>More: losing a peer, how capacity is counted, and when the size changes</summary>
+<summary>How elastic sizing works</summary>
 
 An elastic gang that loses a peer comes back smaller instead of waiting for
 a replacement. `gang.decisions` says why each generation got its size, and
@@ -280,7 +280,7 @@ assert retried.generation == 2
 ```
 
 <details>
-<summary>More: resuming, why the restart takes 15 s, and GangFailed</summary>
+<summary>Why the restart takes 15 s</summary>
 
 Resume from your own checkpoint; `g.generation` tells you which try this
 is. After `max_attempts` generations have each lost a rank, the gang fails
@@ -324,7 +324,7 @@ except ValueError as e:
 ```
 
 <details>
-<summary>More: what happens when not all ranks fit</summary>
+<summary>When not all ranks fit</summary>
 
 Ranks are placed one at a time today, not all or nothing, so size each
 gang to what is free when it starts.
@@ -360,7 +360,7 @@ for l in learners:
 ```
 
 <details>
-<summary>More: passing the handle, when join waits, new generations, and misuse</summary>
+<summary>Joining and new generations</summary>
 
 Pass the handle to the members. Inside a member's method, `handle.join()`
 returns its `Group`, with the collectives, `torch()` and `mesh()` that gang
@@ -408,7 +408,7 @@ train_2d.options(ranks=8).gang(1000).result()
 ```
 
 <details>
-<summary>More: an axis's collectives, order and sizes, and its errors</summary>
+<summary>Axis collectives and sizes</summary>
 
 An axis has `ranks` (their ranks in the whole gang) and the store
 collectives, but no torch process group of its own: its `torch()` raises
@@ -458,7 +458,7 @@ except TimeoutError as e:
 ```
 
 <details>
-<summary>More: the collectives explain sees, its fields, and hangs inside NCCL</summary>
+<summary>Reading explain, and NCCL hangs</summary>
 
 `explain()` sees the rendezvous and the four store collectives, not what
 happens inside `torch.distributed`.

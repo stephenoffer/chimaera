@@ -26,7 +26,7 @@ assert future.result() == 2
 you a `ch.Future` at once.
 
 <details>
-<summary>More: argument checks, connecting, pickling and resources</summary>
+<summary>Argument checks and pickling</summary>
 
 `.remote(...)` first checks the arguments against the signature, so
 `add.remote(1)` raises `TypeError` on that line, before anything leaves your
@@ -64,7 +64,7 @@ assert slow.result() == 1.0 and slow.done()
 `f.result()` hands back the value or raises the call's error.
 
 <details>
-<summary>More: error types, every future method, and warning CH101</summary>
+<summary>Every future method</summary>
 
 Your own exceptions come back with their original type and the remote
 traceback ([failures.md](failures.md)).
@@ -110,7 +110,7 @@ result now raises `ch.Cancelled` (unless it finishes first). `False` means it
 had, and it keeps its outcome.
 
 <details>
-<summary>More: calls it started, the grace period and force=True</summary>
+<summary>Grace period and force=True</summary>
 
 Canceling a call also cancels every call it started, including ones it starts
 afterward. In long loops, check `ch.context().cancelled()` so your code can
@@ -150,7 +150,7 @@ assert first_done.remote(ch.handles(counts)).result() in (2, 3)
 ```
 
 <details>
-<summary>More: failed inputs, ch.handles, nested futures, and storing a large value once</summary>
+<summary>Nested futures and ch.handles</summary>
 
 If the input failed, the dependent call fails with the same error. To pass
 futures as futures on purpose, wrap the argument in `ch.handles(...)`, as the
@@ -186,7 +186,7 @@ assert list(word_count.options(latency="interactive").map(["a", "b c"])) == [1, 
 ```
 
 <details>
-<summary>More: results and errors, window and batching rules, and when mapping starts</summary>
+<summary>Map windows and batching rules</summary>
 
 `fn.map(items)` returns a `ch.Results`, a single-pass iterator in input
 order; `ordered=False` yields results as they finish. More items go out as
@@ -236,7 +236,7 @@ assert list(word_count.map(["a", "b c"]).map(double)) == [2, 4]
 ```
 
 <details>
-<summary>More: partial's bound values and options, and futures between stages</summary>
+<summary>Bound values and chained stages</summary>
 
 `fn.partial(*args, **kwargs)` binds arguments as `functools.partial` does. The
 remote function it returns ships the bound values once with the code, not with
@@ -265,7 +265,7 @@ assert ch.gather(add.remote(1, 2), add.remote(3, 4)).result() == [3, 7]
 as it finishes.
 
 <details>
-<summary>More: memory on big lists, the four helpers in full, and warning CH117</summary>
+<summary>The four wait helpers</summary>
 
 `ch.get` on a list holds every value in your script's memory at once, and
 warns (CH117) past a quarter of the machine's memory. For big lists, consume
@@ -303,7 +303,7 @@ assert add.remote(lo, hi).result() == 10 and lo.result() == 1
 ```
 
 <details>
-<summary>More: returning a future, and rules for splitting a result</summary>
+<summary>Returned futures and split rules</summary>
 
 Whoever waits gets the returned future's final value, and the worker is free
 as soon as the function returns.
@@ -337,7 +337,7 @@ with countdown.remote(1_000_000) as stream:
 ```
 
 <details>
-<summary>More: pausing, worker death, errors, closing early, and async streams</summary>
+<summary>Stream reruns and closing</summary>
 
 The generator pauses once it is `max_in_flight` items ahead of you (default
 64). If its worker dies mid-stream, it runs again from the start on another
@@ -383,7 +383,7 @@ except ch.DeadlineExceeded:
 `fn.policy().describe()` lists each effective value and where it came from.
 
 <details>
-<summary>More: which setting wins, typos, deadline rules, priority, and the defaults table</summary>
+<summary>Option precedence and defaults</summary>
 
 The first of these that sets an option wins:
 
@@ -436,7 +436,7 @@ Inside a running call, `ch.context()` tells your code which attempt this is
 and where it runs.
 
 <details>
-<summary>More: reporting progress, and every field on the context</summary>
+<summary>Progress reports and context fields</summary>
 
 Its `report(**metrics)` sends progress the caller reads with
 `future.metrics()`.
@@ -461,7 +461,7 @@ chimaera: waiting for 4 unfinished calls and 1 unread map before exiting (Ctrl-C
 ```
 
 <details>
-<summary>More: streams, failed scripts, ch.shutdown() and a late detach</summary>
+<summary>Streams, Ctrl-C and ch.shutdown()</summary>
 
 Streams nobody reads are stopped, not waited on. If the script raised
 (`chimaera: cancelling 1 unfinished call: the script failed`), or you press

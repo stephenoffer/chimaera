@@ -9,7 +9,7 @@
 
 <p align="center">
   <strong>Distributed Python with one decorator.</strong><br>
-  A Rust runtime with no head node that learns what your code needs.
+  A Rust runtime with no head node. It learns what your code needs.
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
   <a href="docs/README.md">Guides</a> ·
   <a href="docs/guides/from-ray.md">Coming from Ray</a> ·
   <a href="docs/api.md">API</a> ·
-  <a href="docs/qualification.md">Benchmarks</a>
+  <a href="docs/qualification.md#ray-comparison-cluster-1-4-16-and-64-nodes-2026-11-22">Benchmarks</a>
 </p>
 
 ---
@@ -43,18 +43,41 @@ for n in word_count.map(["a", "a b", "a b c"]):
 That's the API you need on day one. `add` starts when both counts are done,
 and their results travel worker to worker without passing through your script.
 On a laptop, the first `.remote()` starts a local peer for you. On a cluster,
-the same file runs unchanged.
+the same file runs unchanged. Coming from Ray? Most Ray Core programs port
+line by line, and on 64 machines Chimaera ran 14,203 no-op tasks a second
+to Ray's 5,188.
 
 ## What you get
 
 ### No head node
 
 Every machine runs the same `chimaera` peer, and none of them is in charge.
-Which calls exist, which finished and what they returned is replicated with
-Raft, so there's no head process to size, babysit or lose. Kill a machine
-mid-run and its calls run elsewhere. In a 64-machine test under a load of
-one-second tasks, every task still returned exactly once, in 9.6 s. Ray took
-18.5 s.
+The record of every call (whether it finished, what it returned) is
+replicated with Raft, so there's no head process to size, babysit or lose.
+Kill a machine mid-run and its calls run elsewhere. In a 64-machine test
+under a load of one-second tasks, every task still finished, in 9.6 s
+against Ray's 18.5 s.
+
+### Fast where it counts
+
+64 × c7i.4xlarge machines (1,024 vCPU), the same machine type for both
+runtimes, median of at least 45 s of repetitions (the machine-loss row is a
+single run):
+
+| Workload | Ray | Chimaera |
+|---|---:|---:|
+| Independent no-op tasks | 5,188/s | 14,203/s |
+| Map over tiny items, no hand batching | 5,171/s | 774,908/s |
+| 32 MiB array passed straight to 2,048 calls | 3.51 s | 0.71 s |
+| Nested tasks (4 parents per CPU, 8 children each) | 1.29 s | 0.82 s |
+| A machine killed under one-second tasks | 18.5 s | 9.6 s |
+
+The map row is Chimaera batching tiny calls by itself against plain Ray
+tasks; neither side was batched by hand. Ray's nested and machine-loss
+figures come from a separate run, because the first run hit its time limit
+before Ray's passes. Ray is still faster at shuffles (6x at 64 machines) and
+at ten calls on a 256 MiB value that was just made. All of it, with method
+and caveats, is in [qualification.md](docs/qualification.md#ray-comparison-cluster-1-4-16-and-64-nodes-2026-11-22).
 
 ### It sizes your calls for you
 
@@ -69,26 +92,8 @@ why, and a `cpus=` or `memory=` you set always wins.
 A crashed worker's calls are retried; your own exceptions aren't, unless you
 list them. A function that charges a card says `effects="external"` and
 starts at most once. If its worker dies mid-call, you get
-`ch.OutcomeUnknown`, not a second charge. Runs outlive your script, too:
+`ch.OutcomeUnknown`, not a second charge. Detached runs outlive your script, too:
 reattach from another process with `ch.runs.attach(run_id)`.
-
-### Fast where it counts
-
-64 × c7i.4xlarge machines (1,024 vCPU), the same machine type for both
-runtimes, median of at least 45 s of repetitions:
-
-| Workload | Ray | Chimaera |
-|---|---:|---:|
-| Independent no-op tasks | 5,188/s | 14,203/s |
-| Map over tiny items, no hand batching | 5,171/s | 774,908/s |
-| 32 MiB array passed straight to 2,048 calls | 3.51 s | 0.71 s |
-| Nested tasks (4 parents per CPU, 8 children each) | 1.29 s | 0.82 s |
-| A machine killed under one-second tasks | 18.5 s | 9.6 s |
-
-Ray's nested and machine-loss figures come from a separate run, because the
-first one hit its time limit. Ray is still faster at shuffles (6x at 64
-machines) and at calls on a value that was just made. All of it, with method
-and caveats, is in [qualification.md](docs/qualification.md).
 
 ### Runs where your machines are
 
