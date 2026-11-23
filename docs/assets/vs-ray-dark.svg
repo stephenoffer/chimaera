@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 422" width="820" height="422" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Chimaera against Ray on 64 machines: times faster per workload">
+<text x="440.0" y="22" text-anchor="end" font-size="13" fill="#9198a1">◀ Ray faster</text>
+<text x="460.0" y="22" font-size="13" fill="#9198a1">Chimaera faster ▶</text>
+<line x1="300.0" x2="300.0" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<line x1="337.5" x2="337.5" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="337.5" y="42" text-anchor="middle" font-size="11" fill="#9198a1">8x</text>
+<line x1="375.0" x2="375.0" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="375.0" y="42" text-anchor="middle" font-size="11" fill="#9198a1">4x</text>
+<line x1="412.5" x2="412.5" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="412.5" y="42" text-anchor="middle" font-size="11" fill="#9198a1">2x</text>
+<line x1="450.0" x2="450.0" y1="48" y2="358" stroke="#656c76" stroke-width="1.5"/>
+<text x="450.0" y="42" text-anchor="middle" font-size="11" fill="#9198a1">1x</text>
+<line x1="487.5" x2="487.5" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="487.5" y="42" text-anchor="middle" font-size="11" fill="#9198a1">2x</text>
+<line x1="525.0" x2="525.0" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="525.0" y="42" text-anchor="middle" font-size="11" fill="#9198a1">4x</text>
+<line x1="562.5" x2="562.5" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="562.5" y="42" text-anchor="middle" font-size="11" fill="#9198a1">8x</text>
+<line x1="600.0" x2="600.0" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="600.0" y="42" text-anchor="middle" font-size="11" fill="#9198a1">16x</text>
+<line x1="637.5" x2="637.5" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="637.5" y="42" text-anchor="middle" font-size="11" fill="#9198a1">32x</text>
+<line x1="675.0" x2="675.0" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="675.0" y="42" text-anchor="middle" font-size="11" fill="#9198a1">64x</text>
+<line x1="712.5" x2="712.5" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="712.5" y="42" text-anchor="middle" font-size="11" fill="#9198a1">128x</text>
+<line x1="750.0" x2="750.0" y1="48" y2="358" stroke="#3d444d" stroke-width="1"/>
+<text x="286" y="78.0" text-anchor="end" font-size="14" fill="#e6edf3">Map over tiny items, no hand batching</text>
+<path d="M450.0,65.0 H717.0 Q721.0,65.0 721.0,69.0 V77.0 Q721.0,81.0 717.0,81.0 H450.0 Z" fill="#5D8BF4"><title>Map over tiny items, no hand batching: Chimaera 150x faster</title></path>
+<text x="728.0" y="78.0" text-anchor="start" font-size="13" font-weight="600" fill="#e6edf3">150x</text>
+<text x="286" y="108.0" text-anchor="end" font-size="14" fill="#e6edf3">32 MiB array passed to 2,048 calls</text>
+<path d="M450.0,95.0 H532.2 Q536.2,95.0 536.2,99.0 V107.0 Q536.2,111.0 532.2,111.0 H450.0 Z" fill="#5D8BF4"><title>32 MiB array passed to 2,048 calls: Chimaera 4.9x faster</title></path>
+<text x="543.2" y="108.0" text-anchor="start" font-size="13" font-weight="600" fill="#e6edf3">4.9x</text>
+<text x="286" y="138.0" text-anchor="end" font-size="14" fill="#e6edf3">Independent no-op tasks</text>
+<path d="M450.0,125.0 H500.5 Q504.5,125.0 504.5,129.0 V137.0 Q504.5,141.0 500.5,141.0 H450.0 Z" fill="#5D8BF4"><title>Independent no-op tasks: Chimaera 2.7x faster</title></path>
+<text x="511.5" y="138.0" text-anchor="start" font-size="13" font-weight="600" fill="#e6edf3">2.7x</text>
+<text x="286" y="168.0" text-anchor="end" font-size="14" fill="#e6edf3">Recovery from a killed machine</text>
+<path d="M450.0,155.0 H481.6 Q485.6,155.0 485.6,159.0 V167.0 Q485.6,171.0 481.6,171.0 H450.0 Z" fill="#5D8BF4"><title>Recovery from a killed machine: Chimaera 1.9x faster</title></path>
+<text x="492.6" y="168.0" text-anchor="start" font-size="13" font-weight="600" fill="#e6edf3">1.9x</text>
+<text x="286" y="198.0" text-anchor="end" font-size="14" fill="#e6edf3">Nested tasks</text>
+<path d="M450.0,185.0 H470.2 Q474.2,185.0 474.2,189.0 V197.0 Q474.2,201.0 470.2,201.0 H450.0 Z" fill="#5D8BF4"><title>Nested tasks: Chimaera 1.6x faster</title></path>
+<text x="481.2" y="198.0" text-anchor="start" font-size="13" font-weight="600" fill="#e6edf3">1.6x</text>
+<text x="286" y="228.0" text-anchor="end" font-size="14" fill="#e6edf3">Actor calls</text>
+<path d="M450.0,215.0 H453.9 Q457.9,215.0 457.9,219.0 V227.0 Q457.9,231.0 453.9,231.0 H450.0 Z" fill="#5D8BF4"><title>Actor calls: Chimaera 1.2x faster</title></path>
+<text x="464.9" y="228.0" text-anchor="start" font-size="13" font-weight="600" fill="#e6edf3">1.2x</text>
+<text x="286" y="258.0" text-anchor="end" font-size="14" fill="#e6edf3">512 MiB value to 2,048 readers</text>
+<path d="M450.0,245.0 H450.4 Q454.4,245.0 454.4,249.0 V257.0 Q454.4,261.0 450.4,261.0 H450.0 Z" fill="#5D8BF4"><title>512 MiB value to 2,048 readers: Chimaera 1.1x faster</title></path>
+<text x="461.4" y="258.0" text-anchor="start" font-size="13" font-weight="600" fill="#e6edf3">1.1x</text>
+<text x="286" y="288.0" text-anchor="end" font-size="14" fill="#e6edf3">CPU scaling efficiency</text>
+<path d="M450.0,275.0 H449.6 Q445.6,275.0 445.6,279.0 V287.0 Q445.6,291.0 449.6,291.0 H450.0 Z" fill="#d95926"><title>CPU scaling efficiency: Ray 1.1x faster</title></path>
+<text x="438.6" y="288.0" text-anchor="end" font-size="13" font-weight="600" fill="#e6edf3">1.1x</text>
+<text x="286" y="318.0" text-anchor="end" font-size="14" fill="#e6edf3">10 calls on a 256 MiB value just made</text>
+<path d="M450.0,305.0 H426.9 Q422.9,305.0 422.9,309.0 V317.0 Q422.9,321.0 426.9,321.0 H450.0 Z" fill="#d95926"><title>10 calls on a 256 MiB value just made: Ray 1.6x faster</title></path>
+<text x="415.9" y="318.0" text-anchor="end" font-size="13" font-weight="600" fill="#e6edf3">1.6x</text>
+<text x="286" y="348.0" text-anchor="end" font-size="14" fill="#e6edf3">Shuffle, 3.2M pairs</text>
+<path d="M450.0,335.0 H355.0 Q351.0,335.0 351.0,339.0 V347.0 Q351.0,351.0 355.0,351.0 H450.0 Z" fill="#d95926"><title>Shuffle, 3.2M pairs: Ray 6.2x faster</title></path>
+<text x="344.0" y="348.0" text-anchor="end" font-size="13" font-weight="600" fill="#e6edf3">6.2x</text>
+<text x="24" y="382" font-size="11.5" fill="#9198a1">64 × c7i.4xlarge machines, the same type for both runtimes. Log scale. Medians of at least 45 s of repetitions; machine loss is one run.</text>
+<text x="24" y="398" font-size="11.5" fill="#9198a1">Ray's actor, nested and machine-loss figures come from a separate run. Source: docs/qualification.md.</text>
+</svg>

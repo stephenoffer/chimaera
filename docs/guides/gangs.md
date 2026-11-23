@@ -1,9 +1,9 @@
 # Distributed training with gangs
 
-A gang runs one function on N ranks that start together, meet at a
-rendezvous, and fail and restart as one. Use it to run PyTorch DDP across
-peers, pass small values between ranks without torch, fit its size to the
-capacity you have, and find the rank holding up the rest.
+Need one function on many GPUs or peers, in lockstep? That's a gang: N ranks
+that start together, meet at a rendezvous, and fail and restart as one. Use
+it to run PyTorch DDP across peers, pass small values between ranks without
+torch, fit its size to your capacity, and find the rank holding up the rest.
 
 ## Run a function on N ranks
 
@@ -24,8 +24,8 @@ assert gang.result() == [4950] * 4
 ```
 
 `fn.options(ranks=n).gang(*args)` starts n calls of `fn` with the same
-arguments and returns a `Gang`, a future of all their return values in rank
-order.
+arguments and returns a `Gang`: one future for all their return values, in
+rank order.
 
 <details>
 <summary>Per-rank resources and retries</summary>
@@ -33,20 +33,21 @@ order.
 Wait on the `Gang`, `await` it, pass it to another call, or `cancel()` it to
 stop them all.
 
-Each rank gets the gang's `cpus`, `memory`, `memory_limit`, `gpus`, `device`,
-`placement`, `priority` and `deadline` (see [resources.md](resources.md)).
-`max_attempts` (default 3) counts generations, not retries of one rank. The
-gang's supervisor is a small call (0.01 CPU) on your script's own peer.
+Each rank gets the gang's `cpus`, `memory`, `memory_limit`, `gpus`,
+`device`, `placement`, `priority` and `deadline` (see
+[resources.md](resources.md)). `max_attempts` (default 3) counts
+generations, not retries of one rank. The gang's supervisor is a small call
+(0.01 CPU) on your script's own peer.
 
-`gang()` without `ranks=` raises `TypeError`; `.remote()` with `ranks=`
+`gang()` without `ranks=` raises `TypeError`, and `.remote()` with `ranks=`
 raises `ch.OptionsError`.
 
 </details>
 
 ## Know where you are
 
-Every rank runs with the variables `torchrun` sets, so torch and DeepSpeed
-code written for it runs as is:
+Written for `torchrun`? Your torch and DeepSpeed code runs as is, since each
+rank gets the variables it sets:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -70,18 +71,18 @@ assert envs[0]["MASTER_ADDR"] == envs[1]["MASTER_ADDR"]
 <details>
 <summary>Group fields and reused workers</summary>
 
-In Python, `ch.context().gang` carries this as a `Group`: `rank`,
-`size`, `local_rank`, `local_size`, `generation`, `id` and `master` (an
-`(addr, port)` pair). Outside a gang it is `None`.
+In Python, `ch.context().gang` gives you this as a `Group`: `rank`, `size`,
+`local_rank`, `local_size`, `generation`, `id` and `master` (an
+`(addr, port)` pair). Outside a gang it's `None`.
 
-A worker reused by later calls gets its old environment back, so plain calls
-never see a stale `RANK`.
+If later calls reuse a worker, it gets its old environment back, so plain
+calls never see a stale `RANK`.
 
 </details>
 
 ## Exchange small values
 
-Four collectives pass small values between ranks with no torch:
+Small values? Four collectives pass them between ranks with no torch:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -99,9 +100,9 @@ assert exchange.options(ranks=3).gang().result() == [(["worker-0", "worker-1", "
 <details>
 <summary>What each collective returns</summary>
 
-They go through the cluster's replicated store, so they suit configs,
+They go through the cluster's replicated store, so they're good for configs,
 seeds, metrics and file lists that pickle to at most 1 MiB each. Move
-tensors with `torch.distributed`. Each rank must run the same sequence of
+tensors with `torch.distributed`. Every rank has to run the same sequence of
 collectives.
 
 | Collective | Returns |
@@ -111,18 +112,18 @@ collectives.
 | `broadcast(obj, src=0)` | Rank `src`'s `obj`, on every rank |
 | `barrier()` | Nothing, once every rank has arrived |
 
-Each takes `timeout=` in seconds. Ranks that reach one point through
-different collectives wait for each other rather than mix data, and
+Each takes `timeout=` in seconds. If ranks reach one point through different
+collectives, they wait for each other instead of mixing data, and
 `explain()` reports the mismatch (see the last section).
 
 </details>
 
 ## Use torch.distributed
 
-`g.torch()` initializes the default `torch.distributed` process group for
-this gang and returns the module. This DDP example with checkpoints needs
-torch, eight GPUs (on any number of peers) and a checkpoint path every peer
-can read:
+`g.torch()` sets up the default `torch.distributed` process group for this
+gang and hands back the module. Here's DDP with checkpoints; it needs torch,
+eight GPUs (on any number of peers) and a checkpoint path every peer can
+read:
 
 ```python
 import os
@@ -176,17 +177,18 @@ losses = train.options(ranks=8, max_attempts=5).gang(20, "/mnt/shared/ckpt.pt").
 
 The backend follows the rank's devices: `nccl` for CUDA and ROCm, `xla` for
 TPU and Neuron, `hccl` for Gaudi, `xccl` for Intel, and `gloo` on CPU or
-Apple's GPU. Pass `backend=` to choose another. A function gang's group is
-torn down when the rank's call returns. A class gang's lasts as long as its
+Apple's GPU. Want another one? Pass `backend=`. A function gang's group is
+torn down when the rank's call returns; a class gang's lasts as long as its
 rank.
 
 </details>
 
 ## Keep a gang alive as actors
 
-`Class.options(ranks=n).gang(*args)` builds n instances together, each with
-the rendezvous environment set for good in its own process, so `__init__`
-can call `ch.context().gang.torch()` and load a model once:
+Want ranks that stay up between steps? `Class.options(ranks=n).gang(*args)`
+builds n instances together, each with the rendezvous environment set for
+good in its own process, so `__init__` can call `ch.context().gang.torch()`
+and load a model once:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -213,12 +215,13 @@ with Worker.options(ranks=3).gang(100) as workers:
 <details>
 <summary>Lost ranks and gang methods</summary>
 
-A lost rank breaks a class gang. Its calls raise `ch.ActorDied`, and nothing
-restarts until you call `workers.restart()`. Restore your checkpoint in
-`__init__`.
+Lose any rank and the class gang breaks: its calls raise `ch.ActorDied`, and
+nothing restarts until you call `workers.restart()`. Restore your checkpoint
+in `__init__`.
 
-- `workers.method.remote(...)` runs on every rank and gives one future of the
-  results in rank order; `workers[i].method.remote(...)` runs on rank `i`.
+- `workers.method.remote(...)` runs on every rank and gives one future of
+  the results in rank order; `workers[i].method.remote(...)` runs on rank
+  `i`.
 - `workers.restart()` rebuilds the whole gang as the next generation, and
   `workers.resize(n)` does so with n ranks.
 - `workers.close()`, or leaving the `with` block, ends all ranks.
@@ -229,8 +232,9 @@ restarts until you call `workers.restart()`. Restore your checkpoint in
 
 ## Let the gang size itself
 
-`ranks=ch.auto(initial, min=, max=)` sizes each generation to how many ranks
-of this shape the live peers can hold:
+Not sure how many ranks you'll get? `ranks=ch.auto(initial, min=, max=)`
+sizes each generation to how many ranks of this shape the live peers can
+hold:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -246,24 +250,25 @@ assert elastic.decisions[0].startswith("generation 1: 2 ranks")
 <details>
 <summary>How elastic sizing works</summary>
 
-An elastic gang that loses a peer comes back smaller instead of waiting for
-a replacement. `gang.decisions` says why each generation got its size, and
-`gang.size` and `gang.generation` say how it ran.
+Lose a peer and an elastic gang comes back smaller instead of waiting for a
+replacement. `gang.decisions` tells you why each generation got its size;
+`gang.size` and `gang.generation` tell you how it ran.
 
 The count goes by the peers' CPUs, plus GPUs when ranks ask for them. It
-counts capacity, not what is free right now. The first generation starts at
-`initial` if you give one. `min` defaults to 1. `max` is required unless you
-give `initial`, which then serves as the max.
+counts capacity, not what's free right now. If you give `initial`, the first
+generation starts there. `min` defaults to 1. `max` is required unless you
+give `initial`, which then doubles as the max.
 
-A running generation never grows, so new peers are used from the following
-one on. An elastic class gang resizes on `restart()`.
+A running generation never grows, so new peers join in from the next one. An
+elastic class gang resizes on `restart()`.
 
 </details>
 
 ## Survive a lost rank
 
-If a rank's worker or peer dies, the other ranks of that generation are
-canceled and the whole gang starts over as a new generation:
+If a rank's worker or peer dies, the gang doesn't limp on: the other ranks
+of that generation are canceled, and the whole gang starts over as a new
+generation:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -282,13 +287,13 @@ assert retried.generation == 2
 <details>
 <summary>Why the restart takes 15 s</summary>
 
-Resume from your own checkpoint; `g.generation` tells you which try this
-is. After `max_attempts` generations have each lost a rank, the gang fails
-with `ch.errors.GangFailed`.
+Resume from your own checkpoint; `g.generation` tells you which try this is.
+After `max_attempts` generations have each lost a rank, the gang fails with
+`ch.errors.GangFailed`.
 
 Before restarting, the supervisor waits up to 15 s to learn whether the dead
-rank's peer is gone, so the new generation isn't sized to fit on it. That
-wait is why the example takes about 15 s.
+rank's peer is gone, so the new generation isn't sized to fit on it. That's
+why the example takes about 15 s.
 
 `ch.errors.GangFailed` is an `InfrastructureFailure`:
 
@@ -305,9 +310,8 @@ except ch.errors.GangFailed as e:
 
 </details>
 
-A rank that raises is different: that's your bug, not a lost machine, so
-the gang fails at once with that rank's own exception and cancels the
-others:
+A rank that raises is different. That's your bug, not a lost machine, so the
+gang fails at once with that rank's own exception and cancels the others:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -326,11 +330,11 @@ except ValueError as e:
 <details>
 <summary>When not all ranks fit</summary>
 
-Ranks are placed one at a time today, not all or nothing, so size each
-gang to what is free when it starts.
+Heads up: ranks are placed one at a time today, not all or nothing, so size
+each gang to what's free when it starts.
 
-When free capacity runs short, whichever ranks fit start and wait at the
-rendezvous. If some rank hasn't arrived within 300 s, the generation counts
+If free capacity runs short, whichever ranks fit start and wait at the
+rendezvous. If some rank hasn't shown up within 300 s, the generation counts
 as lost and the next one tries again.
 
 </details>
@@ -339,8 +343,8 @@ as lost and the next one tries again.
 
 ## Group actors you already have
 
-`ch.dist.group(*actors)` turns actors you created separately into one group,
-ranked in the order you pass them:
+Made your actors one by one? `ch.dist.group(*actors)` turns them into one
+group, ranked in the order you pass them:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -364,19 +368,19 @@ for l in learners:
 
 Pass the handle to the members. Inside a member's method, `handle.join()`
 returns its `Group`, with the collectives, `torch()` and `mesh()` that gang
-ranks have.
+ranks get.
 
-The first `join()` in each member waits for all of them; later ones return
-that `Group`. To start a new generation for a changed set of actors, call
-`ch.dist.group(..., name="k")` again with the same name. `join()` anywhere
-but inside a member's method raises `ValueError`.
+Each member's first `join()` waits for all of them; later ones return that
+`Group`. Changed the set of actors? Call `ch.dist.group(..., name="k")`
+again with the same name to start a new generation. `join()` anywhere but
+inside a member's method raises `ValueError`.
 
 </details>
 
 ## Split ranks into a device mesh
 
-`g.mesh(dp=..., tp=...)` lays the ranks out in a grid and returns this
-rank's `Group` along each axis:
+Mixing data and tensor parallelism? `g.mesh(dp=..., tp=...)` lays the ranks
+out in a grid and returns this rank's `Group` along each axis:
 
 ```python run
 @ch.remote(cpus=0.25)
@@ -390,7 +394,7 @@ assert out[0] == ([0, 1], [0, 2], 1)
 assert out[3] == ([2, 3], [1, 3], 5)
 ```
 
-For tensors, build torch's own mesh after `g.torch()`. This needs torch
+For tensors, build torch's own mesh after `g.torch()`. This one needs torch
 and eight GPUs:
 
 ```python
@@ -411,15 +415,16 @@ train_2d.options(ranks=8).gang(1000).result()
 <summary>Axis collectives and sizes</summary>
 
 An axis has `ranks` (their ranks in the whole gang) and the store
-collectives, but no torch process group of its own: its `torch()` raises
+collectives, but no torch process group of its own, so its `torch()` raises
 `RuntimeError`. The last axis varies fastest, as in torch's `DeviceMesh`.
-The sizes must multiply to the group's size, or `mesh()` raises `ValueError`.
+The sizes must multiply to the group's size, or `mesh()` raises
+`ValueError`.
 
 </details>
 
 ## Find what a hung gang waits for
 
-`explain()` names the ranks a stalled gang waits on:
+Gang stuck? `explain()` tells you which ranks it's waiting on:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -440,8 +445,8 @@ assert hung.explain()["ranks"][1]["op"] == "rendezvous"
 hung.cancel()
 ```
 
-A wait timeout on `gang.result(timeout=)` and a collective's own
-`timeout=` both carry that one-line summary in their message:
+A wait timeout on `gang.result(timeout=)` and a collective's own `timeout=`
+both put that one-line summary in their message:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -460,8 +465,8 @@ except TimeoutError as e:
 <details>
 <summary>Reading explain, and NCCL hangs</summary>
 
-`explain()` sees the rendezvous and the four store collectives, not what
-happens inside `torch.distributed`.
+`explain()` sees the rendezvous and the four store collectives. It can't see
+inside `torch.distributed`.
 
 On a gang, a class gang or a group handle, `explain()` returns the current
 `generation`, a `ranks` list with each rank's last collective (its number,
@@ -469,14 +474,16 @@ On a gang, a class gang or a group handle, `explain()` returns the current
 that hold the others up. On a function gang, a rank that hasn't started
 shows why it's waiting instead.
 
-When ranks call different collectives at one point, the summary reads
+If ranks call different collectives at one point, the summary reads
 `the ranks call different collectives as #1: rank 0 all_gather, rank 1 broadcast`.
 
-A hang inside NCCL shows up as all ranks in one store collective with none
-behind. To narrow it down, add a `g.barrier()` before a suspect step.
+A hang inside NCCL looks like all ranks sitting in one store collective,
+with none behind. To narrow it down, drop a `g.barrier()` before a suspect
+step.
 
 </details>
 
 [observability.md](observability.md) covers `explain()` for every kind of call.
 
-Next: choose CPUs, memory and GPUs for each rank in [resources.md](resources.md).
+Next: pick CPUs, memory and GPUs for each rank in
+[resources.md](resources.md).

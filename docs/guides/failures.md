@@ -1,15 +1,15 @@
 # When things go wrong: errors, retries and recovery
 
-When workers or peers are lost, Chimaera runs their calls again. It doesn't
-retry your own exceptions unless you list them, and it never reruns an
+Worker crashed, or a whole peer went down? Chimaera runs the lost calls again.
+It won't retry your own exceptions unless you list them, and it never reruns an
 `effects="external"` call that may already have started. Detached runs outlive
-the script that started them, and durable workflows don't repeat finished
-steps when their worker dies.
+the script that started them, and durable workflows don't repeat finished steps
+when their worker dies.
 
 ## Catch your own exceptions
 
-Your exception comes back from `result()` with its own type and the remote
-traceback attached as a note:
+Your function raised? `result()` gives you that exception back, same type, with
+the remote traceback attached as a note:
 
 ```python run
 import chimaera as ch
@@ -28,8 +28,8 @@ except ValueError as e:
 <details>
 <summary>Failed inputs and custom exceptions</summary>
 
-A call that depends on a failed one never runs. Instead, it raises the root
-cause's type, with a note naming the failed call:
+A call that depends on a failed one never runs. It raises the root cause's type
+instead, with a note naming the failed call:
 
 ```python run
 @ch.remote
@@ -40,15 +40,15 @@ err = add.remote(parse.remote("x"), 1).exception()     # waits, returns the erro
 assert isinstance(err, ValueError) and "this call never ran" in err.__notes__[0]
 ```
 
-Uncaught, your exception prints your local stack with the remote line that
-raised underneath.
+Leave it uncaught and it prints your local stack, with the remote line that
+raised it underneath.
 
 If your script can't unpickle the original type, you get
 `ch.errors.RemoteError` (`type_name`, `message`, `remote_traceback`) instead.
-The usual cause is an `__init__` that takes different arguments from the ones
+The usual culprit is an `__init__` that takes different arguments from the ones
 it passes to `super().__init__()`. Python rebuilds an exception as
-`cls(*e.args)`, so when you define an exception class, pass every
-`__init__` argument to `super().__init__()` and it survives the trip back:
+`cls(*e.args)`, so when you write your own exception class, pass every
+`__init__` argument to `super().__init__()`. Then it survives the trip back:
 
 ```python run
 class PaymentDeclined(Exception):
@@ -66,8 +66,8 @@ assert isinstance(err, PaymentDeclined) and err.code == "insufficient_funds"
 
 - `SystemExit`, `KeyboardInterrupt` and `GeneratorExit` raised remotely come
   back as `RemoteError`, so they can't end your script.
-- An error nothing reads is reported on stderr
-  (`chimaera: ... failed and nothing read its error`), not dropped.
+- An error nothing reads isn't dropped: it's reported on stderr
+  (`chimaera: ... failed and nothing read its error`).
 - In a map, `results.outcomes()` yields `(index, value, error)` per item
   instead of raising at the first failure ([tasks.md](tasks.md)).
 
@@ -75,8 +75,8 @@ assert isinstance(err, PaymentDeclined) and err.code == "insufficient_funds"
 
 ## Know which error you got
 
-Every error Chimaera itself raises derives from `ch.ChimaeraError`, except a wait's
-built-in `TimeoutError`.
+Every error Chimaera raises itself derives from `ch.ChimaeraError`, except one:
+a wait's built-in `TimeoutError`.
 
 | Error | Raised when | What it carries |
 |---|---|---|
@@ -126,10 +126,10 @@ three).
 
 ## Retry what is safe to retry
 
-Calls lost with a worker or peer are retried for you. Your own exceptions are retried
-only if you list them in `retry_exceptions` (a class or a tuple; subclasses
-match). Retries start at once, with no backoff, and stop early if an attempt
-fails exactly like the one before:
+Calls lost with a worker or peer are retried for you. Your own exceptions? Only
+if you list them in `retry_exceptions` (a class or a tuple; subclasses match).
+Retries start at once, with no backoff, and stop early when an attempt fails
+exactly like the one before:
 
 ```python run
 class Throttled(Exception):
@@ -148,11 +148,11 @@ assert fetch.remote(1).result() == "page 1"
 <details>
 <summary>How retries count</summary>
 
-`max_attempts` (default 3) counts every attempt, the first included, and
+`max_attempts` (default 3) counts every attempt, including the first, and
 worker losses share it with listed exceptions.
 
-When an attempt fails exactly like the one before (type, message and
-traceback lines), Chimaera stops retrying and raises it. A failure that
+When an attempt fails exactly like the one before (type, message and traceback
+lines), Chimaera stops retrying and raises it. Why keep going? A failure that
 repeats word for word won't go away by itself:
 
 ```python run
@@ -172,9 +172,9 @@ Memory kills have their own allowance, apart from `max_attempts`
 
 ## Declare side effects
 
-Mark a function that must not run twice `effects="external"`. If it's lost
-after it has started, you get `ch.OutcomeUnknown`, not a second run. An
-idempotency key then makes retrying it yourself safe:
+Got a function that must not run twice? Mark it `effects="external"`. If it's
+lost after it has started, you get `ch.OutcomeUnknown` instead of a second run,
+and an idempotency key makes retrying it yourself safe:
 
 ```python run
 import os
@@ -219,18 +219,18 @@ Chimaera how careful to be:
 | `"idempotent"` | writes that are safe to repeat | runs again, up to `max_attempts` | honored | is remade by running the call again |
 | `"external"` | charges, emails, anything that must not repeat | runs again only if lost before it started; after that, `ch.OutcomeUnknown` | ignored: your exception is raised | is not remade (`DataLost`) |
 
-Once an `"external"` call has started, losing it means nobody knows whether
-the effect happened. Handle `OutcomeUnknown` with an idempotency key: an id you
+Once an `"external"` call has started, losing it means nobody knows whether the
+effect happened. So handle `OutcomeUnknown` with an idempotency key: an id you
 choose (the order id in the example) that the external system uses to spot a
-repeat, so trying again is safe. Many payment and messaging APIs accept one.
-In the example, a directory stands in for a payment API that charges once per
-key, and the worker dies right after the money moves.
+repeat, which makes trying again safe. Plenty of payment and messaging APIs
+accept one. In the example, a directory stands in for a payment API that
+charges once per key, and the worker dies right after the money moves.
 
-Before your code runs, an `"external"` call's start is written to the run's
-replicated record. Lost before that point, it runs again, up to 3 attempts in
-all; that allowance is separate from `max_attempts`, which an external call
-doesn't use. Setting it yourself is an error: `max_attempts=3` on an
-external call raises `ch.OptionsError` at `.remote()`.
+Before your code runs, an `"external"` call's start goes into the run's
+replicated record. If it's lost before that point, it runs again, up to 3
+attempts in all. That allowance is separate from `max_attempts`, which an
+external call doesn't use, and setting it yourself is an error:
+`max_attempts=3` on an external call raises `ch.OptionsError` at `.remote()`.
 
 - Only the decorator can weaken `effects`. `.options(effects=...)` and
   `with ch.defaults(effects=...)` can make it stricter; loosening the
@@ -244,7 +244,7 @@ external call raises `ch.OptionsError` at `.remote()`.
 
 ## Cap memory
 
-Set `memory_limit` and anything over it is stopped:
+Set `memory_limit`, and anything that goes over it gets stopped:
 
 ```python run
 import time
@@ -267,14 +267,14 @@ assert [a["end_reason"] for a in f.explain()["attempts"]] == ["oom"] * 3
 
 The peer checks memory every 100 ms, stops the worker of anything over its
 limit, and runs it up to twice more. The limit stays where you set it, so a
-function that really needs more fails after three attempts, as above.
+function that really needs more fails after three attempts, like the one above.
 
 Each retry reserves 1.5 times the killed attempt's peak and waits until that
-much is free. A retry whose reservation is bigger than the peer's whole memory
-pool fails at once.
+much is free. If that's more than the peer's whole memory pool, the retry fails
+at once.
 
-Without a `memory_limit`, the peer steps in only when the host is nearly out
-of memory, stopping whatever is furthest over its reservation; retries follow
+No `memory_limit`? Then the peer steps in only when the host is nearly out of
+memory, and it stops whatever is furthest over its reservation. Retries follow
 the rules above. [resources.md](resources.md) covers reservations and learned
 memory.
 
@@ -282,8 +282,8 @@ memory.
 
 ## Fail fast on impossible requests
 
-A request no peer can ever satisfy fails right away with `ch.Infeasible`
-instead of waiting forever:
+A request no peer can ever satisfy fails right away with `ch.Infeasible`, so
+you're not left waiting forever:
 
 ```python run
 err = parse.options(cpus=10_000).remote("1").exception(timeout=10)
@@ -293,15 +293,15 @@ assert isinstance(err, ch.Infeasible) and "cpus=10000" in str(err)
 <details>
 <summary>Requests that wait instead</summary>
 
-A request that's only too big for now (all CPUs busy, memory in use) waits;
-`future.explain()["pending_reason"]` says what for
+A request that's only too big for now (all CPUs busy, memory in use) just
+waits, and `future.explain()["pending_reason"]` tells you what for
 ([observability.md](observability.md)).
 
 </details>
 
 ## Put a deadline on a call
 
-When a call's deadline passes, it's canceled, whether it's queued or running:
+Once a call's deadline passes, it's canceled, queued or running:
 
 ```python run
 import datetime
@@ -325,22 +325,22 @@ assert isinstance(nap.options(deadline=soon).remote(30).exception(), ch.Deadline
 <details>
 <summary>Deadline formats and nested calls</summary>
 
-A deadline is relative (`"500ms"`, `"30s"`, a number of seconds, a
-`timedelta`) or a `datetime`, counted from `.remote()`, so waiting for a
-worker counts too. A wait timeout is different: `f.result(timeout=5)` and
+A deadline is relative (`"500ms"`, `"30s"`, a number of seconds, a `timedelta`)
+or a `datetime`, counted from `.remote()`, so waiting for a worker counts too.
+Don't mix it up with a wait timeout: `f.result(timeout=5)` and
 `ch.get(futures, timeout=5)` raise `TimeoutError` and leave the call running,
-so cancel it if you no longer want it.
+so cancel it if you don't want it anymore.
 
-Calls past their deadline stop like canceled ones (next section). Nested
-calls inherit the deadline; when one sets its own, the earlier wins. In your
-function, `ch.context().deadline_unix_ms` is the deadline in force (0 for
-none).
+Calls past their deadline stop the way canceled ones do (next section). Nested
+calls inherit the deadline, and if one sets its own, the earlier one wins.
+Inside your function, `ch.context().deadline_unix_ms` is the deadline in force
+(0 for none).
 
 </details>
 
 ## Cancel work
 
-`future.cancel()` cancels a call and every call it started:
+Changed your mind? `future.cancel()` cancels a call and every call it started:
 
 ```python run
 @ch.remote
@@ -371,31 +371,31 @@ assert len(trials) == 3 and all(isinstance(e, ch.Cancelled) for e in trials)
 result now raises `ch.Cancelled`), `False` if it had (it keeps its outcome). To
 stop early, your code can watch `ch.context().cancelled()`.
 
-`run.cancel()` cancels every unfinished call in the run; `chimaera cancel RUN`
-does it from a shell.
+`run.cancel()` cancels every unfinished call in the run, and
+`chimaera cancel RUN` does the same from a shell.
 
 Each trial's error names its parent:
-`the call that submitted it (...) was cancelled`. A running call stops in steps:
+`the call that submitted it (...) was cancelled`. Here's how a running call
+stops:
 
 1. Right away, `ch.context().cancelled()` turns true inside it, and anything
    it returns after that is dropped: its outcome is already `ch.Cancelled`.
-2. After 2 s, it is interrupted if it runs on its worker's main thread: a
+2. After 2 s, it's interrupted if it runs on its worker's main thread: a
    `time.sleep` or a pure-Python loop raises `ch.Cancelled`, and that worker
-   stays for the next call.
+   sticks around for the next call.
 3. After 5 s, if it's still running (a C extension that never returns to
    Python, a thread), its worker process is killed.
 
-`cancel(force=True)` skips straight to step 3.
-An actor method gets only step 1, since the actor's state lives in that
-process, and `force=True` kills the actor too ([tasks.md](tasks.md),
-[actors.md](actors.md)).
+`cancel(force=True)` skips straight to step 3. An actor method only gets step
+1, because the actor's state lives in that process, and `force=True` kills the
+actor too ([tasks.md](tasks.md), [actors.md](actors.md)).
 
 </details>
 
 ## When a worker dies
 
-A worker that dies mid-function (a segfault, `os._exit`, a kill) costs that
-attempt, and the function is retried on a fresh worker:
+If a worker dies mid-function (a segfault, `os._exit`, a kill), you lose that
+attempt and the function is retried on a fresh worker:
 
 ```python run
 @ch.remote
@@ -422,27 +422,27 @@ assert str(err).startswith("3 attempts lost to infrastructure failures")
 <details>
 <summary>Actor deaths and end reasons</summary>
 
-Actors are different: when an actor's process dies, the method call it was
-running raises `ch.ActorDied` and is not replayed. Its
+Actors work differently. When an actor's process dies, the method call it was
+running raises `ch.ActorDied` and isn't replayed. Its
 [`restart` policy](actors.md) decides what happens next.
 
 `future.explain()["attempts"]` lists each attempt's `end_reason` (`"ok"`,
-`"killed"`, `"oom"`...) and `detail`; `chimaera explain RUN --task TASK`
-prints them.
+`"killed"`, `"oom"`...) and `detail`. From a shell,
+`chimaera explain RUN --task TASK` prints them.
 
 </details>
 
 ## When a peer dies
 
-On a cluster, Chimaera picks up after a peer that crashes or loses its
-machine: calls run again elsewhere, actors follow their `restart` policy, and
-values are read from a copy or remade.
+Peers crash, and machines go away. On a cluster, Chimaera picks up after them:
+calls run again elsewhere, actors follow their `restart` policy, and values are
+read from a copy or remade.
 
 <details>
 <summary>What survives a lost peer</summary>
 
-Runs, calls and their outcomes live in groups replicated with Raft, so losing
-a peer doesn't take the record with it. What was running on it is lost:
+Runs, calls and their outcomes live in groups replicated with Raft, so losing a
+peer doesn't take the record with it. What was running on it, though, is lost:
 
 - Its calls' attempts count as infrastructure failures and run again on
   another peer within `max_attempts`, except `"external"` calls that had
@@ -453,24 +453,24 @@ a peer doesn't take the record with it. What was running on it is lost:
   (`CHIMAERA_OBJECT_REPLICAS`, default 1; 0 turns copies off), and a reader
   finds the copy ([../objects.md](../objects.md)).
 
-When every copy of a value is gone, reading it (in your script or as another
-call's input) reruns the function that returned it on its original inputs,
-and remakes any lost input the same way. This works only for a function call or
-map item whose effects are not `"external"`, while its run's record still
-exists. Nothing else is remade: values from `ch.put`, arguments you passed,
-actor method results and external calls' results die with their last copy,
-and reading one raises `ch.errors.DataLost` with the reason.
+And when every copy of a value is gone? Reading it (in your script or as
+another call's input) reruns the function that returned it on its original
+inputs, and remakes any lost input the same way. That only works for a function
+call or map item whose effects aren't `"external"`, and only while its run's
+record still exists. Nothing else is remade: values from `ch.put`, arguments
+you passed, actor method results and external calls' results die with their
+last copy, and reading one raises `ch.errors.DataLost` with the reason.
 
-A single machine keeps its record on disk. A local peer killed during a
-detached run resumes it when started again, and `ch.runs.attach(run_id)` sees
+A single machine keeps its record on disk. Kill a local peer during a detached
+run and it resumes the run when started again; `ch.runs.attach(run_id)` sees
 every result exactly once.
 
 </details>
 
 ## Keep a run going without your script
 
-Detach a run and it keeps going after its script exits. Any process can
-reattach to it by id:
+Want a run to outlive its script? Detach it, and any process can reattach to it
+by id:
 
 ```python run
 import subprocess
@@ -501,7 +501,7 @@ run.finish()
 <summary>When a detached run ends</summary>
 
 A detached run stays open until `run.finish()`, `run.cancel()` or
-`chimaera cancel RUN`, and its records are kept for 24 hours after it ends.
+`chimaera cancel RUN`, and its records stick around for 24 hours after it ends.
 `chimaera run --detach` detaches a script that doesn't call
 `ch.init(detach=True)` itself:
 
@@ -515,9 +515,9 @@ $ chimaera cancel 0000035051d3f711106dbf78a87d936e
 run 0000035051d3f711106dbf78a87d936e cancelled
 ```
 
-`run.wait(timeout=None)` blocks until every call is done and returns counts
-by state. `run.outcomes()` yields `(task_id, value, error)` per finished call,
-the error being the exception it would raise.
+`run.wait(timeout=None)` blocks until every call is done and returns counts by
+state. `run.outcomes()` yields `(task_id, value, error)` per finished call,
+where the error is the exception it would raise.
 
 A run that isn't detached ends with its script: a normal exit waits for
 calls you never waited on, an exception or Ctrl-C cancels them, and if the
@@ -531,8 +531,9 @@ Inside a script started this way, `ch.runs.current_run()` returns its run. See [
 
 ## Make a workflow durable
 
-Mark a long chain of steps `workflow="durable"` (it must be an `async def`) so
-its finished steps don't run again when the worker driving it dies:
+Got a long chain of steps you'd rather not redo? Mark it `workflow="durable"`
+(it must be an `async def`), and its finished steps won't run again when the
+worker driving it dies:
 
 ```python run
 STEPS = os.path.join(tempfile.mkdtemp(), "steps")
@@ -560,11 +561,11 @@ assert open(STEPS).read().split() == ["extract", "load"]   # extract ran once
 <details>
 <summary>Durable helpers and replay rules</summary>
 
-When its worker or peer is lost, the workflow restarts from the top, and
-each call it already made is answered from the run's record. So it must
+When its worker or peer is lost, the workflow restarts from the top, and each
+call it already made is answered from the run's record. That means it has to
 repeat itself exactly: same calls, same order, same arguments, every time.
-Anything that varies goes through `ch.durable`, which runs it once and
-records the answer:
+Anything that varies goes through `ch.durable`, which runs it once and records
+the answer:
 
 | Helper | Returns on every replay |
 |---|---|
@@ -573,9 +574,9 @@ records the answer:
 | `await ch.durable.record(fn, *args, **kwargs)` | `fn`'s first result; pass a module-level function |
 | `await ch.durable.sleep(seconds)` | once the first run's sleep is over (a replay waits only for what is left) |
 
-Finished steps return their recorded result; running ones are joined, not
-started twice. A replay that asks for something different at a step raises
-`ch.errors.WorkflowDivergence` there:
+Finished steps return their recorded result, and running ones are joined rather
+than started twice. A replay that asks for something different at a step raises
+`ch.errors.WorkflowDivergence` right there:
 
 ```python run
 @ch.remote(workflow="durable")
@@ -588,10 +589,10 @@ async def careless() -> str:
 assert isinstance(careless.remote().exception(), ch.errors.WorkflowDivergence)
 ```
 
-A durable workflow is retried for lost workers up to 100 times by default,
-but your exceptions still fail it unless listed in `retry_exceptions`.
-The helpers raise `RuntimeError` outside a durable workflow. For an actor
-whose state survives crashes, see [durable actors](actors.md).
+A durable workflow is retried for lost workers up to 100 times by default, but
+your exceptions still fail it unless you list them in `retry_exceptions`.
+Outside a durable workflow, the helpers raise `RuntimeError`. Want an actor
+whose state survives crashes? See [durable actors](actors.md).
 
 </details>
 

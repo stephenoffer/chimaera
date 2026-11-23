@@ -1,8 +1,8 @@
 # Resources, GPUs and automatic tuning
 
-Tell Chimaera what a call needs, or let the peer measure it. Then see what
-was reserved and why, hold capacity ahead of time, and cap what a tree of
-calls may spend.
+Not sure how much CPU or memory a call needs? Let the peer measure it, or tell
+Chimaera yourself. Then see what was reserved and why, hold capacity ahead of
+time, and cap what a tree of calls may spend.
 
 ## Ask for CPUs and memory
 
@@ -24,12 +24,12 @@ The call starts only where both are free and keeps them while it runs.
 <details>
 <summary>Options table and impossible requests</summary>
 
-That's admission, not a fence: touching 2 GiB after reserving 512 MiB
-doesn't get it stopped (`memory_limit=` below is the fence).
+That's admission, not a fence. Touch 2 GiB after reserving 512 MiB and it
+doesn't get stopped (`memory_limit=` below is the fence).
 
-Set options on the decorator, per call with `.options(...)`, or for a block
-of calls with `with ch.defaults(...)`. Values are checked where you write
-them, so a typo raises `ch.OptionsError` on that line.
+Set options on the decorator, per call with `.options(...)`, or for a block of
+calls with `with ch.defaults(...)`. They're checked right where you write them,
+so a typo raises `ch.OptionsError` on that line.
 
 | Option | What it does |
 |---|---|
@@ -45,14 +45,14 @@ them, so a typo raises `ch.OptionsError` on that line.
 | `accounting` | `"auto"` (default), `"process"`, or `"isolated"` for a cgroup per attempt (Linux) |
 
 Fractions work: `cpus=0.25` lets four calls that mostly wait on the network
-share one core. Thread pools follow the grant: `OMP_NUM_THREADS`,
+share one core. Thread pools follow the grant too: `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`,
 `NUMEXPR_NUM_THREADS`, `RAYON_NUM_THREADS`, `POLARS_MAX_THREADS` and
-`NUMBA_NUM_THREADS` are set to the CPUs rounded up (1 for `cpus=0.25`)
-unless your run's environment sets them.
+`NUMBA_NUM_THREADS` are set to the CPUs rounded up (1 for `cpus=0.25`) unless
+your run's environment sets them.
 
-A request no peer could ever meet raises `ch.Infeasible`, naming the
-constraint, when you wait on it:
+Ask for something no peer could ever provide, and waiting on it raises
+`ch.Infeasible`, naming the constraint:
 
 ```python run
 try:
@@ -65,8 +65,8 @@ except ch.Infeasible as e:
 
 ## Write sizes with a unit
 
-A size is an int of bytes or a string with a byte unit, and a bare `"2g"`
-or `"512m"` is refused:
+A size is an int of bytes or a string with a byte unit. A bare `"2g"` or
+`"512m"` gets refused:
 
 ```python run
 try:
@@ -78,9 +78,8 @@ except ch.OptionsError as e:
 <details>
 <summary>Size units and bare suffixes</summary>
 
-It's refused because Docker reads `m` as MiB and Kubernetes as millibytes.
-`"2 GB"` is 2,000,000,000 bytes and `"2 GiB"` is 2,147,483,648, about 7%
-more.
+Why so strict? Docker reads `m` as MiB and Kubernetes as millibytes. `"2 GB"`
+is 2,000,000,000 bytes and `"2 GiB"` is 2,147,483,648, about 7% more.
 
 Decimal and binary units each mean what they say:
 
@@ -90,14 +89,14 @@ Decimal and binary units each mean what they say:
 | `KB`, `MB`, `GB`, `TB` | 10³, 10⁶, 10⁹, 10¹² |
 | `KiB`, `MiB`, `GiB`, `TiB` | 2¹⁰, 2²⁰, 2³⁰, 2⁴⁰ |
 
-Case and the space don't matter, and `"1.5 GiB"` works if it comes to
+Case and the space don't matter, and `"1.5 GiB"` works as long as it comes to
 whole bytes.
 
 </details>
 
 ## Cap a call's memory
 
-`memory_limit=` is enforced:
+Need a hard ceiling? `memory_limit=` is enforced:
 
 ```python run
 @ch.remote(memory_limit="100 MiB")
@@ -115,21 +114,21 @@ except ch.OutOfMemory as e:
 <details>
 <summary>Retries and cgroup enforcement</summary>
 
-Past the limit, the call is stopped and retried twice more under it, then
-fails with `ch.OutOfMemory`, giving its peak and its limit.
-These retries are counted apart from `max_attempts`.
+Go past the limit and it's stopped, then retried twice more under it. After
+that it fails with `ch.OutOfMemory`, giving its peak and its limit. These
+retries are counted apart from `max_attempts`.
 
-With cgroup v2 delegation on Linux, `accounting="isolated"` runs each
-attempt in a fresh worker in its own cgroup, so the kernel enforces the
-memory limit and the CPU and memory readings are the attempt's own. Without
-that delegation the request is `ch.Infeasible`.
+With cgroup v2 delegation on Linux, `accounting="isolated"` runs each attempt
+in a fresh worker in its own cgroup, so the kernel enforces the memory limit
+and the CPU and memory readings are the attempt's own. Without that delegation,
+the request is `ch.Infeasible`.
 
 </details>
 
 ## Let the peer measure
 
-You usually don't need `cpus=` or `memory=`: the peer measures each
-function and reserves from what it saw:
+You usually don't need `cpus=` or `memory=`. The peer measures each function
+and reserves from what it saw:
 
 ```python run
 @ch.remote
@@ -150,13 +149,13 @@ assert "learned" in reserved
 <details>
 <summary>How learned sizing works</summary>
 
-Measurements are keyed by the function's code. An edited function is a new
-one that starts from the old one's numbers. Values you set always win over
+Measurements are keyed by the function's code, so an edited function is a new
+one, though it starts from the old one's numbers. Values you set always beat
 learned ones.
 
-- A function never measured runs one call per four of the peer's CPUs at a
-  time (at least one, so 3 on a 12-CPU peer) until one finishes or has run
-  2 s. More start only while the memory pool has 4 GiB free per call.
+- A function never measured runs one call per four of the peer's CPUs at a time
+  (at least one, so 3 on a 12-CPU peer) until one finishes or has run 2 s. More
+  start only while the memory pool has 4 GiB free per call.
 - After three successful calls, later calls reserve the 95th-percentile
   private memory peak times a margin: 1.2 for steady peaks, 1.5 when they
   vary, 2 when they vary a lot or one was killed for memory. Calls are grouped by
@@ -187,8 +186,8 @@ learned ones.
 
 ## Bound or turn off learning
 
-`ch.auto(min=..., max=...)` keeps the learning but clips it. `adaptive=`
-chooses whether it applies at all:
+Want learning with guardrails? `ch.auto(min=..., max=...)` keeps it but clips
+it, and `adaptive=` decides whether it applies at all:
 
 ```python run
 capped = load.options(memory=ch.auto(max="80 MiB")).remote(64)
@@ -203,9 +202,9 @@ assert "memory not known yet" in frozen.explain()["attempts"][-1]["reservation"]
 <details>
 <summary>Adaptive modes and ch.auto</summary>
 
-Pass only `min=` and `max=` to `ch.auto` for `cpus` and `memory`. Today an
-initial value (`cpus=ch.auto(2, max=4)`) is sent as if you had set `cpus=2`,
-so learning never adjusts it.
+Pass only `min=` and `max=` to `ch.auto` for `cpus` and `memory`. For now, an
+initial value (`cpus=ch.auto(2, max=4)`) is sent as if you'd set `cpus=2`, so
+learning never adjusts it.
 
 | `adaptive=` | Effect |
 |---|---|
@@ -217,8 +216,8 @@ so learning never adjusts it.
 
 ## See what was reserved and why
 
-`chimaera profiles` shows what the peer learned and what the next call
-gets:
+Curious what the peer chose? `chimaera profiles` shows what it learned and what
+the next call gets:
 
 ```bash
 $ chimaera profiles --fn load
@@ -228,10 +227,10 @@ $ chimaera profiles --fn load
 <details>
 <summary>Reading reservations and decisions</summary>
 
-Each attempt in `future.explain()["attempts"]` has a `reservation` string,
-such as `cpus 1 (default); memory 175 MiB (learned: ...)` or
+Each attempt in `future.explain()["attempts"]` has a `reservation` string, such
+as `cpus 1 (default); memory 175 MiB (learned: ...)` or
 `cpus 0.5 (set by the caller)`, and a `placement` string saying why it ran
-where it did. Until the call starts, `pending_reason` says why it waits.
+where it did. Until the call starts, `pending_reason` says why it's waiting.
 
 `chimaera profiles` prints the profiles file first, then a line per
 function. `--fn` filters by name, and `--json` is for scripts.
@@ -268,8 +267,8 @@ except ch.Infeasible as e:
     assert "accelerator" in str(e)
 ```
 
-`gpus=N` asks for N units of any vendor; `device="KIND[:MODEL]"` narrows
-it. This needs a GPU host:
+`gpus=N` asks for N units of any vendor, and `device="KIND[:MODEL]"` narrows it
+down. This one needs a GPU host:
 
 ```python
 @ch.remote(gpus=1, device="cuda:A10G")
@@ -284,8 +283,8 @@ print(matmul.remote(4096).result())
 <details>
 <summary>Device kinds and visibility</summary>
 
-A fractional `gpus=0.5` takes a whole device today; sharing a device between
-calls is not built yet.
+A fractional `gpus=0.5` takes a whole device today. Sharing a device between
+calls isn't built yet.
 
 Inside your function, `ch.dist.device()` is the torch device string of the
 first grant, with no torch import.
@@ -295,12 +294,12 @@ first grant, with no torch import.
 `MI300X` or `v5e`. `device=` alone means one unit. An unknown kind or a
 model no peer has is `ch.Infeasible`.
 
-The worker gets the vendor's visibility variable
-(`CUDA_VISIBLE_DEVICES` with GPU UUIDs, `HIP_VISIBLE_DEVICES`,
-`TPU_VISIBLE_CHIPS`, `NEURON_RT_VISIBLE_CORES`, `HABANA_VISIBLE_MODULES`,
-`ZE_AFFINITY_MASK`). Without `gpus=` or `device=` that list is empty and no
-device is visible. Apple's GPU is the exception: `mps` can't be hidden,
-so there the grant is bookkeeping only.
+The worker gets the vendor's visibility variable (`CUDA_VISIBLE_DEVICES` with
+GPU UUIDs, `HIP_VISIBLE_DEVICES`, `TPU_VISIBLE_CHIPS`,
+`NEURON_RT_VISIBLE_CORES`, `HABANA_VISIBLE_MODULES`, `ZE_AFFINITY_MASK`).
+Without `gpus=` or `device=`, that list is empty and no device is visible.
+Apple's GPU is the exception: `mps` can't be hidden, so there the grant is
+bookkeeping only.
 
 `ch.dist.device()` returns `"cuda:0"`, `"xla:0"`, `"hpu"`, `"xpu:0"`,
 `"mps"`, or `"cpu"` with no grant. `ch.dist.devices()` lists every grant
@@ -317,8 +316,8 @@ devices.
 
 ## Hold capacity before work runs
 
-Reserve capacity up front so nothing else can take it, then place work
-inside it:
+Reserve capacity up front and nothing else can take it. Then place your work
+inside:
 
 ```python run
 @ch.remote
@@ -333,11 +332,11 @@ with ch.dist.reserve([{"cpus": 1}, {"cpus": 1}], strategy="pack") as res:
 <details>
 <summary>Bundles and placement strategies</summary>
 
-`ch.dist.reserve(bundles, strategy=)` holds one bundle per dict (`cpus`,
-which defaults to 1, `gpus`, `memory`, `device`) from `ready()` until
-`release()`, used or not. The `with` block calls both. A call or actor made
-with `.options(within=res[i])` runs inside bundle `i`, on its peer and with
-its resources. Calls in one bundle share one process (as threads, up to the
+`ch.dist.reserve(bundles, strategy=)` holds one bundle per dict (`cpus`, which
+defaults to 1, `gpus`, `memory`, `device`) from `ready()` until `release()`,
+used or not. The `with` block calls both for you. A call or actor made with
+`.options(within=res[i])` runs inside bundle `i`, on its peer and with its
+resources. Calls in one bundle share one process (as threads, up to the
 bundle's CPUs at once), so give each parallel worker its own bundle.
 
 | `strategy=` | Placement |
@@ -361,7 +360,7 @@ bundle's CPUs at once), so give each parallel worker its own bundle.
 
 ## Choose peers by label
 
-Send work only to peers that carry certain labels, or lean toward them:
+Send work only to peers with certain labels, or just lean toward them:
 
 ```python run
 peer = ch.runs.cluster().nodes()[0].peer
@@ -379,11 +378,11 @@ except ch.Infeasible as e:
 
 Every peer carries the labels `node` (its id), `host`, `os` and `arch`, plus
 any set in its environment as `CHIMAERA_LABELS="zone=us-east1-b,rack=r7"`.
-`require={...}` keeps only peers with every pair, and none left is
-`ch.Infeasible`. `prefer=(...)` is a tuple
-of `"key=value"` strings; each one a peer matches makes it cheaper to
-choose, without ruling others out. Keep the trailing comma in
-`prefer=("zone=us-east1-b",)`: a bare string is split into characters.
+`require={...}` keeps only peers with every pair; if none are left, that's
+`ch.Infeasible`. `prefer=(...)` is a tuple of `"key=value"` strings, and each
+one a peer matches makes it cheaper to choose without ruling others out. Watch
+the trailing comma in `prefer=("zone=us-east1-b",)`: a bare string gets split
+into characters.
 
 `ch.runs.cluster().nodes()` shows each peer's `labels`. The `resources=`
 option is accepted but not used for placement yet, so put custom
@@ -393,7 +392,8 @@ capabilities in labels.
 
 ## Cap what a call tree may spend
 
-A budget caps the CPU and GPU time of a call and every call made inside it:
+Worried a fan-out might run away? A budget caps the CPU and GPU time of a call
+and every call made inside it:
 
 ```python run
 @ch.remote
@@ -413,25 +413,26 @@ except ch.errors.BudgetExceeded as e:
 <summary>How budgets are charged</summary>
 
 `budget={"cpu_seconds": ..., "gpu_seconds": ...}` takes seconds or duration
-strings (`"250ms"`, `"30s"`, `"5m"`, `"8h"`). Past either limit, the whole
-call tree is canceled with `ch.errors.BudgetExceeded`.
+strings (`"250ms"`, `"30s"`, `"5m"`, `"8h"`). Go past either limit and the
+whole call tree is canceled with `ch.errors.BudgetExceeded`.
 
-Usage is charged about once a second while calls run, so even a single long
-call is stopped. `ch.errors.BudgetExceeded` is a `ch.Cancelled`, and its
-message names the budget and what was used.
+Usage is charged about once a second while calls run, so even one long call
+gets stopped. `ch.errors.BudgetExceeded` is a `ch.Cancelled`, and its message
+names the budget and what was used.
 
-CPU seconds are a call's measured CPU when it has its worker to itself, else
-its CPU grant times how long it ran. GPU seconds are its GPUs times how long
-it held them. Budgets don't nest: setting one inside a budgeted call raises
-`ch.OptionsError`.
+CPU seconds are a call's measured CPU when it has its worker to itself,
+otherwise its CPU grant times how long it ran. GPU seconds are its GPUs times
+how long it held them. Budgets don't nest: setting one inside a budgeted call
+raises `ch.OptionsError`.
 
 </details>
 
 ## Share a cluster between teams
 
-A peer started with `CHIMAERA_TENANT_QUOTAS="team-a=8,team-b=2.5"` holds
-back a tenant's new calls while its running calls there already use its CPU
-quota. Other tenants' work goes ahead meanwhile.
+Several teams on one cluster? A peer started with
+`CHIMAERA_TENANT_QUOTAS="team-a=8,team-b=2.5"` holds back a tenant's new calls
+while its running calls there already use its CPU quota. Other tenants' work
+goes ahead in the meantime.
 
 <details>
 <summary>Cluster shares and tenants</summary>
