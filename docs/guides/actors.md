@@ -34,8 +34,8 @@ assert Counter.remote(1).add.remote().result() == 2             # no handle kept
 
 Each actor lives until you close it or its run ends, handle or no handle.
 
-`Class.remote(...)` checks your arguments against `__init__` on your line and
-returns once the peer accepts it. `__init__` runs in the worker; if it raises,
+`Class.remote(...)` checks your arguments against `__init__` where you call it
+and returns once the peer accepts it. `__init__` runs in the worker; if it raises,
 every call to that actor raises that error.
 
 - Calling a handle's method without `.remote` raises a `TypeError` that names
@@ -49,7 +49,7 @@ every call to that actor raises that error.
 ## Calls through one handle run in order
 
 Calls through one handle start one at a time, in the order you made them, so
-methods never race on `self`.
+methods don't race on `self` unless one call waits on another (see below).
 
 ```python run
 @ch.remote
@@ -102,7 +102,8 @@ across such a wait.
 ## Write async methods
 
 Give an async actor `concurrency=N` and up to N calls run as coroutines on its
-one event loop, where an awaiting call holds no thread.
+one event loop, where an awaiting call holds no thread. Without it, `async def`
+changes nothing: calls still run one by one.
 
 ```python run
 import asyncio
@@ -124,14 +125,6 @@ assert max(ch.get([serial.fetch.remote() for _ in range(10)])) == 1
 overlapping = Fetcher.options(concurrency=10).remote()
 assert max(ch.get([overlapping.fetch.remote() for _ in range(10)])) > 1
 ```
-
-<details>
-<summary>Async without concurrency</summary>
-
-Without `concurrency`, `async def` changes nothing: calls still run one by
-one, awaiting or not.
-
-</details>
 
 ## Run calls side by side
 
@@ -252,8 +245,7 @@ except ch.NotFound:                       # also a LookupError
 arguments are ignored), and anywhere else `ch.actor(name)` finds it with just
 the name.
 
-A name stays bound to its actor after that actor ends. Until that is fixed,
-give each new actor a new name, as the example does with the run id.
+That's why the example adds the run id to the name.
 
 - A named actor still ends with the run that created it, unless it was created
   with `detach=True`.
@@ -294,8 +286,8 @@ nothing else ends it. Once closed, its name stays taken (see above).
 
 ## End an actor
 
-`handle.close()` ends the actor: its process exits, its unfinished calls raise
-`ch.ActorDied`, it isn't restarted, and any CPUs it held go back.
+`handle.close()` ends it for good: its process exits, its unfinished calls
+raise `ch.ActorDied`, it isn't restarted, and any CPUs it held go back.
 
 ```python run
 temp = Counter.remote(0)
@@ -358,7 +350,7 @@ assert w.work.remote().result() == 1              # a fresh instance: state star
 A call that was running when the process died is never replayed; it raises
 `ch.ActorDied`. Calls that hadn't started run on the new instance, in order.
 
-Moving off a drained peer restarts the actor without using up a restart.
+Actors moved off a drained peer restart without using up a restart.
 
 `ch.ActorDied` (an `InfrastructureFailure`) means the call won't run: the actor
 was closed, ended itself or with its run, died with `restart="never"` or ran
@@ -369,14 +361,14 @@ out of restarts, or died while this call was running. The other errors are in
 
 ## Give an actor CPUs and memory
 
-Actors ask for no CPU unless you set `cpus`, so idle ones never block other
-calls.
+Actors ask for no CPU unless you set `cpus`, so an idle actor holds no CPU
+another call could use. With `@ch.remote(cpus=2)` each instance holds two CPUs
+for its whole life and won't start until some peer has them free.
 
 <details>
 <summary>CPUs held for an actor's life</summary>
 
-With `@ch.remote(cpus=2)` each instance holds two CPUs for its whole life and
-won't start until some peer has them free. A request no peer could ever meet
+A request no peer could ever meet
 makes `Class.remote(...)` raise `ch.Infeasible`, naming the constraint. Memory,
 GPUs and placement work as they do for functions; see
 [resources.md](resources.md).

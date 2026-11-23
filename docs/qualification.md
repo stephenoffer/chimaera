@@ -41,7 +41,6 @@ the colima VM (Linux 6.8 aarch64, 4 vCPU, 6 GiB, cgroup v2 delegated with
 | Thread pools follow the grant | pass (local) | `OMP_NUM_THREADS` and `OPENBLAS_NUM_THREADS` equal `cpus=2` |
 | Prefetch replay adopts 2 and 4, reverts 8, clamps to 2 | pass (local) | `chimaera-core::adapt` replay reproduces the doc's 40.00/73.99/99.65/99.65 batches/s and the decisions |
 | p99 grant-to-handoff ≤ 250 µs | pass on macOS (local), Linux pending | macOS release build: p50 18 µs, p99 34 µs over 10,000 dispatches at about half load |
-
 | Generator calls stream in order; the generator stays a window ahead; an error arrives after the items before it; `close()` stops it; a killed worker replays without duplicates | pass (local) | `test_streams.py`: window 8 keeps the producer within 11 items of a consumer that took 2; SIGKILL after 3 items, all 20 arrive once in order; a cluster test streams on the consumer's peer |
 
 Open in M1: the mypy plugin, the Linux dispatch measurement.
@@ -69,7 +68,6 @@ macOS. Each peer offers 4 CPUs; 4 data groups of 3 voters plus the directory.
 | Durable actor survives the loss of its peer | pass (local) | 3 peers: the host peer SIGKILLed; `ch.actor(key)` from another peer reads total 45 on a new host (4 of 4 runs, after fixing code blobs that lived only on the ingress peer) |
 | Durable actor killed after commit and before its reply | unverified as timed | the retry path it needs (same command id answered from the stored reply) is covered above; the kill is not timed between commit and publish |
 | Workflow killed mid-way replays without repeating finished steps; recorded values repeat; a different call on replay diverges | pass (local) | `test_workflows.py`: worker SIGKILLed after step 2 of 4, each step ran once, result 60; `now`/`random` identical across the two runs; a raw `random.random()` argument raises `WorkflowDivergence` |
-
 | Spillback hand-back refused by the shard keeps the call | pass (local) | `core::tests::only_an_accepted_give_back_moves_the_work_away`: only Accepted or Existing move the work away; Stale, Rejected, NotFound and a lost answer run it where it is. Spillback and peer-kill cluster tests pass |
 | Autoscaling on Kubernetes grows on queued work and shrinks when quiet (P6) | pass (local, kind) | `deploy/k8s/autoscale-test.sh` (layered-api session): the in-cluster provisioner grew 1→3 on "37 calls queued for 6 s"; spillback moved queued calls to the new pod (40 results, 22/18 over two pods); shrank 3→2→1 at 40 s quiet periods. A pod that can't be scheduled is given up after `--start-grace` |
 | Autoscaling on Slurm (P6) | pass (local, dockerized Slurm) | `deploy/slurm/slurm-autoscale-test.sh` (layered-api session): a 1-node job grew to 3 ("14 calls queued for 4 s"), 16 results spread 6/5/5, then 3→2→1 after 20 s quiet periods with all spare jobs cancelled |
@@ -92,9 +90,11 @@ the fsync on every commit set the pace. The Raft layer alone commits
 18,000–29,000 entries/s with 64 proposals in flight, 1 or 3 voters, with or
 without fsync (`measure_concurrent_commit_throughput`, ignored test).
 
-Known limits: a value stored only on a peer that dies is lost (`DataLost`);
-its task is not re-run to rebuild it. Peers on real separate machines have not
-been tested.
+Known limits at this gate: a value stored only on a peer that died was lost
+(`DataLost`), and its task was not re-run to rebuild it; peers on real separate
+machines had not been tested. Both have changed since: lost results of function
+and map calls are rebuilt by running them again, and the Ray comparisons below
+ran on up to 64 separate machines.
 
 ## Ray comparison (cluster, single node)
 

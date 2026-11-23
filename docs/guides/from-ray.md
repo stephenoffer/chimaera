@@ -1,8 +1,8 @@
-# Coming from Ray
+# Port your Ray program
 
 Most Ray Core programs port to Chimaera line by line: `@ray.remote` becomes
 `@ch.remote` and `ray.get(ref)` becomes `future.result()`. Not ready to port?
-The [compatibility shim](#run-a-ray-program-unchanged) runs your Ray program
+The [compatibility shim](#run-a-ray-program-unchanged) runs a Ray Core program
 unchanged, with no Ray installed.
 
 ## Map Ray names to Chimaera
@@ -152,7 +152,7 @@ except ch.OptionsError as e:
 <details>
 <summary>The max_retries trap</summary>
 
-One trap: for `max_retries` the error suggests `max_restarts`, which is for
+For `max_retries` the error suggests `max_restarts`, which is for
 actors. A function wants `max_attempts`.
 
 Conflicting options, such as `effects="external"` with an explicit `max_attempts=3`, raise
@@ -296,8 +296,8 @@ handle, so `Vocabulary.remote().add.remote(["x"])` works.
 <details>
 <summary>When a Ray actor dies</summary>
 
-A Ray actor dies when its last handle goes away. Close actors you're done with
-to give back the CPUs they hold.
+A Ray actor dies when its last handle goes away. Here, close actors you're done with: that ends their processes and gives
+back any CPUs you gave them.
 
 </details>
 

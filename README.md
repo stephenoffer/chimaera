@@ -9,7 +9,7 @@
 
 <p align="center">
   <strong>Distributed Python with one decorator.</strong><br>
-  A Rust runtime with no head node. It learns what your code needs.
+  A Rust runtime with no head node. It learns each function's CPU and memory needs, so you don't have to declare them.
 </p>
 
 <p align="center">
@@ -44,7 +44,7 @@ That's the API you need on day one. `add` starts when both counts are done,
 and their results travel worker to worker without passing through your script.
 On a laptop, the first `.remote()` starts a local peer for you. On a cluster,
 the same file runs unchanged. Coming from Ray? Most Ray Core programs port
-line by line, and on 64 machines Chimaera ran 14,203 no-op tasks a second
+line by line. On 64 machines, Chimaera ran 14,203 no-op tasks a second
 to Ray's 5,188.
 
 ## What you get
@@ -53,7 +53,7 @@ to Ray's 5,188.
 
 Every machine runs the same `chimaera` peer, and none of them is in charge.
 The record of every call (whether it finished, what it returned) is
-replicated with Raft, so there's no head process to size, babysit or lose.
+replicated with Raft, so there's no head node to size, babysit or lose.
 Kill a machine mid-run and its calls run elsewhere. In a 64-machine test
 under a load of one-second tasks, every task still finished, in 9.6 s
 against Ray's 18.5 s.
@@ -75,13 +75,14 @@ single run):
 The map row is Chimaera batching tiny calls by itself against plain Ray
 tasks; neither side was batched by hand. Ray's nested and machine-loss
 figures come from a separate run, because the first run hit its time limit
-before Ray's passes. Ray is still faster at shuffles (6x at 64 machines) and
-at ten calls on a 256 MiB value that was just made. All of it, with method
+before it reached Ray's passes. Ray is still faster at shuffles (6x at 64 machines),
+at ten calls on a 256 MiB value that was just made, and at CPU scaling
+efficiency (8% at 64 machines). All of it, with method
 and caveats, is in [qualification.md](docs/qualification.md#ray-comparison-cluster-1-4-16-and-64-nodes-2026-11-22).
 
 ### It sizes your calls for you
 
-No more guessing `num_cpus` or `memory`. After three calls the peer reserves
+No more guessing CPU and memory requests. After three calls the peer reserves
 the memory peak it measured, so later calls wait for room instead of getting
 OOM-killed, and a call killed for memory retries with 1.5x what it reached.
 Tiny calls batch themselves. `future.explain()` shows what was reserved and

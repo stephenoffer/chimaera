@@ -1,9 +1,10 @@
 # When things go wrong: errors, retries and recovery
 
-Calls fail, workers die, peers go away. Chimaera retries lost workers and
-peers for you, but not your own exceptions unless you list them, and it never
-reruns an `effects="external"` call that may already have started. Detached
-runs and durable workflows survive the rest.
+When workers or peers are lost, Chimaera runs their calls again. It doesn't
+retry your own exceptions unless you list them, and it never reruns an
+`effects="external"` call that may already have started. Detached runs outlive
+the script that started them, and durable workflows don't repeat finished
+steps when their worker dies.
 
 ## Catch your own exceptions
 
@@ -94,8 +95,8 @@ built-in `TimeoutError`.
 <details>
 <summary>Base classes and other errors</summary>
 
-The common ones are on `ch`, all of them in `ch.errors`. The table above holds
-only the ones this page covers.
+The common ones are on `ch`, all of them in `ch.errors`. The rest are in the
+table below.
 
 Two base classes catch whole families. `except ch.InfrastructureFailure`
 covers `OutOfMemory`, `ActorDied`, `DataLost`, `StreamInterrupted`,
@@ -125,7 +126,7 @@ three).
 
 ## Retry what is safe to retry
 
-Lost workers and peers are retried for you. Your own exceptions are retried
+Calls lost with a worker or peer are retried for you. Your own exceptions are retried
 only if you list them in `retry_exceptions` (a class or a tuple; subclasses
 match). Retries start at once, with no backoff, and stop early if an attempt
 fails exactly like the one before:
@@ -219,8 +220,7 @@ Chimaera how careful to be:
 | `"external"` | charges, emails, anything that must not repeat | runs again only if lost before it started; after that, `ch.OutcomeUnknown` | ignored: your exception is raised | is not remade (`DataLost`) |
 
 Once an `"external"` call has started, losing it means nobody knows whether
-the effect happened. So it fails with `ch.OutcomeUnknown`, and Chimaera won't
-run it again. Handle `OutcomeUnknown` with an idempotency key: an id you
+the effect happened. Handle `OutcomeUnknown` with an idempotency key: an id you
 choose (the order id in the example) that the external system uses to spot a
 repeat, so trying again is safe. Many payment and messaging APIs accept one.
 In the example, a directory stands in for a payment API that charges once per
@@ -235,7 +235,7 @@ external call raises `ch.OptionsError` at `.remote()`.
 - Only the decorator can weaken `effects`. `.options(effects=...)` and
   `with ch.defaults(effects=...)` can make it stricter; loosening the
   decorator's setting raises `ch.OptionsError`.
-- An `"idempotent"` call stays in its own cell; only `"none"` calls may go to
+- In a fleet of clusters (cells), an `"idempotent"` call stays in its own cell; only `"none"` calls may go to
   another ([../federation.md](../federation.md)).
 - Durable actors handle repeats with a `command_id` instead
   ([actors.md](actors.md)).
@@ -267,7 +267,7 @@ assert [a["end_reason"] for a in f.explain()["attempts"]] == ["oom"] * 3
 
 The peer checks memory every 100 ms, stops the worker of anything over its
 limit, and runs it up to twice more. The limit stays where you set it, so a
-function that really needs more fails after three tries, as above.
+function that really needs more fails after three attempts, as above.
 
 Each retry reserves 1.5 times the killed attempt's peak and waits until that
 much is free. A retry whose reservation is bigger than the peer's whole memory
@@ -524,8 +524,7 @@ calls you never waited on, an exception or Ctrl-C cancels them, and if the
 connection drops (the process was killed), the run is canceled
 ([tasks.md](tasks.md)).
 
-In the shell example, `nightly.py` gets its run id from
-`ch.runs.current_run()` and prints it. See [../cli.md](../cli.md) for
+Inside a script started this way, `ch.runs.current_run()` returns its run. See [../cli.md](../cli.md) for
 `chimaera logs` and `chimaera inspect`.
 
 </details>
