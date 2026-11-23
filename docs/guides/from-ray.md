@@ -336,6 +336,11 @@ raises `ValueError`. A name stays taken after its actor ends
 `ray.wait` returns after one ref; `ch.wait` waits for all futures unless you
 pass `num_returns`.
 
+```python run
+done, pending = ch.wait(futures, num_returns=1, timeout=10)
+assert len(done) >= 1 and len(done) + len(pending) == 3
+```
+
 <details>
 <summary>Why done can exceed num_returns</summary>
 
@@ -344,11 +349,6 @@ list holds every finished future, which can be more than `num_returns`. It
 fetches values only if you pass `fetch_local=True`.
 
 </details>
-
-```python run
-done, pending = ch.wait(futures, num_returns=1, timeout=10)
-assert len(done) >= 1 and len(done) + len(pending) == 3
-```
 
 ### A decorated function still runs locally
 
