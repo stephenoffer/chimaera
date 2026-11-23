@@ -116,13 +116,13 @@ except ch.OutOfMemory as e:
 <summary>More: retries past the limit, and kernel limits on Linux</summary>
 
 Past the limit, the call is stopped and retried twice more under it, then
-fails with `ch.OutOfMemory` giving the peak it reached and the limit.
+fails with `ch.OutOfMemory`, giving its peak and its limit.
 These retries are counted apart from `max_attempts`.
 
 With cgroup v2 delegation on Linux, `accounting="isolated"` runs each
-attempt in a fresh worker in its own cgroup, so the limit is a kernel limit
-and the CPU and memory readings are the attempt's own. Without that
-delegation the call is `ch.Infeasible`.
+attempt in a fresh worker in its own cgroup, so the kernel enforces the
+memory limit and the CPU and memory readings are the attempt's own. Without
+that delegation the request is `ch.Infeasible`.
 
 </details>
 
@@ -150,32 +150,28 @@ assert "learned" in reserved
 <details>
 <summary>More: what beats a learned value, and the sizing rules step by step</summary>
 
-The peer keys what it measures by the function's code. An edited function
-is a new one that starts from the old one's numbers.
-
-Values you set always win over learned ones. A function never measured
-starts only a few calls at a time. After three successful calls, each call
-reserves its measured memory peak times a margin, and calls wait for memory
-instead of overcommitting it.
+Measurements are keyed by the function's code. An edited function is a new
+one that starts from the old one's numbers. Values you set always win over
+learned ones.
 
 - A function never measured runs one call per four of the peer's CPUs at a
   time (at least one, so 3 on a 12-CPU peer) until one finishes or has run
   2 s. More start only while the memory pool has 4 GiB free per call.
-- After three successful calls, a call reserves the 95th-percentile private
-  memory peak times a margin: 1.2 for steady peaks, 1.5 when they vary, 2
-  when they vary a lot or one was killed for memory. Calls are grouped by
+- After three successful calls, later calls reserve the 95th-percentile
+  private memory peak times a margin: 1.2 for steady peaks, 1.5 when they
+  vary, 2 when they vary a lot or one was killed for memory. Calls are grouped by
   input size. Once the peak grows in a straight line with input size over
   at least 8 calls, each call's reservation is predicted from its own input.
 - Calls wait for memory instead of overcommitting it. A wait over a minute
   prints why on your terminal (`chimaera: waited 60 s on call ...: needs ...`).
-- A call killed for memory is retried with 1.5 times its peak once that
-  fits, or fails at once with `ch.OutOfMemory` if that's more than the
-  peer's whole memory pool.
-- CPU grows at once when three or more calls, with a median of at least
+- After a memory kill, the retry reserves 1.5 times the killed attempt's
+  peak once that fits, or fails at once with `ch.OutOfMemory` if that's more
+  than the peer's whole memory pool.
+- CPU grows right away when three or more calls, with a median of at least
   50 ms, use over 1.3 times their grant. It steps to the next of 0.25, 0.5,
   1, 2, 4 or 8 cores (whole cores above 8).
 - CPU shrinks only after a trial. Once ten calls steadily use well under
-  their grant (median at least 50 ms), every other call gets 1.5 times the
+  their grant (median 50 ms or more), every other call gets 1.5 times the
   measured use, rounded up to that ladder. The smaller grant stays only if
   it finishes more calls per reserved core without hurting tail latency. A
   function that mostly waits on I/O ends up at a quarter core.
@@ -209,7 +205,7 @@ assert "memory not known yet" in frozen.explain()["attempts"][-1]["reservation"]
 
 Pass only `min=` and `max=` to `ch.auto` for `cpus` and `memory`. Today an
 initial value (`cpus=ch.auto(2, max=4)`) is sent as if you had set `cpus=2`,
-so the peer never adjusts it.
+so learning never adjusts it.
 
 | `adaptive=` | Effect |
 |---|---|
@@ -221,7 +217,7 @@ so the peer never adjusts it.
 
 ## See what was reserved and why
 
-`chimaera profiles` shows what the peer has learned and what the next call
+`chimaera profiles` shows what the peer learned and what the next call
 gets:
 
 ```bash
@@ -240,8 +236,8 @@ where it did. Until the call starts, `pending_reason` says why it waits.
 `chimaera profiles` prints the profiles file first, then a line per
 function. `--fn` filters by name, and `--json` is for scripts.
 
-`chimaera explain RUN --decisions` lists the peer's changes with evidence
-and reasons. `RUN` is a run id from `chimaera runs` or
+`chimaera explain RUN --decisions` lists changes with their evidence and
+reasons. `RUN` is a run id from `chimaera runs` or
 `ch.runs.current_run()`. The list holds recent decisions about
 every run's functions, not only RUN's, so on a secured cluster it needs the
 cluster token. Only `--json` names the function, in `scope`.
@@ -258,7 +254,7 @@ $ chimaera explain 000003a491eb48727b1548db9633e829 --decisions
 
 ## Use GPUs and other accelerators
 
-A call sees only the accelerators it was granted:
+Each call sees only the accelerators it was granted:
 
 ```python run
 @ch.remote
@@ -291,7 +287,7 @@ print(matmul.remote(4096).result())
 A fractional `gpus=0.5` takes a whole device today; sharing a device between
 calls is not built yet.
 
-Inside the call, `ch.dist.device()` is the torch device string of the
+Inside your function, `ch.dist.device()` is the torch device string of the
 first grant, with no torch import.
 
 `KIND` is `cuda`, `rocm`, `tpu`, `neuron`, `hpu`, `xpu` or `mps`, and
@@ -299,11 +295,11 @@ first grant, with no torch import.
 `MI300X` or `v5e`. `device=` alone means one unit. An unknown kind or a
 model no peer has is `ch.Infeasible`.
 
-The peer sets the vendor's visibility variable for the worker
+The worker gets the vendor's visibility variable
 (`CUDA_VISIBLE_DEVICES` with GPU UUIDs, `HIP_VISIBLE_DEVICES`,
 `TPU_VISIBLE_CHIPS`, `NEURON_RT_VISIBLE_CORES`, `HABANA_VISIBLE_MODULES`,
-`ZE_AFFINITY_MASK`). Without `gpus=` or `device=` that list is empty, so
-the call sees none. Apple's GPU is the exception: `mps` can't be hidden,
+`ZE_AFFINITY_MASK`). Without `gpus=` or `device=` that list is empty and no
+device is visible. Apple's GPU is the exception: `mps` can't be hidden,
 so there the grant is bookkeeping only.
 
 `ch.dist.device()` returns `"cuda:0"`, `"xla:0"`, `"hpu"`, `"xpu:0"`,
@@ -381,8 +377,8 @@ except ch.Infeasible as e:
 <details>
 <summary>More: the labels every peer has, how require and prefer match, custom capabilities</summary>
 
-Every peer has the labels `node` (its id), `host`, `os` and `arch`, plus any
-set in its environment as `CHIMAERA_LABELS="zone=us-east1-b,rack=r7"`.
+Every peer carries the labels `node` (its id), `host`, `os` and `arch`, plus
+any set in its environment as `CHIMAERA_LABELS="zone=us-east1-b,rack=r7"`.
 `require={...}` keeps only peers with every pair, and none left is
 `ch.Infeasible`. `prefer=(...)` is a tuple
 of `"key=value"` strings; each one a peer matches makes it cheaper to
@@ -417,8 +413,8 @@ except ch.errors.BudgetExceeded as e:
 <summary>More: duration strings, how usage is charged, and nested budgets</summary>
 
 `budget={"cpu_seconds": ..., "gpu_seconds": ...}` takes seconds or duration
-strings (`"250ms"`, `"30s"`, `"5m"`, `"8h"`). Past either limit, the call and
-everything it submitted are canceled with `ch.errors.BudgetExceeded`.
+strings (`"250ms"`, `"30s"`, `"5m"`, `"8h"`). Past either limit, the whole
+call tree is canceled with `ch.errors.BudgetExceeded`.
 
 Usage is charged about once a second while calls run, so even a single long
 call is stopped. `ch.errors.BudgetExceeded` is a `ch.Cancelled`, and its
@@ -440,8 +436,8 @@ quota. Other tenants' work goes ahead meanwhile.
 <details>
 <summary>More: cluster-wide shares, oversized calls, picking a tenant</summary>
 
-`CHIMAERA_TENANT_SHARES` does the same across the cluster. A call larger
-than a whole quota is `ch.Infeasible`. A run belongs to a tenant
+`CHIMAERA_TENANT_SHARES` does the same across the cluster. Calls larger
+than a whole quota are `ch.Infeasible`. A run belongs to a tenant
 (`ch.init(tenant="team-a")`, default `"default"`). [clusters.md](clusters.md)
 covers setting up quotas and shares.
 

@@ -2,7 +2,7 @@
 
 Put `@ch.remote` on a function and it runs on Chimaera's workers. Then chain
 calls without routing values through your script, or fan out over thousands
-of items while Chimaera keeps the work in flight bounded.
+of items while Chimaera bounds the work in flight.
 
 ## Run a function remotely
 
@@ -37,9 +37,9 @@ running ([clusters.md](clusters.md) covers clusters).
 
 Arguments and results travel by cloudpickle, which handles lambdas and
 closures. An argument that can't be pickled, like a lock or an open file,
-raises `ch.SerializationError` naming it: pass what's needed to rebuild it
-(a path, settings) and create it inside the call. CPUs, memory and GPUs are
-in [resources.md](resources.md).
+raises `ch.SerializationError` naming it. Pass what's needed to rebuild it
+(a path, settings) and create it inside your function. CPUs, memory and GPUs
+are in [resources.md](resources.md).
 
 </details>
 
@@ -85,8 +85,8 @@ traceback ([failures.md](failures.md)).
 
 An exception that nothing reads is printed on stderr.
 
-Submit everything before you wait, or use `fn.map`. Waiting on each call from
-one line before making the next draws warning CH101 after 200 in a row.
+Submit everything before you wait, or use `fn.map`. Waiting on each call
+before making the next, 200 times in a row from one line, draws warning CH101.
 
 </details>
 
@@ -105,9 +105,9 @@ assert finished.cancel() is False           # too late: the result stays
 assert finished.result() == 3
 ```
 
-`cancel()` returns at once: `True` means the call had not finished, and its
-result now raises `ch.Cancelled` (unless it finishes first); `False` means it
-had and keeps its outcome.
+`cancel()` returns at once. `True` means the call had not finished, and its
+result now raises `ch.Cancelled` (unless it finishes first). `False` means it
+had, and it keeps its outcome.
 
 <details>
 <summary>More: calls it started, the grace period and force=True</summary>
@@ -116,20 +116,20 @@ Canceling a call also cancels every call it started, including ones it starts
 afterward. In long loops, check `ch.context().cancelled()` so your code can
 stop by itself.
 
-A running call gets a grace period to stop by itself. After 2 s Chimaera
-interrupts it (a `time.sleep` or a pure-Python loop on its main thread raises
+A running call gets a grace period for that. After 2 s Chimaera interrupts
+it (a `time.sleep` or a pure-Python loop on its main thread raises
 `ch.Cancelled`); after 5 s it kills the worker process, though never an
 actor's, whose state lives there.
 
 `cancel(force=True)` kills the call's process immediately, an actor's
-included. Later calls on that actor raise `ch.ActorDied`.
+included, and later calls on that actor raise `ch.ActorDied`.
 
 </details>
 
 ## Pass futures into other calls
 
-A future passed as an argument arrives as its value, sent straight from the
-worker that made it once it is ready, so you never download it.
+Futures passed as arguments arrive as values, each sent straight from the
+worker that made it once it is ready, so you never download them.
 
 ```python run
 total = add.remote(word_count.remote("blue sky"), word_count.remote("rain today"))
@@ -153,22 +153,21 @@ assert first_done.remote(ch.handles(counts)).result() in (2, 3)
 <summary>More: failed inputs, ch.handles, nested futures, and storing a large value once</summary>
 
 If the input failed, the dependent call fails with the same error. To pass
-futures as futures on purpose, wrap the argument in `ch.handles(...)` like
-`first_done`.
+futures as futures on purpose, wrap the argument in `ch.handles(...)`, as the
+example does for `first_done`.
 
 Futures one level inside a list, tuple or dict value arrive as values too.
 Deeper ones, and those in dict keys, sets, or subclasses of list, tuple and
 dict, arrive as a `ch.Future` to wait on.
 
-For a large value that many calls read, `ch.put(value)` stores it once and
-returns a finished future to pass like any other
-([../objects.md](../objects.md)).
+For a large value that many calls read, `ch.put(value)` stores it once; pass
+the finished future it returns like any other ([../objects.md](../objects.md)).
 
 </details>
 
 ## Map a function over many items
 
-`fn.map` fans a function out over thousands of items, a window at a time, so
+`fn.map` runs your function over thousands of items, a window at a time, so
 a slow consumer slows the producer instead of filling memory.
 
 ```python run
@@ -190,10 +189,10 @@ assert list(word_count.options(latency="interactive").map(["a", "b c"])) == [1, 
 <summary>More: results and errors, window and batching rules, and when mapping starts</summary>
 
 `fn.map(items)` returns a `ch.Results`, a single-pass iterator in input
-order; `ordered=False` yields results as they finish. A failed item raises its
-error at its position. Catch it and keep iterating, or read `.outcomes()`,
-whose `(index, value, error)` tuples never raise. More items go out as you
-read.
+order; `ordered=False` yields results as they finish. More items go out as
+you read. A failed item raises its error at its position: catch it and keep
+iterating, or read `.outcomes()`, whose `(index, value, error)` tuples never
+raise.
 
 The default window is the larger of 256 items and 32 per usable core (widened
 so every core can hold two batches), and 256 MiB of arguments plus the
@@ -201,10 +200,10 @@ measured size of results. A `max_in_flight` or `max_in_flight_bytes` you set
 is a hard cap. Leaving a `with` block or calling `.close()` cancels the items
 still running and closes the source iterator.
 
-Fast items are batched. Each batch is one call that grows from one item, by
-the measured time per item, to about 0.1 s of worker time (4096 items at
-most). Every item still gets its own value or error, and slow items are never
-grouped.
+Fast items are batched, one call per batch. Batches start at one item and
+grow, by the measured time per item, to about 0.1 s of worker time (4096
+items at most). Every item still gets its own value or error, and slow items
+are never grouped.
 
 A map your script creates submits nothing until you read it, make or wait on
 any other call, or exit, so `reduce_by_key` can take it over and run the
@@ -212,9 +211,10 @@ function inside its own calls ([data.md](data.md)). A map made inside a call
 starts right away.
 
 Batching is off for `effects="external"`, `retry_exceptions`, `async def` and
-generator functions, and `latency="interactive"` (the example's last line),
-which sends each item as its own call right away and stops the peer from
-grouping quick plain calls of one function into a single worker round trip.
+generator functions, and `latency="interactive"` (the example's last line).
+That last one sends each item as its own call right away, and also stops the
+peer from grouping quick plain calls of one function into a single worker
+round trip.
 `latency` accepts a duration too, but today only `"interactive"` changes
 anything.
 
@@ -240,9 +240,8 @@ assert list(word_count.map(["a", "b c"]).map(double)) == [2, 4]
 
 `fn.partial(*args, **kwargs)` binds arguments as `functools.partial` does. The
 remote function it returns ships the bound values once with the code, not with
-every call. That matters for a big map over a large lookup table.
-
-Options from `.options(...)` carry over to the partial.
+every call, which matters for a big map over a large lookup table. Options
+from `.options(...)` carry over to the partial.
 
 `.map(other_fn)` on a map's results chains a second stage, and each result
 reaches it as a future. `.futures()` gives the futures without reading values.
@@ -262,15 +261,15 @@ assert sorted(f.result() for f in ch.as_completed(futures)) == [0, 1, 2, 3, 4]
 assert ch.gather(add.remote(1, 2), add.remote(3, 4)).result() == [3, 7]
 ```
 
-`ch.get` returns every value in order, and `ch.as_completed` hands you each
-future as it finishes.
+`ch.get` returns every value in order; `ch.as_completed` yields each future
+as it finishes.
 
 <details>
 <summary>More: memory on big lists, the four helpers in full, and warning CH117</summary>
 
-`ch.get` on a list holds every value in your script's memory at once. For
-big lists, consume results with `ch.as_completed` or `fn.map`, or reduce them
-inside calls.
+`ch.get` on a list holds every value in your script's memory at once, and
+warns (CH117) past a quarter of the machine's memory. For big lists, consume
+results with `ch.as_completed` or `fn.map`, or reduce them inside calls.
 
 | Helper | Returns | Notes |
 |---|---|---|
@@ -278,8 +277,6 @@ inside calls.
 | `ch.wait(futures, num_returns=None, timeout=None, fetch_local=False)` | `(done, pending)`, each in the order given | Waits for all by default. Values are not decoded; `fetch_local=True` copies finished results to this machine first. |
 | `ch.as_completed(futures, timeout=None)` | Futures, in completion order | Works with `for` and `async for`. The timeout raises `TimeoutError`. |
 | `ch.gather(*futures)` | One `Future` of a list | Fails with the first error. Await it, call `.result()`, or pass it to another call, which receives the list. Unpack a list: `ch.gather(*futures)`. |
-
-Past a quarter of the machine's memory, `ch.get` warns (CH117).
 
 </details>
 
@@ -314,8 +311,8 @@ as soon as the function returns.
 With `returns=n`, `.split()` gives one future per value. Each part is a
 separate dependency, so whatever takes `lo` receives only that value.
 
-A function with `returns=n` must return a tuple or list of exactly `n` values,
-or reading a part raises `ValueError`. Without `returns=`, call `.split(n)`. Canceling a
+Under `returns=n`, return a tuple or list of exactly `n` values, or reading a
+part raises `ValueError`. Without `returns=`, call `.split(n)`. Canceling a
 part cancels the whole call.
 
 </details>
@@ -323,7 +320,7 @@ part cancels the whole call.
 ## Stream results from a generator
 
 On a generator function, `.remote()` returns a stream (`ch.typing.Stream`)
-that hands you items in order as they are yielded.
+that delivers items in order, as they are yielded.
 
 ```python run
 from collections.abc import Iterator
@@ -347,14 +344,13 @@ The generator pauses once it is `max_in_flight` items ahead of you (default
 worker and skips the items you already have, so make it yield the same items
 each time.
 
-An exception in the generator is raised after the items before it.
-`stream.close()`, like leaving a `with` block, stops the generator and drops
-what you haven't taken.
+An exception in the generator is raised after the items yielded before it.
+`stream.close()`, like leaving a `with` block, stops it and drops what you
+haven't taken.
 
 Streams work with `async for` and as the input of `fn.map(...)`, and
-`async def` generators stream too. A function that returns a generator without
-being one (no `yield` in its body) fails with
-`TypeError: ... returned a generator`.
+`async def` generators stream too. Returning a generator from a plain function
+(no `yield` in its body) fails with `TypeError: ... returned a generator`.
 
 </details>
 
@@ -397,9 +393,6 @@ The first of these that sets an option wins:
 4. What the runtime has learned about the function ([resources.md](resources.md)).
 5. Built-in defaults.
 
-A deadline cancels the call that long after `.remote()`, while
-`result(timeout=...)` only limits how long you wait.
-
 A typo or a bad value raises `ch.OptionsError` on the line where you wrote it,
 with a suggestion.
 
@@ -407,7 +400,8 @@ A deadline is `"250ms"`, `"30s"`, `"5m"`, `"2h"`, a number of seconds, or a
 `datetime`. It counts from `.remote()`, so time queued for a worker counts
 too. When it passes, the call is canceled and its result raises
 `ch.DeadlineExceeded`, a subclass of `ch.Cancelled`. Calls made inside it
-inherit the deadline, and the earlier one wins.
+inherit the deadline, and the earlier one wins. `result(timeout=...)`, by
+contrast, only limits how long you wait.
 
 `priority` (an integer, default 0) puts higher values first among calls
 waiting for a peer. It never stops a running call.
@@ -438,7 +432,7 @@ assert attempt == 1 and len(task_id) == 32
 assert ch.context() is None                 # None in your script
 ```
 
-Inside a running call, `ch.context()` tells your code which attempt it is on
+Inside a running call, `ch.context()` tells your code which attempt this is
 and where it runs.
 
 <details>

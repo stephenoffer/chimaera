@@ -1,8 +1,8 @@
 # Run on a cluster
 
-Your laptop script runs on a cluster unchanged. This guide shows you how to
-start one, point scripts at it, ship your code and keep work running while
-machines come and go.
+Your laptop script runs on a cluster unchanged. Here is how to start one,
+point scripts at it, ship your code and keep work running while machines
+come and go.
 
 ## Start on your laptop
 
@@ -34,9 +34,9 @@ That peer keeps its data and `peer.log` in `~/.chimaera/local` (or
 `$CHIMAERA_HOME`). Started with `--idle-timeout 600`, it exits after ten
 minutes with no connected script and no work.
 
-`chimaera stop` and Ctrl-C stop a peer without draining. After you rebuild
-or upgrade Chimaera, scripts warn with CH111 until you stop the old peer
-([observability.md](observability.md#understand-the-chnnn-warnings)).
+`chimaera stop` and Ctrl-C stop the peer without draining it. After you
+rebuild or upgrade Chimaera, scripts warn with CH111 until you stop the old
+one ([observability.md](observability.md#understand-the-chnnn-warnings)).
 
 </details>
 
@@ -82,17 +82,17 @@ costs a group its majority. Give every peer identical `--seeds`.
 `--advertise`, `--bootstrap-expect`, `--data-groups` and the rest are in
 [../cli.md](../cli.md#chimaera-peer-start).
 
-Without TLS, `chimaera cluster token > token` makes a token by itself; a
-token must be at least 16 characters. `--insecure` lets peers join with no
-token, so use it only on a network you trust.
+Without TLS, `chimaera cluster token > token` makes a token on its own. Any
+token must be at least 16 characters. `--insecure` lets peers join with
+none, so use it only on a network you trust.
 
 </details>
 
 <details>
 <summary>More: try a four-peer cluster on one machine</summary>
 
-Start three founders and a spare with TLS, each on separate ports and a
-separate data directory (`--dir`):
+Start three founders and a spare with TLS, each with its own ports and data
+directory (`--dir`):
 
 ```bash
 chimaera cluster init --out ca
@@ -143,18 +143,18 @@ The CLI chooses the same way, except that `--dir` or `CHIMAERA_HOME`
 means the local peer unless you also pass `--cluster`.
 
 `CHIMAERA_CLUSTERS` names another profile file. `peers` lists client
-addresses, tried in order until one answers. The token comes from
-`~/.chimaera/clusters/lab/token` and the CA from
+addresses, tried in order until one answers. The lab profile's token comes
+from `~/.chimaera/clusters/lab/token` and its CA from
 `~/.chimaera/clusters/lab/ca.pem`. `ch.init(cluster=...)` must come before
 your script's first call.
 
-The keys `token_file` and `ca` name other files. Keep credentials out of
-the profile itself. A `CHIMAERA_TOKEN` or `CHIMAERA_TOKEN_FILE` in the
-environment overrides the profile's token. `default = "local"`, or
+The keys `token_file` and `ca` name other files; keep the credentials
+themselves out of the profile. A `CHIMAERA_TOKEN` or `CHIMAERA_TOKEN_FILE`
+in the environment overrides the profile's token. `default = "local"`, or
 `cluster="local"`, means the local peer.
 
 For the one-machine cluster above, copy `ca/token` and `ca/ca.pem` to
-`~/.chimaera/clusters/lab/` and set `peers` to this:
+`~/.chimaera/clusters/lab/` and set `peers` to
 `["127.0.0.1:17711", "127.0.0.1:17712", "127.0.0.1:17713"]`.
 Then `ch.init(cluster="lab")` connects to it.
 
@@ -246,12 +246,12 @@ live peers 4
 <summary>More: how the program finds the cluster, keeping a run going with --detach</summary>
 
 `chimaera run` starts your program with `CHIMAERA_CLUSTER` set.
-`helper.py` reaches the workers with the project (see below).
+`helper.py` reaches the workers as part of your project (next section).
 
-The run ends when the program exits. `--detach` keeps it going so its
+The run ends when the program exits. `--detach` keeps it going, so the
 calls finish and you can read them later. A program that calls
-`ch.init()` itself ignores the flag, since an explicit `ch.init()` uses
-its own `detach=False`; ask with `ch.init(detach=True)` there.
+`ch.init()` itself ignores the flag, because an explicit `ch.init()`
+defaults to `detach=False`; pass `ch.init(detach=True)` there instead.
 
 </details>
 
@@ -264,20 +264,18 @@ installs your third-party packages.
 <summary>More: what counts as the project, its size limit, package installs, Python versions</summary>
 
 The project is the `sys.path` directories that aren't the interpreter's, a
-virtualenv's or Chimaera's own, and never your home directory or `/`. An
-unchanged project uploads once. Without a `uv.lock`, every peer must have
-your third-party packages already.
+virtualenv's or Chimaera's own, and never your home directory or `/`. It
+travels as one archive named by its content and uploads once until it
+changes; each peer unpacks it once onto the workers' `sys.path`. The
+archive skips `.git`, `__pycache__`, virtualenvs, `node_modules`, `build`,
+`dist`, `target` and other caches. It may hold at most 100 MiB
+(`CHIMAERA_PROJECT_MAX_BYTES`); past that, `ch.init` fails and names the
+largest files.
 
-The project goes as one archive named by its content, and each peer
-unpacks it once onto the workers' `sys.path`. The archive skips `.git`,
-`__pycache__`, virtualenvs, `node_modules`, `build`, `dist`, `target` and
-other caches. It may hold at most 100 MiB (`CHIMAERA_PROJECT_MAX_BYTES`);
-past that, `ch.init` fails and names the largest files.
-
-Packages from a `uv.lock` go in once per peer, with `uv sync --frozen` and
-that peer's Python, and workers put them ahead of what that Python
-already has. `uv`
-must be on the peers' `PATH`, and an install slower than
+Without a `uv.lock`, every peer must have your third-party packages
+already. With one, they go in once per peer, with `uv sync --frozen` and
+that peer's Python, and workers put them ahead of what that Python already
+has. `uv` must be on the peers' `PATH`, and an install slower than
 `CHIMAERA_ENV_BUILD_TIMEOUT` seconds (set on the peers; default 900) fails
 the call that needed it.
 
@@ -320,7 +318,7 @@ your laptop.
 A run also carries `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ` and `PYTHONHASHSEED`.
 `CHIMAERA_ENV_PASSTHROUGH` is comma-separated, with `*` wildcards allowed.
 
-Workers never see the token: the peer removes
+Workers never see a token: the peer removes
 `CHIMAERA_CLUSTER_TOKEN`, `CHIMAERA_TOKEN` and `CHIMAERA_TOKEN_FILE` before
 starting them.
 
@@ -382,17 +380,15 @@ INFO chimaera_peer::runtime: drained: values handed to other peers copied=0 left
 <details>
 <summary>More: what a drain waits for and hands over, Slurm, actors, cloud preemption</summary>
 
-A draining peer stops taking new work, waits up to
-`CHIMAERA_DRAIN_SECONDS` (default 30) for its queued and running calls,
-and meanwhile hands what it holds to other peers.
+A draining peer stops taking new work, and the other peers stop sending it
+any. It waits up to `CHIMAERA_DRAIN_SECONDS` (default 30) for its queued
+and running calls, and meanwhile hands the Raft groups it leads to other
+voters, gives its voter seats to live peers and copies its stored values
+elsewhere.
 
 Kubernetes sends SIGTERM. Under Slurm, use SIGUSR1, which `srun` forwards.
 Actors don't move with a drain: they restart elsewhere as on a lost peer,
 which counts against their restart limit.
-
-Other peers stop sending a draining peer any work. It hands the Raft groups
-it leads to other voters, gives its voter seats to live peers and copies
-its stored values elsewhere.
 
 On cloud VMs, `CHIMAERA_PREEMPTION_NOTICES=gce|aws|azure` drains the peer
 when the provider announces a preemption

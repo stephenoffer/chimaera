@@ -1,6 +1,6 @@
 # Data: large values, pipelines and shared state
 
-Pass a large NumPy array to a thousand calls and it's stored once. This page covers that, then pipelines that regroup data by key and write it out, and the queues and stores that let calls share state.
+Pass a large NumPy array to a thousand calls and it's stored once. Further down are pipelines that regroup data by key and write it out, and the queues and stores that let calls share state.
 
 ## Pass a large value to many calls
 
@@ -23,7 +23,7 @@ assert means == [199998.0, 199999.0, 200000.0, 200001.0]
 <details>
 <summary>More: what each call sees, how arguments travel by size, and the warnings that catch waste</summary>
 
-Each call receives the value, read from the stored copy, and you get it back with `table.result()`. Arguments are captured at `.remote()`, so changing the array afterward doesn't change what the call sees.
+Each call receives the value, read from the stored copy, and `table.result()` hands it back to you. Arguments are captured at `.remote()`, so changing the array afterward doesn't affect calls already made.
 
 You don't always need `ch.put`: every call stores its arguments by size.
 
@@ -34,11 +34,11 @@ You don't always need `ch.put`: every call stores its arguments by size.
 | A NumPy array, `bytes` or other buffer of 1 MiB or more, or a top-level argument that pickles to 1 MiB or more | stored once, named by a hash of its contents; every call that passes the same bytes reads that one copy |
 | `ch.put(value)` | inside the future when it is 256 KiB or less, else one stored file |
 
-- Passing the same large value straight to many calls stores it once but hashes it every time. Once one line has done that 20 times and spent 0.1 s or more encoding, warning `CH107` suggests `ch.put(value)` or binding it once with `fn.partial(value)`.
+- Passing one large value straight to many calls stores it once but hashes it every time. After one line has done that 20 times and spent 0.1 s or more encoding, warning `CH107` suggests `ch.put(value)` or binding it once with `fn.partial(value)`.
 - A large `list` or `dict` is stored once, but every call that reads it unpickles its own full copy. A NumPy array or an Arrow table is mapped instead, one copy per machine. Warning `CH118` fires for collections of 8 MiB or more.
-- Don't call `.result()` on a large value only to pass it to the next call. Pass the future, and the value goes worker to worker (warning `CH103` points this out).
-- A future passed as an argument, or one level inside a list, tuple or dict argument, arrives as its value. Nested deeper it arrives as a future. [tasks.md](tasks.md) covers dependencies and `ch.handles`.
-- An open file can't be sent. Pass its path and open it in the call.
+- Don't call `.result()` on a large value only to pass it to the next call. Pass the future instead, and the value goes worker to worker (warning `CH103` points this out).
+- A future passed as an argument, or one level inside a list, tuple or dict argument, arrives as its value; nested deeper, it stays a future. [tasks.md](tasks.md) covers dependencies and `ch.handles`.
+- An open file can't be sent. Pass its path and open it in your function.
 
 </details>
 
@@ -93,7 +93,7 @@ Chimaera deletes what it stored on this schedule:
 | Large arguments, and `ch.put` values your script made | when the run ends |
 | Results, stream items, and `ch.put` values made inside a call | 24 hours after the run ends |
 
-- A dropped `ch.put` value waits until its run ends instead when its future was sent to an actor or nested deeper than one level in an argument, or when a script connected to a remote cluster made it.
+- A dropped `ch.put` value lasts until its run ends instead if its future was sent to an actor or nested deeper than one level in an argument, or if a script connected to a remote cluster made it.
 - While a detached actor of the run is alive, the run's stored arguments and `ch.put` values stay too, because a restart rebuilds the actor from them.
 - A `ch.put` future kept outside the run, such as in a `ch.coord.Store` key, stops reading when that run ends, unless the value was small enough to travel inside the future.
 
@@ -132,7 +132,7 @@ A spilled object is read by mapping its disk file, so there's no restore step. N
 
 The memory is a huge-page tmpfs if one is mounted, else `/dev/shm` when it has at least 2 GiB. Past 80% of the memory limit the peer moves the oldest objects to disk, and past the limit plus a quarter, new objects go straight to disk.
 
-These are the peer's environment variables, so set them where the peer starts:
+These are the peer's environment variables, so set them where it starts:
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -186,13 +186,13 @@ assert sorted(os.listdir(out)) == ["_manifest.json", "part-00000.jsonl", "part-0
 <details>
 <summary>More: what your function receives, and what comes back</summary>
 
-`fn.map(partitions)` runs your function on each partition across the peers, handing it a `ch.data.Partition` to iterate for rows. Only what you ask for comes back to the script, here the `to_dict()` and the manifest.
+`fn.map(partitions)` runs your function on every partition, spread across the peers, and hands it a `ch.data.Partition` to iterate for rows. Only what you ask for comes back to the script: here, the `to_dict()` and the manifest.
 
 </details>
 
 ### Cut input into partitions
 
-`ch.data.partitions` cuts a sequence, a glob or directory of files, or an `ext.Source` into partitions; `columns=` keeps only those keys of dict rows, and `filter=` keeps only the rows that pass:
+`ch.data.partitions` cuts a sequence, a glob or directory of files, or an `ext.Source` into partitions. `columns=` keeps only those keys of dict rows, and `filter=` only the rows that pass:
 
 ```python run
 info_only = ch.data.partitions(os.path.join(logs, "*.jsonl"), columns=["text"], filter=[("level", "==", "info")])
@@ -210,9 +210,7 @@ assert count_words.map(info_only).reduce_by_key(operator.add).to_dict()["cat"] =
 | A glob or a directory | one per file. `.jsonl`/`.ndjson` rows are dicts, `.csv` rows are dicts of strings, `.parquet` rows are dicts (needs `pyarrow`), any other file gives lines |
 | An `ext.Source` | whatever its `partitions()` returns |
 
-Every peer that may run a call must find the files under the path you give.
-
-A pattern that matches nothing raises `FileNotFoundError`.
+Every peer that may run a call must find the files under the path you give. A pattern that matches nothing raises `FileNotFoundError`.
 
 `filter=` is either a callable on each row or a list of `(column, op, value)` triples, all of which must hold; the ops are `==`, `!=`, `<`, `<=`, `>`, `>=`, `in` and `not in`.
 
@@ -229,10 +227,10 @@ Only `.parquet` pushes the filter and columns down into the reader; other format
 
 `combine` folds two values for the same key and must be associative (`operator.add`); without it, each key maps to the list of its values.
 
-Scatter calls split each result into buckets by key, and one gather call per output partition merges its buckets. A worker that dies re-runs only its own call.
+Scatter calls split each result into buckets by key, and one gather call per output partition merges its buckets. When a worker dies, only its call runs again.
 
 - `partitions` sets the number of output partitions, by default the number of inputs capped at the peer's usable cores.
-- Keys go to buckets by a stable hash, so they must pickle the same way in every process: `str`, `bytes`, numbers and tuples of them do.
+- Keys go to buckets by a stable hash, so they must pickle identically in every process: `str`, `bytes`, numbers and tuples of them do.
 - When nothing has read the map yet, as in the example, its function runs inside the scatter calls and its pairs are never stored in between.
 - Each gather reads one small handle per input, so keep inputs × partitions in the low millions.
 
@@ -240,7 +238,7 @@ Scatter calls split each result into buckets by key, and one gather call per out
 
 ### Read a `Partitioned` result
 
-The result of `reduce_by_key` is a `ch.data.Partitioned`, whose partitions stay on the workers until you read them:
+`reduce_by_key` produces a `ch.data.Partitioned`, whose partitions stay on the workers until you read them:
 
 ```python run
 assert len(totals) == 2                   # two partitions, still on the workers
@@ -251,7 +249,7 @@ assert totals.to_dict() == counts
 <details>
 <summary>More: reading in the script or on the workers, and what each partition holds</summary>
 
-`items()` and `to_dict()` bring every pair to the script. `totals.map(fn)` runs a remote function on each partition instead, where the data already is.
+`items()` and `to_dict()` bring every pair to the script. `totals.map(fn)` instead runs a remote function on every partition, where the data already is.
 
 A key lives in one partition only, and without a `combine` its value is the list of its values. `totals.futures` holds one future per partition.
 
@@ -259,7 +257,7 @@ A key lives in one partition only, and without a `combine` its value is the list
 
 ### Write to a sink
 
-`write(sink)` writes each partition in a separate call, so the data never passes through your script, then calls the sink's `commit` once:
+`write(sink)` writes each partition in its own call, never through your script, then calls the sink's `commit` once:
 
 ```python run
 with open(os.path.join(out, "_manifest.json")) as f:
@@ -280,7 +278,7 @@ Each part is written under a temporary name and renamed, so a retried write repl
 
 ### Plug in your own source or sink
 
-A source lists small, picklable partition descriptors and reads one of them, and a sink writes every partition, then commits once:
+A source lists small, picklable partition descriptors and reads one of them. A sink writes every partition, then commits once:
 
 ```python run
 class Ranges(ext.Source):
@@ -310,7 +308,7 @@ assert squared.map(ch.data.partitions(Ranges(25))).write(SumSink()).result() == 
 <details>
 <summary>More: receipts, retries, what a source or sink may hold, and where one-time steps go</summary>
 
-A sink's `write` returns a receipt per partition, and `commit` gets every receipt once, in partition order. A retried call runs `write` again for its partition, so `write` must be idempotent (overwrite a part, never append to it).
+A sink's `write` returns a receipt per partition, and `commit` gets every receipt once, in partition order. A retry runs `write` again for its partition, so `write` must be idempotent (overwrite a part, never append to it).
 
 Sources and sinks are pickled to the workers, so keep their state small: paths, URIs, credential names. Put one-time steps, such as publishing a table, in `commit`.
 
@@ -347,7 +345,7 @@ assert bump.remote(Tally(41)).result() == 42
 <details>
 <summary>More: where loads and the registration must live</summary>
 
-`loads` must be a module-level function, not a lambda. Every process that sends the type must register it, including a worker whose result is a `Tally`, so put the call in a module that both your script and your functions import.
+`loads` must be a module-level function, not a lambda. Every process that sends the type must register it, including a worker whose result is a `Tally`, so register it in a module that both your script and your functions import.
 
 </details>
 
@@ -373,7 +371,7 @@ The generator runs at most `max_in_flight` items ahead of you (default 64), so a
 
 `stream.close()` stops the generator, and `async for` works too.
 
-Generator methods on actors don't stream yet: the call fails with `cannot pickle 'generator' object`. Return a list from the method or put items on a `ch.coord.Queue` instead. [tasks.md](tasks.md) covers generators in full, with errors, retries and replay.
+Generator methods on actors don't stream yet. Call one and you get `cannot pickle 'generator' object`. Return a list from the method or put items on a `ch.coord.Queue` instead. [tasks.md](tasks.md) covers generators in full, with errors, retries and replay.
 
 </details>
 
@@ -401,7 +399,7 @@ q.close()
 assert total.result() == 45
 ```
 
-`put` and `get` return futures, and iterating a queue takes items until it's closed and empty.
+`put` and `get` return futures.
 
 <details>
 <summary>More: sharing by name, bounded queues, timeouts and closing</summary>
@@ -467,12 +465,12 @@ assert ch.get([meet.remote(store, 2) for _ in range(2)]) == [1, 1]
 <details>
 <summary>More: what it survives, heavy traffic, versions, value size, expiry, leases, watches and barriers</summary>
 
-A namespace survives the loss of any process and a minority of peers. Keys outlive your run, so the example takes a fresh namespace. A namespace is one Raft group, so spread heavy traffic over several namespaces.
+A namespace survives the loss of any process and a minority of peers. Keys outlive your run, so the example takes a fresh namespace. Each namespace is one Raft group, so spread heavy traffic over several.
 
 - `put` returns the key's new version. `if_version=v` makes it a compare-and-set that raises `ch.errors.VersionConflict` (its `.version` is the current one); `if_version=0` means "only if the key doesn't exist". `delete` takes `if_version=` too.
-- Values are pickled and limited to 1 MiB; a bigger one raises `ValueError`. Store a `ch.put` future instead; it reads only while its run lasts.
+- Values are pickled and limited to 1 MiB; a bigger one raises `ValueError`. Store the future from `ch.put` instead; it reads only while its run lasts.
 - `ttl="30s"` on `put` makes the key expire.
-- `lock(key, ttl="30s", timeout=None)` returns a lease, renewed in the background while you hold it, whose `token` grows with every grant. A write with `fence=lease` raises `ch.errors.LeaseLost` once the lease expired or passed to another holder; that is what makes leader election safe. `store.holder(key)` says who holds it.
+- `lock(key, ttl="30s", timeout=None)` returns a lease, renewed in the background while you hold it, whose `token` grows with every grant. A write with `fence=lease` raises `ch.errors.LeaseLost` once the lease has expired or passed to another holder; that is what makes leader election safe. `store.holder(key)` says who holds it.
 - `watch(prefix, start="latest")` yields `put` and `delete` events in order. A watch that falls behind replays the current value of every key under the prefix, so it may repeat a change but never misses one.
 - `barrier(key, parties).wait()` returns once that many callers arrive, round after round.
 - `scan(prefix)` and `keys(prefix)` list keys in order.
@@ -499,7 +497,7 @@ assert jobs.qsize() == 0
 <details>
 <summary>More: claims and leases, sharing it, and how WorkQueue differs from Queue</summary>
 
-A consumer claims an item under a lease. The item is removed when the `with` block finishes, and delivered again if the block raises or the consumer's process dies and the lease lapses. Pass the queue to calls, or open it by name from any process.
+A consumer claims an item under a lease. The item is removed when the `with` block finishes, and delivered again if the block raises, or if the consumer's process dies and the lease lapses. Pass the queue to calls, or open it by name from any process.
 
 Unlike `Queue`, its methods are synchronous: `put` returns once the item is stored, and `get()` claims and removes in one step. `maxsize=`, `timeout=`, `close()` and iteration work as they do on `Queue`.
 

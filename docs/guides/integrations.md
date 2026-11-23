@@ -7,8 +7,8 @@ local ones.
 ## Swap in for a process pool
 
 `ch.Executor` is a `concurrent.futures.Executor`. Code written against
-`ProcessPoolExecutor` needs only the constructor changed, and then runs on one
-machine or a whole cluster.
+`ProcessPoolExecutor` needs only its constructor changed to run on one machine
+or a whole cluster.
 
 ```python run
 import concurrent.futures
@@ -51,9 +51,9 @@ except ch.OptionsError as e:
 `asyncio.wrap_future` all accept these futures. Done-callbacks run on a
 thread of their own, so a slow one never holds up other results.
 
-- A function already decorated with `@ch.remote` keeps its options; the
-  executor's override the ones with the same name.
-- A class passed to `submit` is called like a function and its instance comes
+- A function already decorated with `@ch.remote` keeps its options; where
+  both set one, the executor's wins.
+- A class passed to `submit` is called like a function, and its instance comes
   back. It never becomes an actor ([actors.md](actors.md)).
 - A generator function raises `TypeError`. Stream it with
   `ch.remote(fn).remote(...)` instead ([tasks.md](tasks.md)).
@@ -91,13 +91,12 @@ assert squares == [i * i for i in range(100)]
 <summary>More: how batches run, errors, n_jobs and generator output</summary>
 
 Each batch joblib dispatches becomes one Chimaera call, placed on whichever
-peers have room. When a task raises, `Parallel` raises that error and the
-batches still running are canceled.
+peers have room. joblib sizes its batches by how long they take, so many small
+tasks share a call. `n_jobs` is the number of batches in flight; by default,
+and with `-1`, that's the CPU count of the machine your script runs on.
 
-joblib sizes its batches by how long they take, so many small tasks share a
-call. `n_jobs` is the number of batches in flight: by default, and with `-1`,
-the CPU count of the machine your script runs on. `return_as="generator"`
-works too.
+When a task raises, `Parallel` raises that error and the batches still running
+are canceled. `return_as="generator"` works too.
 
 </details>
 
@@ -122,10 +121,10 @@ async def main() -> list[int]:
 assert asyncio.run(main()) == [3, 2, 4, 0, 2, 4]
 ```
 
-Inside a coroutine, use `await`: `.result()` blocks the loop until the call
-finishes. A timeout from `asyncio.wait_for`, or canceling the task that
-awaits, ends your wait but not the call; call `.cancel()` on the future to
-stop it.
+Inside a coroutine, use `await`, because `.result()` blocks the loop until the
+call finishes. A timeout from `asyncio.wait_for`, or canceling the task that
+awaits, ends your wait and leaves the call running; `.cancel()` on the future
+stops it.
 
 A map, a generator's stream and `ch.as_completed` all work with `async for`,
 and `with ch.defaults(...)` has an `async with` form.
@@ -152,8 +151,8 @@ assert add_then_double.remote(3).result() == 8
 ```
 
 Each call to an `async def` remote function runs its coroutine to the end on a
-new event loop in the worker, and its future holds the coroutine's value. An
-`async def` generator streams its items like a plain generator.
+new event loop in the worker, and the future holds what the coroutine returns.
+An `async def` generator streams its items like a plain generator.
 
 ### Async actor methods
 
@@ -184,7 +183,7 @@ An actor's async methods run on one event loop in its process.
 
 Functions need nothing extra: `@ch.remote` keeps the signature, so mypy checks
 `.remote(...)` arguments and gives `.result()` the function's return type.
-Classes need the plugin, because mypy ignores what a class decorator returns.
+Classes need a plugin, because mypy ignores what a class decorator returns.
 Add it to `mypy.ini`:
 
 ```ini

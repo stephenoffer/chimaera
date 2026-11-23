@@ -1,8 +1,8 @@
 # See what your program is doing
 
 Every call leaves a record on the peer: what it printed, each attempt, what
-it measured and why it waited. Here is how to read it from Python or the
-`chimaera` command, and what the `CHnnn` warnings mean.
+it measured and why it waited. Read it from Python or the `chimaera`
+command, and look up any `CHnnn` warning in the table at the end.
 
 ## Read what your calls print
 
@@ -59,19 +59,18 @@ chimaera logs 0000027da0522d95e30e656fd7268a93
 <details>
 <summary>More: how workers get your log level, the line format, following, where output is kept</summary>
 
-Workers log at your script's level, so
+Workers log at your script's level. The run carries your root logger's
+level, and a worker with no logging handlers of its own calls
+`logging.basicConfig` at that level. So
 `logging.basicConfig(level=logging.INFO)` in the script shows `log.info`
 from inside calls. At the default `WARNING` level those records are
 dropped.
 
-The run carries your root logger's level, and a worker with no logging
-handlers of its own calls `logging.basicConfig` at that level.
-
 `run.logs()` yields lines of `<task> <stream>| <text>`, where `<task>` is
 the first 12 hex digits of the task id (the second half of `future.id`).
 
-`run.logs(follow=True)` keeps waiting until you break out of the loop, and
-`chimaera logs RUN --follow` waits for more (Ctrl-C to stop).
+To follow new output, use `run.logs(follow=True)` (break out of the loop
+to stop) or `chimaera logs RUN --follow` (Ctrl-C to stop).
 
 Each peer stores its calls' output in `logs/runs/<run>.log` under its data
 directory, up to 64 MiB per run. On a cluster, output from calls on other
@@ -249,8 +248,8 @@ peer still holds (it keeps the latest 10,000), and `follow=False` stops at
 the newest.
 
 Events come from the connected peer: member events for the whole cluster,
-call and actor events for the shards it leads. They are notifications. The
-durable record is `run.outcomes()` or the actor itself.
+call and actor events for the shards it leads. They are notifications. For
+the durable record, read `run.outcomes()` or ask the actor itself.
 
 </details>
 
@@ -313,9 +312,9 @@ RUN                               STATE       AGE  COMMAND
 0000027da0522d95e30e656fd7268a93  finished     6s  etl.py
 ```
 
-`chimaera profiles` reads what the peer saves every 30 seconds while
-profiles change, and when it stops. Right after a first run, it may say
-none are saved yet. `calls` counts the samples kept, at most 64 per
+`chimaera profiles` reads what the peer has saved: every 30 seconds while
+profiles change, and again when it stops. Right after a first run it may
+say none are saved yet. `calls` counts the samples kept, at most 64 per
 function. A name can repeat, because profiles are kept per code digest:
 
 ```text
@@ -379,7 +378,7 @@ values, but bind it where only your scraper can reach it.
 <summary>More: every metric, other paths, a script's own peer, Kubernetes</summary>
 
 - Gauges: calls queued and running, CPUs in use, workers, object and memory bytes, connected drivers, proposals in flight, and dispatch latency (p50 and p99).
-- Counters since the peer started: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a canceled call, and failed object replicas.
+- Counters since startup: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a canceled call, and failed object replicas.
 - On cluster peers, `chimaera_groups_without_leader`, and for each group they hold, `chimaera_group_leading{group="N"}` plus, on the leader, `chimaera_group_max_lag_entries{group="N"}`.
 
 Every other path answers 404.
