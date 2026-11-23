@@ -10,7 +10,7 @@ unchanged, with no Ray installed.
 | Ray | Chimaera |
 |---|---|
 | `ray.init()` | Nothing, or `ch.init()`. The first call starts or connects to the local peer. |
-| `ray.init(address=...)`, `ray job submit` | `ch.init(cluster="lab")` (a profile) or `"tcp://host:port"`; `chimaera run --cluster lab -- python app.py`, `chimaera submit`. See [clusters.md](clusters.md). |
+| `ray.init(address=...)`, `ray job submit` | `ch.init(cluster="lab")` (a profile) or `"tcp://host:port"`; `chimaera run --cluster lab -- python app.py`. See [clusters.md](clusters.md). |
 | `runtime_env={"env_vars": ...}` | `ch.init(env={...})` |
 | `runtime_env` `working_dir`, `pip` | A script on a remote cluster ships its project directories, and a `uv.lock` is installed on each peer. There is no per-call environment. See [clusters.md](clusters.md). |
 | `@ray.remote`, `f.remote(...)` | `@ch.remote`, `f.remote(...)`, which returns a `ch.Future` |

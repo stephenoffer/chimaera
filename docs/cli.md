@@ -14,7 +14,6 @@ For a walkthrough, see [guides/clusters.md](guides/clusters.md) and
 | Command | What it does |
 |---|---|
 | [`chimaera run`](#chimaera-run) | Run a program against a peer or a cluster |
-| [`chimaera submit`](#chimaera-submit) | Run a program on the cluster in the background |
 | [`chimaera status`](#chimaera-status) | See CPU in use, the queue and why work waits |
 | [`chimaera runs`](#chimaera-runs) | List runs, newest first |
 | [`chimaera actors`](#chimaera-actors) | List live named actors |
@@ -102,36 +101,6 @@ A program that calls `ch.init()` itself ignores `--detach`, since `detach`
 defaults to `False`. Use `ch.init(detach=True)` there.
 
 </details>
-
-### `chimaera submit`
-
-Run a program on the cluster in the background and get its run id back.
-
-<details>
-<summary><code>chimaera submit [OPTIONS] &lt;COMMAND&gt;...</code></summary>
-
-One peer runs it as the only call of a detached run, with this directory shipped as its project. `submit` prints the run's id and returns (`chimaera logs RUN`, `chimaera cancel RUN`).
-
-```text
-chimaera submit [OPTIONS] <COMMAND>...
-```
-
-| Flag | Description |
-|---|---|
-| `<COMMAND>...` | The program and its arguments, after `--` |
-| `--cluster <CLUSTER>` | A cluster profile or tcp://host:port (default: as for a driver) |
-
-It runs at most once. A leading `python` or `python3` in the
-command becomes the peer's own interpreter. If no peer has taken it
-within 60 seconds, `submit` fails. The run stays active after your
-program exits, until `chimaera cancel RUN` ends it.
-
-`submit` itself runs `$CHIMAERA_PYTHON -m chimaera._submit` (default
-`python3`) on this machine, so that interpreter needs Chimaera installed.
-
-</details>
-
-## Inspect
 
 ### `chimaera status`
 
@@ -315,17 +284,15 @@ latency.
 Cancel a run: its unfinished calls are cancelled and its actors stopped.
 
 <details>
-<summary><code>chimaera cancel [OPTIONS] [RUNS]...</code></summary>
+<summary><code>chimaera cancel [OPTIONS] <RUN></code></summary>
 
 ```text
-chimaera cancel [OPTIONS] [RUNS]...
+chimaera cancel [OPTIONS] <RUN>
 ```
 
 | Flag | Description |
 |---|---|
-| `[RUNS]...` | Runs to cancel, ids as `chimaera runs` prints them |
-| `--match <PATTERN>` | Instead of ids: the active runs whose command contains this text |
-| `--yes` | With `--match`, cancel them. Without it, `--match` only lists what would be cancelled |
+| `<RUN>` | The run to cancel, its id as `chimaera runs` prints it |
 
 </details>
 

@@ -141,7 +141,6 @@ These are the peer's environment variables, so set them where the peer starts:
 | `CHIMAERA_SPILL_THRESHOLD` | `0.8` | share of the limit past which the oldest objects move to disk |
 | `CHIMAERA_OBJECT_DIR` | found automatically | where objects live |
 | `CHIMAERA_OBJECT_REPLICAS` | `1` | copies of each object kept on other peers (Linux only); `0` turns them off |
-| `CHIMAERA_SPILL_URL` | unset | spill to `s3://`, `gs://` or `az://`; only in a peer built with the `object-store-spill` cargo feature, which is off by default |
 
 [../objects.md](../objects.md) has the internals and every setting, and [../configuration.md](../configuration.md) lists all variables.
 

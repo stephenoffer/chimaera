@@ -255,39 +255,6 @@ its own `detach=False`; ask with `ch.init(detach=True)` there.
 
 </details>
 
-To run the whole program remotely too, use `chimaera submit`:
-
-```text
-$ chimaera submit --cluster lab -- python app.py
-00000158597987ff150ede66097dafc5
-$ chimaera logs 00000158597987ff150ede66097dafc5 --cluster lab
-00000158161c stdout| run 0000036bbfad7594c6fa317401a32a25
-00000158161c stdout| total 2470
-00000158161c stdout| live peers 4
-$ chimaera runs --cluster lab
-RUN                               STATE       AGE  COMMAND
-0000036bbfad7594c6fa317401a32a25  finished     2s  app.py
-00000158597987ff150ede66097dafc5  active       3s  .../chimaera/_submit.py -- python app.py  (detached)
-000001994bf57c4e7d950c570c16c8e7  finished     4s  app.py
-$ chimaera cancel 00000158597987ff150ede66097dafc5 --cluster lab
-run 00000158597987ff150ede66097dafc5 cancelled
-```
-
-<details>
-<summary>More: at-most-once starts, logs, ending a submitted run</summary>
-
-`submit` returns as soon as the cluster holds the program. It ships the
-current directory as the project of a detached run, starts the program on
-one of the peers as that run's one call, and prints the run's id.
-
-- The program runs at most once. If its peer is lost, the call fails rather than start it again.
-- A leading `python` or `python3` becomes the peer's own interpreter.
-- Its output is the run's log: `chimaera logs RUN --cluster lab`. Its own `ch.init()` starts a second run, which `chimaera runs` lists separately.
-- The run stays `active` after its program exits, until `chimaera cancel RUN --cluster lab` ends it.
-- `submit` first runs `python3 -m chimaera._submit` on your machine, so that `python3` needs Chimaera installed (`CHIMAERA_PYTHON` names another interpreter).
-
-</details>
-
 ## Get your code and settings to the workers
 
 Your script uploads its project, and with a `uv.lock` each peer also

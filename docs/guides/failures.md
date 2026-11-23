@@ -169,9 +169,9 @@ Memory kills have their own allowance, apart from `max_attempts`
 
 ## Declare side effects
 
-Mark a call that must not repeat `effects="external"`: once it has started,
-losing it fails the call with `ch.OutcomeUnknown` instead of running it again,
-and an idempotency key makes your own retry safe:
+Mark a function that must not run twice `effects="external"`. Once it has
+started, losing it raises `ch.OutcomeUnknown` instead of running it again, and
+an idempotency key makes your own retry safe:
 
 ```python run
 import os
@@ -207,7 +207,7 @@ assert os.listdir(GATEWAY) == ["order-17"]               # charged once
 <details>
 <summary>More: the effects table, idempotency keys, when an external call counts as started, and who may change effects</summary>
 
-Retrying is safe only if running the call twice is harmless. `effects` tells
+Retrying is safe only if running twice is harmless. `effects` tells
 Chimaera how careful to be:
 
 | `effects=` | Use it for | A lost attempt | `retry_exceptions` | A lost result |
@@ -263,16 +263,16 @@ assert [a["end_reason"] for a in f.explain()["attempts"]] == ["oom"] * 3
 <details>
 <summary>More: how often memory is checked, how a retry reserves memory, and calls with no limit</summary>
 
-The peer checks each call's memory every 100 ms, stops the worker of a call
-over its limit, and runs the call up to twice more. The limit stays where you
-set it, so one that really needs more fails after three tries, as above.
+The peer checks memory every 100 ms, stops the worker of anything over its
+limit, and runs it up to twice more. The limit stays where you set it, so a
+function that really needs more fails after three tries, as above.
 
 Each retry reserves 1.5 times the killed attempt's peak and waits until that
 much is free. A retry whose reservation is bigger than the peer's whole memory
 pool fails at once.
 
-Without a `memory_limit`, the peer stops a call only when the host is nearly
-out of memory, picking the call furthest over its reservation; retries follow
+Without a `memory_limit`, the peer steps in only when the host is nearly out
+of memory, stopping whatever is furthest over its reservation; retries follow
 the rules above. [resources.md](resources.md) covers reservations and learned
 memory.
 
@@ -393,8 +393,8 @@ process, and `force=True` kills the actor too ([tasks.md](tasks.md),
 
 ## When a worker dies
 
-A worker that dies while running a function call (a segfault, `os._exit`, a
-kill) costs that attempt, and the call runs again on a fresh worker:
+A worker that dies mid-function (a segfault, `os._exit`, a kill) costs that
+attempt, and the function runs again on a fresh worker:
 
 ```python run
 @ch.remote
