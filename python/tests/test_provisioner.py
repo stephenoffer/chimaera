@@ -159,8 +159,10 @@ def test_skypilot_spares_launch_join_and_drain_before_teardown(tmp_path, monkeyp
     log = tmp_path / "calls"
     for tool in ("sky", "ssh"):  # stand-ins that record their arguments, one line per call
         path = tmp_path / tool
+        # One write per line: the two launches run at once, and piecemeal
+        # appends would interleave their lines.
         path.write_text(
-            f'#!/bin/sh\nprintf "{tool}" >> {log}\nfor a in "$@"; do printf " [%s]" "$a" >> {log}; done\necho >> {log}\n'
+            f'#!/bin/sh\nline="{tool}"\nfor a in "$@"; do line="$line [$a]"; done\nprintf "%s\\n" "$line" >> {log}\n'
         )
         path.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")

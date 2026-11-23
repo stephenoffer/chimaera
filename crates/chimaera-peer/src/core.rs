@@ -3700,7 +3700,16 @@ impl Core {
             if *e != exec {
                 continue;
             }
-            for w in host.mailbox.values().filter(|w| waits.contains(&w.tk)) {
+            // Queued here, or already sent to its busy executor in another
+            // batch (a call sent straight to the actor is not counted as
+            // running here, so the next one may be sent behind it). A call in
+            // the waiting call's own batch starts when that one waits.
+            let sent = self
+                .running
+                .iter()
+                .filter(|r| r.exec == exec && !r.items.iter().any(|w| w.tk == *task))
+                .flat_map(|r| r.items.iter());
+            for w in host.mailbox.values().chain(sent).filter(|w| waits.contains(&w.tk)) {
                 let waiter = self
                     .running
                     .iter()
