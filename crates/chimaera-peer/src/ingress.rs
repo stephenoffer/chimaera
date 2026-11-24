@@ -539,12 +539,16 @@ impl pb::peer_server::Peer for Service {
                             let _ = this.core.send(CoreMsg::DirectInflight(inflight)).await;
                         }
                         let mut ran = crate::direct::attempts(&s, &this.router.identity.pb());
+                        // A direct call's record: its caller has the outcome, so the
+                        // session is not sent it again (one event and one read a call).
+                        let recorded: BTreeSet<Tk> = ran.iter().map(|r| r.tk).collect();
                         let acks = this.submit(s).await;
                         let accepted: Vec<Tk> = acks
                             .acks
                             .iter()
                             .filter(|a| a.status() != pb::task_ack::Status::Rejected)
                             .filter_map(|a| a.task.as_ref().and_then(Tk::parse))
+                            .filter(|t| !recorded.contains(t))
                             .collect();
                         if !ran.is_empty() {
                             // A resubmission of one already recorded is a Duplicate: no second attempt.

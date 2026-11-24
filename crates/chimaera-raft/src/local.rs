@@ -45,6 +45,8 @@ use tokio::sync::oneshot;
 thread_local! {
     /// The applier thread's `Applier::event_delay_us` (tests only).
     static DELAY: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
+    /// Overlay entries this thread's scans stepped over (tests only).
+    static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Commands applied in one batch at most.
@@ -397,11 +399,18 @@ impl<T: ReadableTable<&'static [u8], &'static [u8]>> KvRead for View<'_, T> {
             };
             let (key, value) = if from_overlay {
                 let (k, v) = over.next().expect("peeked");
+                #[cfg(test)]
+                SCANNED.with(|n| n.set(n.get() + 1));
                 if next_base.as_ref().is_some_and(|(bk, _)| bk == k) {
                     next_base = base.next(); // shadowed by the overlay
                 }
                 match v {
                     Some(v) => (k.clone(), v.clone()),
+                    // Past the prefix's keys a deleted key ends the scan as a
+                    // live one does, or the scan steps over every later delete
+                    // in the overlay (up to MAX_OVERLAY), each time. One before
+                    // them (`after` below the prefix) is only skipped.
+                    None if k.as_slice() > prefix && !k.starts_with(prefix) => break,
                     None => continue, // deleted
                 }
             } else {
@@ -588,6 +597,44 @@ mod tests {
             let k = key(1 + (next() % 3) as usize, &mut next);
             assert_eq!(view.get(&k), model.get(&k), "step {step}");
         }
+    }
+
+    /// A scan stops at the first deleted key past its prefix, as at a live
+    /// one. A finished call's scan for its dependents stepped over every
+    /// later delete in the overlay, and the peer spent most of a direct
+    /// actor call's time there.
+    #[test]
+    fn a_scan_stops_at_a_deleted_key_past_its_prefix() {
+        use super::{SCANNED, SM, View};
+        use chimaera_core::kv::KvRead;
+        use redb::{Database, ReadableDatabase};
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("sm.redb")).unwrap();
+        let txn = db.begin_write().unwrap();
+        drop(txn.open_table(SM).unwrap());
+        txn.commit().unwrap();
+        let mut overlay = std::collections::BTreeMap::new();
+        overlay.insert(b"a0".to_vec(), None);
+        overlay.insert(b"a1".to_vec(), Some(b"v".to_vec()));
+        for i in 0..10_000u32 {
+            overlay.insert([&b"z"[..], &i.to_be_bytes()].concat(), None);
+        }
+        let base = db.begin_read().unwrap().open_table(SM).unwrap();
+        let view = View { base: &base, group: 1, overlay: &overlay };
+        SCANNED.with(|n| n.set(0));
+        assert_eq!(view.scan_prefix(b"a", usize::MAX), vec![(b"a1".to_vec(), b"v".to_vec())]);
+        let scanned = SCANNED.with(|n| n.get());
+        assert!(scanned <= 3, "the scan stepped over {scanned} overlay entries");
+        // A deleted key below the prefix (a scan after a key below it) is only
+        // skipped: the scan reads as the map without it does.
+        let mut below = std::collections::BTreeMap::new();
+        below.insert(b"a0".to_vec(), None);
+        below.insert(b"b1".to_vec(), Some(b"v".to_vec()));
+        let mut model = chimaera_core::kv::MemKv::default();
+        chimaera_core::kv::Kv::put(&mut model, b"b1".to_vec(), b"v".to_vec());
+        let view = View { base: &base, group: 1, overlay: &below };
+        assert_eq!(view.scan_after(b"b", b"a", usize::MAX), model.scan_after(b"b", b"a", usize::MAX));
+        assert_eq!(model.scan_after(b"b", b"a", usize::MAX).len(), 1);
     }
 
     fn ready(g: &crate::Group) -> usize {
