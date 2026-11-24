@@ -1307,6 +1307,46 @@ print("SLOTS", sorted(set(got)), len(got))
         c.close()
 
 
+def test_explain_at_the_drivers_peer_says_why_an_actor_on_another_peer_has_not_started(monkeypatch):
+    # The wait is the actor's host's (here: memory, behind live actors that
+    # fill its pool): explain() asked at the driver's peer asks the host.
+    monkeypatch.setenv("CHIMAERA_MEMORY_POOL", "600MiB")
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    try:
+        out = c.run(
+            0,
+            """
+import time
+import numpy as np
+import chimaera as ch
+
+@ch.remote(cpus=0.01)
+class Holder:
+    def __init__(self):
+        self.a = np.ones(150 * 2**20 // 8)
+
+    def ping(self):
+        return 1
+
+on_s1 = ch.dist.Placement(require={"slot": "s1"})
+actors = [Holder.options(placement=on_s1).remote() for _ in range(8)]
+calls = [a.ping.remote() for a in actors]
+reason, deadline = "", time.time() + 60
+while time.time() < deadline and "has not started" not in reason:
+    waiting = [f for f in calls if not f.done()]
+    reason = str(waiting[-1].explain().get("pending_reason")) if waiting else ""
+    time.sleep(0.5)
+print("REASON", reason)
+for a in actors:
+    a.close()
+""",
+        )
+        reason = lines(out, "REASON")[0]
+        assert "its actor, on 127.0.0.1:" in reason and "has not started: " in reason, reason
+    finally:
+        c.close()
+
+
 def test_values_lost_with_their_peer_are_made_again_from_their_calls():
     c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
     marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")

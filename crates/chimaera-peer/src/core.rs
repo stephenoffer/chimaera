@@ -179,6 +179,11 @@ pub enum CoreMsg {
         req: pb::ExplainRequest,
         reply: oneshot::Sender<pb::ExplainReply>,
     },
+    /// Why an actor placed here has not started ("" if it is not waiting).
+    ActorWait {
+        actor: Id,
+        reply: oneshot::Sender<String>,
+    },
     /// Result of committing an external-effect attempt's start.
     StartResult {
         work: Box<Work>,
@@ -1478,6 +1483,9 @@ impl Core {
             CoreMsg::CloseActor { actor, reason } => self.close_actor(actor, &reason),
             CoreMsg::Explain { req, reply } => {
                 let _ = reply.send(self.explain(req));
+            }
+            CoreMsg::ActorWait { actor, reply } => {
+                let _ = reply.send(self.actors.get(&actor).and_then(|h| h.waiting_memory.clone()).unwrap_or_default());
             }
             CoreMsg::Status { reply } => {
                 let _ = reply.send(self.status());
@@ -5960,7 +5968,8 @@ impl Core {
             reasons.push(format!("{} actor(s) waiting to start; the first: {why}", self.actors_waiting_memory.len()));
         }
         if !self.actors_waiting_env.is_empty() {
-            reasons.push(format!("{} actor(s) {ENV_WAIT}", self.actors_waiting_env.len()));
+            let n = self.actors_waiting_env.len();
+            reasons.push(format!("{n} actor(s) waiting for their run's environment to reach this peer"));
         }
         if let Some((n, held)) = self.nested_waits() {
             reasons.push(format!(

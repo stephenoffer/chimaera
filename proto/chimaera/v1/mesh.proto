@@ -43,6 +43,18 @@ service Mesh {
   rpc Replicate(ReplicateRequest) returns (ReplicateReply);
   // What this peer's object store holds (`chimaera objects --cluster`).
   rpc Inventory(InventoryRequest) returns (InventoryReply);
+  // Why an actor placed on this peer has not started ("" if it is not
+  // waiting): explain() on another peer asks the actor's host.
+  rpc ActorWait(ActorWaitRequest) returns (ActorWaitReply);
+}
+
+message ActorWaitRequest {
+  string cluster = 1;
+  bytes actor = 2;
+}
+
+message ActorWaitReply {
+  string reason = 1;
 }
 
 message InventoryRequest {

@@ -22,6 +22,9 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
+/// How long explain() waits for an actor's host to say why it waits.
+const ACTOR_WAIT_ASK: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Make an object's file readable here, downloading it from object storage
 /// if it was spilled there: whether it is here now. A failed download is
 /// logged and reads as absent, so the caller looks elsewhere.
@@ -781,6 +784,11 @@ impl pb::peer_server::Peer for Service {
             .await
             .map_err(|_| Status::unavailable("peer is stopping"))?;
         let mut out = rx.await.map_err(|_| Status::unavailable("peer is stopping"))?;
+        // A call to an actor placed on another peer waits on what that peer
+        // knows (the actor may not have started there): ask it.
+        if let Some(note) = self.0.actor_wait_elsewhere(&out).await {
+            out.pending_reason += &note;
+        }
         // The core reads only the groups this peer hosts: read another group's run from a replica of it.
         if let Ok(run) = Id::from_slice(&req.run) {
             if out.run.is_none() && !self.0.router.hosts(run.vshard()) {
@@ -1317,6 +1325,36 @@ impl Ingress {
         };
         let reply = self.remote_read(after.vshard(), req).await?;
         Ok(reply.page_keys.iter().filter_map(Tk::parse).zip(reply.tasks).collect())
+    }
+
+    /// Why the actor a pending call goes to has not started on its host, when
+    /// the host is another peer: its own reason, or that it did not answer in
+    /// ACTOR_WAIT_ASK. None when the call is not to an actor, its actor is here
+    /// (the core explained it), the core already named the actor's wait, or
+    /// the actor is not waiting.
+    async fn actor_wait_elsewhere(&self, out: &pb::ExplainReply) -> Option<String> {
+        if out.pending_reason.is_empty() || out.pending_reason.contains("its actor") {
+            return None;
+        }
+        let actor = Id::from_slice(&out.task.as_ref()?.spec.as_ref()?.actor).ok()?;
+        let rec = match self.router.read(actor.vshard(), |kv| read::actor(kv, actor)) {
+            Some(local) => local,
+            None => {
+                let req = pb::ReadRequest { actor: actor.to_vec(), ..Default::default() };
+                self.remote_read(actor.vshard(), req).await.ok()?.actor
+            }
+        };
+        let host = rec?.host?;
+        if host.peer == self.router.identity.peer.to_vec() {
+            return None;
+        }
+        let mesh = self.router.mesh.clone()?;
+        let member = mesh.member_by_peer(&host.peer)?.member;
+        match tokio::time::timeout(ACTOR_WAIT_ASK, mesh.actor_wait(member.node_id, &actor.to_vec())).await {
+            Ok(Ok(reason)) if reason.is_empty() => None,
+            Ok(Ok(reason)) => Some(format!("; its actor, on {}, has not started: {reason}", member.addr)),
+            _ => Some(format!("; its actor's host ({}) did not answer", member.addr)),
+        }
     }
 
     /// Read from a replica on another peer (this one does not host the group).

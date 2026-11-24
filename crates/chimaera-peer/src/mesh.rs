@@ -573,6 +573,17 @@ impl MeshClient {
         Ok(r.into_inner().json)
     }
 
+    /// Why `actor`, placed on `node`, has not started there ("" if it is not waiting).
+    pub async fn actor_wait(&self, node: u64, actor: &[u8]) -> std::io::Result<String> {
+        let mut c = self.rpc(node)?;
+        let req = pb::ActorWaitRequest { cluster: self.cluster.clone(), actor: actor.to_vec() };
+        let r = tokio::time::timeout(CALL_TIMEOUT, c.actor_wait(req))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(status_err)?;
+        Ok(r.into_inner().reason)
+    }
+
     /// Another peer asked for `object` (it will hold a copy).
     pub fn note_served(&self, object: &[u8]) {
         let mut s = self.served.lock().expect("lock");
@@ -1529,6 +1540,22 @@ impl pb::mesh_server::Mesh for MeshService {
         self.0.check(&r.cluster)?;
         let _ = self.0.core.send(CoreMsg::RemoteLogs { run: r.run, lines: r.lines }).await;
         Ok(Response::new(pb::PushLogsReply {}))
+    }
+
+    /// Why an actor placed here has not started (explain() on another peer asks).
+    async fn actor_wait(&self, req: Request<pb::ActorWaitRequest>) -> Result<Response<pb::ActorWaitReply>, Status> {
+        let r = req.into_inner();
+        self.0.check(&r.cluster)?;
+        let actor = chimaera_core::ids::Id::from_slice(&r.actor)
+            .map_err(|_| Status::invalid_argument("actor_wait names a 16-byte actor id"))?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.0
+            .core
+            .send(CoreMsg::ActorWait { actor, reply })
+            .await
+            .map_err(|_| Status::unavailable("peer is stopping"))?;
+        let reason = rx.await.map_err(|_| Status::unavailable("peer is stopping"))?;
+        Ok(Response::new(pb::ActorWaitReply { reason }))
     }
 
     async fn inventory(&self, req: Request<pb::InventoryRequest>) -> Result<Response<pb::InventoryReply>, Status> {
