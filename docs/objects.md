@@ -289,11 +289,15 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 
 Not matched yet:
 
-- Nothing in Ray's object store. Ray Direct Transport's NIXL option is
-  `CHIMAERA_CUDA_NET=nixl` (see CUDA tensors above); its gloo option, for
-  CPU tensors, is not needed here, since a CPU tensor is a shared-memory
-  object read in place on one machine and fetched in parallel ranges
-  across machines.
+- `ray.experimental.get_object_locations`. No peer keeps a record of where
+  every copy of an object is (a reader whose holder is gone asks the peers
+  its copies go to), so the Ray shim does not offer it. It is mostly asked
+  for to place work near its inputs, which placement does by itself.
+
+Ray Direct Transport's NIXL option is `CHIMAERA_CUDA_NET=nixl` (see CUDA
+tensors above); its gloo option, for CPU tensors, is not needed here, since
+a CPU tensor is a shared-memory object read in place on one machine and
+fetched in parallel ranges across machines.
 
 ## Limits
 
@@ -323,5 +327,6 @@ Not matched yet:
   `CHIMAERA_OBJECT_REPLICAS`) loses the object too. A call's
   result lost that way is made again by running its call (see the table
   above); a `put` value is not.
-  Replicas are made on Linux only (the replicator watches the store with
-  inotify).
+  The replicator watches the store with inotify on Linux, and lists it
+  every 250 ms elsewhere (macOS), so an object written there may wait up to
+  that long for its copy.

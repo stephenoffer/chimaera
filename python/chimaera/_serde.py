@@ -632,7 +632,6 @@ def _pread(fd: int, length: int, offset: int) -> bytes:
     return os.pread(fd, length, offset)
 
 
-
 def read_file(path: str) -> Any:
     """Map an object file and decode it; out-of-band buffers stay mapped
     (except a large bytes value's, read in one copy: see _plain_bytes)."""
