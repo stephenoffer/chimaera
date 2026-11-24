@@ -467,7 +467,6 @@ fn class_bytes(k: u32) -> u64 {
 /// which a dead peer takes a `put` value with it (a call's result can be made
 /// again, a put cannot). A wait lets a reader on another peer fetch it first,
 /// which then counts as the copy and saves a transfer.
-#[cfg(target_os = "linux")]
 fn replica_delay() -> Duration {
     static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
@@ -485,10 +484,10 @@ fn is_object_name(name: &str) -> bool {
 /// gone finds the copy on another live member. Objects are seen through
 /// inotify as they appear in the store: renamed into place from a writer's
 /// `.tmp` name, or hard-linked from a NumPy arena. Copies fetched from other
-/// peers (`.part` names) and spills are not replicated again. The copy lags
+/// peers (`.part` names) and spills are not replicated again; where there
+/// is no inotify (macOS) the store is listed instead (see poll). The copy lags
 /// the write by one transfer. `CHIMAERA_OBJECT_REPLICAS=N` keeps N copies on
 /// the next N peers (default 1); 0 turns this off.
-#[cfg(target_os = "linux")]
 pub fn replicate_new_objects(
     objects: PathBuf,
     mesh: std::sync::Arc<crate::mesh::MeshClient>,
@@ -498,10 +497,55 @@ pub fn replicate_new_objects(
         return;
     }
     let _ = std::thread::Builder::new().name("chimaera-replicas".into()).spawn(move || {
-        if let Err(e) = watch(&objects, &mesh, &rt) {
+        #[cfg(target_os = "linux")]
+        let watched = watch(&objects, &mesh, &rt);
+        #[cfg(not(target_os = "linux"))]
+        let watched = poll(&objects, &mesh, &rt);
+        if let Err(e) = watched {
             tracing::warn!("object replicas are off: cannot watch {}: {e}", objects.display());
         }
     });
+}
+
+/// Where there is no inotify (macOS): list the store every 250 ms and
+/// replicate the objects that appeared since, but not copies that arrived
+/// from other peers (the mesh records those) and not spills (symlinks).
+/// Objects already there when it starts are left alone, as with watch.
+#[cfg(not(target_os = "linux"))]
+fn poll(
+    objects: &Path,
+    mesh: &std::sync::Arc<crate::mesh::MeshClient>,
+    rt: &tokio::runtime::Handle,
+) -> std::io::Result<()> {
+    use std::collections::HashSet;
+    std::fs::read_dir(objects)?; // the store exists
+    let mut seen: Option<HashSet<(String, String)>> = None;
+    loop {
+        let mut now = HashSet::new();
+        for run in std::fs::read_dir(objects).into_iter().flatten().flatten() {
+            let run_name = run.file_name().to_string_lossy().into_owned();
+            if !is_object_name(&run_name) {
+                continue;
+            }
+            for e in std::fs::read_dir(run.path()).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                // A symlink is a spilled object or a replica of another peer's.
+                if !is_object_name(&name) || e.file_type().map_or(true, |t| t.is_symlink()) {
+                    continue;
+                }
+                let key = (run_name.clone(), name);
+                if let Some(seen) = seen.as_ref()
+                    && !seen.contains(&key)
+                    && !decode_hex(&key.1).is_some_and(|o| mesh.arrived(&o))
+                {
+                    replicate_one(&run.path(), &key.1, mesh, rt);
+                }
+                now.insert(key);
+            }
+        }
+        seen = Some(now);
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -603,7 +647,6 @@ fn watch(
 /// unless another peer fetched it meanwhile (that copy suffices) or it was
 /// freed. The grace keeps a replica from competing with a reader on another
 /// peer for this peer's bandwidth.
-#[cfg(target_os = "linux")]
 fn replicate_one(
     run_dir: &Path,
     name: &str,
@@ -642,7 +685,6 @@ fn replicate_one(
 
 /// Copies of each object on other peers (`CHIMAERA_OBJECT_REPLICAS`, default
 /// 1; 0 turns replicas off), on the next peers round the ring.
-#[cfg(target_os = "linux")]
 fn replica_count() -> usize {
     std::env::var("CHIMAERA_OBJECT_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
 }
@@ -650,7 +692,6 @@ fn replica_count() -> usize {
 /// Replicas being copied at once, from one peer.
 const REPLICAS_AT_ONCE: usize = 8;
 
-#[cfg(target_os = "linux")]
 fn replica_turns() -> &'static tokio::sync::Semaphore {
     static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     TURNS.get_or_init(|| tokio::sync::Semaphore::new(REPLICAS_AT_ONCE))

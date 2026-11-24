@@ -1582,3 +1582,50 @@ except ch.errors.DataLost as e:
         assert lost and "ch.put" in lost[0], out + err[-3000:]
     finally:
         c.close()
+
+
+def test_a_put_made_on_a_killed_peer_and_an_actor_result_there_are_read_from_their_replicas():
+    # With replicas on (the default), on every OS: what a call put and what
+    # an actor returned on a peer that is then killed are read from the copy
+    # its peer made, not lost with it (Ray loses both).
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    marks = tempfile.mkdtemp(prefix="chr", dir="/tmp")
+    go = os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+import chimaera as ch
+
+there = ch.dist.Placement(require={{"slot": "s1"}})
+
+@ch.remote
+def stash(n):
+    return ch.put(bytes(range(256)) * (n // 256))
+
+@ch.remote
+class A:
+    def make(self, n):
+        return bytes(range(256)) * (n // 256)
+
+p = stash.options(placement=there).remote(1 << 20)
+a = A.options(placement=there).remote()
+r = a.make.remote(1 << 20)
+ch.wait([p, r], timeout=60)
+handle = p.result(timeout=60)  # the put's handle; its value stays on s1
+time.sleep(2)  # its copies are made as soon as the values are written
+print("READY", flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+print("PUT", len(handle.result(timeout=120)), flush=True)
+print("ACTOR", len(r.result(timeout=120)), flush=True)
+""",
+        )
+        assert driver.stdout.readline().strip() == "READY", driver.stderr.read()[-2000:]
+        c.signal(1, signal.SIGKILL)  # the peer holding both values
+        open(go, "w").close()
+        out, err = driver.communicate(timeout=240)
+        assert f"PUT {1 << 20}" in out and f"ACTOR {1 << 20}" in out, out + err[-3000:]
+    finally:
+        c.close()

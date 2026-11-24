@@ -348,7 +348,6 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     if cfg.token.is_none() {
         tracing::warn!("no cluster token: anyone who can reach {} can join this cluster", cfg.listen);
     }
-    #[cfg(target_os = "linux")]
     crate::objplane::replicate_new_objects(
         node.objects.dir().to_path_buf(),
         mesh.clone(),

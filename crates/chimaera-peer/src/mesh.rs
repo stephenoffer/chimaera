@@ -177,6 +177,9 @@ pub struct MeshClient {
     /// Objects other peers asked this one for, and when: their fetched copy
     /// already makes a replica unnecessary (see objplane).
     served: Mutex<HashMap<Vec<u8>, Instant>>,
+    /// Objects copied here from another peer (fetched, or sent as a replica),
+    /// and when: not replicated again by a replicator that only sees names.
+    arrived: Mutex<HashMap<Vec<u8>, Instant>>,
     /// Profiles other peers sent with their ping replies, for the core.
     received: Mutex<Vec<(u64, pb::ProfileSummary)>>,
     /// SWIM membership (who is alive), driven by the liveness loop.
@@ -266,6 +269,7 @@ impl MeshClient {
             recent: Mutex::new(VecDeque::new()),
             parts: Arc::default(),
             served: Mutex::new(HashMap::new()),
+            arrived: Mutex::new(HashMap::new()),
             received: Mutex::new(Vec::new()),
             swim: Mutex::new(Swim::new(me_node, swim_inc(me_inc), me_node, swim_config())),
             epoch: Instant::now(),
@@ -593,6 +597,21 @@ impl MeshClient {
         s.insert(object.to_vec(), Instant::now());
     }
 
+    /// `object` was copied here from another peer (just before it appears
+    /// under its name).
+    fn note_arrived(&self, object: &[u8]) {
+        let mut a = self.arrived.lock().expect("lock");
+        if a.len() > 65536 {
+            a.retain(|_, t| t.elapsed() < Duration::from_secs(60));
+        }
+        a.insert(object.to_vec(), Instant::now());
+    }
+
+    /// Whether `object` was copied here from another peer in the last minute.
+    pub fn arrived(&self, object: &[u8]) -> bool {
+        self.arrived.lock().expect("lock").get(object).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+    }
+
     /// Whether another peer asked for `object` in the last minute.
     pub fn was_served(&self, object: &[u8]) -> bool {
         self.served.lock().expect("lock").get(object).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
@@ -777,6 +796,7 @@ impl MeshClient {
         }
         match got {
             Ok(n) => {
+                self.note_arrived(object); // before it appears under its name
                 tokio::fs::rename(&tmp, dest).await?;
                 self.note_transfer(node, n, started.elapsed());
                 self.note_recent(object);
@@ -918,6 +938,7 @@ impl MeshClient {
             let _ = tokio::fs::remove_file(&tmp).await;
             return None;
         }
+        self.note_arrived(object); // before it appears under its name
         if tokio::fs::rename(&tmp, dest).await.is_err() {
             let _ = tokio::fs::remove_file(&tmp).await;
             return None;
