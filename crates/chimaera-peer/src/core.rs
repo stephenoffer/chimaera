@@ -1402,6 +1402,7 @@ impl Core {
                     pb::shard_cmd::Body::CancelRun(pb::CancelRun {
                         run: run.to_vec(),
                         message: "cancelled by its owner".into(),
+                        ..Default::default()
                     })
                 } else {
                     pb::shard_cmd::Body::RunFinish(pb::RunFinish { run: run.to_vec(), state: 0 })
@@ -1493,10 +1494,9 @@ impl Core {
                     }
                 }
             }
-            Event::CancelRunContinues { run, v } if leader => self.propose(
-                v,
-                pb::shard_cmd::Body::CancelRun(pb::CancelRun { run: run.to_vec(), message: String::new() }),
-            ),
+            Event::CancelRunContinues { run, v, message, after } if leader => {
+                self.propose(v, pb::shard_cmd::Body::CancelRun(pb::CancelRun { run: run.to_vec(), message, after }))
+            }
             Event::CancelRunContinues { .. } => {}
             // The copies a run keeps in its spread end and expire with it; the
             // run's own group does the run-wide work, once.
@@ -1542,7 +1542,7 @@ impl Core {
         let cancelled = rec.state() == pb::run_record::State::Cancelled;
         for v in rec.spread.iter().map(|v| *v as u16).filter(|v| *v != run.vshard()) {
             let body = if cancelled {
-                pb::shard_cmd::Body::CancelRun(pb::CancelRun { run: run.to_vec(), message: String::new() })
+                pb::shard_cmd::Body::CancelRun(pb::CancelRun { run: run.to_vec(), ..Default::default() })
             } else {
                 pb::shard_cmd::Body::RunFinish(pb::RunFinish { run: run.to_vec(), state: 0 })
             };
@@ -2647,6 +2647,7 @@ impl Core {
                     pb::shard_cmd::Body::CancelRun(pb::CancelRun {
                         run: run.to_vec(),
                         message: "the driver disconnected".into(),
+                        ..Default::default()
                     }),
                 );
             }

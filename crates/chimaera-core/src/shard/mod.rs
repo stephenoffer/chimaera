@@ -109,10 +109,12 @@ pub enum Event {
         object: Option<pb::ObjectRef>,
     },
     ActorChanged(Id),
-    /// A bounded CancelRun stopped early; propose it again.
+    /// A bounded CancelRun stopped early; propose it again from `after`.
     CancelRunContinues {
         run: Id,
         v: u16,
+        message: String,
+        after: Vec<u8>,
     },
     /// A run and its tasks were deleted after retention; its objects can go.
     RunExpired(Id),
@@ -519,18 +521,28 @@ impl ShardState {
             pb::run_record::State::Cancelled => pb::run_record::State::Cancelled,
             _ => pb::run_record::State::Finished,
         };
-        self.end_run(cx, v, &r.run, state, "run finished with this task outstanding")
+        self.end_run(cx, v, &r.run, state, "run finished with this task outstanding", &[])
     }
 
     fn cancel_run(&self, cx: &mut Cx, v: u16, c: &pb::CancelRun) -> pb::ShardReply {
         let msg = if c.message.is_empty() { "run cancelled" } else { c.message.as_str() };
-        self.end_run(cx, v, &c.run, pb::run_record::State::Cancelled, msg)
+        self.end_run(cx, v, &c.run, pb::run_record::State::Cancelled, msg, &c.after)
     }
 
     /// Mark a run ended and cancel its outstanding tasks, one bounded page per
-    /// command (`Event::CancelRunContinues` asks the leader to propose again).
+    /// command (`Event::CancelRunContinues` asks the leader to propose again,
+    /// after the page's last task: the tasks a page finished stay until the
+    /// run expires, so a page from the first task again would find only them).
     /// The run and its tasks expire `retention_ms` after it ends.
-    fn end_run(&self, cx: &mut Cx, v: u16, run: &[u8], state: pb::run_record::State, msg: &str) -> pb::ShardReply {
+    fn end_run(
+        &self,
+        cx: &mut Cx,
+        v: u16,
+        run: &[u8],
+        state: pb::run_record::State,
+        msg: &str,
+        after: &[u8],
+    ) -> pb::ShardReply {
         let Ok(id) = Id::from_slice(run) else { return rejected("bad run id") };
         let key = keys::run(v, &id);
         let Some(mut rec) = load::<pb::RunRecord>(cx.kv, &key) else { return rejected("unknown run") };
@@ -541,8 +553,7 @@ impl ShardState {
             cx.kv.put(keys::expiry(cx.now + hlc::from_ms(rec.retention_ms), &key), Vec::new());
             cx.events.push(Event::RunEnded(id));
         }
-        let page = cx.kv.scan_prefix(&keys::tasks_of_run(v, &id), CANCEL_BATCH);
-        let mut cancelled = 0u64;
+        let page = cx.kv.scan_after(&keys::tasks_of_run(v, &id), after, CANCEL_BATCH);
         for (tkey, bytes) in &page {
             let task = pb::TaskRecord::decode(bytes.as_slice()).expect("shard state is corrupt");
             if task.state() == TState::Done {
@@ -550,10 +561,9 @@ impl ShardState {
             }
             let (run, t) = keys::trailing_pair(tkey);
             self.finish(cx, Tk { run, task: t }, task, err_outcome(Kind::Cancelled, msg));
-            cancelled += 1;
         }
-        if page.len() == CANCEL_BATCH && cancelled > 0 {
-            cx.events.push(Event::CancelRunContinues { run: id, v });
+        if let Some((last, _)) = page.last().filter(|_| page.len() == CANCEL_BATCH) {
+            cx.events.push(Event::CancelRunContinues { run: id, v, message: msg.to_string(), after: last.clone() });
         }
         reply(pb::shard_reply::Body::Run(rec))
     }

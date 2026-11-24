@@ -321,6 +321,7 @@ message Charge {
 message CancelRun {
   bytes run = 1;
   string message = 2;
+  bytes after = 3;  // a long run's next page of tasks starts after this task key
 }
 
 // Ask the producer's vshard to notify `subscriber_vshard` when it completes.

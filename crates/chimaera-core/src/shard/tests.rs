@@ -721,6 +721,33 @@ fn finished_run_cancels_leftovers_and_expires() {
 }
 
 #[test]
+fn ending_a_run_cancels_every_outstanding_task_however_many_pages_it_takes() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let n = 2 * CANCEL_BATCH + 7;
+    let tasks: Vec<Tk> = (0..n).map(|i| task_id(V, i)).collect();
+    let specs = tasks.iter().map(|tk| spec(*tk, &[], pb::Effects::None, 3)).collect();
+    h.raw(Body::SubmitTasks(pb::SubmitTasks { tasks: specs, grant_to: Some(peer_pb(p)) }), V);
+    let mut events = h.raw(Body::RunFinish(pb::RunFinish { run: run_id(V).to_vec(), state: 0 }), V).events;
+    let mut pages = 1;
+    while let Some(Event::CancelRunContinues { run, v, message, after }) =
+        events.iter().find(|e| matches!(e, Event::CancelRunContinues { .. })).cloned()
+    {
+        assert!(pages <= n / CANCEL_BATCH, "a page started over");
+        let next = pb::CancelRun { run: run.to_vec(), message, after };
+        events = h.raw(Body::CancelRun(next), v).events;
+        pages += 1;
+    }
+    assert_eq!(pages, n.div_ceil(CANCEL_BATCH));
+    for tk in tasks {
+        let rec = h.task(tk).unwrap();
+        assert_eq!(err_kind(&rec), Some(Kind::Cancelled));
+        let pb::outcome::Value::Err(e) = rec.outcome.unwrap().value.unwrap() else { unreachable!() };
+        assert_eq!(e.message, "run finished with this task outstanding", "later pages keep the first's reason");
+    }
+}
+
+#[test]
 fn cancelling_a_spread_call_cancels_its_calls_in_the_runs_own_vshard_and_later_ones_at_once() {
     let mut h = Harness::new(ShardState::new());
     let p = (peer(0), 1);
@@ -785,7 +812,7 @@ fn a_run_spread_over_another_vshard_admits_calls_there_and_its_copy_ends_and_exp
     assert_eq!(page.iter().map(|(tk, _)| *tk).collect::<Vec<_>>(), vec![in_v2]);
     assert!(read::tasks_page(&h.a, run, None, 10).iter().all(|(tk, _)| tk.v() == V), "the run's own vshard alone");
     // Ending the copy cancels the calls it admitted and leaves the run's own record.
-    let end = h.raw(Body::CancelRun(pb::CancelRun { run: run.to_vec(), message: String::new() }), V2);
+    let end = h.raw(Body::CancelRun(pb::CancelRun { run: run.to_vec(), ..Default::default() }), V2);
     assert!(end.events.contains(&Event::RunEnded(run)));
     assert_eq!(err_kind(&h.task(in_v2).unwrap()), Some(Kind::Cancelled));
     assert_eq!(read::run(&h.a, run).unwrap().state(), pb::run_record::State::Active);
