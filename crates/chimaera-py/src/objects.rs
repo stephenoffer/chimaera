@@ -12,7 +12,7 @@
 //!   reuse (bounded), as malloc keeps its heap, so temporaries do not fault in
 //!   fresh pages each time.
 
-use pyo3::exceptions::{PyOSError, PyValueError};
+use pyo3::exceptions::{PyEOFError, PyOSError, PyValueError};
 use pyo3::prelude::*;
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -128,6 +128,25 @@ fn class_of(len: usize) -> u32 {
     k
 }
 
+/// Reserve files this process has listed and not yet taken: the directory,
+/// and its file names by class. Listing a reserve of 2,000 files for every
+/// take cost more than the write it served; a listed file that another
+/// process took meanwhile fails its rename and the next is tried, and the
+/// directory is listed again when the classes asked for run out.
+type Listed = (PathBuf, std::collections::HashMap<u32, Vec<std::ffi::OsString>>);
+static LISTED: std::sync::Mutex<Option<Listed>> = std::sync::Mutex::new(None);
+
+fn list_reserve(dir: &Path) -> std::collections::HashMap<u32, Vec<std::ffi::OsString>> {
+    let mut by_class: std::collections::HashMap<u32, Vec<std::ffi::OsString>> = Default::default();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let n = e.file_name();
+        if let Some(class) = n.to_str().and_then(|s| s.split_once('-')).and_then(|(c, _)| c.parse::<u32>().ok()) {
+            by_class.entry(class).or_default().push(n); // "want-" markers do not parse
+        }
+    }
+    by_class
+}
+
 /// Move a pre-zeroed file of at least `len` bytes (at most twice that) from
 /// the reserve to `to`. On a miss, leave a `want-<class>` marker so the peer
 /// keeps some of that size from now on.
@@ -136,22 +155,27 @@ fn take_reserve(dir: &Path, len: usize, to: &Path) -> bool {
     if k > RESERVE_MAX_CLASS {
         return false;
     }
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        let mut names: Vec<(u32, std::ffi::OsString)> = rd
-            .flatten()
-            .filter_map(|e| {
-                let n = e.file_name();
-                let class: u32 = n.to_str()?.split_once('-')?.0.parse().ok()?;
-                (class == k || class == k + 1).then_some((class, n))
-            })
-            .collect();
-        names.sort();
-        for (_, n) in names {
-            if std::fs::rename(dir.join(&n), to).is_ok() {
-                return true; // others may race for the same file: the rename decides
+    let mut listed = LISTED.lock().expect("lock");
+    let mut fresh = false;
+    loop {
+        if listed.as_ref().is_none_or(|(d, _)| d != dir) {
+            *listed = Some((dir.to_path_buf(), list_reserve(dir)));
+            fresh = true;
+        }
+        let names = &mut listed.as_mut().expect("listed above").1;
+        for class in [k, k + 1] {
+            while let Some(n) = names.get_mut(&class).and_then(Vec::pop) {
+                if std::fs::rename(dir.join(&n), to).is_ok() {
+                    return true; // others may race for the same file: the rename decides
+                }
             }
         }
+        if fresh {
+            break;
+        }
+        *listed = None; // none left of these classes since the last listing
     }
+    drop(listed);
     // One marker per miss (the peer fills a class that misses repeatedly).
     static MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -422,6 +446,83 @@ pub fn write_object(py: Python<'_>, path: PathBuf, parts: Vec<Bound<'_, PyAny>>)
     });
     drop(bufs);
     r.map_err(os_err)
+}
+
+/// `length` bytes of `fd` from `offset`, as a new `bytes` object on the heap,
+/// not in the arena, read with the GIL released. A value read is seldom
+/// stored again, and an arena block costs a new tmpfs file whose 4 KiB pages
+/// fault in one at a time as the copy reaches them: reading 2,048 values of
+/// 1 MiB in one call took 590 us each into the arena against 475 on the heap
+/// (Ray: 511). `EOFError` when the file is shorter.
+#[pyfunction]
+pub fn pread_heap(py: Python<'_>, fd: i32, length: usize, offset: u64) -> PyResult<Bound<'_, pyo3::types::PyBytes>> {
+    let n = pyo3::ffi::Py_ssize_t::try_from(length).map_err(|_| PyValueError::new_err("length too large"))?;
+    // SAFETY: a new bytes object of `length` uninitialized bytes, every one
+    // written below before Python can see the object.
+    let obj = with_heap(|| unsafe { pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), n) });
+    if obj.is_null() {
+        return Err(PyErr::fetch(py));
+    }
+    // SAFETY: `obj` is a new reference to a bytes object.
+    let bytes = unsafe { Bound::from_owned_ptr(py, obj).cast_into_unchecked::<pyo3::types::PyBytes>() };
+    // SAFETY: the buffer of that bytes object, `length` bytes long.
+    let base = unsafe { pyo3::ffi::PyBytes_AsString(obj) } as usize;
+    py.detach(|| {
+        let mut at = 0usize;
+        while at < length {
+            // SAFETY: [at, length) lies in the buffer above.
+            let r = unsafe {
+                libc::pread(fd, (base + at) as *mut libc::c_void, length - at, (offset + at as u64) as libc::off_t)
+            };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    return Err(e);
+                }
+            } else if r == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the file ended early"));
+            } else {
+                at += r as usize;
+            }
+        }
+        Ok(())
+    })
+    .map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof { PyEOFError::new_err(e.to_string()) } else { os_err(e) }
+    })?;
+    Ok(bytes)
+}
+
+/// `s` encoded to UTF-8 (`surrogatepass`, as pickle encodes a `str`) into a
+/// new bytes object on the heap, not in the arena: a large `str` stored out
+/// of band (chimaera._serde) is then written into its object file with one
+/// copy. Encoding a 1 MiB `str` into a new arena block, whose 4 KiB pages
+/// fault in one at a time, then storing it by link took 583 us on
+/// `/dev/shm`; encoding on the heap and writing took 313 us.
+#[pyfunction]
+pub fn encode_utf8_heap<'py>(
+    py: Python<'py>,
+    s: &Bound<'py, pyo3::types::PyString>,
+) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+    // SAFETY: `s` is a str; the call returns a new reference or null with an
+    // exception set.
+    let obj = with_heap(|| unsafe {
+        pyo3::ffi::PyUnicode_AsEncodedString(s.as_ptr(), c"utf-8".as_ptr(), c"surrogatepass".as_ptr())
+    });
+    if obj.is_null() {
+        return Err(PyErr::fetch(py));
+    }
+    // SAFETY: a new reference to a bytes object (the UTF-8 codec returns bytes).
+    Ok(unsafe { Bound::from_owned_ptr(py, obj).cast_into_unchecked::<pyo3::types::PyBytes>() })
+}
+
+/// Run `f` with this thread's large Python allocations on the heap, not in
+/// the arena.
+fn with_heap<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "linux")]
+    return arena::with_heap(f);
+    #[cfg(not(target_os = "linux"))]
+    f()
 }
 
 #[cfg(target_os = "linux")]
@@ -816,12 +917,25 @@ mod arena {
         q
     }
 
+    thread_local! {
+        /// Set while `with_heap` runs: this thread's raw allocations skip the arena.
+        static HEAP_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Run `f` with this thread's large Python allocations on the heap.
+    pub fn with_heap<T>(f: impl FnOnce() -> T) -> T {
+        HEAP_NEXT.with(|h| h.set(true));
+        let r = f();
+        HEAP_NEXT.with(|h| h.set(false));
+        r
+    }
+
     /// Python's raw allocator (under its large `bytes`, `str`, lists and
     /// dicts): blocks of at least the arena's minimum come from the arena,
     /// so a large `bytes` is stored by link, like a NumPy array.
     unsafe extern "C" fn raw_malloc(ctx: *mut c_void, size: usize) -> *mut c_void {
         let ar = arena();
-        if size >= ar.min {
+        if size >= ar.min && !HEAP_NEXT.with(|h| h.get()) {
             let p = ar.alloc(size, false);
             if !p.is_null() {
                 return p;
@@ -1336,9 +1450,40 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(plain_tree, m)?)?;
     m.add_function(wrap_pyfunction!(objects_config, m)?)?;
     m.add_function(wrap_pyfunction!(write_object, m)?)?;
+    m.add_function(wrap_pyfunction!(pread_heap, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_utf8_heap, m)?)?;
     m.add_function(wrap_pyfunction!(arena_install, m)?)?;
     m.add_function(wrap_pyfunction!(arena_claim, m)?)?;
     m.add_function(wrap_pyfunction!(arena_stats, m)?)?;
     m.add_function(wrap_pyfunction!(arena_shutdown, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+
+    #[test]
+    fn reserve_files_are_taken_from_one_listing_and_listed_again_when_it_runs_out() {
+        let dir = std::env::temp_dir().join(format!("chimaera-reserve-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["20-1", "20-2", "21-1"] {
+            std::fs::write(dir.join(n), b"").unwrap();
+        }
+        let to = |i: u32| dir.join(format!("taken-{i}"));
+        assert!(take_reserve(&dir, 1 << 20, &to(1)), "from the listing");
+        let left: Vec<_> = ["20-1", "20-2"].into_iter().filter(|n| dir.join(n).exists()).collect();
+        assert_eq!(left.len(), 1);
+        std::fs::remove_file(dir.join(left[0])).unwrap(); // another process took it after the listing
+        assert!(take_reserve(&dir, 1 << 20, &to(2)), "the next listed file, of the class above");
+        assert!(!dir.join("21-1").exists());
+        std::fs::write(dir.join("20-3"), b"").unwrap(); // the peer filled the reserve since
+        assert!(take_reserve(&dir, 1 << 20, &to(3)), "listed again when the classes ran out");
+        assert!(!dir.join("20-3").exists() && to(3).exists());
+        assert!(!take_reserve(&dir, 1 << 20, &to(4)), "a miss");
+        let markers = std::fs::read_dir(&dir).unwrap().flatten();
+        assert_eq!(markers.filter(|e| e.file_name().to_string_lossy().starts_with("want-20-")).count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

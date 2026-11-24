@@ -104,6 +104,8 @@ _ATOMS = (bytes, bytearray, str, int, float, bool, type(None))
 _plain = getattr(_native, "plain_tree", lambda _: False)  # absent from older builds
 _plain_encode = getattr(_native, "plain_encode", None)  # absent from older builds
 _plain_column = getattr(_native, "plain_encode_column", None)  # absent from older builds
+_pread_heap = getattr(_native, "pread_heap", None)  # absent from older builds
+_encode_heap = getattr(_native, "encode_utf8_heap", None)  # likewise
 
 
 def _pickle(value: Any, pickler_cls: type, buffer_callback: Callable[[pickle.PickleBuffer], bool]) -> bytes:
@@ -193,7 +195,13 @@ def _big_str(s: str) -> Any:
     the encoded bytes (in the arena when large, so then stored by link) go
     into the object file as they are, instead of being encoded into pickle's
     stream and copied from there. `surrogatepass` is what pickle uses, so the
-    string comes back exactly, lone surrogates included."""
+    string comes back exactly, lone surrogates included. Below 8 MiB the
+    bytes are encoded on the heap and written into the object file (see
+    _native.encode_utf8_heap); from 8 MiB the arena is faster, as for reads
+    (_pread): its blocks are populated on several threads as they are
+    handed out, and the encoded bytes are stored by link."""
+    if _encode_heap is not None and len(s) < 8 << 20:
+        return _OutOfBand(_str_from_utf8, _encode_heap(s))
     return _OutOfBand(_str_from_utf8, s.encode("utf-8", "surrogatepass"))
 
 
@@ -584,6 +592,8 @@ def _plain_bytes(head: bytes, fd: int, run_dir: str) -> bytes | None:
     if head[off : off + main_len] != main:
         return None
     if blob is None:
+        if fd < 0:
+            return None  # a frame held in memory: its bytes are right there
         start = off + main_len + _pad(off + main_len)
         data = os.pread(fd, length, start)
     else:
@@ -592,10 +602,23 @@ def _plain_bytes(head: bytes, fd: int, run_dir: str) -> bytes | None:
         except FileNotFoundError:
             return None  # held by another peer: the mapped path fetches it
         try:
-            data = os.pread(src, length, start)
+            data = _pread(src, length, start)
         finally:
             os.close(src)
     return data if len(data) == length else None
+
+
+def _pread(fd: int, length: int, offset: int) -> bytes:
+    """`length` bytes of `fd` at `offset` (fewer if the file is shorter).
+    From 1 to 8 MiB into a new bytes object on the heap rather than in the
+    arena (see _native.pread_heap). From 8 MiB the arena is faster: its blocks
+    are populated on several threads."""
+    if _pread_heap is not None and 1 << 20 <= length < 8 << 20:
+        try:
+            return _pread_heap(fd, length, offset)
+        except EOFError:
+            return b""
+    return os.pread(fd, length, offset)
 
 
 

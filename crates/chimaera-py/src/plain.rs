@@ -41,6 +41,29 @@ const INT32: u8 = 11;
 const STR8: u8 = 12;
 const STRREF: u8 = 13;
 
+/// Hashes an object's address with one multiply. Addresses are unique while
+/// the encoder runs, so SipHash's flood resistance buys nothing, and it was
+/// most of the cost of a column of unique strings.
+#[derive(Default)]
+struct AddrHasher(u64);
+
+impl std::hash::Hasher for AddrHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        // Objects are 16-byte aligned: the low bits carry nothing.
+        self.0 = ((n as u64) >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type ByAddr = std::hash::BuildHasherDefault<AddrHasher>;
+
 /// Deeper nesting is declined (encoding) or refused (decoding).
 const MAX_DEPTH: usize = 200;
 /// Containers tracked before declining (memory for the seen set).
@@ -81,11 +104,11 @@ impl Types {
 
 struct Encoder {
     out: Vec<u8>,
-    seen: std::collections::HashSet<usize>,
+    seen: std::collections::HashSet<usize, ByAddr>,
     ty: Types,
     /// Column mode: each str object's index, by address, and no containers
     /// below the top-level list.
-    strings: Option<std::collections::HashMap<usize, u32>>,
+    strings: Option<std::collections::HashMap<usize, u32, ByAddr>>,
 }
 
 impl Encoder {
@@ -257,17 +280,22 @@ pub fn plain_encode_column<'py>(py: Python<'py>, items: &Bound<'py, PyAny>) -> O
     if !items.is_exact_instance_of::<pyo3::types::PyList>() {
         return None;
     }
-    encode(py, items, Some(std::collections::HashMap::new()))
+    let n = items.len().unwrap_or(0);
+    encode(py, items, Some(std::collections::HashMap::with_capacity_and_hasher(n, ByAddr::default())))
 }
 
 fn encode<'py>(
     py: Python<'py>,
     obj: &Bound<'py, PyAny>,
-    strings: Option<std::collections::HashMap<usize, u32>>,
+    strings: Option<std::collections::HashMap<usize, u32, ByAddr>>,
 ) -> Option<Bound<'py, PyBytes>> {
     let version = if strings.is_some() { VERSION_SHARED } else { VERSION };
-    let mut enc =
-        Encoder { out: Vec::with_capacity(1 << 16), seen: std::collections::HashSet::new(), ty: Types::get(), strings };
+    let mut enc = Encoder {
+        out: Vec::with_capacity(1 << 16),
+        seen: std::collections::HashSet::default(),
+        ty: Types::get(),
+        strings,
+    };
     enc.out.push(version);
     // SAFETY: the GIL is held (`py`), and `obj` is alive for the call.
     if !unsafe { enc.value(obj.as_ptr(), 0) } {

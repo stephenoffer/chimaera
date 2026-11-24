@@ -65,14 +65,38 @@ def test_a_large_str_is_encoded_once_and_comes_back_exactly():
     from chimaera import _serde
 
     arena = _arena()
-    s = "é" * (1 << 20) + "ascii" + "\ud800"  # 2 MiB of UTF-8, and a lone surrogate pickle allows
-    assert _serde.dumps_parts(s)[2] == 1, "the encoded string travels out of band, not in the pickle"
-    claims = _native.arena_stats()[3]
-    f = ch.put(s)
-    if arena:
-        assert _native.arena_stats()[3] == claims + 1, "the encoded bytes were linked, not copied again"
-    assert ch.get(f) == s
-    assert length_and_last.remote(s).result(timeout=60) == (len(s), "\ud800")
+    for s, linked in [
+        ("é" * (1 << 20) + "ascii" + "\ud800", 0),  # 2 MiB of UTF-8, and a lone surrogate pickle allows
+        ("x" * (8 << 20) + "\ud800", 1),
+    ]:
+        assert _serde.dumps_parts(s)[2] == 1, "the encoded string travels out of band, not in the pickle"
+        claims = _native.arena_stats()[3]
+        f = ch.put(s)
+        if arena:
+            # Below 8 MiB the encoded bytes are written from the heap, one copy
+            # with no arena pages to fault in; from 8 MiB they are linked.
+            assert _native.arena_stats()[3] == claims + linked, "written below 8 MiB, linked from 8 MiB"
+        assert ch.get(f) == s
+        assert length_and_last.remote(s).result(timeout=60) == (len(s), "\ud800")
+
+
+def test_a_str_encoded_on_the_heap_is_what_pickle_would_encode():
+    for s in ["", "ascii", "é" * 1000, "\ud800", "a\udfffb" * 100, "x" * (2 << 20)]:
+        assert _native.encode_utf8_heap(s) == s.encode("utf-8", "surrogatepass")
+
+
+def test_a_read_into_the_heap_is_the_file_s_bytes_and_a_short_file_gives_fewer(tmp_path):
+    from chimaera import _serde
+
+    data = os.urandom(3 << 20)  # 1 to 8 MiB: read into the heap (_native.pread_heap)
+    (tmp_path / "blob").write_bytes(data)
+    fd = os.open(tmp_path / "blob", os.O_RDONLY)
+    try:
+        assert _serde._pread(fd, len(data), 0) == data
+        assert _serde._pread(fd, 2 << 20, 1 << 20) == data[1 << 20 :]
+        assert len(_serde._pread(fd, 2 << 20, 2 << 20)) < 2 << 20, "past the end: fewer bytes, never garbage"
+    finally:
+        os.close(fd)
 
 
 def test_a_large_buffer_keeps_its_contents_as_it_grows_and_shrinks():

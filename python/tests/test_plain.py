@@ -187,7 +187,11 @@ def test_other_arrays_reduce_as_numpys_own():
 
 def test_a_pandas_frame_with_an_object_column_round_trips():
     pd = pytest.importorskip("pandas")
-    df = pd.DataFrame({"id": range(5000), "x": [i / 3 for i in range(5000)], "s": [f"s{i % 7}" for i in range(5000)]})
+    # An object column, as pandas before 3 makes for strings (pandas 3 makes a
+    # string dtype column by default, which is not an object array).
+    s = pd.Series([f"s{i % 7}" for i in range(5000)], dtype=object)
+    df = pd.DataFrame({"id": range(5000), "x": [i / 3 for i in range(5000)], "s": s})
+    assert df["s"].dtype == object
     got = _roundtrip(df)
     assert got.equals(df) and got["s"].dtype == object
 
