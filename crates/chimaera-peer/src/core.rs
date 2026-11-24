@@ -5119,6 +5119,13 @@ impl Core {
         }
         let handle = w.spec.handle;
         if w.kind() == pb::CallKind::CallActorCtor {
+            if host.constructed {
+                // Its instance is built, or restored from its durable state:
+                // this is its constructor sent again (a new leader pushes an
+                // actor's record and constructor once more), and running it
+                // would start the instance over.
+                return;
+            }
             host.ctor = Some(w);
         } else {
             host.mailbox.insert((w.spec.handle, w.spec.seq), w);
