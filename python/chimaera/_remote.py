@@ -302,6 +302,8 @@ def submit_call(rt: Runtime, target: Any, args: tuple[Any, ...], kwargs: dict[st
         rt._reads[key] = reads
     rt.wait_for_room(spec["read_bytes"], site)
     fut: Future[Any] = future_cls(rt, key, site)
+    if getattr(target, "__module__", "").startswith("chimaera."):
+        fut._seen = True  # the runtime's own call (a gang's supervisor...): its errors are its to read
     if reads:
         # Lineage: a lost result is made again by running its call, which reads
         # the same inputs, so they stay while its future does (as well as until

@@ -56,7 +56,8 @@ def test_a_malformed_quota_setting_stops_the_peer():
         home=home,
         timeout=60,
     )
-    assert bad.returncode != 0 and "did not start" in bad.stderr, bad.stderr[-2000:]
+    # The driver names why the peer would not start (older wording: "did not start").
+    assert bad.returncode != 0 and ("did not start" in bad.stderr or "exited while starting" in bad.stderr), bad.stderr[-2000:]
     import os
 
     with open(os.path.join(home, "peer.log")) as f:

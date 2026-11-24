@@ -1012,3 +1012,152 @@ def test_nested_pydantic_models_arrive_whole_or_fail_saying_how_to_fix_it():
     )
     assert r.returncode == 0, r.stderr
     assert r.stdout.split() == ["True"], (pydantic.VERSION, r.stdout)
+
+
+def test_driver_threads_submit_get_and_wait_at_once():
+    # Ray documents ray.get/ray.wait from several driver threads as a special
+    # case; here a threaded driver needs nothing special.
+    r = run_script(
+        """
+        import threading
+        import chimaera as ch
+
+        @ch.remote
+        def sq(x):
+            return x * x
+
+        bad = []
+
+        def worker(k):
+            try:
+                fs = [sq.remote(k * 100 + i) for i in range(30)]
+                done, _ = ch.wait(fs[:10], num_returns=10, timeout=60)
+                if len(done) != 10 or ch.get(fs, timeout=60) != [(k * 100 + i) ** 2 for i in range(30)]:
+                    bad.append(k)
+            except BaseException as e:
+                bad.append(repr(e))
+
+        threads = [threading.Thread(target=worker, args=(k,)) for k in range(12)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        print(bad)
+        """,
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["[]"], r.stdout
+
+
+def test_init_with_other_settings_after_the_first_call_says_so():
+    # Ray's ray.init is first-call-wins: a later runtime_env is silently ignored.
+    r = run_script(
+        """
+        import chimaera as ch
+
+        @ch.remote
+        def one():
+            return 1
+
+        one.remote().result(timeout=60)
+        try:
+            ch.init(env={"MODE": "fast"})
+        except RuntimeError as e:
+            print("refused:", "ch.shutdown()" in str(e))
+        ch.shutdown()
+        ch.init(env={"MODE": "fast"})
+        print(one.remote().result(timeout=60))
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["refused:", "True", "1"], r.stdout
+
+
+def test_importing_and_using_chimaera_leaves_the_programs_logging_alone():
+    # `import ray` replaces root handlers, patches Logger.makeRecord, and its
+    # loggers do not propagate: a program's own logging setup breaks.
+    r = run_script(
+        """
+        import logging, sys
+        logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+        before = (list(logging.getLogger().handlers), logging.Logger.makeRecord, logging.getLogRecordFactory())
+        import chimaera as ch
+
+        @ch.remote
+        def one():
+            return 1
+
+        one.remote().result(timeout=60)
+        after = (list(logging.getLogger().handlers), logging.Logger.makeRecord, logging.getLogRecordFactory())
+        print(before[0] == after[0], before[1] is after[1], before[2] is after[2])
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["True", "True", "True"], r.stdout
+
+
+def test_a_future_pickled_by_one_program_is_read_by_another():
+    # A Ray ObjectRef rebuilt from bytes in another process fails or hangs:
+    # its owner is unknown there. A future names its call, which any program
+    # of the tenant can read while the run that made it lasts.
+    import tempfile
+
+    from conftest import HOME, REPO
+
+    out = os.path.join(tempfile.mkdtemp(prefix="chf", dir="/tmp"), "future.pkl")
+    maker = subprocess.Popen(
+        [sys.executable, "-c", (
+            "import pickle, sys, time\n"
+            "import chimaera as ch\n"
+            "@ch.remote\n"
+            "def sq(x):\n"
+            "    return x * x\n"
+            "f = sq.remote(9)\n"
+            "f.result(timeout=60)\n"
+            f"open({out!r}, 'wb').write(pickle.dumps(f))\n"
+            "time.sleep(30)\n"
+        )],
+        env=dict(os.environ, CHIMAERA_HOME=HOME, CHIMAERA_BIN=BIN, PYTHONPATH=os.path.join(REPO, "python")),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not os.path.exists(out) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        r = run_script(
+            f"""
+            import pickle
+            f = pickle.loads(open({out!r}, "rb").read())
+            print(f.result(timeout=30))
+            """,
+            timeout=120,
+        )
+    finally:
+        maker.kill()
+        maker.wait(timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["81"], r.stdout
+
+
+def test_calls_run_in_the_programs_directory_so_relative_paths_work():
+    # Ray's workers run in /tmp/ray/session_*: open("data.csv") fails there.
+    r = run_script(
+        """
+        import os
+        import chimaera as ch
+
+        with open("data.csv", "w") as f:
+            f.write("a,b")
+
+        @ch.remote
+        def where(driver_cwd):
+            return os.getcwd() == driver_cwd, open("data.csv").read()
+
+        print(*where.remote(os.getcwd()).result(timeout=60))
+        """,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["True", "a,b"], r.stdout
