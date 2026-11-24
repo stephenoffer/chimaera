@@ -542,12 +542,15 @@ impl Work {
     }
 
     /// May run as a guest beside waiting calls (sharing): a plain call with no
-    /// external effects and not a gang's (a rank sets process-wide variables
-    /// and torch's per-process group). shortcut: gang calls are known by their
-    /// module's name; give Policy a flag if `chimaera._gang` moves.
+    /// external effects, no memory limit (a kill for memory takes the whole
+    /// process, its host included, and the call's retries would do it again),
+    /// and not a gang's (a rank sets process-wide variables and torch's
+    /// per-process group). shortcut: gang calls are known by their module's
+    /// name; give Policy a flag if `chimaera._gang` moves.
     fn guest_ok(&self) -> bool {
         matches!(self.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem)
             && self.spec.effects() != pb::Effects::External
+            && self.policy.memory_limit == 0
             && !self.policy.fn_name.starts_with("chimaera._gang.")
     }
 
@@ -3262,6 +3265,12 @@ impl Core {
         found.map(|(_, id)| id)
     }
 
+    /// What `pid`'s NumPy arena holds now (Linux: arrays allocated as tmpfs
+    /// files), read fresh: the 100 ms sample can miss one just allocated.
+    fn arena_bytes(&self, pid: u32) -> u64 {
+        crate::stores::dir_bytes(&self.objects.dir().join(".arena").join(pid.to_string()))
+    }
+
     /// A guest starts on `exec`: from now its process is measured in slices.
     /// The calls there ran alone until now, so each gets what the process
     /// used since its start reading, and what it holds now. Returns the
@@ -3269,8 +3278,8 @@ impl Core {
     /// just before it waited, after the last sample).
     fn begin_sharing(&mut self, exec: u32) -> u64 {
         self.slice(exec);
-        let Some((pid, arena, last)) = self.execs.get(&exec).map(|e| (e.pid, e.arena, e.private)) else { return 0 };
-        let held = budget::private_bytes(pid).unwrap_or(last) + arena;
+        let Some((pid, last)) = self.execs.get(&exec).map(|e| (e.pid, e.private)) else { return 0 };
+        let held = budget::private_bytes(pid).unwrap_or(last) + self.arena_bytes(pid);
         let now = accounting::read(pid).map(|r| r.cpu_ns);
         for r in self.running.iter_mut().filter(|r| r.exec == exec && !r.sliced) {
             r.sliced = true;
@@ -3291,9 +3300,9 @@ impl Core {
         if !self.running.iter().any(|r| r.exec == exec && r.sliced) {
             return;
         }
-        let Some((pid, mark, arena)) = self.execs.get(&exec).map(|e| (e.pid, e.cpu_mark, e.arena)) else { return };
+        let Some((pid, mark)) = self.execs.get(&exec).map(|e| (e.pid, e.cpu_mark)) else { return };
         let now = accounting::read(pid).map(|r| r.cpu_ns);
-        let held = budget::private_bytes(pid).map(|p| p + arena);
+        let held = budget::private_bytes(pid).map(|p| p + self.arena_bytes(pid));
         let mut on: Vec<&mut Running> = self.running.iter_mut().filter(|r| r.exec == exec && r.sliced).collect();
         let active: Vec<bool> = on.iter().map(|r| !r.blocked).collect();
         let mut own: Vec<Option<u64>> = on.iter().map(|r| r.cpu_own).collect();

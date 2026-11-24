@@ -139,11 +139,12 @@ def test_a_guest_is_measured_apart_from_its_waiting_host(one_cpu):
         import time
         import numpy as np
         import chimaera as ch
+        from chimaera._runtime import Runtime
 
         @ch.remote
         def child():
             a = np.ones(20 * 2**20 // 8)
-            end = time.process_time() + 0.3
+            end = time.process_time() + 2.0
             while time.process_time() < end:
                 pass
             time.sleep(0.3)  # several 100 ms memory samples
@@ -154,16 +155,20 @@ def test_a_guest_is_measured_apart_from_its_waiting_host(one_cpu):
             a = np.ones(300 * 2**20 // 8)
             c = child.remote()
             c.result()
-            deadline = time.monotonic() + 10
-            while not (attempts := c.explain()["attempts"]) or not attempts[-1].get("measures"):
+            return c.key, float(a[-1])
+
+        def measures(key):
+            # Read by the driver, so the parent spends no CPU waiting for them.
+            client = Runtime.get().client
+            deadline = time.monotonic() + 30
+            while not (attempts := client.explain(key)["attempts"]) or not attempts[-1].get("measures"):
                 assert time.monotonic() < deadline
-                time.sleep(0.05)
-            return attempts[-1]["measures"], float(a[-1])
+                time.sleep(0.1)
+            return attempts[-1]["measures"]
 
         f = parent.remote()
-        child, _ = f.result(timeout=60)
-        time.sleep(0.5)
-        mine = f.explain()["attempts"][-1]["measures"]
+        key, _ = f.result(timeout=120)  # a few seconds, unless the host is swamped
+        child, mine = measures(key), measures(f.key)
         for name, m in (("child", child), ("parent", mine)):
             print(name, m["memory_private_peak_bytes"][0] / 2**20, m["cpu_seconds"][0])
         """,
@@ -176,9 +181,10 @@ def test_a_guest_is_measured_apart_from_its_waiting_host(one_cpu):
     # Its own 20 MiB, not the 300 its host held when it began.
     assert 15 <= child_mib < 100, got
     assert parent_mib >= 300, got
-    # The child's loop is its own; the waiting parent's CPU leaves it out.
-    assert 0.25 <= child_cpu <= 0.6, got
-    assert parent_cpu < 0.25, got
+    # The child's 2 s loop is its own; the waiting parent's CPU leaves it out.
+    # The parent's own work is importing numpy and allocating 300 MiB.
+    assert 1.8 <= child_cpu <= 3.0, got
+    assert parent_cpu < child_cpu - 0.6, got
 
 
 def test_a_cancelled_guest_stops_while_its_host_goes_on(one_cpu):
@@ -216,7 +222,10 @@ def test_a_cancelled_guest_stops_while_its_host_goes_on(one_cpu):
     assert what == "cancelled" and float(waited) < 10, r.stdout
 
 
-def test_a_guest_over_its_memory_limit_fails_alone(one_cpu):
+def test_a_call_with_a_memory_limit_runs_in_a_process_of_its_own(one_cpu):
+    # A kill for memory takes the whole process: a call that can be killed for
+    # its own memory is never a guest, so its waiting parent is never killed
+    # with it (nor again on each of its retries).
     r = run_script(
         """
         import time
@@ -239,16 +248,12 @@ def test_a_guest_over_its_memory_limit_fails_alone(one_cpu):
 
         f = parent.remote()
         print(f.result(timeout=120))
-        print([a.get("end_reason") for a in f.explain()["attempts"]])
-        print(f.explain()["attempts"][0].get("detail", ""))
+        print(len(f.explain()["attempts"]))
         """,
         home=one_cpu,
         timeout=180,
     )
     assert r.returncode == 0, r.stderr
-    result, reasons, detail = r.stdout.splitlines()[-3:]
+    result, attempts = r.stdout.splitlines()[-2:]
     assert result == "greedy ran out of memory", r.stdout
-    # The parent lost its worker to its guest's memory: retried as an
-    # infrastructure failure, not blamed (no OOM, no memory hint).
-    assert "oom" not in reasons and "killed" in reasons, r.stdout
-    assert "another call running beside it" in detail, r.stdout
+    assert attempts == "1", r.stdout  # the parent was never killed beside it

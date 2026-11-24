@@ -20,6 +20,7 @@ import logging
 import os
 import pickle
 import queue
+import select
 import signal
 import sys
 import sysconfig
@@ -170,8 +171,16 @@ class _Stdout:
 
     def pump(self) -> None:
         partial = b""
-        while data := os.read(self.r, 65536):
-            self.seen += len(data)
+        while True:
+            select.select([self.r], [], [])
+            # Counted while still in the pipe, so a drain that finds neither
+            # unread bytes nor new counted ones has nothing in flight.
+            n = _unread(self.r)
+            self.seen += n
+            data = os.read(self.r, n or 65536)
+            if not data:
+                return
+            self.seen += max(0, len(data) - n)
             *lines, partial = (partial + data).split(b"\n")
             for line in lines:
                 if line == self._DRAIN[:-1]:
@@ -183,14 +192,16 @@ class _Stdout:
                 else:
                     os.write(self.log, line + b"\n")
 
-    def drain(self, seen_before: int) -> None:
+    def drain(self, seen_before: int, wait: float = 1.0) -> None:
         """Before a call ends: forward what it wrote that is still in the pipe
-        (only if it wrote anything, so quiet calls pay nothing)."""
-        if self.seen == seen_before and not _unread(self.r):
+        (only if it wrote anything, so quiet calls pay nothing). The pipe is
+        read before the count: the pump counts bytes before it takes them,
+        so a byte is always in one or the other."""
+        if not _unread(self.r) and self.seen == seen_before:
             return
         self.drained.clear()
         os.write(1, self._DRAIN)
-        self.drained.wait(1.0)
+        self.drained.wait(wait)
 
 
 def _unread(fd: int) -> int:
@@ -699,7 +710,9 @@ class Executor:
             sys.stdout.flush()
             sys.stderr.flush()
             if self.stdout is not None and not self.active(besides=key):
-                self.stdout.drain(seen)
+                # Beside other calls, a line forwarded once this one ends would
+                # go to them: wait longer for it under load.
+                self.stdout.drain(seen, 5.0 if len(self.running) > 1 else 1.0)
             if token is not None:
                 _context.reset(token)
             self.running.pop(key, None)
