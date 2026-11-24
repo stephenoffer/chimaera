@@ -99,7 +99,7 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | `inspect_serializability` | Submission preflight names the unpicklable variable and its path | Today (names the argument or captured variable) / P3 (path inside the object) |
 | `ray memory`, `get_object_locations` | `chimaera memory RUN` and `ch.runs.cluster().objects(run=)`: owner, holders, size, who pins it | New (P4) |
 | `ObjectStoreFullError`, `OutOfDiskError` | `ch.DiskFull` with the budget and the largest holders; objects spill before that | Partly today (an `OSError` naming the disk and its free space) / M3 (`ch.DiskFull`) |
-| `put(_tensor_transport="nixl")` | `ch.put(tensor, transport="device")` | P5 |
+| `put(_tensor_transport="nixl")` | `ch.put(tensor)` of a CUDA tensor: through CUDA IPC on the same machine, else from its host copy; across machines GPU to GPU over NCCL with `CHIMAERA_CUDA_NET=1`, or NIXL with `CHIMAERA_CUDA_NET=nixl` | Today, opt-in: unauthenticated and unencrypted, for trusted cluster networks; on plain TCP the host copy measured faster |
 | Ray Direct Transport (alpha), `tensor_transport=` on methods | `transport="device"` on any call or method; transport negotiated per pair (D5) | P5 |
 
 ### Scheduling and placement

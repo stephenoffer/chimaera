@@ -92,16 +92,32 @@ Every case where Chimaera is slower than Ray, or barely faster:
 
 | data, pattern | vs Ray | why | what helps |
 |---|---:|---|---|
-| small results through `return` and `pipeline`, and 1 MiB `str`, `bytes` and list results | 0.35–0.4x for an empty call; 0.45–0.99x for 1 MiB results | The call path, not the objects: an empty call returns in 1.07 ms against Ray's 0.37 ms, and a two-call pipeline takes 2.0 ms against 0.80 ms. From 16 MiB the values' own speed wins. | Outside the object store (the runtime's call path). |
+| one actor's result passed to another actor (`b.f.remote(a.g.remote())`, `pipeline`), and 1 MiB `str` through it | 0.4x for an empty call (1.84–1.87 ms against 0.75–0.81 ms); 0.7x for 1 MiB `str` | The call path, not the objects: the second call waits for the first one's record through the peer. Timed one by one, the empty case's median is level (806–820 µs against 886–895 µs), but its p99 is 1.94–2.0 ms against 1.07–1.25 ms. Larger values pass faster: 1 MiB `bytes` 2.7–3.9x, lists 3.3–3.5x. | Outside the object store (the runtime's call path). |
+| 1 MiB `str` through `return` | 0.9–1.0x | Not known yet. It is not the call path: other 1 MiB results are 1.6–1.8x faster on the same call. A 1 MiB `str` put varies the same way (below). | - |
 | pandas with object columns, put of 1 MiB | 0.88x (return and pipeline of 1 MiB 1.0x; 1.08–1.74x from 16 MiB, and get 1.2x at 1 MiB) | At this size pandas' own pickling of the frame's structure and the call path cost more than the column's values, which the codec (below) now encodes. | NumPy or Arrow columns, or `category` dtype. |
 | `str` get of 16 MiB | 0.94–0.99x (1.4x at 1 MiB, 1.8x at 256 MiB) | Decoding the UTF-8 into a new `str` is the cost in both. | - |
-| writing 3x the memory limit (spill) | 0.5–0.7x (16 MB objects: 7.6 s against 5.0 s; 256 MB: 14.6 s against 8.1 s) | Each new array is allocated in shared memory. With shared-memory huge pages off (`shmem_enabled=never`, the usual default), first-touch faults there cost more than on Ray's heap, where NumPy gets huge pages through `madvise`. Writing such arrays to disk at birth once memory passes the spill line was slower (16 MB: 7.4 s → 11.2 s; 256 MB: 15.0 s → 18.6 s): the put then waits for a disk write the background spiller does off the critical path. Populating new blocks in parallel (below) did not change it. | Larger memory limit, reusing arrays, or a huge-page tmpfs. |
+| writing 3x the memory limit (spill) | 0.5–0.7x (16 MB objects: 7.6 s against 5.0 s; 256 MB: 14.6 s against 8.1 s) | Each new array is allocated in shared memory. With shared-memory huge pages off (`shmem_enabled=never`, the usual default), first-touch faults there cost more than on Ray's heap, where NumPy gets huge pages through `madvise`. Writing such arrays to disk at birth once memory passes the spill line was slower (16 MB: 7.4 s → 11.2 s; 256 MB: 15.0 s → 18.6 s): the put then waits for a disk write the background spiller does off the critical path. Populating new blocks in parallel (below) did not change it. The cause is fresh pages: Ray's store reuses the same pages as it spills, while a spilled Chimaera object frees its pages and the next array gets new ones, which the kernel allocates and zeroes. Measured on 2026-11-24 (4 GiB of 64 MiB objects into `/dev/shm`, two runs): fresh tmpfs pages 2.6 s (1.7 GB/s), a heap array copied into warm shared memory as Ray does 1.5 s (2.9 GB/s), and pages already in a tmpfs file, mapped with `MAP_POPULATE`, 0.95 s (4.5 GB/s). | Larger memory limit, reusing arrays, or a huge-page tmpfs. Not built: handing a spilled object's pages to the next array, which would be faster than Ray but is safe only once no process still maps the old object, and only within one run. |
 | many 1 MB objects, get (not re-measured on 2026-11-22) | 1.0x | One file and one copy per object, against Ray's copy into reused memory (puts are 12x faster: linked). | Batch small values into one array. |
 | Arrow tables on 4 KiB pages (not re-measured on 2026-11-22) | about 1.2x | Arrow buffers are copied; the zero-copy allocator covers NumPy only. | Huge pages (6–9x). |
 
 A 1 MiB `str` put measured 1.2x in one run and 0.64x in another on the
 same build (the code it runs did not change between them): treat 1 MiB puts
 of `str` as level with Ray.
+
+Fixed on 2026-11-24: small results through `return`, which were 0.35–0.4x
+Ray for an empty call (1.07 ms against 0.37 ms) and 0.45–0.99x at 1 MiB.
+With the direct actor path (`CHIMAERA_DIRECT`, docs/configuration.md), a
+driver's call to a one-at-a-time actor on its local peer goes straight to
+the actor's worker, which answers it, and the peer records the call just
+after. Two runs of `bench/objects/run.py --scenarios return` the same day,
+on a release peer, the 1 MiB rows minus the empty call:
+
+| same day, 4 KiB pages | Ray | Chimaera |
+|---|---:|---:|
+| empty call | 359 / 365 µs | 200 / 200 µs (**1.8x**) |
+| `bytes` return, 1 MiB | 527 / 496 µs | 290 / 303 µs (**1.8x / 1.6x**) |
+| list return, 1 MiB | 2.32 / 2.28 ms | 1.26 / 1.25 ms (**1.8x**) |
+| `str` return, 1 MiB | 935 / 983 µs | 992 / 999 µs (0.9x / 1.0x) |
 
 Fixed on 2026-11-22: plain dicts and lists. A top-level dict, list or tuple
 of at least 1024 items made of `str`, `bytes`, `int` (to 64 bits), `float`,
@@ -234,6 +250,34 @@ Both spill to the same NVMe disk.
 
 Both runtimes read back every object correctly. Chimaera's write rate is
 still the slower one; the next section explains why.
+
+Spilling to S3 (`CHIMAERA_SPILL_URL`, 2026-11-24, one workspace node, a 64
+MiB pool): 2,000 `put`s of 64 KiB NumPy arrays went up as 2 packs, not 2,000
+objects, like Ray's fusing up to `min_spilling_size`. Every value read back
+correct, each with one ranged read of its pack. Freeing the values while the
+run went on deleted both packs, and so did ending the run with them still
+held: nothing was left in the bucket or in the peer's restore cache.
+
+## CUDA tensors across machines
+
+Two g5.2xlarge nodes (one A10G each, plain TCP: no EFA), a CUDA tensor put
+on one and read by a call granted a GPU on the other (best of 3, including
+the call):
+
+| read on the other machine's GPU | host copy (the default here) | NCCL (`CHIMAERA_CUDA_NET=1`) | NIXL (`CHIMAERA_CUDA_NET=nixl`, 2026-11-24) |
+|---|---:|---:|---:|
+| 256 MiB | 345 ms | 470 ms | 824 ms |
+| 1 GiB | 1,184 ms | 1,852 ms | 3,032 ms |
+
+The NIXL run used UCX over the same TCP network (no EFA here); the same day
+NCCL measured 505 ms and 1,873 ms and the host copy 323 ms and 1,233 ms.
+
+Both arrive on the reader's granted GPU (`cuda:0`), and a reader without a
+GPU gets a CPU tensor. On TCP, NCCL's socket transport is the slower one
+whatever its socket count (4 to 16 measured alike), and NIXL slower still,
+so both are off unless `CHIMAERA_CUDA_NET` asks for one. On an RDMA network
+(InfiniBand, EFA) they skip both the host copy's fetch and its copy up to
+the GPU; that was not measured here.
 
 ## Recovery: a node dies holding values
 
@@ -371,6 +415,8 @@ The full feature comparison with Ray's object store is in
   (huge). At 1–16 MB it is 0.7–1.3x, and one 16 MB get on huge pages
   measured 6.0 ms against 2.8 ms in the previous run (0.5x Ray); that run
   was not repeated, so whether it is noise is not known.
-- **The call path** (1.9 ms per actor call against Ray's 0.37 ms) is not part
-  of this work; it hides the object path for small values in `return` and
-  `pipeline`.
+- **The call path** for one actor's result passed to another is still
+  0.4x Ray (in the table at the top); results through `return` are now
+  1.8x faster (fixed above). The per-type `return` and `pipeline` rows
+  below were measured before the direct path, so their small sizes show
+  the old call path.

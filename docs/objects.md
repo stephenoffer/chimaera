@@ -145,6 +145,28 @@ memory a handle names is never freed while a reader may open it. Readers
 on other machines, readers that cannot see that GPU, and the owner itself
 use the host copy. `CHIMAERA_CUDA_IPC=0` turns the handle off.
 
+Across machines, with `CHIMAERA_CUDA_NET=1`, a put CUDA tensor is also
+offered for NCCL (`chimaera._gpunet`): a call granted a GPU on another
+machine asks the putting process, and the two send it GPU to GPU through a
+two-rank NCCL group kept for that pair. The host copy is then stored as a
+blob of its own, replicated as usual and fetched only when that fails (the
+putting process gone, no NCCL), so a dead holder costs speed, never the
+value. A reader without a GPU still gets a CPU tensor. It is off by default:
+these transfers are neither authenticated nor encrypted (the token in each
+value is the only capability), so turn it on only on a trusted cluster
+network. It is meant for RDMA networks (InfiniBand, EFA): on plain TCP,
+NCCL's socket transport was slower than the host copy (1 GiB in 2.5 s
+against 1.8 s between two 10 Gb/s g5 nodes, with 4 to 16 sockets alike).
+
+`CHIMAERA_CUDA_NET=nixl` sends such tensors with NIXL instead, Ray Direct
+Transport's other option: the putting process registers the tensor's memory
+and tells the reader where it is, and the reader reads it one-sided (UCX,
+or LIBFABRIC where an EFA device is present), with no group to set up. Both
+sides need the `nixl` package (`pip install nixl nixl-cu12`); a holder
+without it leaves the reader the host copy. On plain TCP it was the slowest
+of the three (1 GiB in 3.0 s, against 1.9 s over NCCL and 1.2 s for the host
+copy, between two g5 nodes), so it is for RDMA networks.
+
 `ch.wait(fs, fetch_local=True)` also copies each finished value (its file
 and any blobs it names) to this host before returning, as Ray's
 `fetch_local` does. Waiting never moves data otherwise.
@@ -239,6 +261,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | `CHIMAERA_SPILL_URL` | unset | spill to object storage (`s3://bucket/prefix`, `gs://`, `az://`, `file://`) instead of disk; needs a peer built with the `object-store-spill` cargo feature (off by default) |
 | `CHIMAERA_MACHINE_ID` | the boot id | peers with the same id take objects from each other's stores (tests set one per peer to stand for separate machines) |
 | `CHIMAERA_CUDA_IPC` | `1` | `0`: a put CUDA tensor carries no IPC handle; same-machine readers use the host copy |
+| `CHIMAERA_CUDA_NET` | unset (off) | `1`: a put CUDA tensor read on another machine goes GPU to GPU over NCCL; `nixl`: with NIXL's one-sided reads (needs the `nixl` package on both sides). Unauthenticated and unencrypted, so for trusted cluster networks only; on plain TCP both are slower than the host copy |
 | `CHIMAERA_OBJECT_REPLICAS` | `1` | copies of each object on other peers; `0`: none |
 | `CHIMAERA_REPLICA_DELAY_MS` | `0` | how long a new object waits before it is copied to another peer. At `0` a `put` value is protected as soon as it is written. A wait (say `1000`) lets a reader on another peer make that copy instead, saving a transfer for objects read elsewhere soon after they are written, but a peer that dies within the wait takes the object with it |
 
@@ -252,8 +275,8 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | pickle 5 out-of-band buffers, `register_serializer` | the same, `ext.register_serializer` |
 | `object_store_memory` | `CHIMAERA_MEMORY_POOL` |
 | huge pages (`_plasma_directory` plus a flag) | a mounted huge-page tmpfs is found and used; `CHIMAERA_OBJECT_DIR` |
-| spill to local disk, `object_spilling_config` directories (one or several) | `spill/`, or the directories in `CHIMAERA_SPILL_DIR`, each in turn; past the hard cap, new objects are written to disk directly |
-| spill to S3 through `smart_open` (marked not for production) | `CHIMAERA_SPILL_URL`: S3, GCS, Azure or `file://`, uploaded in 16 MiB parts several at a time. A spilled object is downloaded on its first read (or when another peer fetches it), and its remote copy is deleted with its run. Credentials and region come from the usual `AWS_*`/`GOOGLE_*`/`AZURE_*` variables or the machine's role. An S3 bucket's region is looked up when none is set |
+| spill to local disk, `object_spilling_config` directories (one or several) | `spill/`, or the directories in `CHIMAERA_SPILL_DIR`, each in turn; past the hard cap, new objects are written to disk directly. On disk each object keeps a file of its own (Ray fuses small ones there too), so a restore is a mapping of it and a freed object gives its space back at once |
+| spill to S3 through `smart_open` (marked not for production) | `CHIMAERA_SPILL_URL`: S3, GCS, Azure or `file://`, uploaded in 16 MiB parts several at a time. Objects under 4 MiB go up together, a run's at a time, packed into objects of up to 64 MiB (Ray's `min_spilling_size`): 2,000 objects of 64 KiB are 2 uploads, not 2,000. A spilled object is downloaded on its first read (or when another peer fetches it), a packed one with one ranged read of its pack. Its remote copy is deleted when it is freed (a pack, when the last of its objects is) or with its run. Credentials and region come from the usual `AWS_*`/`GOOGLE_*`/`AZURE_*` variables or the machine's role. An S3 bucket's region is looked up when none is set |
 | `object_spilling_threshold`, `max_io_workers` | `CHIMAERA_SPILL_THRESHOLD`, `CHIMAERA_SPILL_THREADS` |
 | restore: a copy back into the store | a mapping of the disk file: no copy |
 | `ObjectStoreFullError` after the fallback allocator fills | no store-full error: memory, then disk; a full disk is an `OSError` naming it |
@@ -266,12 +289,11 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 
 Not matched yet:
 
-- `min_spilling_size`: Ray packs small objects into larger spill files;
-  Chimaera spills one file per object.
-- Device tensors moved between GPUs on different machines without the
-  host copy (Ray Direct Transport over NCCL/NIXL, `_tensor_transport`): P5
-  of the layered-API plan. On one machine, a put CUDA tensor is read device
-  to device through CUDA IPC.
+- Nothing in Ray's object store. Ray Direct Transport's NIXL option is
+  `CHIMAERA_CUDA_NET=nixl` (see CUDA tensors above); its gloo option, for
+  CPU tensors, is not needed here, since a CPU tensor is a shared-memory
+  object read in place on one machine and fetched in parallel ranges
+  across machines.
 
 ## Limits
 
