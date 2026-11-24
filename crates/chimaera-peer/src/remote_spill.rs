@@ -60,6 +60,19 @@ impl RemoteSpill {
         }
     }
 
+    /// Download `len` bytes from `offset` of object `name` of run `run` (an
+    /// object packed with others, see ObjectStore::spill_pack) to `dest`,
+    /// atomically; its size.
+    pub fn download_range(&self, run: &str, name: &str, offset: u64, len: u64, dest: &Path) -> io::Result<u64> {
+        #[cfg(feature = "object-store-spill")]
+        return self.inner.download_range(run, name, offset, len, dest);
+        #[cfg(not(feature = "object-store-spill"))]
+        {
+            let _ = (run, name, offset, len, dest);
+            unreachable!("opened only with the feature")
+        }
+    }
+
     /// Delete the remote copies of `objects` of `run`, or the run's whole
     /// prefix when `objects` is None. In the background: never blocks a caller.
     pub fn delete(&self, run: &str, objects: Option<Vec<String>>) {
@@ -207,6 +220,34 @@ mod imp {
                 .await;
                 match got.and_then(|()| std::fs::rename(&tmp, &dest)) {
                     Ok(()) => Ok(n),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        Err(e)
+                    }
+                }
+            })
+        }
+
+        pub fn download_range(&self, run: &str, name: &str, offset: u64, len: u64, dest: &Path) -> io::Result<u64> {
+            let (store, path, dest) = (self.store.clone(), self.path(run, name), dest.to_path_buf());
+            self.run(async move {
+                let bytes = store.get_range(&path, offset..offset + len).await.map_err(err)?;
+                if bytes.len() as u64 != len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the pack is shorter than its index says",
+                    ));
+                }
+                if let Some(dir) = dest.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let tmp = dest.with_extension(format!(
+                    "part-restore-{}-{}",
+                    std::process::id(),
+                    SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &dest)) {
+                    Ok(()) => Ok(len),
                     Err(e) => {
                         let _ = std::fs::remove_file(&tmp);
                         Err(e)

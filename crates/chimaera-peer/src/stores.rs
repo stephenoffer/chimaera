@@ -138,12 +138,22 @@ pub struct ObjectStore {
     next_spill: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Object storage that spilled objects go to instead (CHIMAERA_SPILL_URL).
     remote: Option<std::sync::Arc<crate::remote_spill::RemoteSpill>>,
+    /// Objects still stored in each pack uploaded by this process, by (run,
+    /// pack): the pack is deleted when its last one is freed (after a
+    /// restart, with its run).
+    packs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), usize>>>,
 }
 
 impl ObjectStore {
     pub fn open(dir: PathBuf) -> io::Result<ObjectStore> {
         std::fs::create_dir_all(&dir)?;
-        Ok(ObjectStore { dir, spill: Vec::new(), next_spill: Default::default(), remote: None })
+        Ok(ObjectStore {
+            dir,
+            spill: Vec::new(),
+            next_spill: Default::default(),
+            remote: None,
+            packs: Default::default(),
+        })
     }
 
     /// Spill to `dirs` (on disk) when the store itself is in memory (tmpfs).
@@ -170,6 +180,17 @@ impl ObjectStore {
             return Ok(true);
         }
         let (Some(remote), Ok(target)) = (&self.remote, std::fs::read_link(&path)) else { return Ok(false) };
+        // Packed with other small objects: its range of the pack (spill_pack).
+        if let Ok(entry) = std::fs::read_to_string(target.with_extension("pack")) {
+            let f: Vec<&str> = entry.split_whitespace().collect();
+            let (Some(pack), Some(offset), Some(len)) =
+                (f.first(), f.get(1).and_then(|o| o.parse().ok()), f.get(2).and_then(|l| l.parse().ok()))
+            else {
+                return Err(io::Error::other(format!("a malformed pack index for {}", hex(object))));
+            };
+            remote.download_range(&hex(run), pack, offset, len, &target)?;
+            return Ok(true);
+        }
         remote.download(&hex(run), &hex(object), &target)?;
         Ok(true)
     }
@@ -218,9 +239,31 @@ impl ObjectStore {
             planned += len;
             picked.push((len, path));
         }
-        let next = std::sync::atomic::AtomicUsize::new(0);
         let moved = std::sync::atomic::AtomicU64::new(0);
         let failed: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
+        // To object storage, small objects go several to one upload (Ray's
+        // fused spilling): one request each would cost more than their bytes.
+        let picked = match &self.remote {
+            Some(remote) => {
+                let (small, large): (Vec<_>, Vec<_>) = picked.into_iter().partition(|(len, _)| *len < PACK_MAX_OBJECT);
+                let mut single = large;
+                for batch in pack_batches(small) {
+                    if batch.len() < 2 {
+                        single.extend(batch);
+                        continue;
+                    }
+                    match self.spill_pack(remote, &batch) {
+                        Ok(n) => {
+                            moved.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => *failed.lock().expect("lock") = Some(e),
+                    }
+                }
+                single
+            }
+            None => picked,
+        };
+        let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|s| {
             for _ in 0..spill_threads().min(picked.len()) {
                 s.spawn(|| {
@@ -248,6 +291,50 @@ impl ObjectStore {
         }
     }
 
+    /// Upload small in-memory objects of one run as one object storage object
+    /// (a pack), then make each one's path a link to its cache file, with an
+    /// index beside that file naming its range of the pack: the first reader
+    /// restores it with one ranged read (ensure_local). The pack goes with
+    /// its run (delete_run), however many of its objects are freed sooner.
+    fn spill_pack(&self, remote: &crate::remote_spill::RemoteSpill, members: &[(u64, PathBuf)]) -> io::Result<u64> {
+        use std::io::Write;
+        let rel = |p: &Path| p.strip_prefix(&self.dir).expect("listed under the store").to_path_buf();
+        let run_rel = rel(&members[0].1).parent().map(Path::to_path_buf).unwrap_or_default();
+        let Some(run) = run_rel.to_str() else { return Err(io::Error::other("not an object path")) };
+        let mut id = [0u8; 8];
+        getrandom(&mut id)?;
+        let name = format!("pack-{}", hex(&id));
+        let tmp = remote.cache.join(run).join(format!(".{name}.tmp"));
+        std::fs::create_dir_all(tmp.parent().expect("run directory"))?;
+        let mut ranges = Vec::with_capacity(members.len());
+        let written: io::Result<()> = (|| {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+            let mut at = 0u64;
+            for (_, path) in members {
+                let data = std::fs::read(path)?;
+                f.write_all(&data)?;
+                ranges.push((at, data.len() as u64));
+                at += data.len() as u64;
+            }
+            f.flush()
+        })();
+        let uploaded = written.and_then(|()| remote.upload(&tmp, run, &name));
+        let _ = std::fs::remove_file(&tmp);
+        uploaded?;
+        let mut total = 0;
+        for ((_, path), (offset, len)) in members.iter().zip(ranges) {
+            let target = remote.cache.join(rel(path));
+            std::fs::write(target.with_extension("pack"), format!("{name} {offset} {len}\n"))?;
+            let link = path.with_extension("spilling");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link)?;
+            std::fs::rename(&link, path)?; // readers see the file or the link
+            total += len;
+        }
+        self.packs.lock().expect("lock").insert((run.to_string(), name), members.len());
+        Ok(total)
+    }
+
     /// Upload one in-memory object to object storage and make its path a
     /// link to its cache file, which the first reader restores.
     fn spill_remote(&self, remote: &crate::remote_spill::RemoteSpill, path: &Path) -> io::Result<()> {
@@ -260,6 +347,7 @@ impl ObjectStore {
         remote.upload(path, run, object)?;
         let target = remote.cache.join(rel);
         std::fs::create_dir_all(target.parent().expect("run directory"))?;
+        std::fs::write(target.with_extension("remote"), b"")?; // remove() deletes the upload
         let link = path.with_extension("spilling");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&target, &link)?;
@@ -300,21 +388,43 @@ impl ObjectStore {
 
     fn remove(&self, run: &[u8], object: &[u8]) {
         let path = self.path(run, object);
-        let remote = self.remote.as_ref().filter(|r| self.spilled_remotely(r, &path));
         let _ = std::fs::remove_file(&path);
         for spill in &self.spill {
             let _ = std::fs::remove_file(spill.join(hex(run)).join(hex(object)));
         }
-        if let Some(remote) = remote {
-            let _ = std::fs::remove_file(remote.cache.join(hex(run)).join(hex(object)));
-            remote.delete(&hex(run), Some(vec![hex(object)]));
+        if let Some(remote) = &self.remote {
+            let run = hex(run);
+            if let Some(gone) = self.forget_remote(remote, &run, &hex(object)) {
+                remote.delete(&run, Some(vec![gone]));
+            }
         }
     }
 
-    /// Whether the object at `path` was spilled to object storage (its path
-    /// links into the remote cache).
-    fn spilled_remotely(&self, remote: &crate::remote_spill::RemoteSpill, path: &Path) -> bool {
-        std::fs::read_link(path).is_ok_and(|t| t.starts_with(&remote.cache))
+    /// Drop this peer's record of an object it spilled to object storage:
+    /// its cache file and the sidecar its spill wrote there (`.remote` for
+    /// an upload of its own, `.pack` for a range of a pack). The record, not
+    /// the object's path, decides: that path may be gone already (a driver
+    /// unlinks the put values it owns before the peer hears of their
+    /// release). Returns the name to delete from object storage: the
+    /// object's upload, or a pack whose last live member this was.
+    fn forget_remote(&self, remote: &crate::remote_spill::RemoteSpill, run: &str, object: &str) -> Option<String> {
+        let cached = remote.cache.join(run).join(object);
+        let _ = std::fs::remove_file(&cached);
+        if std::fs::remove_file(cached.with_extension("remote")).is_ok() {
+            return Some(object.to_string());
+        }
+        let index = cached.with_extension("pack");
+        let pack = std::fs::read_to_string(&index).ok()?.split_whitespace().next()?.to_string();
+        let _ = std::fs::remove_file(&index);
+        let key = (run.to_string(), pack);
+        let mut packs = self.packs.lock().expect("lock");
+        let left = packs.get_mut(&key)?; // unknown after a restart: it goes with its run
+        if *left > 1 {
+            *left -= 1;
+            return None;
+        }
+        packs.remove(&key);
+        Some(key.1)
     }
 
     /// Delete an ended run's content-addressed values: large arguments, uploads
@@ -338,8 +448,8 @@ impl ObjectStore {
                 continue;
             }
             freed += std::fs::metadata(e.path()).map_or(0, |m| m.len());
-            if self.remote.as_ref().is_some_and(|r| self.spilled_remotely(r, &e.path())) {
-                gone.push(name.to_string());
+            if let Some(remote) = &self.remote {
+                gone.extend(self.forget_remote(remote, &run_hex, name));
             }
             let _ = std::fs::remove_file(e.path());
             for spill in &self.spill {
@@ -347,9 +457,6 @@ impl ObjectStore {
             }
         }
         if let Some(remote) = self.remote.as_ref().filter(|_| !gone.is_empty()) {
-            for name in &gone {
-                let _ = std::fs::remove_file(remote.cache.join(&run_hex).join(name));
-            }
             remote.delete(&run_hex, Some(gone));
         }
         freed
@@ -476,6 +583,36 @@ pub async fn read_chunks(
     Ok(rx)
 }
 
+/// Objects smaller than this go to object storage packed with others.
+const PACK_MAX_OBJECT: u64 = 4 << 20;
+/// A pack holds objects up to about this many bytes.
+const PACK_TARGET: u64 = 64 << 20;
+
+/// Small objects to spill, in packs: one run's objects to a pack (it goes
+/// with its run), up to PACK_TARGET bytes each.
+fn pack_batches(small: Vec<(u64, PathBuf)>) -> Vec<Vec<(u64, PathBuf)>> {
+    let mut by_run: std::collections::BTreeMap<PathBuf, Vec<(u64, PathBuf)>> = std::collections::BTreeMap::new();
+    for (len, path) in small {
+        by_run.entry(path.parent().map(Path::to_path_buf).unwrap_or_default()).or_default().push((len, path));
+    }
+    let mut out = Vec::new();
+    for (_, objects) in by_run {
+        let (mut batch, mut bytes) = (Vec::new(), 0);
+        for (len, path) in objects {
+            if bytes + len > PACK_TARGET && !batch.is_empty() {
+                out.push(std::mem::take(&mut batch));
+                bytes = 0;
+            }
+            bytes += len;
+            batch.push((len, path));
+        }
+        if !batch.is_empty() {
+            out.push(batch);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +698,85 @@ mod tests {
         assert!(!store.path(&run.0, &value).exists(), "the stored argument is gone");
         assert!(store.path(&run.0, &result.0).exists(), "the result stays for reattaching clients");
         assert_eq!(store.delete_values(&run), 0);
+    }
+
+    #[cfg(feature = "object-store-spill")]
+    #[test]
+    fn small_objects_go_to_object_storage_packed_and_come_back_one_by_one() {
+        let (mem, bucket, cache) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let url = format!("file://{}", bucket.path().display());
+        let peer = "cd".repeat(16);
+        let remote = crate::remote_spill::RemoteSpill::open(&url, &peer, cache.path().to_path_buf()).unwrap();
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_remote(std::sync::Arc::new(remote));
+        let (run_a, run_b) = (Id::derive(0, 0, &[b"a"]), Id::derive(0, 0, &[b"b"]));
+        let body = |i: u8, n: usize| (0..n).map(|k| i.wrapping_add(k as u8)).collect::<Vec<u8>>();
+        let mut wrote = Vec::new();
+        for (run, i, n) in
+            [(&run_a, 1u8, 3000), (&run_a, 2, 70_000), (&run_a, 3, 1), (&run_b, 4, 5000), (&run_b, 5, 9000)]
+        {
+            let path = store.path(&run.0, &[i]);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body(i, n)).unwrap();
+            wrote.push((run, i, n));
+        }
+        let big = store.path(&run_a.0, &[9]);
+        std::fs::write(&big, body(9, (PACK_MAX_OBJECT + 10) as usize)).unwrap();
+        let all: u64 = wrote.iter().map(|(_, _, n)| *n as u64).sum::<u64>() + PACK_MAX_OBJECT + 10;
+        assert_eq!(store.spill_oldest(u64::MAX).unwrap(), all, "everything went to object storage");
+        let prefix = bucket.path().join(format!("chimaera-{}", &peer[..16]));
+        let listed = |run: &Id| {
+            let mut names: Vec<String> = std::fs::read_dir(prefix.join(run.hex()))
+                .map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            names.sort();
+            names
+        };
+        let (a, b) = (listed(&run_a), listed(&run_b));
+        assert!(a.len() == 2 && a.iter().any(|n| n.starts_with("pack-")) && a.contains(&"09".to_string()), "{a:?}");
+        assert!(b.len() == 1 && b[0].starts_with("pack-"), "one pack per run: {b:?}");
+        for (run, i, n) in &wrote {
+            let path = store.path(&run.0, &[*i]);
+            assert!(!path.exists(), "its path waits for the first reader");
+            assert!(store.ensure_local(&run.0, &[*i]).unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), body(*i, *n), "object {i} restored from its range of the pack");
+        }
+        assert!(store.ensure_local(&run_a.0, &[9]).unwrap(), "a large object comes back on its own");
+        // The last object freed from a pack takes the pack with it, and a large
+        // object its own upload, though their paths were unlinked first (as a
+        // driver does with the put values it owns before releasing them).
+        for i in [1u8, 2, 3] {
+            if i != 3 {
+                std::fs::remove_file(store.path(&run_a.0, &[i])).unwrap();
+            }
+            store.remove(&run_a.0, &[i]);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while listed(&run_a).iter().any(|n| n.starts_with("pack-")) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(listed(&run_a), vec!["09".to_string()], "run a's pack went with its last object");
+        std::fs::remove_file(&big).unwrap();
+        store.remove(&run_a.0, &[9]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !listed(&run_a).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(listed(&run_a).is_empty(), "the large object's upload went with it");
+        // Freeing one packed object leaves the others readable (the pack stays).
+        let first = store.path(&run_b.0, &[4]);
+        store.remove(&run_b.0, &[4]);
+        assert!(!first.exists());
+        let other = store.path(&run_b.0, &[5]);
+        std::fs::remove_file(std::fs::read_link(&other).unwrap()).unwrap(); // its cached copy, as if evicted
+        assert!(store.ensure_local(&run_b.0, &[5]).unwrap());
+        assert_eq!(std::fs::read(&other).unwrap(), body(5, 9000));
+        store.delete_run(&run_b);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !listed(&run_b).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(listed(&run_b).is_empty(), "the pack goes with its run");
     }
 
     #[cfg(feature = "object-store-spill")]
