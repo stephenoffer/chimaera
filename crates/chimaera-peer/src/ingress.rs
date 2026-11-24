@@ -283,28 +283,32 @@ impl Ingress {
         // A cluster of one (or one whose other members are all gone) has
         // nowhere else to place work: grant it here in the submission's own
         // commit, as a local peer does, instead of a placement round and a
-        // second commit per batch.
+        // second commit per batch. Only calls that may run on any peer: the
+        // others are only thought gone (a peer whose core answers a ping late
+        // reports itself draining), and an actor's calls must reach its host.
         let alone = self.router.mesh.as_ref().is_some_and(|m| !m.has_live_others());
         // Local first: plain calls go to this peer's idle CPUs in the
         // submission's own commit (nested calls whose parent waits here, a
         // driver's burst on its own machine). The rest are placed by the
         // group leader, which weighs inputs, labels and devices.
         let mut split: BTreeMap<(u16, bool), Vec<pb::TaskSpec>> = BTreeMap::new();
-        if self.router.is_cluster() && !alone {
+        if self.router.is_cluster() {
             for ((v, stream), tasks) in by_vshard {
                 if stream {
-                    split.insert((v, true), tasks);
+                    split.entry((v, true)).or_default().extend(tasks);
                     continue;
                 }
-                let (plain, other): (Vec<_>, Vec<_>) = tasks.into_iter().partition(local_first_candidate);
-                let k = self.router.take_local_room(plain.len());
-                let mut plain = plain;
-                let rest = plain.split_off(k);
-                if !plain.is_empty() {
-                    split.insert((v, true), plain);
+                let (here, rest): (Vec<_>, Vec<_>) = if alone {
+                    tasks.into_iter().partition(runs_anywhere)
+                } else {
+                    let (mut plain, other): (Vec<_>, Vec<_>) = tasks.into_iter().partition(local_first_candidate);
+                    let mut rest = plain.split_off(self.router.take_local_room(plain.len()));
+                    rest.extend(other);
+                    (plain, rest)
+                };
+                if !here.is_empty() {
+                    split.entry((v, true)).or_default().extend(here);
                 }
-                let mut rest = rest;
-                rest.extend(other);
                 if !rest.is_empty() {
                     split.entry((v, false)).or_default().extend(rest);
                 }
@@ -315,7 +319,7 @@ impl Ingress {
         for ((v, here), tasks) in split {
             // A local peer grants to itself in the same commit; in a cluster
             // the group's leader places the rest.
-            let grant_to = (!self.router.is_cluster() || here || alone).then(|| self.router.identity.pb());
+            let grant_to = (!self.router.is_cluster() || here).then(|| self.router.identity.pb());
             let batch: Vec<Tk> = tasks.iter().filter_map(|t| t.key.as_ref().and_then(Tk::parse)).collect();
             let body = pb::shard_cmd::Body::SubmitTasks(pb::SubmitTasks { tasks, grant_to });
             match self.propose_patiently(v, body).await {
@@ -358,15 +362,19 @@ impl Ingress {
 }
 
 /// Whether a call may be granted to the submitting peer at submission: a
-/// call made inside a task (its parent waits on this peer), a plain function
-/// call or map item with no dependencies, no placement constraint and no
-/// devices. Everything else, a driver's calls included (gang ranks that wait
-/// for each other must spread), is placed by the group leader.
+/// call made inside a task (its parent waits on this peer) with no
+/// dependencies, that may run on any peer. Everything else, a driver's calls
+/// included (gang ranks that wait for each other must spread), is placed by
+/// the group leader.
 fn local_first_candidate(spec: &pb::TaskSpec) -> bool {
-    if spec.parent.is_none()
-        || !matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem)
-        || !spec.deps.is_empty()
-    {
+    spec.parent.is_some() && spec.deps.is_empty() && runs_anywhere(spec)
+}
+
+/// Whether a call may run on whichever peer takes it: a plain function call
+/// or map item with no placement constraint, no devices and at most one CPU.
+/// An actor's calls must reach its host, which its group's leader looks up.
+fn runs_anywhere(spec: &pb::TaskSpec) -> bool {
+    if !matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem) {
         return false;
     }
     let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
@@ -1400,7 +1408,35 @@ fn object_upload(data: &[u8], checksum: &[u8], existing: Option<&[u8]>) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{keyed_actor_id, object_upload};
+    use super::{keyed_actor_id, local_first_candidate, object_upload, runs_anywhere};
+    use chimaera_core::pb;
+    use prost::Message;
+
+    #[test]
+    fn only_calls_that_may_run_on_any_peer_are_granted_where_they_were_submitted() {
+        let call = |kind: pb::CallKind, policy: pb::Policy| pb::TaskSpec {
+            kind: kind as i32,
+            policy: policy.encode_to_vec(),
+            ..Default::default()
+        };
+        let plain = pb::Policy::default;
+        assert!(runs_anywhere(&call(pb::CallKind::CallFunction, plain())));
+        assert!(runs_anywhere(&call(pb::CallKind::CallMapItem, plain())));
+        // An actor's calls go to its host, whichever peer they were submitted to.
+        assert!(!runs_anywhere(&call(pb::CallKind::CallActorCtor, plain())));
+        assert!(!runs_anywhere(&call(pb::CallKind::CallActorMethod, plain())));
+        let pinned = pb::Policy { require: [("slot".to_string(), "s1".to_string())].into(), ..plain() };
+        assert!(!runs_anywhere(&call(pb::CallKind::CallFunction, pinned)));
+        assert!(!runs_anywhere(&call(pb::CallKind::CallFunction, pb::Policy { gpus: 1.0, ..plain() })));
+        assert!(!runs_anywhere(&call(pb::CallKind::CallFunction, pb::Policy { cpus: 2.0, ..plain() })));
+        // Local first also needs a parent waiting here and no dependencies.
+        let mut nested = call(pb::CallKind::CallFunction, plain());
+        assert!(!local_first_candidate(&nested), "a driver's call is placed by the leader");
+        nested.parent = Some(pb::TaskKey::default());
+        assert!(local_first_candidate(&nested));
+        nested.deps.push(pb::TaskKey::default());
+        assert!(!local_first_candidate(&nested), "a call with prerequisites is not ready at submission");
+    }
 
     #[test]
     fn a_named_actors_id_is_the_one_the_client_derives() {

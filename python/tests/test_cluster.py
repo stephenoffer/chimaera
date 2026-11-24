@@ -417,6 +417,55 @@ print("EXACT", values == list(range(200)))
         c.close()
 
 
+def test_an_actor_call_reaches_its_host_from_a_peer_that_sees_no_other_peer_up():
+    # A peer that sees no other peer able to take work grants the calls
+    # submitted to it to itself. Under load that happens without any peer
+    # failing: a peer whose core answers a ping late reports itself draining.
+    # Here peer 1 is stopped for 3 s (suspect, not retired). An actor's calls
+    # must still reach its host: granted to the submitting peer, which does
+    # not host the actor, they waited there forever.
+    c = Cluster(2, labels={i: f"slot=s{i}" for i in range(2)})
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    ready, go = os.path.join(marks, "ready"), os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+os.environ["CHIMAERA_DIRECT"] = "0"  # through the peers: direct calls skip submission
+import chimaera as ch
+
+@ch.remote
+class Echo:
+    def echo(self, x):
+        return x
+
+a = Echo.options(placement=ch.dist.Placement(require={{"slot": "s1"}})).remote()
+print("FIRST", a.echo.remote(1).result(timeout=120), flush=True)
+open({ready!r}, "w").close()
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+print("SECOND", a.echo.remote(2).result(timeout=90), flush=True)
+""",
+        )
+        deadline = time.monotonic() + 120
+        while not os.path.exists(ready):
+            assert driver.poll() is None, driver.communicate()[1][-3000:]
+            assert time.monotonic() < deadline, "the actor never answered its first call"
+            time.sleep(0.05)
+        c.signal(1, signal.SIGSTOP)
+        time.sleep(2)  # peer 0's pings to it time out (0.8 s): suspect, so peer 0 sees no other peer up
+        open(go, "w").close()
+        time.sleep(1)  # the second call is submitted meanwhile
+        c.signal(1, signal.SIGCONT)  # 3 s in all, under the 6 s floor: peer 1 is not retired
+        out, err = driver.communicate(timeout=180)
+        assert driver.returncode == 0 and "SECOND 2" in out, out[-2000:] + err[-3000:]
+        assert "retiring it" not in c.log(0), "a 3 s stall must not retire the peer"
+    finally:
+        c.close()
+        shutil.rmtree(marks, ignore_errors=True)
+
+
 @pytest.mark.slow
 def test_dead_voters_are_replaced_so_a_second_loss_is_survivable():
     c = Cluster(3, spares=1)
