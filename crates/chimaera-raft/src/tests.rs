@@ -54,18 +54,24 @@ async fn wait_leader(g: &Group) {
     panic!("group {} never elected a leader", g.id);
 }
 
-async fn setup_run(g: &Group, v: u16) {
-    // Just after an election leadership can still move: retry until it settles.
-    let adopt = cmd(v, pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards: vec![v as u32], epoch: 1 }));
-    let mut r = g.propose(&adopt).await;
+/// Propose `c`, retrying while leadership settles: just after an election or
+/// a transfer it can still move, or not be committed yet, and the propose
+/// fails meanwhile (`NotLeader`, leader unknown).
+async fn propose_settled(g: &Group, c: &pb::ShardCmd) -> pb::ShardReply {
+    let mut r = g.propose(c).await;
     for _ in 0..40 {
         if r.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        r = g.propose(&adopt).await;
+        r = g.propose(c).await;
     }
-    let r = r.unwrap();
+    r.unwrap()
+}
+
+async fn setup_run(g: &Group, v: u16) {
+    let adopt = cmd(v, pb::shard_cmd::Body::AdoptVshard(pb::AdoptVShard { vshards: vec![v as u32], epoch: 1 }));
+    let r = propose_settled(g, &adopt).await;
     assert!(matches!(r.body, Some(pb::shard_reply::Body::Count(1))));
     let run = pb::RunRecord { run: run_id(v).to_vec(), tenant: "t".into(), ..Default::default() };
     g.propose(&cmd(v, pb::shard_cmd::Body::RunCreate(pb::RunCreate { run: Some(run) }))).await.unwrap();
@@ -594,7 +600,7 @@ async fn a_leader_hands_its_group_to_another_voter() {
     group(1).transfer_leader(2).await.unwrap();
     wait_leader(&group(2)).await;
     assert!(!group(1).is_leader().await);
-    group(2).propose(&submit(9, 1)).await.unwrap();
+    propose_settled(&group(2), &submit(9, 1)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
