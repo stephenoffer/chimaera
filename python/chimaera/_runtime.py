@@ -377,6 +377,8 @@ class Runtime:
         self._seq = itertools.count()
         self._nonce = os.urandom(8)
         self._waiters: dict[int, list[Any]] = {}
+        # Answers to actor creations that came in before their creator waited.
+        self._early: dict[int, tuple[Any, ...]] = {}
         # Driver backpressure (wait_for_room): arguments of unfinished calls.
         self._pending_bytes = 0
         self._pending_calls = 0
@@ -665,6 +667,9 @@ class Runtime:
     def wait_actor(self, seq: int, timeout: float = 60.0) -> tuple[Any, ...]:
         box: list[Any] = []
         with self.cond:
+            early = self._early.pop(seq, None)
+            if early is not None:
+                return early
             self._waiters[seq] = box
             deadline = time.monotonic() + timeout
             while not box:
@@ -731,10 +736,15 @@ class Runtime:
                         out.write(f"{label} {line}\n")
                     out.flush()
                 elif tag in ("actor", "error"):
-                    box = self._waiters.pop(ev[1], None)
-                    if box is not None:
-                        box.append(ev)
-                        changed = True
+                    # Sending a creation releases the GIL, so its answer can
+                    # come in before its creator waits for it (wait_actor).
+                    with self.cond:
+                        box = self._waiters.pop(ev[1], None)
+                        if box is None:
+                            self._early[ev[1]] = ev
+                        else:
+                            box.append(ev)
+                            changed = True
             # Drop this batch's last future and stream before blocking for the
             # next: held here, a dropped future would outlive the program's
             # last reference (and keep its result and its call's inputs).

@@ -264,3 +264,20 @@ def test_exit_actor_outside_an_actor_says_where_it_belongs():
     with pytest.raises(RuntimeError, match="inside one of the actor's methods"):
         not_an_actor.remote().result(timeout=60)
 
+
+def test_an_actor_is_created_when_its_peer_answers_before_the_creator_waits(monkeypatch):
+    # The peer can answer a creation before the creating thread starts waiting
+    # for the answer (sending it releases the GIL, and the events thread takes
+    # the answer). It must still reach the creator: dropped, the creator waited
+    # 60 s and raised "timed out creating the actor".
+    from chimaera._runtime import Runtime
+
+    wait = Runtime.wait_actor
+
+    def late(self, seq, timeout=60.0):
+        time.sleep(0.5)  # the answer is in by now
+        return wait(self, seq, timeout=10.0)
+
+    monkeypatch.setattr(Runtime, "wait_actor", late)
+    log = Log.remote()
+    assert log.append.remote(1).result(timeout=60) == 1
