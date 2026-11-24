@@ -99,6 +99,10 @@ const NESTED_NOTE_AT: usize = 32;
 /// How long a closed actor's process has for its own cleanup before it is
 /// stopped outright.
 const ACTOR_CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Why an actor placed here has not started while its run's record is read.
+const ENV_WAIT: &str = "waiting for its run's environment to reach this peer";
+/// How often a run's record is read again for actors waiting on it.
+const RUN_FETCH_EVERY: Duration = Duration::from_secs(1);
 /// Calls of a one-at-a-time actor sent to its executor in one Execute.
 const ACTOR_BATCH: usize = 64;
 /// Inputs of one call fetched from other peers at once.
@@ -142,6 +146,12 @@ pub enum CoreMsg {
     DirectInflight(Vec<(Tk, crate::direct::Call)>),
     /// Calls the direct path ran: their attempts, and samples to learn from.
     DirectAttempts(Vec<crate::direct::Ran>),
+    /// A run's record read from its group for actors here waiting on it
+    /// (None: it could not be read; tried again later).
+    RunFetched {
+        run: Id,
+        rec: Option<Box<pb::RunRecord>>,
+    },
     Cancel {
         task: Tk,
         force: bool,
@@ -607,6 +617,12 @@ fn with_blobs(obj: &pb::ObjectRef) -> Vec<pb::ObjectRef> {
     all
 }
 
+/// Whether to read a run's record again: none in flight, and the last read
+/// asked at least RUN_FETCH_EVERY ago.
+fn run_fetch_due(last: Option<&(bool, Instant)>, now: Instant) -> bool {
+    last.is_none_or(|(in_flight, at)| !*in_flight && now.duration_since(*at) >= RUN_FETCH_EVERY)
+}
+
 /// Why no more workers start: the task limit (a pod's pids.max) is reached.
 fn pids_full(current: u64, max: u64) -> String {
     let at = if max > 0 { format!(" (cgroup pids.max {max}, {current} in use)") } else { String::new() };
@@ -833,6 +849,12 @@ pub struct Core {
     direct: crate::direct::Inflight,
     /// Actors placed here whose process waits for memory (see start_actor).
     actors_waiting_memory: VecDeque<(Id, Option<Id>, pb::ActorSpec)>,
+    /// Actors placed here whose run's record (its environment) this peer
+    /// does not hold yet, oldest first (see start_actor).
+    actors_waiting_env: VecDeque<(Id, Option<Id>, pb::ActorSpec)>,
+    /// Runs whose record is being read from their group: whether a read is in
+    /// flight, and when the last one was asked (see fetch_run).
+    run_fetches: HashMap<Id, (bool, Instant)>,
     /// Runs told that many of their calls wait on calls they started (see note_nested_waits).
     nested_noted: VecDeque<Id>,
     /// What waiting calls of one-at-a-time actors wait for, by (executor, call) (see note_actor_wait).
@@ -999,6 +1021,8 @@ impl Core {
             attempt_bytes: 0,
             direct: Default::default(),
             actors_waiting_memory: VecDeque::new(),
+            actors_waiting_env: VecDeque::new(),
+            run_fetches: HashMap::new(),
             nested_noted: VecDeque::new(),
             actor_waits: HashMap::new(),
             pids_note: None,
@@ -1388,6 +1412,7 @@ impl Core {
             }
             CoreMsg::Watch { session, tasks } => self.watch(session, tasks),
             CoreMsg::DirectInflight(calls) => self.direct.note(calls),
+            CoreMsg::RunFetched { run, rec } => self.on_run_fetched(run, rec),
             CoreMsg::DirectAttempts(records) => {
                 for r in records {
                     self.learn_direct(&r);
@@ -4774,10 +4799,23 @@ impl Core {
             }
             return;
         }
+        let env = run.and_then(|r| self.env_of(&r));
+        if let (Some(r), None) = (run, &env) {
+            // This peer holds no record of the actor's run (it is not in the
+            // run's group, and the leader that placed it held none either):
+            // wait, saying why, and read it from the run's group.
+            if let Some(h) = self.actors.get_mut(&actor) {
+                h.waiting_memory = Some(ENV_WAIT.into());
+            }
+            if !self.actors_waiting_env.iter().any(|(a, ..)| *a == actor) {
+                self.actors_waiting_env.push_back((actor, run, spec.clone()));
+            }
+            self.fetch_run(r);
+            return;
+        }
         if let Some(h) = self.actors.get_mut(&actor) {
             h.waiting_memory = None;
         }
-        let env = run.and_then(|r| self.env_of(&r));
         let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
         let threads = if policy.cpus > 0.0 { policy.cpus.ceil() as u32 } else { 1 };
         if let Some(env) = env {
@@ -4856,11 +4894,13 @@ impl Core {
         })
     }
 
-    /// Actors this peer hosts: running, and placed here but waiting for memory
-    /// to start (placement must count those too, or a peer whose actors wait
-    /// looks empty and gets more).
+    /// Actors this peer hosts: running, and placed here but waiting (for
+    /// memory, or their run's record) to start. Placement must count those
+    /// too, or a peer whose actors wait looks empty and gets more.
     fn hosted_actors(&self) -> usize {
-        self.execs.values().filter(|e| e.actor.is_some()).count() + self.actors_waiting_memory.len()
+        self.execs.values().filter(|e| e.actor.is_some()).count()
+            + self.actors_waiting_memory.len()
+            + self.actors_waiting_env.len()
     }
 
     /// Actors waiting for memory to start, oldest first, as room frees.
@@ -4868,12 +4908,57 @@ impl Core {
         while let Some((actor, run, spec)) = self.actors_waiting_memory.front().cloned() {
             if self.actors.get(&actor).is_some_and(|h| !h.dead && h.exec.is_none() && h.waiting_memory.is_some()) {
                 self.start_actor(actor, run, &spec);
-                if self.actors.get(&actor).is_some_and(|h| h.waiting_memory.is_some()) {
+                let for_env = self.actors_waiting_env.iter().any(|(a, ..)| *a == actor);
+                if !for_env && self.actors.get(&actor).is_some_and(|h| h.waiting_memory.is_some()) {
                     break; // still no room: later ones wait their turn
                 }
             }
             self.actors_waiting_memory.pop_front();
         }
+    }
+
+    /// Actors waiting for their run's record: each starts once the record is
+    /// here (or moves on to wait for memory); the others stay, in order, and
+    /// their runs are read again.
+    fn start_env_waiters(&mut self) {
+        for (actor, run, spec) in std::mem::take(&mut self.actors_waiting_env) {
+            if self.actors.get(&actor).is_some_and(|h| !h.dead && h.exec.is_none()) {
+                self.start_actor(actor, run, &spec);
+            }
+        }
+    }
+
+    /// Read `run`'s record from its group for the actors here waiting on it:
+    /// one read at a time per run, and no more often than RUN_FETCH_EVERY.
+    fn fetch_run(&mut self, run: Id) {
+        let Some(mesh) = self.router.mesh.clone() else { return };
+        let now = Instant::now();
+        if !run_fetch_due(self.run_fetches.get(&run), now) {
+            return;
+        }
+        self.run_fetches.insert(run, (true, now));
+        let (group, tx) = (self.router.group_of(run.vshard()), self.me_tx.clone());
+        tokio::spawn(async move {
+            let req = pb::ReadRequest { run: run.to_vec(), ..Default::default() };
+            let rec = mesh.read_group(group, req).await.ok().and_then(|r| r.run).map(Box::new);
+            let _ = tx.send(CoreMsg::RunFetched { run, rec }).await;
+        });
+    }
+
+    fn on_run_fetched(&mut self, run: Id, rec: Option<Box<pb::RunRecord>>) {
+        if let Some(f) = self.run_fetches.get_mut(&run) {
+            f.0 = false;
+        }
+        let Some(rec) = rec else { return }; // housekeeping asks again
+        let Some(spec) = rec.exec_env.clone() else { return };
+        self.quotas.tenant(run, || Some(rec.tenant.clone()));
+        self.runs.entry(run).or_insert(RunInfo {
+            env: ExecEnv::from_spec(spec),
+            detached: rec.detached,
+            sessions: BTreeSet::new(),
+        });
+        self.run_fetches.remove(&run);
+        self.start_env_waiters();
     }
 
     /// The current record of an actor this peer hosts (or is about to).
@@ -5478,6 +5563,9 @@ impl Core {
         if !self.actors_waiting_memory.is_empty() {
             self.start_waiting_actors();
         }
+        if !self.actors_waiting_env.is_empty() {
+            self.start_env_waiters();
+        }
         if let Some(mesh) = self.router.mesh.clone() {
             for (node, p) in mesh.take_profiles() {
                 self.profiles.merge_remote(node, &p);
@@ -5864,6 +5952,9 @@ impl Core {
         {
             reasons.push(format!("{} actor(s) waiting to start; the first: {why}", self.actors_waiting_memory.len()));
         }
+        if !self.actors_waiting_env.is_empty() {
+            reasons.push(format!("{} actor(s) {ENV_WAIT}", self.actors_waiting_env.len()));
+        }
         if let Some((n, held)) = self.nested_waits() {
             reasons.push(format!(
                 "{n} worker processes held by calls waiting on calls they started ({} MiB in all)",
@@ -5954,6 +6045,15 @@ mod tests {
     fn acked(status: pb::task_ack::Status) -> Result<pb::ShardReply, ()> {
         let ack = pb::TaskAck { status: status as i32, ..Default::default() };
         Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(pb::TaskAcks { acks: vec![ack] })) })
+    }
+
+    #[test]
+    fn a_runs_record_is_read_again_only_once_none_is_in_flight_and_a_second_passed() {
+        let now = Instant::now();
+        assert!(run_fetch_due(None, now), "the first read goes out at once");
+        assert!(!run_fetch_due(Some(&(true, now - Duration::from_secs(5))), now), "one read at a time");
+        assert!(!run_fetch_due(Some(&(false, now)), now), "a failed read is not repeated at once");
+        assert!(run_fetch_due(Some(&(false, now - RUN_FETCH_EVERY)), now), "it is asked again after a second");
     }
 
     #[test]

@@ -1228,6 +1228,36 @@ time.sleep(3)  # output is shipped to the driver's peer on the next housekeeping
         c.close()
 
 
+def test_actors_on_peers_outside_their_runs_group_start():
+    # Five peers, groups of three voters: two peers hold no replica of the run's
+    # group. A named actor placed there by a leader that holds none either arrives
+    # without its run's environment; its host fetches the run's record from the
+    # group and starts it (it used to never start, with no reason given).
+    c = Cluster(5, labels={i: f"slot=s{i}" for i in range(5)})
+    try:
+        out = c.run(
+            0,
+            """
+import chimaera as ch
+
+@ch.remote
+class Where:
+    def slot(self, s):
+        return s
+
+slots = [f"s{i}" for i in range(5)]
+# Named actors' ids come from their names, not their run, so their groups
+# (whose leaders place them) are unrelated to the run's.
+actors = [Where.options(name=f"w-{s}-{i}", placement=ch.dist.Placement(require={"slot": s})).remote() for s in slots for i in range(8)]
+got = ch.get([a.slot.remote(s) for a, s in zip(actors, [s for s in slots for _ in range(8)])], timeout=120)
+print("SLOTS", sorted(set(got)), len(got))
+""",
+        )
+        assert lines(out, "SLOTS") == ["['s0', 's1', 's2', 's3', 's4'] 40"], out.stdout[-2000:] + out.stderr[-2000:]
+    finally:
+        c.close()
+
+
 def test_values_lost_with_their_peer_are_made_again_from_their_calls():
     c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
     marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
