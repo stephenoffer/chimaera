@@ -184,13 +184,23 @@ def store(
                 owned.append(os.path.join(rdir, got[0].hex()))
             return got
 
+        def write_blob(view: memoryview) -> tuple[bytes, bytes]:
+            # A CUDA tensor's host copy, kept apart from the value so a reader
+            # that takes it GPU to GPU never fetches it (see tensor_from_gpu).
+            blob = prefix + os.urandom(16 - len(prefix))
+            path = os.path.join(rdir, blob.hex())
+            _serde.write_file(path, [view])
+            owned.append(path)
+            return run, blob
+
         if device_holds is not None:
             _put_holds.list = device_holds
+            _put_holds.write_blob = write_blob
         try:
             parts, size, _ = _serde.dumps_parts(value, external=claim)
         finally:
             if device_holds is not None:
-                del _put_holds.list
+                del _put_holds.list, _put_holds.write_blob
         object_id = prefix + os.urandom(16 - len(prefix))
         if size <= inline_limit:
             return object_id, b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts), size, owned
@@ -571,6 +581,10 @@ def torch_reducers() -> dict[type, Callable[[Any], Any]]:
             except (TypeError, RuntimeError):  # dtypes NumPy lacks: torch pickles the host copy
                 payload = host
             share = _cuda_share(t)
+            write_blob = getattr(_put_holds, "write_blob", None)
+            if share and share.get("net") and write_blob is not None and not isinstance(payload, torch.Tensor):
+                run, blob = write_blob(memoryview(payload).cast("B"))
+                return (tensor_from_gpu, (run, blob, payload.shape, payload.dtype.str, share))
             return (tensor_on_device, (payload, "cuda", share) if share else (payload, "cuda"))
         if t.device.type != "cpu" or t.requires_grad or t.is_sparse or not t.is_contiguous():
             return t.__reduce_ex__(5)
@@ -626,7 +640,13 @@ def _cuda_share(t: Any) -> dict[str, Any] | None:
     except Exception:  # noqa: BLE001 -- sharing is an optimization; the host copy is always there
         return None
     holds.append(t)
-    return {"host": host, "pid": os.getpid(), "gpu": gpu, "args": args}
+    from . import _gpunet
+
+    share = {"host": host, "pid": os.getpid(), "gpu": gpu, "args": args}
+    net = _gpunet.offer(t)
+    if net is not None:
+        share["net"] = net  # read GPU to GPU from another machine
+    return share
 
 
 def _from_cuda_share(share: dict[str, Any], target: str | None) -> Any:
@@ -661,6 +681,42 @@ def keep_device_holds(holds: list[Any]) -> None:
     may be read for as long as this process lives, so the tensors stay."""
     _kept_device.extend(holds)
     holds.clear()
+
+
+def tensor_from_gpu(run: bytes, blob: bytes, shape: tuple[int, ...], dtype: str, share: dict[str, Any]) -> Any:
+    """A CUDA tensor put with a network offer: on this machine, from its
+    owner's GPU through CUDA IPC; on another machine, in a call granted a GPU,
+    sent GPU to GPU by its owner (_gpunet); else from its host copy, the blob
+    stored with the put, which only then is fetched."""
+    import numpy as np
+    import torch
+
+    from . import _gpunet
+    from ._devices import device, devices
+
+    granted = device()
+    target = granted if granted.startswith("cuda") else ("cuda" if not devices() else None)
+    if target is not None and torch.cuda.is_available():
+        if target == "cuda":
+            target = f"cuda:{torch.cuda.current_device()}"
+        direct = _from_cuda_share(share, target)
+        if direct is None and share.get("host") != _boot_id() and share.get("net"):
+            direct = _gpunet.fetch(share["net"], target)
+        if direct is not None:
+            global cuda_net_reads
+            cuda_net_reads += share.get("host") != _boot_id()
+            return direct
+    blob_dir = getattr(_serde._reading, "blob_dir", None)
+    if blob_dir is None:  # an inline value decoded without its run's directory
+        from ._runtime import Runtime
+
+        blob_dir = _serde.run_dir(Runtime.get().object_dir, run)
+    host = np.frombuffer(_serde._blob_view(blob_dir, blob), dtype=np.dtype(dtype)).reshape(shape)
+    return tensor_on_device(host, "cuda")
+
+
+# CUDA tensors read GPU to GPU from another machine by this process (tests).
+cuda_net_reads = 0
 
 
 def tensor_on_device(payload: Any, kind: str, share: dict[str, Any] | None = None) -> Any:
