@@ -82,6 +82,9 @@ class _Pickler(pickle.Pickler):
     types pickle never asks about (and so never scans a large pickle)."""
 
     def reducer_override(self, obj: Any) -> Any:
+        reduce = reducers.get(type(obj))
+        if reduce is not None:
+            return reduce(obj)
         if isinstance(obj, (type, types.FunctionType)) and getattr(obj, "__module__", None) == "__main__":
             raise _MainRefused("refers to __main__")
         return NotImplemented
@@ -92,6 +95,9 @@ class _CloudPickler(cloudpickle.Pickler):
     the sender and deliver a copy of its contents in place of the file."""
 
     def reducer_override(self, obj: Any) -> Any:
+        reduce = reducers.get(type(obj))
+        if reduce is not None:
+            return reduce(obj)
         if isinstance(obj, io.TextIOWrapper) and obj not in (sys.stdin, sys.stdout, sys.stderr):
             name = getattr(obj, "name", "?")
             raise pickle.PicklingError(f"an open file ({name!r}) cannot be sent; pass its path and open it in the call")
@@ -106,6 +112,11 @@ _plain_encode = getattr(_native, "plain_encode", None)  # absent from older buil
 _plain_column = getattr(_native, "plain_encode_column", None)  # absent from older builds
 _pread_heap = getattr(_native, "pread_heap", None)  # absent from older builds
 _encode_heap = getattr(_native, "encode_utf8_heap", None)  # likewise
+
+# Reducers for values this module pickles, by type (ext.register_reducer),
+# and only there: unlike copyreg's, a plain pickle.dumps elsewhere in the
+# program does not use them. Both picklers below ask them first.
+reducers: dict[type, Callable[[Any], Any]] = {}
 
 
 def _pickle(value: Any, pickler_cls: type, buffer_callback: Callable[[pickle.PickleBuffer], bool]) -> bytes:

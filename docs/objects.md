@@ -272,7 +272,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | `ray.put`, `ray.get`, refs nested in values | `ch.put`, `ch.get` / `future.result()`, `ch.handles()` to pass handles inside values |
 | `ray.wait(..., fetch_local=True)` | `ch.wait(..., fetch_local=True)` |
 | zero-copy NumPy reads, read-only | zero-copy reads, writable (copy-on-write); zero-copy *writes* for NumPy arrays and large `bytes` too |
-| pickle 5 out-of-band buffers, `register_serializer` | the same, `ext.register_serializer` |
+| pickle 5 out-of-band buffers, `register_serializer` | the same; `ext.register_reducer` (Chimaera's values only, lambdas allowed) or `ext.register_serializer` |
 | `object_store_memory` | `CHIMAERA_MEMORY_POOL` |
 | huge pages (`_plasma_directory` plus a flag) | a mounted huge-page tmpfs is found and used; `CHIMAERA_OBJECT_DIR` |
 | spill to local disk, `object_spilling_config` directories (one or several) | `spill/`, or the directories in `CHIMAERA_SPILL_DIR`, each in turn; past the hard cap, new objects are written to disk directly. On disk each object keeps a file of its own (Ray fuses small ones there too), so a restore is a mapping of it and a freed object gives its space back at once |

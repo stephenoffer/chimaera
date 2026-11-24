@@ -910,7 +910,10 @@ assert keep.map(ch.data.partitions(Squares(25))).write(Total()).result() == sum(
 
 `ext.register_serializer(cls, dumps=, loads=)` pickles a type your way;
 `loads` must be importable (a module-level function), and every process that
-sends the type registers it. Planned:
+sends the type registers it. `ext.register_reducer(cls, reduce)` changes only
+the values Chimaera stores and sends, not a plain `pickle.dumps` elsewhere in
+the program, and `reduce` may return a lambda or a local function, which
+travels inside each value; `ext.unregister_reducer(cls)` undoes it. Planned:
 
 ```python
 class RackAware(ext.PlacementPolicy):         # ranks reservations and gangs (P5)

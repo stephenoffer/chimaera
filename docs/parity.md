@@ -95,7 +95,7 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | Nested refs stay refs | Same | Today |
 | Zero-copy numpy (read-only arrays) | Copy-on-write mappings: arrays arrive writable, writes stay in the call | Today |
 | Spilling to disk / S3 | Disk: Today (`stores.rs`); object-store URI target: M3 | Today / M3 |
-| `register_serializer` / `deregister_serializer` | `ext.register_serializer` / `ext.unregister_serializer` | Today (`ext.register_serializer`) / P4 (deregister) |
+| `register_serializer` / `deregister_serializer` | `ext.register_reducer` / `ext.unregister_reducer` (Chimaera's values only, lambdas allowed), or `ext.register_serializer` (copyreg); the Ray shim has both of Ray's names | Today |
 | `inspect_serializability` | Submission preflight names the unpicklable variable and its path | Today (names the argument or captured variable) / P3 (path inside the object) |
 | `ray memory`, `get_object_locations` | `chimaera memory RUN` and `ch.runs.cluster().objects(run=)`: owner, holders, size, who pins it | New (P4) |
 | `ObjectStoreFullError`, `OutOfDiskError` | `ch.DiskFull` with the budget and the largest holders; objects spill before that | Partly today (an `OSError` naming the disk and its free space) / M3 (`ch.DiskFull`) |

@@ -715,3 +715,59 @@ def test_refs_inside_a_list_arrive_as_refs_as_in_ray():
     a = RefKinds.remote(tuple(refs))
     assert ray.get(a.check.remote(refs)) == ([True, True], [True, True])
     ray.kill(a)
+
+
+def test_a_ref_gives_a_concurrent_future_of_its_value_as_in_ray():
+    import asyncio
+    import concurrent.futures
+
+    @ray.remote
+    def double(x):
+        return 2 * x
+
+    @ray.remote
+    def boom():
+        raise ValueError("no")
+
+    @ray.remote
+    class C:
+        def get(self):
+            return "actor"
+
+    refs = [double.remote(21), ray.put("put"), C.remote().get.remote()]
+    futures = [r.future() for r in refs]
+    assert all(isinstance(f, concurrent.futures.Future) for f in futures)
+    done, _ = concurrent.futures.wait(futures, timeout=60)
+    assert len(done) == 3 and [f.result() for f in futures] == [42, "put", "actor"]
+
+    async def awaited():
+        return await asyncio.wrap_future(double.remote(4).future())
+
+    assert asyncio.run(awaited()) == 8
+    err = boom.remote().future().exception(timeout=60)
+    assert isinstance(err, ray.exceptions.RayTaskError) and isinstance(err, ValueError)
+
+
+class _Point:  # module-level, so a plain pickle can name it
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+
+
+def test_register_serializer_takes_any_callables_lambdas_included():
+    import pickle
+
+    @ray.remote
+    def ys(p):
+        return p.y
+
+    ray.util.register_serializer(_Point, serializer=lambda p: (p.x, p.y), deserializer=lambda t: _Point(t[1], t[0]))
+    try:
+        plain = pickle.loads(pickle.dumps(_Point(1, 2)))
+        assert (plain.x, plain.y) == (1, 2), "a plain pickle elsewhere in the program is untouched"
+        back = ray.get(ray.put(_Point(1, 2)))
+        assert (back.x, back.y) == (2, 1), "Chimaera's own serialization uses the pair (which swaps them)"
+        assert ray.get(ys.remote(_Point(3, 4))) == 3, "and a worker, which has nothing registered, rebuilds it"
+    finally:
+        ray.util.deregister_serializer(_Point)
+    back = ray.get(ray.put(_Point(1, 2)))
+    assert (back.x, back.y) == (1, 2), "serialized the usual way again"

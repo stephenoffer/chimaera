@@ -7,6 +7,7 @@ from typing import Any
 
 from .._unsupported import UnsupportedAttribute, unsupported
 from . import collective, multiprocessing, queue, scheduling_strategies
+from ._serializers import deregister_serializer, register_serializer
 from .actor_pool import ActorPool
 from .placement_group import (
     get_current_placement_group,

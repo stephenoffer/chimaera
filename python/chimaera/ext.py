@@ -63,6 +63,24 @@ def register_serializer(cls: type, *, dumps: Callable[[Any], bytes], loads: Call
     copyreg.pickle(cls, lambda obj: (loads, (dumps(obj),)))
 
 
+def register_reducer(cls: type, reduce: Callable[[Any], tuple[Any, ...]]) -> None:
+    """Pickle instances of `cls` as ``reduce(obj)`` returns (a callable and
+    its arguments, as ``__reduce__`` does) in the values Chimaera stores and
+    sends, and only there: a plain ``pickle.dumps`` elsewhere in the program
+    is untouched, unlike `register_serializer` (copyreg). The callable may be
+    a lambda or a local function: it travels inside each value."""
+    from . import _serde
+
+    _serde.reducers[cls] = reduce
+
+
+def unregister_reducer(cls: type) -> None:
+    """Pickle `cls` as before `register_reducer`."""
+    from . import _serde
+
+    _serde.reducers.pop(cls, None)
+
+
 # ---- built-in sources and sinks ---------------------------------------------
 
 

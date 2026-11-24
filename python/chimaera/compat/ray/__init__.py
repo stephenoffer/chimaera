@@ -157,6 +157,11 @@ def _get_one(ref: Any, timeout: float | None) -> Any:
         reraise(e)
 
 
+from ._ref_future import attach as _attach_future  # noqa: E402 -- needs _get_one, above
+
+_attach_future(_get_one, (ch.Future, PutRef, ItemRef))  # ref.future(), as in Ray
+
+
 def get(object_refs: Any, *, timeout: float | None = None) -> Any:
     """Values for one ref or a list of refs. Errors come back Ray-shaped."""
     if not isinstance(object_refs, list):
