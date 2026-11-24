@@ -53,6 +53,7 @@ or when you pass `--cluster` ([cli.md](cli.md#which-peer-a-command-asks)).
 | `CHIMAERA_MAX_PENDING_BYTES` | driver | unset: half the peer's memory, at least 256 MiB | Bytes of unfinished calls' arguments the driver may hold before `.remote()` waits for room (warning CH110). It also waits at 1,000,000 unfinished calls |
 | `CHIMAERA_SPREAD_RATE` | driver | `2000` | Calls per second a driver must submit before its calls spread over several Raft groups. Below it they stay in the run's own group |
 | `CHIMAERA_STALL_NOTICE_S` | driver, worker | `60` | Seconds a wait on a call that has not started may last before the reason is printed to stderr, once |
+| `CHIMAERA_DIRECT` | driver | `1` | `0` sends every actor call through the peer. By default a driver's call to a one-at-a-time actor on its local peer goes straight to the actor's worker, which answers it, and the peer records the call just after: about half the round trip. Calls made inside a call, and calls to durable actors or with a deadline, retries or a generator, always go through the peer |
 
 ## Resources and memory
 
