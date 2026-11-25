@@ -373,10 +373,47 @@ fn parallel_fill(file: &std::fs::File, parts: &[&[u8]], total: usize) -> io::Res
 /// pod's pids.max counts threads) only leaves more pieces for the others,
 /// never a panic. Stops at the first error and returns it.
 fn for_chunks(len: usize, work: impl Fn(usize, usize) -> io::Result<()> + Sync) -> io::Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    for_chunks_on(len, MAX_THREADS, work)
+}
+
+thread_local! {
+    /// CPU time the helpers of this thread's `for_chunks` calls have spent.
+    /// An executor reports it with each call, and the peer leaves it out of
+    /// the cores it learns for the function (see `helper_cpu_ns`).
+    static HELPER_CPU_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's CPU time, in nanoseconds (0 if the clock is unavailable).
+fn thread_cpu_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid out pointer for clock_gettime.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return 0;
+    }
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// The CPU time, in nanoseconds, that helper threads have spent for the
+/// calling thread so far: runtime work (copying and populating large values
+/// in parallel), not the user's code. An executor reads it before and after a
+/// call and reports the difference, so a one-core function whose 256 MiB
+/// argument was read on four threads isn't learned as needing four CPUs.
+#[pyfunction]
+pub fn helper_cpu_ns() -> u64 {
+    HELPER_CPU_NS.with(|c| c.get())
+}
+
+/// `for_chunks` on at most `max_threads` threads, the caller's included.
+fn for_chunks_on(
+    len: usize,
+    max_threads: usize,
+    work: impl Fn(usize, usize) -> io::Result<()> + Sync,
+) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let chunks = len.div_ceil(CHUNK);
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, MAX_THREADS).min(chunks);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, max_threads.max(1)).min(chunks);
     let next = AtomicUsize::new(0);
+    let helpers_ns = AtomicU64::new(0);
     let failed: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
     let run = || {
         loop {
@@ -390,12 +427,19 @@ fn for_chunks(len: usize, work: impl Fn(usize, usize) -> io::Result<()> + Sync) 
             }
         }
     };
+    let helper = || {
+        let t0 = thread_cpu_ns();
+        run();
+        helpers_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Ordering::Relaxed);
+    };
     std::thread::scope(|s| {
         for _ in 1..threads {
-            let _ = std::thread::Builder::new().spawn_scoped(s, run);
+            let _ = std::thread::Builder::new().spawn_scoped(s, helper);
         }
         run();
     });
+    let spent = helpers_ns.into_inner();
+    HELPER_CPU_NS.with(|c| c.set(c.get().saturating_add(spent)));
     failed.into_inner().expect("lock").map_or(Ok(()), Err)
 }
 
@@ -453,7 +497,10 @@ pub fn write_object(py: Python<'_>, path: PathBuf, parts: Vec<Bound<'_, PyAny>>)
 /// stored again, and an arena block costs a new tmpfs file whose 4 KiB pages
 /// fault in one at a time as the copy reaches them: reading 2,048 values of
 /// 1 MiB in one call took 590 us each into the arena against 475 on the heap
-/// (Ray: 511). `EOFError` when the file is shorter.
+/// (Ray: 511). From READ_PARALLEL_MIN the read is split over READ_THREADS
+/// threads: one 256 MiB read went from 120 to 47 ms, and ten at once on 16
+/// vCPUs from 235 ms (into the arena) to 141. `EOFError` when the file is
+/// shorter.
 #[pyfunction]
 pub fn pread_heap(py: Python<'_>, fd: i32, length: usize, offset: u64) -> PyResult<Bound<'_, pyo3::types::PyBytes>> {
     let n = pyo3::ffi::Py_ssize_t::try_from(length).map_err(|_| PyValueError::new_err("length too large"))?;
@@ -467,25 +514,15 @@ pub fn pread_heap(py: Python<'_>, fd: i32, length: usize, offset: u64) -> PyResu
     let bytes = unsafe { Bound::from_owned_ptr(py, obj).cast_into_unchecked::<pyo3::types::PyBytes>() };
     // SAFETY: the buffer of that bytes object, `length` bytes long.
     let base = unsafe { pyo3::ffi::PyBytes_AsString(obj) } as usize;
+    #[cfg(target_os = "linux")]
+    if length >= READ_PARALLEL_MIN {
+        arena::defer_free(obj as usize); // the object is its own raw block (see arena::defer_free)
+    }
     py.detach(|| {
-        let mut at = 0usize;
-        while at < length {
-            // SAFETY: [at, length) lies in the buffer above.
-            let r = unsafe {
-                libc::pread(fd, (base + at) as *mut libc::c_void, length - at, (offset + at as u64) as libc::off_t)
-            };
-            if r < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::Interrupted {
-                    return Err(e);
-                }
-            } else if r == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the file ended early"));
-            } else {
-                at += r as usize;
-            }
+        if length < READ_PARALLEL_MIN {
+            return pread_exact(fd, base, length, offset);
         }
-        Ok(())
+        for_chunks_on(length, READ_THREADS, |cs, ce| pread_exact(fd, base + cs, ce - cs, offset + cs as u64))
     })
     .map_err(|e| {
         if e.kind() == io::ErrorKind::UnexpectedEof { PyEOFError::new_err(e.to_string()) } else { os_err(e) }
@@ -514,6 +551,33 @@ pub fn encode_utf8_heap<'py>(
     }
     // SAFETY: a new reference to a bytes object (the UTF-8 codec returns bytes).
     Ok(unsafe { Bound::from_owned_ptr(py, obj).cast_into_unchecked::<pyo3::types::PyBytes>() })
+}
+
+/// Reads at least this large are split over READ_THREADS threads.
+const READ_PARALLEL_MIN: usize = 16 << 20;
+/// Threads for one large read. More helped a lone read (8: 36 ms for 256 MiB)
+/// but not ten at once, which is when it matters.
+const READ_THREADS: usize = 4;
+
+/// Fill `len` bytes at `base` from `fd` at `offset`, retrying short reads.
+fn pread_exact(fd: i32, base: usize, len: usize, offset: u64) -> io::Result<()> {
+    let mut at = 0usize;
+    while at < len {
+        // SAFETY: [base + at, base + len) lies in a buffer the caller owns.
+        let r =
+            unsafe { libc::pread(fd, (base + at) as *mut libc::c_void, len - at, (offset + at as u64) as libc::off_t) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        } else if r == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the file ended early"));
+        } else {
+            at += r as usize;
+        }
+    }
+    Ok(())
 }
 
 /// Run `f` with this thread's large Python allocations on the heap, not in
@@ -974,10 +1038,62 @@ mod arena {
     }
 
     unsafe extern "C" fn raw_free(ctx: *mut c_void, ptr: *mut c_void) {
-        if !arena().free(ptr as usize) {
-            // SAFETY: not ours: the previous raw allocator owns `ptr`.
-            unsafe { raw().free.expect("free")(ctx, ptr) }
+        if arena().free(ptr as usize) {
+            return;
         }
+        if DEFERRED_LIVE.load(Ordering::Relaxed) > 0 && free_later(ptr as usize) {
+            return;
+        }
+        // SAFETY: not ours: the previous raw allocator owns `ptr`.
+        unsafe { raw().free.expect("free")(ctx, ptr) }
+    }
+
+    /// Heap blocks of large values read for a call (`pread_heap`), freed on a
+    /// background thread once Python lets go of them. Unmapping 256 MiB took
+    /// 22 ms, 33 to 42 ms with ten calls doing it at once, and it happened
+    /// as the call's frame ended, before its outcome could be reported.
+    static DEFERRED: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    static DEFERRED_LIVE: AtomicUsize = AtomicUsize::new(0);
+    /// The reclaiming thread's queue, and the process that started it (a
+    /// forked child starts its own).
+    static RECLAIM: Mutex<Option<(u32, std::sync::mpsc::Sender<usize>)>> = Mutex::new(None);
+
+    /// Free `ptr` (a block of the previous raw allocator) on the background
+    /// thread once Python frees it, if the raw hooks are in place.
+    pub fn defer_free(ptr: usize) {
+        if RAW.get().is_none() || !arena().enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        DEFERRED.lock().expect("lock").insert(ptr);
+        DEFERRED_LIVE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Hand `ptr` to the reclaiming thread if it was deferred; false if not,
+    /// or if no thread could be started (the caller frees it now).
+    fn free_later(ptr: usize) -> bool {
+        if !DEFERRED.lock().expect("lock").remove(&ptr) {
+            return false;
+        }
+        DEFERRED_LIVE.fetch_sub(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let mut q = RECLAIM.lock().expect("lock");
+        if q.as_ref().is_none_or(|(p, _)| *p != pid) {
+            let (tx, rx) = std::sync::mpsc::channel::<usize>();
+            let started = std::thread::Builder::new().name("chimaera-free".into()).spawn(move || {
+                for p in rx {
+                    // SAFETY: a block of the previous raw allocator that
+                    // Python has freed; nothing else refers to it.
+                    unsafe { raw().free.expect("free")(raw().ctx, p as *mut c_void) }
+                }
+            });
+            if started.is_err() {
+                *q = None;
+                return false;
+            }
+            *q = Some((pid, tx));
+        }
+        q.as_ref().is_some_and(|(_, tx)| tx.send(ptr).is_ok())
     }
 
     /// Wrap Python's raw allocator (once). A hook that forwards everything
@@ -1451,6 +1567,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(objects_config, m)?)?;
     m.add_function(wrap_pyfunction!(write_object, m)?)?;
     m.add_function(wrap_pyfunction!(pread_heap, m)?)?;
+    m.add_function(wrap_pyfunction!(helper_cpu_ns, m)?)?;
     m.add_function(wrap_pyfunction!(encode_utf8_heap, m)?)?;
     m.add_function(wrap_pyfunction!(arena_install, m)?)?;
     m.add_function(wrap_pyfunction!(arena_claim, m)?)?;

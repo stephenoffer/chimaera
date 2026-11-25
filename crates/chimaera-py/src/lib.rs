@@ -1478,7 +1478,7 @@ impl ExecConn {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (key, attempt, outcome, retryable, fingerprint, entry_unix_ns, exit_unix_ns, durable_state=Vec::new()))]
+    #[pyo3(signature = (key, attempt, outcome, retryable, fingerprint, entry_unix_ns, exit_unix_ns, durable_state=Vec::new(), helper_cpu_ns=0))]
     fn send_done(
         &self,
         py: Python<'_>,
@@ -1490,6 +1490,7 @@ impl ExecConn {
         entry_unix_ns: u64,
         exit_unix_ns: u64,
         durable_state: Vec<u8>,
+        helper_cpu_ns: u64,
     ) -> PyResult<()> {
         // ("forward", key): the call returned that call's future.
         let tag: String = outcome.get_item(0)?.extract()?;
@@ -1509,6 +1510,7 @@ impl ExecConn {
             exit_unix_ns,
             forward_to,
             durable_state,
+            helper_cpu_ns,
         };
         py.detach(|| write_msg(&self.writer, pb::ExecToPeer { msg: Some(pb::exec_to_peer::Msg::Done(done)) }))
     }

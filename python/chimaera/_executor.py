@@ -33,8 +33,15 @@ import cloudpickle
 
 from . import _batch, _direct, _context, _future, _objects, _project, _serde
 from ._errors import ActorDied, NonRetryable
+from . import _native
 from ._native import ExecConn, blake3_digest, child_id
 from ._serde import Dep
+
+# CPU this thread's runtime helpers spent (parallel reads and writes of large
+# values): reported with each call so the peer doesn't learn it as the
+# function's cores. None with an older extension, whose send_done takes no
+# helper_cpu_ns either.
+_helper_cpu_ns = getattr(_native, "helper_cpu_ns", None)
 
 CODE_CACHE = 256
 # Threads that start and finish an actor's async calls (their awaiting holds none).
@@ -360,7 +367,13 @@ class Executor:
             raise RuntimeError(f"prerequisite has no value: {outcome[:4]}")
         _, inline, run, obj, _size, _oob = outcome
         if inline is not None:
-            return _serde.loads(inline, _serde.run_dir(self.object_dir, run))
+            rdir = _serde.run_dir(self.object_dir, run)
+            # A large bytes value is a frame of a few bytes naming its blob:
+            # one read onto the heap (see Runtime.read_value). Decoded through
+            # a mapping, ten calls reading a 256 MiB value at once spent their
+            # time faulting new arena pages and then unmapping them.
+            fast = _serde._plain_bytes(inline, -1, rdir)
+            return fast if fast is not None else _serde.loads(inline, rdir)
         from ._runtime import read_object
 
         return read_object(self.object_dir, run, obj)
@@ -596,6 +609,7 @@ class Executor:
         ctx = self.task_context(msg, item)
         self.running[key] = ctx
         token = _context.set_task(ctx)
+        helper0 = _helper_cpu_ns() if _helper_cpu_ns is not None else None
         entry = time.time_ns()
         seen = self.stdout.seen if self.stdout is not None else 0
         on_main = threading.current_thread() is threading.main_thread()
@@ -619,7 +633,7 @@ class Executor:
                     self.end_guest(key)
         except BaseException as exc:  # user code may raise anything, including SystemExit
             error = exc  # a guest's cancel interrupt lands here even if it fired in end_guest
-        self.finish(msg, item, ctx, entry, seen, result, error, token)
+        self.finish(msg, item, ctx, entry, seen, result, error, token, helper0)
         if self.terminating and on_main:
             raise SystemExit(0)  # its outcome is out: carry on exiting, as on_terminate began
 
@@ -677,8 +691,11 @@ class Executor:
         result: Any,
         error: BaseException | None,
         token: Any,
+        helper0: int | None = None,
     ) -> None:
-        """Encode and send a call's outcome (its value or its error)."""
+        """Encode and send a call's outcome (its value or its error).
+        `helper0` is this thread's helper CPU when the call began (run on this
+        thread from start to end): what the helpers spent since is sent."""
         key, attempt = item[0], item[1]
         retryable, fingerprint, state = False, b"", b""
         try:
@@ -721,7 +738,11 @@ class Executor:
         if "direct" in msg:  # straight back to the caller, who records it with the peer
             msg["direct"].done(key, outcome, entry, msg["cpu0"])
         else:
-            self.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
+            done = (key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
+            if helper0 is not None and _helper_cpu_ns is not None:
+                self.conn.send_done(*done, _helper_cpu_ns() - helper0)
+            else:
+                self.conn.send_done(*done)
         if ctx.exiting and not self.exited:
             # After this call's outcome went out: closing the actor ends this process.
             from ._runtime import Runtime

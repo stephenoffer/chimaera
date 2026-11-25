@@ -606,7 +606,7 @@ def _plain_bytes(head: bytes, fd: int, run_dir: str) -> bytes | None:
         if fd < 0:
             return None  # a frame held in memory: its bytes are right there
         start = off + main_len + _pad(off + main_len)
-        data = os.pread(fd, length, start)
+        data = _pread(fd, length, start)
     else:
         try:
             src = os.open(os.path.join(run_dir, blob.hex()), os.O_RDONLY)
@@ -621,10 +621,10 @@ def _plain_bytes(head: bytes, fd: int, run_dir: str) -> bytes | None:
 
 def _pread(fd: int, length: int, offset: int) -> bytes:
     """`length` bytes of `fd` at `offset` (fewer if the file is shorter).
-    From 1 to 8 MiB into a new bytes object on the heap rather than in the
-    arena (see _native.pread_heap). From 8 MiB the arena is faster: its blocks
-    are populated on several threads."""
-    if _pread_heap is not None and 1 << 20 <= length < 8 << 20:
+    From 1 MiB into a new bytes object on the heap rather than in the arena,
+    large ones read on several threads (see _native.pread_heap): ten calls
+    reading a 256 MiB value at once took 235 ms into the arena, 141 here."""
+    if _pread_heap is not None and length >= 1 << 20:
         try:
             return _pread_heap(fd, length, offset)
         except EOFError:

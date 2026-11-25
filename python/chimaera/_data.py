@@ -128,6 +128,52 @@ def write(futures: list[Future[Any]], sink: Sink) -> Future[Any]:
 # ---- partitioned results -----------------------------------------------------------
 
 
+# How many partitions an iterator over a Partitioned brings to this machine
+# ahead of the one it yields. They mostly live on other peers, and reading
+# them one after another costs a round trip each: 64 partitions on four
+# machines arrived 40 ms after the last gather finished. Only localized ahead,
+# never decoded: one partition is in the driver's memory at a time. Decided
+# here alone, so a byte cap can bound the same window.
+READ_AHEAD = 8
+
+
+def _read_ahead(futures: Sequence[Future[Any]]) -> int:
+    """The read-ahead window for iterating `futures`."""
+    return min(READ_AHEAD, max(0, len(futures) - 1))
+
+
+def _in_order(futures: Sequence[Future[Any]]) -> Iterator[Any]:
+    """Each future's value, in order, with the stored bytes of the next
+    ``_read_ahead`` made local in the background. A failed one raises at its
+    own position; stopping early stops the background work."""
+    window = _read_ahead(futures)
+    if window == 0:
+        for f in futures:
+            yield f.result()
+        return
+    import concurrent.futures
+
+    from ._future import wait
+
+    pool = concurrent.futures.ThreadPoolExecutor(window, thread_name_prefix="chimaera-read-ahead")
+
+    def localize(f: Future[Any]) -> None:
+        try:
+            wait([f], fetch_local=True)
+        except Exception:  # noqa: BLE001 -- reading it in order raises the real error at its place
+            pass
+
+    started = 0
+    try:
+        for i, f in enumerate(futures):
+            while started < len(futures) and started <= i + window:
+                pool.submit(localize, futures[started])
+                started += 1
+            yield f.result()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 class Partitioned:
     """Results split into partitions that stay on the workers: the output of
     ``reduce_by_key``. Each partition is a dict from key to its value (to the
@@ -141,17 +187,16 @@ class Partitioned:
 
     def __iter__(self) -> Iterator[dict[Any, Any]]:
         """Each partition's dict, in partition order (brings them to the
-        driver, one partition at a time)."""
-        for f in self.futures:
-            yield f.result()
+        driver, one partition at a time, fetching the next few meanwhile)."""
+        yield from _in_order(self.futures)
 
     def __repr__(self) -> str:
         return f"<Partitioned {len(self.futures)} partitions>"
 
     def items(self) -> Iterator[tuple[Any, Any]]:
         """Every (key, value), partition by partition (brings them to the driver)."""
-        for f in self.futures:
-            yield from f.result().items()
+        for part in _in_order(self.futures):
+            yield from part.items()
 
     def to_dict(self) -> dict[Any, Any]:
         out: dict[Any, Any] = {}

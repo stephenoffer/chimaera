@@ -3466,7 +3466,16 @@ impl Core {
         // The profile's batch counts calls of the function; a map chunk is
         // already `items` of them.
         let k = if first.batchable() {
-            (self.profiles.batch(&first.key()) / first.policy.items.max(1) as usize).clamp(1, profiles::MAX_BATCH)
+            let profile =
+                (self.profiles.batch(&first.key()) / first.policy.items.max(1) as usize).clamp(1, profiles::MAX_BATCH);
+            // Never more than an even share of the queue for each free slot:
+            // a batch runs its calls one after another, so while CPUs sit
+            // idle a deep batch only delays the calls at its back. Sixteen
+            // 5 ms calls on a 16-CPU peer went to one executor as a 200 ms
+            // batch and took 80 ms instead of 5. A long queue (a large map)
+            // still gets the profile's batches.
+            let free = ((self.capacity - self.cpu_used) / first.cpus.max(0.01)).floor().max(1.0) as usize;
+            profile.min((self.queue.len() + 1).div_ceil(free))
         } else {
             1
         };
@@ -4202,8 +4211,12 @@ impl Core {
             let cpu_s = b.cpu_ns.saturating_sub(a.cpu_ns) as f64 / 1e9;
             let span_s = now_ns().saturating_sub(dispatched_ns) as f64 / 1e9;
             // Cores over the whole attempt, decoding and reporting included:
-            // a call of microseconds otherwise looks like many cores.
-            cpu_measured = (span_s > 0.0).then(|| cpu_s / span_s);
+            // a call of microseconds otherwise looks like many cores. The
+            // runtime's helper threads are not the function's: a 256 MiB
+            // argument read on four threads made a one-core function learn
+            // four CPUs, and four such calls filled a 16-CPU machine.
+            let helper_s = done.helper_cpu_ns as f64 / 1e9;
+            cpu_measured = (span_s > 0.0).then(|| (cpu_s - helper_s).max(0.0) / span_s);
             measures.insert(
                 "cpu_seconds".into(),
                 pb::Measure { value: cpu_s, scope: scope.into(), method: "rusage".into(), coverage: 1.0 },

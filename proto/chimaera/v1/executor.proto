@@ -63,6 +63,10 @@ message ExecDone {
   TaskKey forward_to = 8;
   // Durable actors: the instance's state after the call, to commit.
   bytes durable_state = 9;
+  // CPU the runtime's helper threads spent on this attempt (copying and
+  // populating large values in parallel). The process's CPU includes it; the
+  // peer leaves it out of the cores it learns for the function.
+  uint64 helper_cpu_ns = 10;
 }
 
 // Durable actors: set the instance's state to the committed one (a restart,
