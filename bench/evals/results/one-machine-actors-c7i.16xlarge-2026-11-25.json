@@ -1,0 +1,181 @@
+{
+ "date": "2026-11-25",
+ "machine": {
+  "platform": "Linux-6.8.0-1069-aws-x86_64-with-glibc2.35",
+  "cpu": "Intel(R) Xeon(R) Platinum 8488C",
+  "cpus": 64,
+  "memory_gib": 123.8,
+  "python": "3.11.16"
+ },
+ "versions": {
+  "ray": "ray 2.59.0",
+  "chimaera": "chimaera ?"
+ },
+ "commit": "1d9844c",
+ "peer_sha256": "743ab2ba264b2334",
+ "profile": "release",
+ "runtimes": [
+  "chimaera",
+  "ray"
+ ],
+ "workloads": [
+  "many_actors"
+ ],
+ "trials": 3,
+ "seed": 584595147,
+ "scale": 0.25,
+ "min_seconds": 10.0,
+ "load": {
+  "min": 6.2,
+  "max": 55.8,
+  "median": 31.6
+ },
+ "records": [
+  {
+   "samples": [
+    45.1
+   ],
+   "version": "ray 2.59.0",
+   "actors": 250,
+   "runtime": "ray",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 0.25,
+   "wall_s": 8.3,
+   "settled_s": 0.0,
+   "load_before": 6.2,
+   "load_after": 31.2,
+   "trial": 0
+  },
+  {
+   "samples": [
+    245.7
+   ],
+   "version": "chimaera ?",
+   "actors": 250,
+   "runtime": "chimaera",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 0.25,
+   "wall_s": 1.5,
+   "settled_s": 0.0,
+   "load_before": 31.2,
+   "load_after": 31.2,
+   "trial": 0
+  },
+  {
+   "samples": [
+    235.9
+   ],
+   "version": "chimaera ?",
+   "actors": 250,
+   "runtime": "chimaera",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 0.25,
+   "wall_s": 1.3,
+   "settled_s": 1.0,
+   "load_before": 31.2,
+   "load_after": 31.6,
+   "trial": 1
+  },
+  {
+   "samples": [
+    44.8
+   ],
+   "version": "ray 2.59.0",
+   "actors": 250,
+   "runtime": "ray",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 0.25,
+   "wall_s": 8.5,
+   "settled_s": 1.0,
+   "load_before": 31.6,
+   "load_after": 39.9,
+   "trial": 1
+  },
+  {
+   "samples": [
+    46.1
+   ],
+   "version": "ray 2.59.0",
+   "actors": 250,
+   "runtime": "ray",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 0.25,
+   "wall_s": 8.1,
+   "settled_s": 0.0,
+   "load_before": 39.9,
+   "load_after": 55.8,
+   "trial": 2
+  },
+  {
+   "samples": [
+    229.6
+   ],
+   "version": "chimaera ?",
+   "actors": 250,
+   "runtime": "chimaera",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 0.25,
+   "wall_s": 1.3,
+   "settled_s": 0.0,
+   "load_before": 55.8,
+   "load_after": 55.8,
+   "trial": 2
+  }
+ ],
+ "summary": {
+  "many_actors": {
+   "ray": {
+    "samples": [
+     45.1,
+     44.8,
+     46.1
+    ],
+    "trials": [
+     45.1,
+     44.8,
+     46.1
+    ],
+    "errors": [],
+    "median": 45.1
+   },
+   "chimaera": {
+    "samples": [
+     245.7,
+     235.9,
+     229.6
+    ],
+    "trials": [
+     245.7,
+     235.9,
+     229.6
+    ],
+    "errors": [],
+    "median": 235.9
+   }
+  }
+ }
+}

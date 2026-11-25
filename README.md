@@ -61,6 +61,10 @@ it stores the array once. Map a function over tiny items and it gets through
 them 180x faster, with no batching by hand on either side: it sizes the
 batches itself.
 
+On one machine, it beats Ray at Ray's own million-call release test: 91 s
+against 106 s. It starts in 0.22 s where Ray takes 4.2 s, and a call whose
+worker is killed gets its result in 5 ms instead of 1.6 s.
+
 The chart's five workloads lead at every size we measured, from 1 machine to
 64.
 Every number, how it was measured and how to rerun it:

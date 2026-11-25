@@ -13,7 +13,9 @@ where Ray wins, is in the raw results named under each section.
 | Independent tasks a second, 64 machines | 11,235/s | 4,502/s | **2.5x** |
 | 4,096 one-second calls, a machine killed 2 s in, 64 machines | 9.59 s | 18.5 s | **1.9x** |
 | A 32 MiB array passed to 2,048 calls, 64 machines | 0.91 s | 4.26 s | **4.7x** |
-| Put a 16 GiB NumPy array and read it in a call | 0.31 s | 2.16 s | **6.9x** |
+| Ray's million-call release test, one machine | 91.0 s | 105.9 s | **1.2x** |
+| Start the runtime and get a first result | 0.22 s | 4.21 s | **19x** |
+| Put a 16 GiB NumPy array and read it in a call | 0.28 s | 1.46 s | **5.2x** |
 
 On independent tasks Chimaera leads by 1.8x or more at every size, from
 one machine to 64. The 16 GiB array is born in shared memory, so its put is
@@ -60,12 +62,17 @@ performance. Each test here is written for both runtimes.
 
 ### Release tests
 
-Ray's single-node release test for a large object (`release/benchmarks/single_node`), on one
-c7i.16xlarge (64 vCPU), four runs per runtime:
+Ray's single-node release tests (`release/benchmarks/single_node`) on one
+c7i.16xlarge (64 vCPU), three trials per runtime; the actor test creates 250 actors:
 
 | Test | Chimaera | Ray | Speedup |
 |---|---:|---:|---:|
-| Put a 16 GiB NumPy array and read it in a call (64 vCPU) | 0.31 s | 2.16 s | **6.9x** |
+| Put a 16 GiB NumPy array and read it in a call | 0.28 s | 1.46 s | **5.2x** |
+| 1,000,000 calls queued at once | 91.0 s | 105.9 s | **1.2x** |
+| One call returning 3,000 values | 2.23 s | 2.89 s | **1.3x** |
+| Get 10,000 stored lists in one call | 5.92 s | 8.30 s | **1.4x** |
+| Get 10,000 stored NumPy arrays in one call | 1.22 s | 2.32 s | **1.9x** |
+| Create 250 actors, each answering one call | 236/s | 45.1/s | **5.2x** |
 
 Ray's actor-creation test (`test_many_actors`, two actors per CPU, each
 answering one call) on clusters of c7i.4xlarge machines, one run each:
@@ -97,9 +104,22 @@ faster one.
 | single client tasks async | 7,326/s | 6,619/s | **1.1x** |  |
 
 Raw results: `bench/microbench/results-2026-11-24-m5.16xlarge.json`,
-`bench/evals/results/release-suite-c7i.16xlarge-2026-11-24.json`,
-`bench/evals/results/compare-c7i.16xlarge-2026-11-24.json` and
-`bench/evals/results/ray-release-scale-{16,64}-2026-11-24.json`.
+`bench/evals/results/ray-release-scale-{16,64}-2026-11-24.json`,
+`bench/evals/results/one-machine-c7i.16xlarge-2026-11-25.json` and
+`bench/evals/results/one-machine-actors-c7i.16xlarge-2026-11-25.json`.
+
+## Everyday work on one machine
+
+From the one-machine run above:
+
+| Workload | Chimaera | Ray | Speedup |
+|---|---:|---:|---:|
+| Start the runtime and get one result | 0.22 s | 4.21 s | **19x** |
+| A call whose worker is killed: time to its result | 5 ms | 1.59 s | **325x** |
+| A 32 MiB array passed to 2 calls per CPU | 18 ms | 0.13 s | **7.3x** |
+| 20,000 no-op calls in one burst | 12,596/s | 11,022/s | **1.1x** |
+| Map over tiny items | 2,010,914/s | 10,170/s | **198x** |
+| One call's round trip | 1,764 µs | 3,500 µs | **2.0x** |
 
 ## Moving data
 
@@ -144,7 +164,7 @@ from source on each machine with `cargo build --release` and
 | Section | Chimaera | Machines |
 |---|---|---|
 | On a cluster; Ray's actor-creation test | commit 933f9a2 | c7i.4xlarge (16 vCPU), 1 to 64 of them |
-| The 16 GiB object | commit 933f9a2 | one c7i.16xlarge (64 vCPU) |
+| Release tests and everyday work on one machine | commit 1d9844c | one c7i.16xlarge (64 vCPU) |
 | Microbenchmarks | commit 933f9a2 | one m5.16xlarge (64 vCPU) |
 
 **Clusters.** `bench/evals/multi_node.py` through

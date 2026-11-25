@@ -55,6 +55,20 @@ artifacts = [
 replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait (eval-1node, eval-4node and eval-16node for the other sizes)"
 
 [[claim]]
+id = "one-machine-2026-11-25"
+kind = "speed"
+tier = "cluster"
+quotes = [
+  "On one machine, it beats Ray at Ray's own million-call release test: 91 s against 106 s.",
+  "It starts in 0.22 s where Ray takes 4.2 s, and a call whose worker is killed gets its result in 5 ms instead of 1.6 s.",
+]
+artifacts = [
+  { path = "bench/evals/results/one-machine-c7i.16xlarge-2026-11-25.json", sha256 = "cd63b241336e3fd820cc0c2df79f172353f4e93c56f5cc2507c1a9d130c84039" },
+  { path = "bench/evals/results/one-machine-actors-c7i.16xlarge-2026-11-25.json", sha256 = "43a8aa18c88f83ab4e0491e235c596ea16a4096b79c84ae47abb8aa1e3fa7dbb" },
+]
+replay = "anyscale job submit -f deploy/anyscale/compare.job.yaml --wait (COMPARE_RUNTIMES=chimaera,ray)"
+
+[[claim]]
 id = "machine-loss-64-nodes"
 kind = "fault"
 tier = "cluster"
