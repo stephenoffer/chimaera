@@ -5657,11 +5657,7 @@ impl Core {
             let space = budget::disk_space(self.objects.dir());
             self.disk_space = space;
             // Objects, plus the object plane's pre-zeroed reserve: both memory.
-            self.object_bytes = if self.budget.objects_in_pool {
-                self.objects.bytes_used() + crate::stores::dir_bytes(&self.objects.dir().join(".reserve"))
-            } else {
-                0
-            };
+            self.object_bytes = if self.budget.objects_in_pool { self.objects.memory_bytes() } else { 0 };
             crate::objplane::publish_usage(self.objects.dir(), self.object_bytes);
             // Objects in memory move to disk (oldest first, off the core's
             // thread) past spill_above() of the pool, or when their filesystem
@@ -5673,9 +5669,13 @@ impl Core {
             );
             if over > 0 && self.object_bytes > 0 && !self.spilling.swap(true, std::sync::atomic::Ordering::AcqRel) {
                 let (objects, flag) = (self.objects.clone(), self.spilling.clone());
+                // Until the objects are under the line again, not one round a
+                // second (see spill_down_to).
+                let keep = self.object_bytes.saturating_sub(over);
                 tokio::task::spawn_blocking(move || {
                     let to = objects.spill_target();
-                    match objects.spill_oldest(over) {
+                    let publish = |used| crate::objplane::publish_usage(objects.dir(), used);
+                    match objects.spill_down_to(keep, over, publish) {
                         Ok(n) if n > 0 => {
                             tracing::info!(
                                 "objects past the memory pool's or their filesystem's room: moved {n} bytes to {to}"

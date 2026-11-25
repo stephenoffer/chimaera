@@ -41,7 +41,7 @@ sudo mount -t tmpfs -o huge=within_size,size=50%,mode=1777 tmpfs /mnt/chimaera-s
 Nodes Chimaera launches itself (the SkyPilot spares of
 `chimaera.provisioner`) mount one at `/mnt/chimaera-objects` before their
 peer starts, wherever `sudo` needs no password. Writing three times the
-memory limit in 16 MB objects then took 5.7–5.9 s, against 7.3–7.6 s on
+memory limit in 16 MB objects then took 3.2–3.3 s, against 5.5–5.8 s on
 `/dev/shm` (bench/objects/RESULTS.md). A pod cannot mount one itself:
 `emptyDir` takes no mount options. On Kubernetes, mount it on the nodes (a
 privileged DaemonSet, or the node image) and give the pod a `hostPath`
@@ -188,10 +188,12 @@ and any blobs it names) to this host before returning, as Ray's
 - **The limit.** Objects may use `CHIMAERA_MEMORY_POOL` bytes of memory,
   or 90% of the object filesystem when that is unset (the `.plane` file
   tells writers). The count covers only this peer's objects: the peer
-  publishes it each second in `.usage`, and each writer adds what it wrote
-  since.
+  publishes it each second (and after each round of spilling) in `.usage`,
+  and each writer adds what it wrote since.
 - **Background spill.** From 80% of the pool, the peer moves the oldest
-  objects to disk, four at a time, without blocking anyone.
+  objects to disk, four at a time, without blocking anyone. It measures
+  again after each round and goes on until they are under that line, so
+  fast writers seldom reach the hard cap below.
 - **Spill at birth.** Writers keep going to memory until the limit plus a
   quarter. Past that hard cap, a new object is written straight to the
   spill directory on disk, and its name in the object directory becomes a

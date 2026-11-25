@@ -242,7 +242,7 @@ class SlurmSpares:
 
 # Objects on a huge-page tmpfs: a spare's peer finds one and keeps its objects
 # there (objplane.rs). Writing three times its memory limit in 16 MB objects
-# then took 5.7-5.9 s against 7.3-7.6 s on /dev/shm's 4 KiB pages
+# then took 3.2-3.3 s against 5.5-5.8 s on /dev/shm's 4 KiB pages
 # (bench/objects/RESULTS.md). Mounted only where sudo needs no password, at
 # most half the RAM as /dev/shm is (pages are taken only as written); any
 # failure leaves the peer on /dev/shm.

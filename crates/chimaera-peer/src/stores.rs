@@ -473,6 +473,37 @@ impl ObjectStore {
         }
     }
 
+    /// Move the oldest objects to disk until those in memory (with the
+    /// object plane's reserve) are at most `keep` bytes; `want` is what a
+    /// measurement found past that. Writers go on writing while a round
+    /// runs, so each round measures again, tells writers (`publish`), and the
+    /// next one moves what is past `keep` by then: waiting for the next scan
+    /// instead let writers reach the hard cap, where each new object is
+    /// written to disk before its put returns. Returns the bytes moved.
+    pub fn spill_down_to(&self, keep: u64, mut want: u64, publish: impl Fn(u64)) -> io::Result<u64> {
+        let mut moved = 0;
+        while want > 0 {
+            let n = match self.spill_oldest(want) {
+                Ok(n) => n,
+                Err(_) if moved > 0 => break,
+                Err(e) => return Err(e),
+            };
+            moved += n;
+            let used = self.memory_bytes();
+            publish(used);
+            if n == 0 {
+                break;
+            }
+            want = used.saturating_sub(keep);
+        }
+        Ok(moved)
+    }
+
+    /// Bytes in memory: the objects and the object plane's pre-zeroed reserve.
+    pub fn memory_bytes(&self) -> u64 {
+        self.bytes_used() + dir_bytes(&self.dir.join(".reserve"))
+    }
+
     /// Bytes currently held, for admission and status.
     pub fn bytes_used(&self) -> u64 {
         fn walk(p: &Path) -> u64 {
@@ -645,6 +676,34 @@ mod tests {
         let mut rx = read_chunks(&path, 0, 1, 1024).await.unwrap();
         let first = rx.recv().await.unwrap().unwrap();
         assert_eq!((first.data.len(), first.object_size), (1, 10_000), "a one-byte range reports the whole size");
+    }
+
+    #[test]
+    fn spilling_goes_on_until_memory_is_down_to_what_is_kept() {
+        let (mem, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(vec![disk.path().to_path_buf()]);
+        let run = Id::derive(0, 0, &[b"run"]);
+        for i in 1..=5u8 {
+            let path = store.path(&run.0, &[i]);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![i; 1000]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
+        }
+        let seen = std::sync::Mutex::new(Vec::new());
+        // Keep 2500 (2000 of objects, and the links left in place of the
+        // spilled ones). The measurement that started it is stale: 1000
+        // past, where about 2500 are.
+        let moved = store.spill_down_to(2500, 1000, |used| seen.lock().unwrap().push(used)).unwrap();
+        assert_eq!(moved, 3000, "it measured again and moved what was still past the line");
+        assert!(store.memory_bytes() <= 2500, "{}", store.memory_bytes());
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 2, "each round's measurement is published: {seen:?}");
+        assert_eq!(*seen.last().unwrap(), store.memory_bytes());
+        for i in 1..=3u8 {
+            assert!(std::fs::symlink_metadata(store.path(&run.0, &[i])).unwrap().is_symlink(), "the oldest moved");
+            assert_eq!(std::fs::read(store.path(&run.0, &[i])).unwrap(), vec![i; 1000]);
+        }
+        assert_eq!(store.spill_down_to(u64::MAX, 0, |_| panic!("nothing past the line")).unwrap(), 0);
     }
 
     #[test]

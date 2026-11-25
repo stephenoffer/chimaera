@@ -63,6 +63,7 @@ plane, not the cost of turning Python objects into bytes. The result:
 | `put` of a 1 KB value | 11–30x | inline in the handle |
 | `get` of a 1–64 KB value on another node | **17–137x** | inline in the handle, no transfer at all |
 | first get of a spilled 256 MB object | **360–1,080x** | restore is a mapping of the disk file |
+| writing 3x the memory limit (spill): 256 MB objects, or any size on huge pages | 1.2–2.2x | the spiller keeps memory under its line, so writes seldom wait for the disk |
 | recovery when a node dies holding a value | **90–70,000x**, and values Ray loses survive | replicas on the next peer (Ray: 12–14 s of detection, then a re-run) |
 | `bytes` get, str up to 16 MB, dicts, lists, pandas, 1 MB+ | 0.5–1.7x | bound by pickling or by the one copy both must make |
 | `str` put of 256 MB | 1.9x (4 KiB pages), 3.8x (huge pages) | encoded to UTF-8 once into an arena block, then linked |
@@ -93,7 +94,7 @@ barely faster:
 
 | data, pattern | vs Ray | why | what helps |
 |---|---:|---|---|
-| writing 3x the memory limit (spill) | 0.65–0.70x with 16 MB objects, 0.86–0.88x with 256 MB on `/dev/shm`; 0.76–0.79x and 0.89–0.90x with both runtimes on a huge-page tmpfs (see Spill and restore) | Each new array is allocated in shared memory, and the cause is fresh pages: Ray's store reuses the same pages as it spills, while a spilled Chimaera object frees its pages and the next array gets new ones, which the kernel allocates and zeroes. Measured on 2026-11-24 (4 GiB of 64 MiB objects into `/dev/shm`, two runs): fresh tmpfs pages 2.6 s (1.7 GB/s), a heap array copied into warm shared memory as Ray does 1.5 s (2.9 GB/s), and pages already in a tmpfs file, mapped with `MAP_POPULATE`, 0.95 s (4.5 GB/s). On `/dev/shm`, with shared-memory huge pages off (`shmem_enabled=never`, the usual default), those faults cost more again: a huge-page tmpfs took Chimaera's 16 MB write from 7.3–7.6 s to 5.7–5.9 s, though Ray gained there too. Populating new blocks in parallel did not change it, and neither did 16 spill threads instead of 4. Writing arrays to disk at birth once memory passes the spill line was slower (2026-11-22, 16 MB: 7.4 s → 11.2 s; 256 MB: 15.0 s → 18.6 s): the put then waits for a disk write the background spiller does off the critical path. Reading them back is 2.7–5.1x faster than Ray. | A huge-page tmpfs (`mount -t tmpfs -o huge=within_size`; the peer uses one it finds, and nodes Chimaera provisions mount one), a larger memory limit, or reusing arrays. Not built: handing a spilled object's pages to the next array, which would give it pages already faulted in, but is safe only once no process still maps the old object, and only within one run. |
+| writing 3x the memory limit (spill), 16 MB objects on `/dev/shm` | 0.82–0.89x (5.5–5.8 s against 4.8–4.9 s) | Each new array is allocated in shared memory, on pages the kernel allocates and zeroes, while Ray reuses its heap's pages for each new array and copies it into its store on several threads: making and filling each 16 MB array took 2.8 ms against Ray's 1.2 ms. Measured on 2026-11-24 (4 GiB of 64 MiB objects into `/dev/shm`, two runs): fresh tmpfs pages 2.6 s (1.7 GB/s), a heap array copied into warm shared memory as Ray does 1.5 s (2.9 GB/s), and pages already in a tmpfs file, mapped with `MAP_POPULATE`, 0.95 s (4.5 GB/s). Those faults cost the most on `/dev/shm`, with shared-memory huge pages off (`shmem_enabled=never`, the usual default): on a huge-page tmpfs the same writes are 1.4x faster than Ray's, and 256 MB objects are faster on `/dev/shm` too. 8 or 16 spill threads did no better than 4. | A huge-page tmpfs (`mount -t tmpfs -o huge=within_size`; the peer uses one it finds, and nodes Chimaera provisions mount one), a larger memory limit, or reusing arrays. Not built: handing a spilled object's pages to the next array, which would give it pages already faulted in, but is safe only once no process still maps the old object, and only within one run. |
 | first touch of a value's pages just after `get` | pandas 16 MiB 0.5x (693 µs against 312), Arrow 1 MiB 0.6x (72–82 µs against 45) | A value read in place is a mapping of its file, whose pages fault in when first touched. `get` and the touch together are faster than Ray's: pandas 16 MiB 37.3 ms against 41.4–42.9, Arrow 1 MiB 166–179 µs against 200. | - |
 | pandas with object columns, get of 1 MiB | 1.0x (1.73–1.75 ms against 1.66–1.68) | Unpickling the frame's structure is most of the time in both (put is 2.0–2.1x, return and pipeline 1.3–1.5x). | NumPy or Arrow columns, or `category` dtype. |
 | Arrow tables, `return` and `pipeline` of 1 MiB | 0.9–1.4x | Arrow buffers are copied once into shared memory: the zero-copy allocator covers NumPy. From 16 MiB 1.2–2.1x; put and get are 1.2–1.9x. | - |
@@ -240,43 +241,48 @@ the put and return paths reach hundreds.
 
 ## Spill and restore
 
-Re-measured on 2026-11-24 at e012f2b on one workspace node, both runtimes
-the same day, two runs each (the ranges below). Each runtime gets 8 GiB of
+Measured on 2026-11-24 on one workspace node, both runtimes in one
+session, two runs each (the ranges below). Each runtime gets 8 GiB of
 object memory: Ray a local cluster of its own started with
 `object_store_memory`, Chimaera `CHIMAERA_MEMORY_POOL`. On Anyscale, unset
 `RAY_OVERRIDE_RESOURCES` for such a cluster: it sets the node's 41 GB as
 the object store, Ray then never spills in this test, and its restore looks
-7 to 50 times faster. Each runtime writes 24 GiB of distinct NumPy objects, then
-reads every object back in another process and checks it. Both spill to
-the same NVMe disk. Ray's log shows 49 GB spilled in every run: the write,
-then the restore making room.
+7 to 50 times faster. Each runtime writes 24 GiB of distinct NumPy objects,
+then reads every object back in another process and checks it. Both spill
+to the same NVMe disk. Ray's log shows 49 GB spilled in every run: the
+write, then the restore making room.
+
+Chimaera's spiller goes on until memory is under its line, measuring after
+each round. When it ran one round a second, writers reached the hard cap
+and each put then wrote its object to disk before returning: the 16 MB and
+256 MB writes on `/dev/shm` took 7.3–7.5 s and 9.3 s, against 5.9 s for
+both with it (one build of each from the same tree, two runs).
 
 Objects on `/dev/shm` (4 KiB pages, the default on these hosts):
 
 | object size | measure | Ray | Chimaera | speedup |
 |---|---|---:|---:|---:|
-| 16 MB | write 24 GiB | 4.87–5.10 s | 7.29–7.55 s | 0.65–0.70x |
-| 16 MB | restore and check 24 GiB | 6.56–7.39 s | 1.45–1.54 s | **4.3–5.1x** |
-| 16 MB | first get of the oldest object | 0.19–0.23 ms | 0.19–0.28 ms | 0.7–1.2x |
-| 256 MB | write 24 GiB | 8.24–8.29 s | 9.32–9.61 s | 0.86–0.88x |
-| 256 MB | restore and check 24 GiB | 3.50–5.56 s | 1.28–1.39 s | **2.7–4.0x** |
-| 256 MB | first get of the oldest object | 46–118 ms | 0.10–0.11 ms | **440–1,080x** |
+| 16 MB | write 24 GiB | 4.79–4.86 s | 5.48–5.82 s | 0.82–0.89x |
+| 16 MB | restore and check 24 GiB | 7.80–8.12 s | 1.46–1.49 s | **5.3–5.4x** |
+| 256 MB | write 24 GiB | 7.86–7.92 s | 5.86–6.38 s | 1.23–1.35x |
+| 256 MB | restore and check 24 GiB | 3.35–3.83 s | 1.26 s | **2.7–3.0x** |
 
 Both on a `huge=within_size` tmpfs (Ray's plasma directory there, and
 Chimaera's objects, which it finds by itself):
 
 | object size | measure | Ray | Chimaera | speedup |
 |---|---|---:|---:|---:|
-| 16 MB | write 24 GiB | 4.52–4.54 s | 5.74–5.91 s | 0.76–0.79x |
-| 16 MB | restore and check 24 GiB | 4.58–4.59 s | 0.95–1.13 s | **4.1–4.9x** |
-| 16 MB | first get of the oldest object | 0.19 ms | 0.19–0.20 ms | 0.9–1.0x |
-| 256 MB | write 24 GiB | 7.96–8.02 s | 8.84–8.98 s | 0.89–0.90x |
-| 256 MB | restore and check 24 GiB | 4.09–4.11 s | 0.93–1.09 s | **3.8–4.4x** |
-| 256 MB | first get of the oldest object | 45–49 ms | 0.10–0.13 ms | **360–450x** |
+| 16 MB | write 24 GiB | 4.50–4.53 s | 3.22–3.29 s | 1.38–1.40x |
+| 16 MB | restore and check 24 GiB | 4.59–4.63 s | 1.22–1.26 s | **3.6–3.8x** |
+| 256 MB | write 24 GiB | 8.10–8.18 s | 3.68–5.56 s | 1.47–2.20x |
+| 256 MB | restore and check 24 GiB | 3.58–4.28 s | 0.95 s | **3.8–4.5x** |
 
-In the second run of each (the one whose rows were kept), both runtimes
-read back all 1,536 and all 96 objects correctly. Chimaera writes slower in
-every case; "What Chimaera is not faster for" above says why.
+The first get of the oldest (spilled) object, timed on its own in that
+day's earlier runs (the spiller does not change reads): 0.10–0.28 ms for
+Chimaera at both sizes, against Ray's 0.19–0.23 ms at 16 MB and 45–118 ms
+at 256 MB. In every run both runtimes read back all 1,536 and all 96
+objects correctly. Chimaera still writes 16 MB objects on `/dev/shm`
+slower; "What Chimaera is not faster for" above says why.
 
 Spilling to S3 (`CHIMAERA_SPILL_URL`, 2026-11-24, one workspace node, a 64
 MiB pool): 2,000 `put`s of 64 KiB NumPy arrays went up as 2 packs, not 2,000
