@@ -240,6 +240,19 @@ class SlurmSpares:
         self._run(*args, "--wrap", f"srun sh -c '{peer}'")
 
 
+# Objects on a huge-page tmpfs: a spare's peer finds one and keeps its objects
+# there (objplane.rs). Writing three times its memory limit in 16 MB objects
+# then took 5.7-5.9 s against 7.3-7.6 s on /dev/shm's 4 KiB pages
+# (bench/objects/RESULTS.md). Mounted only where sudo needs no password, at
+# most half the RAM as /dev/shm is (pages are taken only as written); any
+# failure leaves the peer on /dev/shm.
+HUGE_OBJECTS = (
+    "sudo -n mkdir -p /mnt/chimaera-objects && "
+    "{ mountpoint -q /mnt/chimaera-objects || "
+    "sudo -n mount -t tmpfs -o huge=within_size,size=50%,mode=1777 tmpfs /mnt/chimaera-objects; } || true"
+)
+
+
 class SkySpares:
     """A cluster grown by one-node SkyPilot clusters whose peers join it.
     Growing runs ``sky launch`` with ``launch_args`` (where and on what, e.g.
@@ -306,7 +319,7 @@ class SkySpares:
         while len(names) < want:
             seeds, port = _seeds()
             peer = (
-                f"chimaera peer start --provider static --listen 0.0.0.0:{port} "
+                f"{HUGE_OBJECTS}; chimaera peer start --provider static --listen 0.0.0.0:{port} "
                 f'--advertise "$(hostname -I | cut -d" " -f1):{port}" --seeds {seeds}'
             )
             name = f"{self.PREFIX}-{max((int(x.rsplit('-', 1)[1]) for x in names), default=0) + 1}"

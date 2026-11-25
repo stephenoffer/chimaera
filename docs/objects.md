@@ -38,6 +38,16 @@ sudo mkdir -p /mnt/chimaera-shm
 sudo mount -t tmpfs -o huge=within_size,size=50%,mode=1777 tmpfs /mnt/chimaera-shm
 ```
 
+Nodes Chimaera launches itself (the SkyPilot spares of
+`chimaera.provisioner`) mount one at `/mnt/chimaera-objects` before their
+peer starts, wherever `sudo` needs no password. Writing three times the
+memory limit in 16 MB objects then took 5.7–5.9 s, against 7.3–7.6 s on
+`/dev/shm` (bench/objects/RESULTS.md). A pod cannot mount one itself:
+`emptyDir` takes no mount options. On Kubernetes, mount it on the nodes (a
+privileged DaemonSet, or the node image) and give the pod a `hostPath`
+volume there, named in `CHIMAERA_OBJECT_DIR`, in place of the `emptyDir`
+at `/dev/shm` in deploy/k8s/example.yaml.
+
 ## Writing a value
 
 `ch.put(value)`, a call's return value and a call's large arguments are all

@@ -182,8 +182,10 @@ def test_skypilot_spares_launch_join_and_drain_before_teardown(tmp_path, monkeyp
     assert len(launches) == 2 and pool.replicas() == 3
     first = launches[0]
     assert first.startswith(
-        "sky [launch] [-c] [chimaera-spare-1] [-y] [-d] [--secret] [CHIMAERA_CLUSTER_TOKEN] [--infra] [aws] [--use-spot] [chimaera peer start"
+        "sky [launch] [-c] [chimaera-spare-1] [-y] [-d] [--secret] [CHIMAERA_CLUSTER_TOKEN] [--infra] [aws] [--use-spot] [sudo -n mkdir"
     )
+    # A huge-page tmpfs for its objects first (best effort), then its peer.
+    assert "huge=within_size" in first and first.index("huge=within_size") < first.index("chimaera peer start")
     assert "--listen 0.0.0.0:7700" in first and "--seeds 10.0.0.5:7700,10.0.0.6:7700]" in first
     assert "chimaera-spare-2" in launches[1]
     # A restarted provisioner knows the spares; shrinking drains the newest, then tears it down.
