@@ -21,8 +21,9 @@ from typing import Any
 
 import chimaera as ch
 
-from . import _state
+from . import _ids, _state
 from ._nodes import available_resources, cluster_resources, nodes
+from ._ids import JobID, TaskID
 from ._remote import ActorClass, ActorHandle, ItemRef, ObjectRefGenerator, PutRef, RemoteFunction, get_actor, make
 from ._unsupported import ChimaeraCompatWarning, Unsupported, UnsupportedAttribute, unsupported, warn_once
 from .exceptions import GetTimeoutError, reraise
@@ -32,7 +33,23 @@ __version__ = "2.60.0+chimaera"
 
 
 class ObjectRef(abc.ABC):
-    """``isinstance(x, ray.ObjectRef)`` holds for Chimaera futures and ``put`` references."""
+    """``isinstance(x, ray.ObjectRef)`` holds for Chimaera futures and ``put``
+    references. ``ray.ObjectRef(id)`` is the live ref with that id (see _ids)."""
+
+    def __new__(cls, id: bytes, *_: Any, **__: Any) -> Any:
+        return _ids.find(id)
+
+    from_binary = staticmethod(_ids.find)
+    nil = staticmethod(_ids.nil)
+    from_random = staticmethod(_ids.from_random)
+
+    @staticmethod
+    def from_hex(hex_id: str) -> Any:
+        return _ids.find(bytes.fromhex(hex_id))
+
+    @staticmethod
+    def size() -> int:
+        return _ids.SIZE
 
 
 ObjectRef.register(ch.Future)
@@ -161,24 +178,7 @@ from ._ref_future import attach as _attach_future  # noqa: E402 -- needs _get_on
 
 _attach_future(_get_one, (ch.Future, PutRef, ItemRef))  # ref.future(), as in Ray
 
-
-def _ref_binary(self: Any) -> bytes:
-    """The ref's id (Ray's ``ObjectRef.binary()``): a call's or put's run and
-    object ids, then the index of one of a call's ``num_returns`` values."""
-    if isinstance(self, ItemRef):
-        return self._id
-    whole, _, index = (self._ref if isinstance(self, PutRef) else self).id.partition("#")
-    return bytes.fromhex(whole) + (int(index).to_bytes(4, "little") if index else b"")
-
-
-def _ref_hex(self: Any) -> str:
-    """The ref's id in hex (Ray's ``ObjectRef.hex()``)."""
-    return _ref_binary(self).hex()
-
-
-for _ref_type in (ch.Future, PutRef, ItemRef):
-    setattr(_ref_type, "binary", _ref_binary)  # noqa: B010 -- as _attach_future does
-    setattr(_ref_type, "hex", _ref_hex)  # noqa: B010
+_ids.attach((ch.Future, PutRef, ItemRef))  # ref.hex(), ref.task_id() and the rest, as in Ray
 
 
 def get(object_refs: Any, *, timeout: float | None = None) -> Any:
@@ -196,7 +196,7 @@ def get(object_refs: Any, *, timeout: float | None = None) -> Any:
 def put(value: Any, *, _owner: Any = None) -> PutRef:
     if _owner is not None:
         warn_once("CHR001", "put(_owner=...)", "ignored: objects belong to the run, not to an actor")
-    return PutRef(ch.put(value))
+    return PutRef(ch.put(value), _ids.this_task())
 
 
 def wait(
@@ -310,6 +310,8 @@ from . import actor, util  # noqa: E402 -- submodules that use the functions abo
 __all__ = [
     "ActorClass",
     "ChimaeraCompatWarning",
+    "JobID",
+    "TaskID",
     "UnsupportedAttribute",
     "ObjectRef",
     "ObjectRefGenerator",

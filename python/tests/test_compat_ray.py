@@ -761,6 +761,49 @@ def test_refs_have_ray_ids_await_and_ray_s_object_errors_are_there_to_catch():
     assert issubclass(rex.ObjectStoreFullError, rex.RayError) and issubclass(rex.OutOfDiskError, rex.RayError)
 
 
+def test_a_ref_id_finds_its_ref_and_names_its_task_and_run_as_in_ray():
+    @ray.remote
+    def whose():
+        ctx = ray.get_runtime_context()
+        return ctx.get_task_id(), ctx.get_job_id()
+
+    @ray.remote(num_returns=2)
+    def two():
+        return "a", "b"
+
+    @ray.remote
+    def puts():
+        return [ray.put(1)], ray.get_runtime_context().get_task_id()
+
+    @ray.remote
+    def items():
+        yield 1
+
+    call = whose.remote()
+    task, job = ray.get(call)
+    assert isinstance(call.task_id(), ray.TaskID) and isinstance(call.job_id(), ray.JobID)
+    assert (call.task_id().hex(), call.job_id().hex()) == (task, job), "the ids the call itself sees"
+    a, b = two.remote()
+    assert a.task_id() == b.task_id() != call.task_id() and a.job_id() == call.job_id()
+    put, item = ray.put("p"), next(iter(items.options(num_returns="streaming").remote()))
+    assert put.task_id().is_nil() and item.task_id().is_nil(), "a driver's put, an item: made by no call"
+    assert put.job_id() == item.job_id() == call.job_id()
+    [inner], putter = ray.get(puts.remote())
+    assert inner.task_id().hex() == putter, "a put made in a call names that call"
+    refs = [call, a, b, put, item, inner]
+    assert {len(r.binary()) for r in refs} == {ray.ObjectRef.size()}
+    for r in refs:
+        assert ray.ObjectRef.from_hex(r.hex()) is r and ray.ObjectRef(r.binary()) is r and not r.is_nil()
+    assert ray.get(ray.ObjectRef.from_binary(b.binary())) == "b"
+    for none in (ray.ObjectRef.nil(), ray.ObjectRef.from_random(), ray.ObjectRef(bytes(36))):
+        assert isinstance(none, ray.ObjectRef) and none.is_nil() == (none.hex() == "ff" * 36)
+        with pytest.raises(ray.exceptions.ObjectLostError):
+            ray.get(none)
+    with pytest.raises(ValueError, match="36 bytes"):
+        ray.ObjectRef(b"short")
+    assert call.call_site() == ""  # as in Ray unless RAY_record_ref_creation_sites is set
+
+
 def test_a_ref_gives_a_concurrent_future_of_its_value_as_in_ray():
     import asyncio
     import concurrent.futures

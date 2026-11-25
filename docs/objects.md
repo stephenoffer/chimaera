@@ -371,7 +371,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | lineage reconstruction of task outputs | both: replicas on another peer (another failure domain first), for task outputs *and* `put` values, with a durability class per value (above). When every copy of a call's result is lost, the call runs again on the reader's peer, under the same attempt, so it writes the same object and blob ids. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again, and not one declared `deterministic=False`, which could return other bytes under the old id; the chain is rebuilt depth first, three levels at most. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
 | `OwnerDiedError` when a `put`'s owner dies | the value is read from its replica |
 | ref counting, `free` | a `put` handle dropped without escaping is freed at once; a released value is deleted on every peer that fetched it; the rest go when their run ends, except values another run's handle holds, which go when the last such handle does |
-| `ObjectRef.hex()`, `.binary()`, `.future()`, `.as_future()`, `await ref` | the same through the Ray shim (docs/compat-ray.md); a `ch.Future` has `.id` and `await` |
+| `ObjectRef.hex()`, `.binary()`, `.task_id()`, `.job_id()`, `.future()`, `.as_future()`, `await ref`, `ObjectRef(id)`, `from_binary`, `from_hex`, `nil()` | the same through the Ray shim (docs/compat-ray.md); a `ch.Future` has `.id` and `await` |
 | `ray.exceptions`: `ObjectLostError`, `OwnerDiedError`, `ObjectReconstructionFailedError`, `ObjectFreedError`, `ObjectFetchTimedOutError`, `OutOfDiskError` | a lost value is `ch.errors.DataLost`, `ObjectLostError` through the shim, which has the other classes to import and catch |
 | `ray.get(timeout=)` | `ch.get(timeout=)`, `result(timeout=)`, `ch.wait(timeout=)`; `GetTimeoutError` through the shim |
 | `num_returns=N`, `"dynamic"`, `"streaming"` | `returns=N`, and generator calls (an `ObjectRefGenerator` through the shim) |
@@ -379,7 +379,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | task results up to 100 KiB returned to the caller inline (`max_direct_call_object_size`); a `ray.put` value always in the store | a result up to 64 KiB and a `put` value up to 4 KiB travel in the handle |
 | Ray Direct Transport: GPU tensors between actors over NCCL or NIXL | a `put` CUDA tensor: on one machine over CUDA IPC, across machines GPU to GPU with `CHIMAERA_CUDA_NET` (NCCL over EFA measured; NIXL did not complete there, bench/objects/RESULTS.md); `durability="ephemeral"` keeps no host copy |
 
-Not matched yet: `ObjectRef.from_hex()`, `.task_id()`, `.call_site()`, `.owner_address()` and `.size()`, and a Python call that lists objects (`chimaera objects --cluster` lists them from the CLI).
+Not matched yet: a Python call that lists objects (`chimaera objects --cluster` lists them from the CLI), and `ObjectRef.call_site()` with `RAY_record_ref_creation_sites` set (it is always empty). `ObjectRef.owner_address()` has no counterpart: no process owns a value.
 `ray.experimental.get_object_locations` is `ch.runs.object_locations`: the
 peer each value is stored at, with its size. Copies made in the background
 are not listed, as no peer keeps a record of where every copy is, and Ray

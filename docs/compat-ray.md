@@ -66,7 +66,11 @@ Chimaera API work on them too.
 | `ray.wait(refs, num_returns=, timeout=)` | Same contract: at most `num_returns` ready, both lists in input order, unique refs required |
 | `ray.cancel(ref, force=)` | The result becomes `TaskCancelledError` at once. Without `force`, a running body is asked to stop through `ch.context().cancelled()` and keeps running until it checks; Ray interrupts it. With `force`, the worker is killed. `recursive=False` is `Unsupported` |
 | `isinstance(x, ray.ObjectRef)` | True for futures and `put` references |
-| `ref.hex()`, `ref.binary()`, `ref.future()`, `ref.as_future()`, `await ref` | The same, for every kind of ref. The id is a call's or put's run and object ids, with the index of one of a call's `num_returns` values; a generator item's is its own. `ObjectRef.from_hex`, `task_id()`, `call_site()`, `owner_address()` and `size()` are missing |
+| `ref.hex()`, `ref.binary()`, `ref.future()`, `ref.as_future()`, `await ref` | The same, for every kind of ref. An id is 36 bytes (`ObjectRef.size()`): the run, the call or `put`, and which of a call's `num_returns` values; a generator item's middle is random |
+| `ref.task_id()`, `ref.job_id()`, `ray.TaskID`, `ray.JobID` | The call that made the value and its run, the ids `get_runtime_context()` gives inside that call. A driver's `put` and a generator item have the nil `TaskID` |
+| `ray.ObjectRef(id)`, `ObjectRef.from_binary`, `from_hex`, `nil()`, `from_random()`, `ref.is_nil()` | The ref with that id while it is alive in this process and its id was read here, as Ray finds an id through its owner. Any other id, `nil()` and `from_random()` make a ref whose `ray.get` raises `ObjectLostError` (Ray's `from_hex` raises `NotImplementedError`) |
+| `ref.call_site()` | `""`, Ray's answer unless `RAY_record_ref_creation_sites` is set |
+| `ref.owner_address()` | Missing: a value has no owner process; it belongs to its run, and its copies are on other peers |
 | `f.bind()`, `ray.dag` | `Unsupported` until `ch.graph` (P5) |
 
 ### Task options

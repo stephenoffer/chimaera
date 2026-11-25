@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 import sys
 import types
 from collections.abc import Callable, Generator, Mapping
 from typing import Any
 
 import chimaera as ch
+
+from . import _ids
 
 from . import _options
 from ._unsupported import unsupported, warn_once
@@ -26,10 +27,11 @@ class PutRef:
     in Ray.
     """
 
-    __slots__ = ("_ref",)
+    __slots__ = ("_ref", "_task", "__weakref__")
 
-    def __init__(self, ref: ch.Future[Any]) -> None:
+    def __init__(self, ref: ch.Future[Any], task: bytes | None = None) -> None:
         self._ref = ref
+        self._task = task  # the call that put it (ObjectRef.task_id()), None for a driver
 
     def result(self, timeout: float | None = None) -> Any:
         return self._ref.result(timeout)
@@ -38,7 +40,7 @@ class PutRef:
         return self._ref.__await__()
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (PutRef, (self._ref,))
+        return (PutRef, (self._ref, self._task))
 
     def __repr__(self) -> str:
         return f"<ObjectRef put {self._ref.id[-12:]}>"
@@ -48,11 +50,11 @@ class ItemRef:
     """One item of an ``ObjectRefGenerator``: already resolved (or the error
     the generator raised there, raised by ``ray.get``)."""
 
-    __slots__ = ("_value", "_error", "_id")
+    __slots__ = ("_value", "_error", "_id", "__weakref__")
 
     def __init__(self, value: Any = None, error: BaseException | None = None, id: bytes | None = None) -> None:
         self._value, self._error = value, error
-        self._id = id or os.urandom(16)  # its ObjectRef id: an item is not stored under one of its own
+        self._id = id or _ids.item_id()  # its ObjectRef id: an item is not stored under one of its own
 
     def result(self, timeout: float | None = None) -> Any:
         if self._error is not None:
