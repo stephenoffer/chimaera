@@ -203,6 +203,14 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            - name: CHIMAERA_K8S_NODE
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
             - name: CHIMAERA_FOUNDERS
               value: "{founders}"
             - name: CHIMAERA_PORT
@@ -460,6 +468,8 @@ mod tests {
         for want in [
             "podManagementPolicy: Parallel",
             "updateStrategy:\n    type: OnDelete",
+            "name: CHIMAERA_K8S_NODE\n              valueFrom:\n                fieldRef:\n                  fieldPath: spec.nodeName",
+            "name: POD_UID\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.uid",
             "publishNotReadyAddresses: true",
             "automountServiceAccountToken: false",
             "terminationGracePeriodSeconds: 45",
