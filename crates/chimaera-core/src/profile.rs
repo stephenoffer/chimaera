@@ -183,11 +183,15 @@ pub struct Stats {
     pub total: u64,
     /// Summary loaded from disk or received from another peer; used until
     /// enough local samples exist.
-    pub prior: Option<Summary>,
+    prior: Option<Summary>,
+    /// `summary()` until the next push or prior: placement asks for it
+    /// several times per call, and summarizing the ring sorts its samples.
+    summary: std::cell::RefCell<Option<Summary>>,
 }
 
 impl Stats {
     pub fn push(&mut self, s: Sample) {
+        self.summary.take();
         if !s.oom {
             self.total += 1;
         }
@@ -206,9 +210,19 @@ impl Stats {
         self.ring.iter().filter(|s| !s.oom).count() as u64
     }
 
+    /// What was known before the local samples (see `prior`).
+    pub fn set_prior(&mut self, prior: Option<Summary>) {
+        self.summary.take();
+        self.prior = prior;
+    }
+
     /// The local summary once there are enough samples, else the prior (with
     /// local OOM bounds added), else whatever the local samples show.
     pub fn summary(&self) -> Summary {
+        self.summary.borrow_mut().get_or_insert_with(|| self.summarize()).clone()
+    }
+
+    fn summarize(&self) -> Summary {
         let local = summarize(self.ring.iter());
         match &self.prior {
             Some(p) if local.n < MIN_SAMPLES => {
@@ -780,10 +794,19 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_asked_for_again_reflects_a_prior_set_since() {
+        let remote = stats((0..20).map(|_| ok(1.0, 1.0, 500 * MIB, MIB))).summary();
+        let mut s = stats([ok(1.0, 1.0, 100 * MIB, MIB)]);
+        assert_eq!(s.summary().peak_p95, 100 * MIB);
+        s.set_prior(Some(remote));
+        assert_eq!(s.summary().peak_p95, 500 * MIB, "the cached summary was dropped with the new prior");
+    }
+
+    #[test]
     fn a_prior_is_used_until_local_samples_suffice() {
         let remote = stats((0..20).map(|_| ok(1.0, 1.0, 500 * MIB, MIB))).summary();
         let mut s = stats([ok(1.0, 1.0, 100 * MIB, MIB)]);
-        s.prior = Some(remote.clone());
+        s.set_prior(Some(remote.clone()));
         assert_eq!(s.summary().peak_p95, 500 * MIB);
         s.push(ok(1.0, 1.0, 100 * MIB, MIB));
         s.push(ok(1.0, 1.0, 100 * MIB, MIB));

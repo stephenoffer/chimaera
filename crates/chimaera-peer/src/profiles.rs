@@ -85,7 +85,7 @@ impl Entry {
         for s in self.remotes.values() {
             prior = Some(prior.map_or_else(|| s.clone(), |p| p.merge(s)));
         }
-        self.stats.prior = prior;
+        self.stats.set_prior(prior);
     }
 }
 
