@@ -177,6 +177,8 @@ pub struct MeshClient {
     bandwidth: Mutex<HashMap<u64, f64>>,
     /// Objects fetched from each peer: (transfers, bytes).
     fetched: Mutex<HashMap<u64, (u64, u64)>>,
+    /// Objects taken from a peer's store on this machine: (copies, bytes).
+    linked: Mutex<HashMap<u64, (u64, u64)>>,
     /// Objects fetched recently (locality hints for other peers).
     recent: Mutex<VecDeque<(Instant, Vec<u8>)>>,
     /// Which peer holds the parts of results fetched here (see parts).
@@ -217,6 +219,46 @@ static FETCH_SEQ: AtomicU64 = AtomicU64::new(0);
 fn ranges(size: u64, n: u64) -> Vec<(u64, u64)> {
     let step = size.div_ceil(n.max(1)).max(1);
     (0..size).step_by(step as usize).map(|off| (off, step.min(size - off))).collect()
+}
+
+/// Rounds in which the unverified rest of failed ranges is asked for again
+/// before a fetch in ranges fails.
+const RANGE_RETRIES: u32 = 2;
+
+/// Fetch `size` bytes as FETCH_RANGES ranges with `get(range, lane,
+/// verified)`, which counts in `verified` the bytes of its range it checked
+/// and wrote. Every range settles before any is asked for again, so no writer
+/// of an earlier round is still writing when the next starts (or when the
+/// caller renames the file). A failed range is asked for again from its first
+/// unverified byte, for up to RANGE_RETRIES more rounds while each verifies
+/// something: one lost stream costs its unfinished part, not the object.
+async fn in_ranges<F, Fut>(size: u64, get: F) -> std::io::Result<u64>
+where
+    F: Fn((u64, u64), usize, Arc<AtomicU64>) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<u64>>,
+{
+    let (mut todo, mut round) = (ranges(size, FETCH_RANGES), 0);
+    loop {
+        let verified: Vec<Arc<AtomicU64>> = todo.iter().map(|_| Arc::default()).collect();
+        let asks = todo.iter().zip(&verified).enumerate().map(|(i, (&r, v))| get(r, 1 + i % FETCH_LANES, v.clone()));
+        let results = futures_util::future::join_all(asks).await;
+        let (mut left, mut failed, mut progress) = (Vec::new(), None, false);
+        for ((&(offset, len), v), result) in todo.iter().zip(&verified).zip(results) {
+            let done = v.load(Ordering::Relaxed).min(len);
+            progress |= done > 0;
+            if let Err(e) = result {
+                if done < len {
+                    left.push((offset + done, len - done));
+                }
+                failed = Some(e);
+            }
+        }
+        match failed {
+            _ if left.is_empty() => return Ok(size),
+            Some(e) if round >= RANGE_RETRIES || !progress => return Err(e),
+            _ => (todo, round) = (left, round + 1),
+        }
+    }
 }
 
 /// Whether a call failed because nothing listens at the peer's address: its
@@ -277,6 +319,7 @@ impl MeshClient {
             inflight: Mutex::new(HashMap::new()),
             bandwidth: Mutex::new(HashMap::new()),
             fetched: Mutex::new(HashMap::new()),
+            linked: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
             parts: Arc::default(),
             served: Mutex::new(HashMap::new()),
@@ -829,7 +872,7 @@ impl MeshClient {
             dest.with_extension(format!("part-{}-{}", std::process::id(), FETCH_SEQ.fetch_add(1, Ordering::Relaxed)));
         let started = Instant::now();
         if let Some(n) = self.same_machine_copy(node, run, object, size, dest).await {
-            self.note_transfer(node, n, started.elapsed());
+            self.note_linked(node, n);
             self.note_recent(object);
             return Ok(n);
         }
@@ -844,7 +887,7 @@ impl MeshClient {
         if got.is_err() {
             // Small, or a peer that does not serve ranges: one stream.
             tokio::fs::File::create(&tmp).await?;
-            got = self.fetch_range(node, run, object, (0, 0), &tmp, 1, traffic).await;
+            got = self.fetch_range(node, run, object, (0, 0), &tmp, 1, traffic, Arc::default()).await;
         }
         match got {
             Ok(n) => {
@@ -889,24 +932,15 @@ impl MeshClient {
         traffic: pb::TrafficClass,
     ) -> std::io::Result<u64> {
         tokio::fs::File::create(tmp).await?.set_len(size).await?;
-        let parts = ranges(size, FETCH_RANGES);
-        let got: u64 = futures_util::future::try_join_all(
-            parts
-                .iter()
-                .enumerate()
-                .map(|(i, &range)| self.fetch_range(node, run, object, range, tmp, 1 + i % FETCH_LANES, traffic)),
-        )
-        .await?
-        .into_iter()
-        .sum();
-        if got != size {
-            return Err(std::io::Error::other(format!("fetched {got} of {size} bytes")));
-        }
-        Ok(got)
+        in_ranges(size, |range, lane, verified| {
+            self.fetch_range(node, run, object, range, tmp, lane, traffic, verified)
+        })
+        .await
     }
 
     /// Write bytes [offset, offset+len) of the object (len 0: to the end) into
-    /// `path` at the same offset, checking each chunk.
+    /// `path` at the same offset, checking each chunk; `verified` counts the
+    /// bytes checked and written, so a range that fails partway can resume.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_range(
         &self,
@@ -917,6 +951,7 @@ impl MeshClient {
         path: &Path,
         lane: usize,
         traffic: pb::TrafficClass,
+        verified: Arc<AtomicU64>,
     ) -> std::io::Result<u64> {
         let mut c = self.rpc_lane(node, lane)?;
         let req = pb::FetchRequest {
@@ -947,6 +982,7 @@ impl MeshClient {
                 }
                 f.write_all_at(&data, offset + got)?;
                 got += data.len() as u64;
+                verified.store(got, Ordering::Relaxed);
             }
             Ok(got)
         });
@@ -1008,7 +1044,18 @@ impl MeshClient {
         Some(len)
     }
 
+    /// A copy taken from a store on this machine (see same_machine_copy):
+    /// counted apart from fetches, and teaching the bandwidth estimate
+    /// nothing, since a hard link of any size takes microseconds.
+    fn note_linked(&self, node: u64, bytes: u64) {
+        let mut linked = self.linked.lock().expect("lock");
+        let l = linked.entry(node).or_default();
+        (l.0, l.1) = (l.0 + 1, l.1 + bytes);
+        crate::counters::OBJECT_BYTES_LINKED.add(bytes);
+    }
+
     fn note_transfer(&self, node: u64, bytes: u64, took: Duration) {
+        crate::counters::OBJECT_BYTES_FETCHED.add(bytes);
         let mut fetched = self.fetched.lock().expect("lock");
         let f = fetched.entry(node).or_default();
         (f.0, f.1) = (f.0 + 1, f.1 + bytes);
@@ -1036,7 +1083,9 @@ impl MeshClient {
     }
 
     /// What was fetched from each peer and at what learned rate, for status:
-    /// "from node N: T transfers, B bytes, R MB/s".
+    /// "from node N: T transfers, B bytes, R MB/s", and what was taken from
+    /// peers' stores on this machine: "from node N on this machine: C copies,
+    /// B bytes, no network".
     pub fn links(&self) -> Vec<String> {
         let bw = self.bandwidth.lock().expect("lock");
         let fetched = self.fetched.lock().expect("lock");
@@ -1047,6 +1096,12 @@ impl MeshClient {
                 format!("from node {n}: {t} transfers, {b} bytes, {rate}")
             })
             .collect();
+        let linked = self.linked.lock().expect("lock");
+        out.extend(
+            linked
+                .iter()
+                .map(|(n, (c, b))| format!("from node {n} on this machine: {c} copies, {b} bytes, no network")),
+        );
         out.sort();
         out
     }
@@ -1883,6 +1938,75 @@ mod tests {
         m.ungate(a, &reader);
         m.ungate(b, &other);
         assert!(m.inflight.lock().unwrap().is_empty(), "the last one out removes it");
+    }
+
+    /// A fake range fetch for `in_ranges`: records each range asked for and
+    /// how many asks were running when it started; `fail(round, range)` gives
+    /// the bytes of the range verified before it fails, or None to finish it.
+    async fn ask(
+        log: &std::sync::Mutex<Vec<((u64, u64), usize)>>,
+        running: &std::sync::atomic::AtomicUsize,
+        fail: impl Fn((u64, u64)) -> Option<u64>,
+        range: (u64, u64),
+        verified: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> std::io::Result<u64> {
+        use std::sync::atomic::Ordering;
+        let others = running.fetch_add(1, Ordering::SeqCst);
+        log.lock().unwrap().push((range, others));
+        let failed = fail(range);
+        if failed.is_none() {
+            tokio::task::yield_now().await; // still running while a failed one returns
+        }
+        verified.store(failed.unwrap_or(range.1), Ordering::Relaxed);
+        running.fetch_sub(1, Ordering::SeqCst);
+        match failed {
+            Some(_) => Err(std::io::Error::other("stream lost")),
+            None => Ok(range.1),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_range_resumes_from_its_last_verified_byte() {
+        use std::sync::atomic::AtomicUsize;
+        let size = 64 << 20;
+        let parts = super::ranges(size, super::FETCH_RANGES);
+        let (last, len) = *parts.last().unwrap();
+        let (log, running) = (std::sync::Mutex::new(Vec::new()), AtomicUsize::new(0));
+        let once = std::sync::atomic::AtomicBool::new(false);
+        // The last of eight ranges loses its stream after 3 MiB, once.
+        let fail =
+            |r: (u64, u64)| (r.0 == last && !once.swap(true, std::sync::atomic::Ordering::SeqCst)).then_some(3 << 20);
+        let got = super::in_ranges(size, |r, _, v| ask(&log, &running, &fail, r, v)).await.unwrap();
+        assert_eq!(got, size);
+        let log = log.into_inner().unwrap();
+        assert_eq!(log.len(), parts.len() + 1, "one more ask: {log:?}");
+        assert_eq!(log.last().unwrap().0, (last + (3 << 20), len - (3 << 20)), "only the unverified rest");
+        assert_eq!(log.last().unwrap().1, 0, "no ask of the first round is still writing");
+        let asked: u64 = log.iter().map(|((_, l), _)| l).sum();
+        assert_eq!(asked, size + len - (3 << 20), "the object once, plus the lost part of one range");
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_sends_nothing_more_fails_the_fetch_instead_of_looping() {
+        use std::sync::atomic::AtomicUsize;
+        let size = 16 << 20;
+        let (log, running) = (std::sync::Mutex::new(Vec::new()), AtomicUsize::new(0));
+        let first = super::ranges(size, super::FETCH_RANGES)[0].0;
+        // The first range verifies 1 MiB, then nothing on every later ask.
+        let fail = |r: (u64, u64)| match r.0 {
+            o if o == first => Some(1 << 20),
+            o if o == first + (1 << 20) => Some(0),
+            _ => None,
+        };
+        let e = super::in_ranges(size, |r, _, v| ask(&log, &running, &fail, r, v)).await.unwrap_err();
+        assert!(e.to_string().contains("stream lost"), "{e}");
+        assert_eq!(log.lock().unwrap().len(), super::FETCH_RANGES as usize + 1, "one retry, which made no progress");
+        // A range that keeps losing its stream partway stops after the retries.
+        let (log, running) = (std::sync::Mutex::new(Vec::new()), AtomicUsize::new(0));
+        let always = |r: (u64, u64)| (r.0 < (2 << 20)).then_some(1 << 18);
+        assert!(super::in_ranges(size, |r, _, v| ask(&log, &running, &always, r, v)).await.is_err());
+        let asks = log.lock().unwrap().len();
+        assert_eq!(asks, super::FETCH_RANGES as usize + super::RANGE_RETRIES as usize, "{asks}");
     }
 
     #[tokio::test]

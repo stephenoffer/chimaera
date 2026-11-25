@@ -884,6 +884,43 @@ def test_a_driver_on_another_machine_runs_over_tcp_and_moves_large_values(tcp):
     assert lines(out, "REMOTE ") == ["True"], "the driver must not have fallen back to a local peer"
 
 
+UPLOAD = """
+import resource, sys
+import numpy as np
+import chimaera as ch
+
+def peak():
+    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return r if sys.platform == "darwin" else r * 1024
+
+@ch.remote
+def total(a):
+    return int(a.sum(dtype=np.uint64))
+
+ch.init()
+w = ch.put(np.ones(8 << 20, dtype=np.uint8))  # first put: lazy imports, the hashing threads, the connection
+del w
+a = np.full(128 << 20, 7, dtype=np.uint8)  # made with no temporary that would lift the peak before the put
+a[::4096] = 200
+before = peak()
+stored = ch.put(a)
+print("GREW", peak() - before)
+print("SAME", total.remote(stored).result(timeout=120) == int(a.sum(dtype=np.uint64)))
+"""
+
+
+def test_a_drivers_upload_is_sent_from_the_array_without_copying_it_whole(tcp):
+    # The upload copies a few 1 MiB chunks at a time out of the array's own
+    # buffer: the peak grew 33-36 MiB on a Mac (18-21 MiB for 32 MiB, 42 for
+    # 256). It used to take three whole copies (bytes(), the native argument,
+    # and its chunks) before sending a byte: 386 MiB more at this size. Any
+    # one whole copy breaks the bound of half the payload.
+    out = tcp.remote(1, UPLOAD)
+    assert lines(out, "SAME ") == ["True"], out.stderr[-2000:]
+    grew = int(lines(out, "GREW ")[0])
+    assert grew < 64 << 20, f"ch.put of a 128 MiB array raised the driver's peak memory by {grew >> 20} MiB"
+
+
 def test_a_driver_on_another_chimaera_version_than_the_cluster_is_told(tcp):
     connect = "import chimaera as ch\nch.init()\nprint('CONNECTED', ch._runtime.Runtime.get().remote)\n"
     same = tcp.remote(1, connect)
@@ -1651,6 +1688,63 @@ except ch.errors.DataLost as e:
         assert len(open(os.path.join(marks, "make")).read().splitlines()) == 2, "make ran again to remake its result"
         lost = [ln for ln in out.splitlines() if ln.startswith("PUT_LOST")]
         assert lost and "ch.put" in lost[0], out + err[-3000:]
+    finally:
+        c.close()
+
+
+def test_a_lost_result_of_a_nondeterministic_function_is_never_made_again(monkeypatch):
+    # Running it again could return other bytes under the old id, so neither
+    # a call reading the result as its input nor a program reading it runs
+    # the function again: both fail, saying why.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    go = os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+import chimaera as ch
+
+def on(slot):
+    return ch.dist.Placement(require={{"slot": slot}})
+
+@ch.remote(deterministic=False)
+def noise(n):
+    with open(os.path.join({marks!r}, "noise"), "a") as f:
+        f.write("ran\\n")
+    return os.urandom(n)
+
+@ch.remote
+def size(b):
+    return len(b)
+
+as_input = noise.options(placement=on("s1")).remote(1 << 20)
+as_read = noise.options(placement=on("s1")).remote(1 << 20)
+ch.wait([as_input, as_read], timeout=60)  # finished, not read: both values are only on s1
+print("READY", flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+try:
+    print("SIZE", size.options(placement=on("s2")).remote(as_input).result(timeout=120), flush=True)
+except ch.errors.ChimaeraError as e:
+    print("INPUT_LOST", type(e).__name__, e, flush=True)
+try:
+    print("READ", len(as_read.result(timeout=120)), flush=True)
+except ch.errors.DataLost as e:
+    print("READ_LOST", e, flush=True)
+""",
+        )
+        assert driver.stdout.readline().strip() == "READY", driver.stderr.read()[-2000:]
+        c.signal(1, signal.SIGKILL)  # the only peer holding either value
+        open(go, "w").close()
+        out, err = driver.communicate(timeout=240)
+        for tag in ("INPUT_LOST", "READ_LOST"):
+            lost = [ln for ln in out.splitlines() if ln.startswith(tag)]
+            assert lost and "deterministic=False" in lost[0], tag + "\n" + out + err[-3000:]
+        ran = len(open(os.path.join(marks, "noise")).read().splitlines())
+        assert ran == 2, f"noise ran {ran} times: once per call, never again"
     finally:
         c.close()
 

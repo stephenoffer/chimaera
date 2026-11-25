@@ -268,6 +268,12 @@ def test_a_peer_on_the_same_machine_takes_an_object_from_the_holders_store():
     c = Cluster(3, labels={0: "zone=a", 1: "zone=b", 2: "zone=c"}, one_machine=True)
     try:
         _same_machine_read(c)
+        # Counted as a copy on this machine, and no network rate learned from
+        # it: a link of any size takes microseconds.
+        s = subprocess.run([BIN, "--dir", c.dir(1), "status", "--json"], capture_output=True, text=True, timeout=30)
+        links = json.loads(s.stdout)["links"]
+        assert any("on this machine" in link for link in links), links
+        assert not any("MB/s" in link for link in links), links
     finally:
         c.close()
 

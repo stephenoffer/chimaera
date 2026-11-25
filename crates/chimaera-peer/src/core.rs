@@ -35,6 +35,7 @@ mod actor_state;
 mod demand;
 mod holds;
 mod native;
+mod shortlist;
 
 type Kind = pb::error_record::Kind;
 
@@ -472,10 +473,28 @@ async fn rebuild_plan(
     Ok((producer, attempt, spec, deps))
 }
 
+/// Why the call `spec` describes may not run again to remake a value it
+/// returned, or None when it may: only a plain function or map item without
+/// external effects, declared deterministic (the default), runs again. A
+/// function declared `deterministic=False` could return other bytes, which
+/// would then be read under the old value's id.
+fn replay_refusal(spec: &pb::TaskSpec) -> Option<&'static str> {
+    if !matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem) {
+        return Some("an actor method made it, and such a call does not run again apart from its actor");
+    }
+    if spec.effects() == pb::Effects::External {
+        return Some("its call has external effects, which run at most once");
+    }
+    if !pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default().deterministic {
+        return Some("its function is declared deterministic=False, so running it again could return another value");
+    }
+    None
+}
+
 /// How to make `object` again by running `producer`, the call that returned
 /// it: the attempt that made it (the same attempt writes the same object id),
-/// its spec and its own inputs' outcomes. Only a plain function or map item
-/// without external effects runs again; the error says why another cannot.
+/// its spec and its own inputs' outcomes. The error says why the call cannot
+/// run again (see `replay_refusal`).
 pub(crate) async fn producer_plan(
     router: &Router,
     mesh: &crate::mesh::MeshClient,
@@ -484,11 +503,8 @@ pub(crate) async fn producer_plan(
 ) -> Result<(u32, pb::TaskSpec, Vec<pb::Outcome>), String> {
     let record = task_record(router, mesh, producer).await?.ok_or("its call's record is gone (its run ended)")?;
     let spec = record.spec.ok_or("its call's record holds no spec")?;
-    if !matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem) {
-        return Err("an actor method made it, and such a call does not run again apart from its actor".into());
-    }
-    if spec.effects() == pb::Effects::External {
-        return Err("its call has external effects, which run at most once".into());
+    if let Some(why) = replay_refusal(&spec) {
+        return Err(why.into());
     }
     let Some(outcome) = record.outcome.filter(|o| made(o, object)) else {
         return Err("its call's recorded outcome is another value".into());
@@ -2061,18 +2077,16 @@ impl Core {
         // cost a 64-peer leader 63 copies per call.
         let others = mesh.live_other_ids(|m| m.cpus + 1e-9 >= cpus && allowed(m));
         if !others.is_empty() {
-            // Two random choices (near-least-loaded without a global view),
-            // plus the peers that hold the call's largest input.
+            // Two random choices plus the peers holding the most input bytes
+            // (core/shortlist.rs); below LOCALITY_MIN_BYTES, the largest
+            // input's holders.
             let seed = (tk.task.0[0] as usize) ^ (now_ns() as usize);
-            let mut picks: Vec<usize> = (0..2.min(others.len())).map(|i| (seed + i * 7919) % others.len()).collect();
-            for h in &cost.holders {
-                if let Some(i) = others.iter().position(|n| n == h)
-                    && !picks.contains(&i)
-                {
-                    picks.push(i);
-                }
-            }
-            for i in picks {
+            let ranked = if cost.held.is_empty() {
+                cost.holders.clone()
+            } else {
+                shortlist::by_bytes(&cost.inputs, &cost.held, seed as u64)
+            };
+            for i in shortlist::shortlist(&others, seed, &ranked) {
                 let Some(p) = mesh.member(others[i]) else { continue };
                 let reported = p.load.as_ref().map_or(0.0, |l| l.cpu_used + l.queued as f64);
                 let (used, pool) = p.load.as_ref().map_or((0, 0), |l| (l.memory_used, l.memory_pool));
@@ -2112,6 +2126,7 @@ impl Core {
             .chain(dep_objects)
             .filter(|o| o.inline_data.is_empty() && !o.run.is_empty())
             .collect();
+        let inputs = shortlist::distinct(inputs);
         let total = inputs.iter().map(|o| o.size).sum();
         let key = profile_key(spec, policy);
         let est_s = self.profiles.summary(&key).map(|s| s.wall_p50_s).filter(|s| *s > 0.0).unwrap_or(1.0);
@@ -6619,5 +6634,26 @@ mod tests {
         }
         assert!(!give_back_taken::<()>(&Err(())), "a lost answer must keep the work here");
         assert!(!give_back_taken::<()>(&Ok(pb::ShardReply { body: None })));
+    }
+
+    #[test]
+    fn only_a_deterministic_function_without_external_effects_runs_again_to_remake_its_value() {
+        let call = |kind: pb::CallKind, effects: pb::Effects, deterministic: bool| pb::TaskSpec {
+            kind: kind as i32,
+            effects: effects as i32,
+            policy: pb::Policy { deterministic, ..Default::default() }.encode_to_vec(),
+            ..Default::default()
+        };
+        use pb::CallKind::{CallActorMethod, CallFunction, CallMapItem};
+        let pure = pb::Effects::None;
+        assert_eq!(replay_refusal(&call(CallFunction, pure, true)), None);
+        assert_eq!(replay_refusal(&call(CallMapItem, pb::Effects::Idempotent, true)), None);
+        let why = replay_refusal(&call(CallFunction, pure, false)).expect("a nondeterministic function is refused");
+        assert!(why.contains("deterministic=False"), "{why}");
+        assert!(replay_refusal(&call(CallMapItem, pure, false)).is_some(), "so is a nondeterministic map item");
+        assert!(replay_refusal(&call(CallFunction, pb::Effects::External, true)).is_some());
+        assert!(replay_refusal(&call(CallActorMethod, pure, true)).is_some());
+        let no_policy = pb::TaskSpec { policy: vec![], ..call(CallFunction, pure, true) };
+        assert!(replay_refusal(&no_policy).is_some(), "a call recorded without a policy is not assumed deterministic");
     }
 }

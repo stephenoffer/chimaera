@@ -161,6 +161,7 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 | `memory_limit` | Enforced; going over raises `ch.OutOfMemory` with the measured peak. |
 | `gpus`, `device` | Accelerators (P5 assigns and isolates them; see Tier 3). |
 | `effects` | `"none"` (default), `"idempotent"` or `"external"`. External calls start at most once. |
+| `deterministic` | `True` (default): the function returns the same value for the same inputs, so a result lost with every copy of it is made again by running its call. `False`: such a result is `DataLost`, saying why, and the call is never speculated or cached. |
 | `durability` | What the result survives if its peer is lost: by default a background copy on another peer, and the call runs again; `"ephemeral"` (no copy, lost with its peer), `"replayable"` (no copy, the call runs again) or `"retained"` (the call succeeds only once copies on other peers, other racks first, exist). See [objects](objects.md#fault-tolerance). |
 | `max_attempts`, `retry_exceptions` | Infrastructure failures are retried; your exceptions only when listed. |
 | `deadline` | Relative (`"30s"`) or a `datetime`; children inherit the earliest one. |

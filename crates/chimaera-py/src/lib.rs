@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 mod objects;
 mod plain;
 mod scatter;
+mod upload;
 
 const BATCH_MAX: usize = 64;
 const BATCH_WINDOW: Duration = Duration::from_micros(200);
@@ -1400,7 +1401,9 @@ impl Client {
             .map_err(rpc_err)
     }
 
-    /// Upload a content-addressed blob (`blob_id` = blake3 of `data`, 16 bytes) in 1 MiB chunks.
+    /// Upload a content-addressed blob (`blob_id` = blake3 of `data`, 16 bytes)
+    /// from any contiguous buffer (bytes, a memoryview, an array), copying a
+    /// few 1 MiB chunks at a time rather than the whole payload (upload.rs).
     /// `keep_local`: the peer makes no background copy of it.
     #[pyo3(signature = (run, blob_id, data, keep_local=false))]
     fn put_blob(
@@ -1408,23 +1411,28 @@ impl Client {
         py: Python<'_>,
         run: Vec<u8>,
         blob_id: Vec<u8>,
-        data: Vec<u8>,
+        data: &Bound<'_, PyAny>,
         keep_local: bool,
     ) -> PyResult<()> {
-        let mut peer = self.peer.clone();
-        let size = data.len() as u64;
-        let mut chunks: Vec<pb::PutBlobChunk> =
-            data.chunks(1 << 20).map(|c| pb::PutBlobChunk { data: c.to_vec(), ..Default::default() }).collect();
-        if chunks.is_empty() {
-            chunks.push(pb::PutBlobChunk::default());
+        let buf = pyo3::buffer::PyUntypedBuffer::get(data)?;
+        if !buf.is_c_contiguous() {
+            return Err(PyValueError::new_err("put_blob needs a contiguous buffer"));
         }
-        chunks[0].run = run;
-        chunks[0].blob_id = blob_id;
-        chunks[0].size = size;
-        chunks[0].keep_local = keep_local;
-        py.detach(|| runtime().block_on(async move { peer.put_blob(tokio_stream::iter(chunks)).await }))
-            .map(|_| ())
-            .map_err(rpc_err)
+        let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
+        let mut peer = self.peer.clone();
+        let head = pb::PutBlobChunk { run, blob_id, keep_local, ..Default::default() };
+        let sent = py.detach(move || {
+            // SAFETY: `buf` keeps the buffer exported, so its memory stays
+            // valid until it drops after this closure returns, and
+            // upload::put_blob reads it only while it runs. A caller that
+            // mutates the buffer from another thread meanwhile sends some mix
+            // of old and new bytes, which the peer refuses: they no longer
+            // match the blob's id.
+            let data: &[u8] = if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(ptr as *const u8, len) } };
+            runtime().block_on(upload::put_blob(&mut peer, head, data))
+        });
+        drop(buf);
+        sent.map_err(rpc_err)
     }
 
     /// Copy an object from the connected peer (which fetches it first if another

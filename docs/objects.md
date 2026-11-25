@@ -104,7 +104,15 @@ that is still exact:
 
 `ch.put` gives each value a fresh id; nothing is hashed. Call arguments are
 still stored by content (so the same array passed to a thousand calls is
-stored once), except arena arrays, which are linked.
+stored once), except arena arrays, which are linked. A driver connected to a
+cluster over TCP stores by content too, and uploads each buffer straight
+from the array or bytes object it serialized: chunks of 1 MiB are copied
+out only as the connection takes them (four at most waiting per upload, and
+32 across all of a process's uploads), so a `ch.put` of a large array does
+not need room for another copy of it: 128 MiB raised a driver's peak memory
+by 33-36 MiB, against 386 MiB before. The peer checks the bytes against their
+id, so a buffer changed by another thread while it was sent is refused,
+never stored under the id.
 
 ## Reading a value
 
@@ -131,7 +139,11 @@ Three kinds of value are read rather than mapped:
 A reader on another host fetches the object's file from the peer that holds
 it. Objects of 1 MiB or more come over eight parallel ranges spread across
 four TCP connections, in chunks of at most 4 MiB, each chunk checked with
-blake3. On both ends a blocking thread does the file work and the hashing
+blake3. A range whose stream is lost partway is asked for again from its
+first unchecked byte, once every other range has finished, for at most two
+more rounds while each round checks some bytes; only then does the reader
+fall back to one stream of the whole object, and then to another holder.
+On both ends a blocking thread does the file work and the hashing
 (`pread` on the sender, `pwrite` on the receiver), so it overlaps the
 network. A reader that names an object without knowing its size first asks
 for one byte, which returns the size. HTTP/2 flow-control windows are fixed
@@ -143,8 +155,12 @@ id) and its object directory, and when the holder shares this machine and
 its file is visible here, the fetch is a hard link (no bytes move, when the
 two stores share a filesystem) or a kernel copy. Anything else (another
 machine, a store this peer cannot see or read, a size that does not match)
-falls back to the network path. Processes under one peer always shared
-pages directly: they map the same object file.
+falls back to the network path. Such a copy is counted apart from network
+fetches (`object_bytes_linked_total` against `object_bytes_fetched_total` in
+`/metrics`, and "on this machine" in `chimaera status`), and it does not
+teach the peer's estimate of the holder's network rate: a hard link of a
+gigabyte takes microseconds. Processes under one peer always shared pages
+directly: they map the same object file.
 
 **CUDA tensors.** A tensor on a GPU is stored as a host copy (readable
 anywhere, and replicated like any object). A `ch.put` of a CUDA tensor of
@@ -276,7 +292,7 @@ and any blobs it names) to this host before returning, as Ray's
   |---|---|---|
   | default | a background copy, as above | a call's result is made again by running its call |
   | `"ephemeral"` | none | `DataLost`, saying it was ephemeral |
-  | `"replayable"` | none | made again by running its call (functions and map items without external effects) |
+  | `"replayable"` | none | made again by running its call (functions and map items without external effects, not declared `deterministic=False`) |
   | `"retained"` | made before the call succeeds (or `ch.put` returns), `CHIMAERA_OBJECT_REPLICAS` of them, at least one; the result's record names them | made again by running its call, where it can |
 
   A writer that wants no background copy leaves an empty
@@ -343,7 +359,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | `ray memory` | `chimaera objects`, `chimaera objects --cluster` (every live peer) |
 | store metrics in the dashboard | Prometheus `object_bytes`, `memory_used_bytes`, `replication_failures_total` |
 | chunked pull between nodes | parallel ranges over four connections, every chunk checked with blake3 (Ray checks nothing) |
-| lineage reconstruction of task outputs | both: replicas on another peer (another failure domain first), for task outputs *and* `put` values, with a durability class per value (above). When every copy of a call's result is lost, the call runs again on the reader's peer, under the same attempt, so it writes the same object and blob ids. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again; the chain is rebuilt depth first, three levels at most. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
+| lineage reconstruction of task outputs | both: replicas on another peer (another failure domain first), for task outputs *and* `put` values, with a durability class per value (above). When every copy of a call's result is lost, the call runs again on the reader's peer, under the same attempt, so it writes the same object and blob ids. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again, and not one declared `deterministic=False`, which could return other bytes under the old id; the chain is rebuilt depth first, three levels at most. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
 | `OwnerDiedError` when a `put`'s owner dies | the value is read from its replica |
 | ref counting, `free` | a `put` handle dropped without escaping is freed at once; a released value is deleted on every peer that fetched it; the rest go when their run ends, except values another run's handle holds, which go when the last such handle does |
 

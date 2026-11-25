@@ -120,7 +120,8 @@ class RemoteBlobSink:
             if key in self._sent:
                 return
         if self.client.has_blobs(run, [blob_id]):
-            self.client.put_blob(run, blob_id, bytes(data), keep_local)
+            # Sent from `data`'s own buffer, a few chunks at a time: no copy of it all.
+            self.client.put_blob(run, blob_id, data, keep_local)
         with self._lock:
             self._sent.add(key)
 

@@ -58,6 +58,13 @@ pub static SPILLED_BYTES: Counter = Counter::new(
 pub static SPILL_MICROSECONDS: Counter =
     Counter::new("spill_microseconds_total", "Time this peer's store spent moving objects out of memory.");
 
+pub static OBJECT_BYTES_FETCHED: Counter =
+    Counter::new("object_bytes_fetched_total", "Bytes of objects this peer fetched from other peers over the network.");
+pub static OBJECT_BYTES_LINKED: Counter = Counter::new(
+    "object_bytes_linked_total",
+    "Bytes of objects this peer took from another peer's store on the same machine (a hard link, or a local copy).",
+);
+
 pub static ALL: &[&Counter] = &[
     &PROPOSALS,
     &PROPOSAL_FAILURES,
@@ -71,4 +78,6 @@ pub static ALL: &[&Counter] = &[
     &FLEET_DIRECTORY_LISTINGS,
     &SPILLED_BYTES,
     &SPILL_MICROSECONDS,
+    &OBJECT_BYTES_FETCHED,
+    &OBJECT_BYTES_LINKED,
 ];
