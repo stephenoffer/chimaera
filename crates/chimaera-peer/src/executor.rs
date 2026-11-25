@@ -158,7 +158,8 @@ impl Supervisor {
         near: &[Option<u32>],
     ) -> io::Result<(u32, u32)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let log = std::fs::File::create(self.log_dir.join(format!("executor-{id}.log")))?;
+        let log_path = self.log_dir.join(format!("executor-{id}.log"));
+        let log = std::fs::File::create(&log_path)?;
         // The client's interpreter and directory may not exist on this host
         // (another machine): fall back to the peer's own.
         let python = if Path::new(&env.python).is_file() {
@@ -255,7 +256,11 @@ impl Supervisor {
             let (detail, signal) = match status {
                 Ok(s) => {
                     use std::os::unix::process::ExitStatusExt;
-                    (s.to_string(), s.signal())
+                    // An interpreter that exits by itself (an import error, a
+                    // file named like a module it needs, a broken environment)
+                    // says why only in its log: carry that to the caller.
+                    let why = (s.signal().is_none() && !s.success()).then(|| last_error(&log_path)).flatten();
+                    (why.map_or_else(|| s.to_string(), |why| format!("{s}: {why}")), s.signal())
                 }
                 Err(e) => (e.to_string(), None),
             };
@@ -431,4 +436,46 @@ fn join_cgroup_before_exec(_cmd: &mut tokio::process::Command, _group: &Path) ->
 pub fn restrict_to_owner(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// The last Python error line (`Name: message`, the name ending in Error or
+/// Exception) in the last 16 KiB of an executor's log, at most 600 characters.
+fn last_error(log: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(log).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(16 << 10))).ok()?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail).ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let line = tail.lines().rev().map(str::trim).find(|l| {
+        let name = l.split_once(':').map_or(*l, |(n, _)| n);
+        // Python has no bare `Error`: such lines come from other programs.
+        name != "Error"
+            && (name.ends_with("Error") || name.ends_with("Exception"))
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    })?;
+    Some(line.chars().take(600).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_last_error_line_of_a_log_is_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("executor-1.log");
+        std::fs::write(
+            &log,
+            "a print from the program\nTraceback (most recent call last):\n  File \"x.py\", line 1\n\
+             ValueError: first\nTraceback (most recent call last):\n  File \"y.py\", line 2\n\
+             mypkg.errors.LicenseError: no seats left\n\n",
+        )
+        .expect("write");
+        assert_eq!(last_error(&log).as_deref(), Some("mypkg.errors.LicenseError: no seats left"));
+        std::fs::write(&log, "only prints\nError: not a Python exception line\n").expect("write");
+        assert_eq!(last_error(&log), None);
+        assert_eq!(last_error(&dir.path().join("missing.log")), None);
+    }
 }

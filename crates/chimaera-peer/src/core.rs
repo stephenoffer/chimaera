@@ -1006,6 +1006,8 @@ pub struct Core {
     /// Why no more executors start: the cgroup task limit is reached (see
     /// topology::pids_room). Shown as the wait reason; cleared by a start.
     pids_note: Option<String>,
+    /// Workers that exit before they connect (see start_failures).
+    start_failures: crate::start_failures::StartFailures,
     attempt_order: VecDeque<Tk>,
     profiles: Profiles,
     profiles_path: PathBuf,
@@ -1185,6 +1187,7 @@ impl Core {
             nested_noted: VecDeque::new(),
             actor_waits: HashMap::new(),
             pids_note: None,
+            start_failures: Default::default(),
             attempt_order: VecDeque::new(),
             profiles,
             profiles_path,
@@ -3291,6 +3294,11 @@ impl Core {
             };
             let (digest, run) = (self.queue[i].spec.fn_digest.clone(), self.queue[i].tk.run);
             let Some(exec) = self.idle_exec(&key, &digest, run).or_else(|| self.host_exec(&key, &self.queue[i])) else {
+                if let Some(why) = self.start_failures.gave_up(&key) {
+                    let w = self.queue.remove(i).expect("index in range");
+                    self.fail_infeasible(&w, &why);
+                    continue;
+                }
                 // Other pools need not wait for this one's executor to start.
                 self.ensure_executor(&env, threads, &key, cpus);
                 i += 1;
@@ -3799,6 +3807,7 @@ impl Core {
                     },
                 );
                 self.pids_note = None;
+                self.start_failures.spawned(id, key);
                 Some(id)
             }
             Err(e) => {
@@ -3979,6 +3988,7 @@ impl Core {
     fn on_exec(&mut self, e: ExecEvent) {
         match e {
             ExecEvent::Ready { exec } => {
+                self.start_failures.ready(exec);
                 if let Some(x) = self.execs.get_mut(&exec) {
                     x.state = ExecState::Idle;
                     x.idle_since = Instant::now();
@@ -4822,6 +4832,7 @@ impl Core {
     }
 
     fn on_exec_exit(&mut self, exec: u32, detail: String, signal: Option<i32>) {
+        self.start_failures.exited(exec, signal.is_some() || detail == "exit status: 0", &detail);
         let info = self.execs.remove(&exec);
         self.actor_waits.retain(|(e, _), _| *e != exec);
         self.sup.forget(exec);

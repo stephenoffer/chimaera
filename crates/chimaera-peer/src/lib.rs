@@ -38,6 +38,7 @@ pub mod runlogs;
 pub mod runtime;
 pub mod settings;
 pub mod sharing;
+pub mod start_failures;
 pub mod stores;
 pub mod target;
 pub mod tls;

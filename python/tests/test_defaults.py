@@ -1203,3 +1203,32 @@ def test_a_peer_allowed_less_than_one_cpu_still_runs_calls_and_actors():
         assert r.stdout.split() == ["2", "7"], r.stdout
     finally:
         subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+
+
+def test_a_worker_that_cannot_start_says_why():
+    # Ray's worker never registers and the job hangs; here every attempt
+    # failed as "executor process exited (exit status: 1)", and why stayed in
+    # the worker's log. A file in the program's directory named like a module
+    # the worker imports is one common way in.
+    r = run_script(
+        """
+        import os
+        import chimaera as ch
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "queue.py"), "w") as f:
+            f.write("raise RuntimeError('this queue.py is not the standard library one')\\n")
+
+        @ch.remote
+        def f():
+            return 1
+
+        try:
+            f.remote().result(timeout=120)
+        except Exception as e:
+            print(e)
+        """,
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "this queue.py is not the standard library one" in r.stdout, r.stdout
