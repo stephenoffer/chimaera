@@ -82,8 +82,10 @@ that is still exact:
   of band the same way (the encoded bytes are an arena block, so they are
   linked), instead of being encoded into pickle's stream and copied again.
   Reading decodes it once, as pickle would.
-- **Small values** (up to 256 KiB for `ch.put`, 64 KiB for results) travel
-  inside the handle; no file is written.
+- **Small values** (up to 4 KiB for `ch.put`, 64 KiB for results) travel
+  inside the handle; no file is written. A larger put is one stored file:
+  passing its handle to calls copies no bytes, and a read maps or copies it
+  once.
 - **Large plain containers** (dicts, lists and tuples of str, int, float,
   bytes, bool and None, with no container reachable twice) are pickled
   without the memo. The memo is most of the cost: a dict of four million

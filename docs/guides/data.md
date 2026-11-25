@@ -32,7 +32,7 @@ You don't always need `ch.put`, though. Every call stores its arguments by size.
 | Arguments that encode to 64 KiB or less | inside the call message |
 | Arguments of 64 KiB up to 1 MiB | one file for that call, deleted when the call ends |
 | A NumPy array, `bytes` or other buffer of 1 MiB or more, or a top-level argument that pickles to 1 MiB or more | stored once, named by a hash of its contents; every call that passes the same bytes reads that one copy |
-| `ch.put(value)` | inside the future when it is 256 KiB or less, else one stored file |
+| `ch.put(value)` | inside the future when it is 4 KiB or less, else one stored file |
 
 - Pass one large value straight to many calls and it's stored once, but each call still reads all of it, because a writable array may have changed since. An array passed again is compared with its stored copy, one pass on one core and two to three times faster than hashing it, and only a changed one is hashed and stored again. A read-only array is hashed once while it lives, and on Linux an array in the object arena is linked without being read. Once a line has passed the same value 20 times and spent 0.1 s or more encoding it, warning `CH107` suggests `ch.put(value)` or binding it once with `fn.partial(value)`.
 - A large `list` or `dict` is stored once too, but every call that reads it unpickles its own full copy. A NumPy array or an Arrow table is mapped instead, one copy per machine. You'll see warning `CH118` for collections of 8 MiB or more.

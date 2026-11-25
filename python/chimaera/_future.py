@@ -571,7 +571,12 @@ def _resolved_future(run: bytes, object_id: bytes, inline: bytes | None, size: i
     return f
 
 
-PUT_INLINE = 256 << 10
+# Puts at most this large travel in the handle itself; larger ones are a
+# file the handle names. A put exists to be passed to calls, and an inline
+# value is copied into every call it is passed to: passing 4,000 handles of
+# 64 KiB took 144 us each inline against 4 us as files, so a put and one read
+# took 169 us against 62 (a file costs 25 us more at the put).
+PUT_INLINE = 4 << 10
 
 
 def put(value: T) -> Future[T]:
@@ -584,14 +589,13 @@ def put(value: T) -> Future[T]:
     ctx = _context.current_task()
     run = ctx.run if ctx is not None else rt.run
     assert run is not None
-    # Small values travel in the handle itself (as Ray's below 100 KB): up to
-    # this size a file costs more than carrying the bytes.
+    # Small values travel in the handle itself (see PUT_INLINE).
     # Inside a call, named like its results (the run's first four bytes):
     # the call may return the handle, and the peer keeps results, not the
     # run's other values, once the run ends.
     prefix = run[:4] if ctx is not None else b""
     holds: list[Any] = []
-    limit = max(rt.inline_limit, PUT_INLINE)
+    limit = min(rt.inline_limit, PUT_INLINE)
     object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, limit, prefix, holds)
     f = _resolved_future(run, object_id, inline, size)
     if holds:

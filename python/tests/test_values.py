@@ -652,3 +652,10 @@ def test_object_locations_name_the_peer_storing_each_value():
     assert loc[f] == {"peers": [me], "size": loc[f]["size"], "inline": False} and loc[f]["size"] >= 8 << 20
     assert loc[p] == {"peers": [me], "size": loc[p]["size"], "inline": False} and loc[p]["size"] >= 2 << 20
     assert loc[small]["peers"] == [] and loc[small]["inline"], loc[small]
+
+
+def test_a_put_above_4_kib_is_a_file_its_handle_names():
+    small, mid = ch.put(b"x" * 1024), ch.put(b"x" * (64 << 10))
+    assert small._put[2] is not None, "a small put travels in its handle"
+    assert mid._put[2] is None, "a 64 KiB put is a file: passing its handle to calls copies no bytes"
+    assert mid.result() == b"x" * (64 << 10)
