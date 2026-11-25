@@ -133,6 +133,42 @@ def test_a_holder_that_cannot_send_with_nixl_leaves_the_reader_none_at_once(monk
     assert not _gpunet._nixl_held, "nothing stays registered"
 
 
+def test_a_read_that_fails_once_begun_is_not_tried_again_from_that_holder(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setenv("CHIMAERA_CUDA_NET", "nixl")
+    monkeypatch.setattr(_gpunet, "_failed", set())
+    monkeypatch.setattr(_gpunet, "_warned", set())
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)  # no GPU needed to get this far
+    asked = []
+
+    def send(conn, t, token):  # a holder that offers it over NIXL
+        asked.append(token)
+        _gpunet._send_msg(conn, {"ok": True, "shape": [4], "dtype": "float32", "descs": "", "meta": "", "name": "h"})
+        _gpunet._recv_msg(conn)
+
+    def stuck(reply, device):
+        raise RuntimeError("the NIXL read ended in PROC")
+
+    monkeypatch.setattr(_gpunet, "_send_nixl", send)
+    monkeypatch.setattr(_gpunet, "_read_nixl", stuck)
+    held = torch.ones(4)
+    offer = _gpunet.offer(held)
+    with pytest.warns(RuntimeWarning, match="over nixl .* failed .*PROC.*host copies from now on"):
+        assert _gpunet.fetch(offer, "cpu") is None
+    assert len(asked) == 1
+    t = time.monotonic()
+    assert _gpunet.fetch(offer, "cpu") is None, "the host copy, without asking the holder again"
+    assert len(asked) == 1 and time.monotonic() - t < 1
+    monkeypatch.setenv("CHIMAERA_CUDA_NET", "1")
+    assert ("nccl", offer["addr"]) not in _gpunet._failed, "only the transport that failed is given up"
+
+
+def test_a_nixl_read_waits_about_as_long_as_its_size_needs():
+    assert _gpunet._nixl_wait(0) == _gpunet._NIXL_MIN_WAIT
+    assert _gpunet._nixl_wait(1 << 30) < 10, "1 GiB: a few seconds, where the host copy takes about one"
+    assert _gpunet._nixl_wait(1 << 40) == _gpunet.TIMEOUT.total_seconds(), "never past TIMEOUT"
+
+
 def test_a_failed_nixl_read_still_unregisters_its_buffer(monkeypatch):
     torch = pytest.importorskip("torch")
     calls = []

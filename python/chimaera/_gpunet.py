@@ -10,7 +10,10 @@ up to the reader's GPU.
 
 Anything that fails here (the holder gone, no NCCL, a timeout) returns None,
 and the reader reads the host copy the put stored as well, which is
-replicated like any value: a dead holder costs speed, never the value.
+replicated like any value: a dead holder costs speed, never the value. A
+transfer that fails once it has begun is not tried again from that holder
+by this process (see `_give_up`): a transport that cannot work there would
+otherwise hold every read until it timed out.
 It is off unless ``CHIMAERA_CUDA_NET`` turns it on; see `enabled`.
 
 ``CHIMAERA_CUDA_NET=nixl`` sends it with NIXL instead, as Ray Direct
@@ -35,6 +38,7 @@ import socket
 import struct
 import threading
 import time
+import warnings
 import weakref
 from datetime import timedelta
 from typing import Any
@@ -53,6 +57,9 @@ _nixl_reads = threading.Lock()  # one read at a time adds and removes its holder
 _handlers = threading.BoundedSemaphore(64)  # requests served at once; the listener closes more
 _REQUEST_MAX = 64 << 10  # what the listener reads: a token and a few fields
 _REPLY_MAX = 4 << 20  # a holder's reply: NIXL's agent metadata grows with what it has registered
+_failed: set[tuple[str, str]] = set()  # (transport, holder address): a transfer from there failed
+_warned: set[str] = set()  # transports whose first failure was reported
+_NIXL_MIN_WAIT = 5.0  # seconds any NIXL read may take; see _nixl_wait
 
 
 def enabled() -> bool:
@@ -255,6 +262,30 @@ def _send_nixl(conn: socket.socket, t: Any, token: bytes) -> None:
                 agent.deregister_memory(held[0])
 
 
+def _nixl_wait(nbytes: int) -> float:
+    """Seconds a NIXL read of `nbytes` may take before it counts as failed:
+    a few, plus the time at 500 MB/s. The host copy of 1 GiB takes about a
+    second, so a read slower than this is not working; waiting for TIMEOUT
+    instead held each read for a minute where reads never completed."""
+    return min(TIMEOUT.total_seconds(), _NIXL_MIN_WAIT + nbytes / 500e6)
+
+
+def _give_up(via: str, holder: str, e: BaseException) -> None:
+    """A transfer from `holder` over `via` failed after it began: read host
+    copies from it from now on, and say so the first time for each transport."""
+    with _lock:
+        _failed.add((via, holder))
+        first = via not in _warned
+        _warned.add(via)
+    if first:
+        warnings.warn(
+            f"CHIMAERA_CUDA_NET: a GPU-to-GPU read over {via} from {holder} failed ({type(e).__name__}: {e}); "
+            "this process reads that holder's host copies from now on",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 def _read_nixl(reply: dict[str, Any], device: Any) -> Any:
     """Read the tensor `reply` describes from its holder's GPU onto `device`."""
     import torch
@@ -271,7 +302,7 @@ def _read_nixl(reply: dict[str, Any], device: Any) -> Any:
             theirs = agent.deserialize_descs(bytes.fromhex(reply["descs"]))
             handle = agent.initialize_xfer("READ", agent.get_xfer_descs([out]), theirs, remote, b"chimaera")
             state = agent.transfer(handle)
-        deadline = time.monotonic() + TIMEOUT.total_seconds()
+        deadline = time.monotonic() + _nixl_wait(out.numel() * out.element_size())
         while state != "DONE":
             if state == "ERR" or time.monotonic() > deadline:
                 raise RuntimeError(f"the NIXL read ended in {state}")
@@ -301,6 +332,11 @@ def fetch(net: dict[str, str], target: str) -> Any:
     CUDA device of this process), or None (the caller reads the host copy)."""
     if not enabled():
         return None
+    via, holder = _via(), net.get("addr", "")
+    with _lock:
+        if (via, holder) in _failed:
+            return None
+    begun = False  # past asking the holder: a failure from here on is the transport's
     try:
         import torch
         import torch.distributed as dist
@@ -310,7 +346,6 @@ def fetch(net: dict[str, str], target: str) -> Any:
         with _lock:
             known = _read_groups.get(key)
         pair = known[0] if known is not None else secrets.token_hex(8)
-        via = _via()
         with socket.create_connection((host, int(port)), timeout=10) as s:
             s.settimeout(TIMEOUT.total_seconds())
             _send_msg(s, {"token": net["token"], "pair": pair, "via": via})
@@ -319,6 +354,7 @@ def fetch(net: dict[str, str], target: str) -> Any:
                 return None
             device = torch.device(target)
             torch.cuda.set_device(device)
+            begun = True
             if via == "nixl":
                 with _nixl_reads:
                     out = _read_nixl(reply, device)
@@ -334,7 +370,9 @@ def fetch(net: dict[str, str], target: str) -> Any:
             known[2].recv([out], 0, 0).wait()
             _send_msg(s, {"done": True})
             return out
-    except Exception:  # noqa: BLE001 -- any failure: the host copy
+    except Exception as e:  # noqa: BLE001 -- any failure: the host copy
         with _lock:
-            _read_groups.pop((net.get("addr", ""), target), None)
+            _read_groups.pop((holder, target), None)
+        if begun:
+            _give_up(via, holder, e)
         return None

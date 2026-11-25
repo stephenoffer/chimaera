@@ -308,9 +308,30 @@ NCCL measured 505 ms and 1,873 ms and the host copy 323 ms and 1,233 ms.
 Both arrive on the reader's granted GPU (`cuda:0`), and a reader without a
 GPU gets a CPU tensor. On TCP, NCCL's socket transport is the slower one
 whatever its socket count (4 to 16 measured alike), and NIXL slower still,
-so both are off unless `CHIMAERA_CUDA_NET` asks for one. On an RDMA network
-(InfiniBand, EFA) they skip both the host copy's fetch and its copy up to
-the GPU; that was not measured here.
+so both are off unless `CHIMAERA_CUDA_NET` asks for one.
+
+On RDMA (2026-11-24, two p4d.24xlarge spot nodes in one zone, one EFA
+device each, Anyscale's `anyscale/ray:2.59.0-py311` image with its EFA
+libraries, Chimaera at e012f2b), neither GPU-to-GPU path used EFA, so the
+host copy stays the default there too:
+
+| read on the other machine's GPU | host copy | NCCL (`CHIMAERA_CUDA_NET=1`) | NIXL (`CHIMAERA_CUDA_NET=nixl`) |
+|---|---:|---:|---:|
+| 64 MiB | 85–93 ms | 88–99 ms | did not complete |
+| 256 MiB | 262–268 ms | 251–261 ms | did not complete |
+| 1 GiB | 944–1,013 ms | 866–922 ms | did not complete |
+
+- **NCCL** used its socket transport in every run, even with the
+  aws-ofi-nccl plugin's directory on the library path and
+  `NCCL_NET_PLUGIN=ofi`; why the plugin did not load was not found.
+- **NIXL**'s LIBFABRIC backend found the EFA device and the two agents
+  connected, but no read completed. At first, Libfabric's EFA provider had
+  no GPU memory support (`FI_HMEM`): it loads the CUDA runtime as
+  `libcudart.so`, and the image has only torch's versioned copy. With that
+  name added, the holder registered GPU memory, but reads still did not
+  complete and each fell back to the host copy. Each such read used to
+  wait a minute before falling back; now it waits a few seconds, and the
+  process reads that holder's host copies from then on (`_gpunet._give_up`).
 
 ## Recovery: a node dies holding values
 

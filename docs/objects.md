@@ -177,7 +177,11 @@ or LIBFABRIC where an EFA device is present), with no group to set up. Both
 sides need the `nixl` package (`pip install nixl nixl-cu12`); a holder
 without it leaves the reader the host copy. On plain TCP it was the slowest
 of the three (1 GiB in 3.0 s, against 1.9 s over NCCL and 1.2 s for the host
-copy, between two g5 nodes), so it is for RDMA networks.
+copy, between two g5 nodes), so it is for RDMA networks. Between two EFA
+nodes (p4d.24xlarge) in Anyscale's standard image no NIXL read completed,
+and NCCL used sockets (bench/objects/RESULTS.md). A read that fails once it
+has begun falls back after a few seconds, with a warning, and that
+process reads the same holder's host copies from then on.
 
 `ch.wait(fs, fetch_local=True)` also copies each finished value (its file
 and any blobs it names) to this host before returning, as Ray's
