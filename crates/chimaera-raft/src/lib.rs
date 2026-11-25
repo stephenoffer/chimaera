@@ -9,6 +9,7 @@ mod diverge;
 mod local;
 mod log_store;
 mod network;
+mod read_pass;
 mod recover;
 mod restore;
 mod settle;
@@ -18,6 +19,7 @@ mod wal;
 
 pub use log_store::{DiskReport, DiskStats, DiskWriter, LogStore, MAX_COMMIT_DELAY, SLOW_COMMIT};
 pub use network::{NetworkFactory, NoTransport, RpcFuture, RpcKind, Transport, handle_rpc, handle_snapshot};
+pub use read_pass::ReadPass;
 pub use recover::force_single_voter;
 pub use restore::{Backed, Restored, backup, restore};
 pub use settle::settle_files;
@@ -373,8 +375,12 @@ impl Group {
         if let Some(local) = &self.local {
             return local.read(f); // includes writes not yet in the database
         }
+        let mut f = Some(f);
+        if let Some(r) = read_pass::with(&self.db, self.id, |view| (f.take().expect("once"))(view)) {
+            return r; // a pass is active on this thread (ReadPass)
+        }
         let view = GroupRead::open(&self.db, self.id)?;
-        Ok(f(&view))
+        Ok((f.take().expect("once"))(&view))
     }
 
     /// Wait until local state reflects everything committed before this call.

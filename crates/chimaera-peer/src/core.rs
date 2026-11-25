@@ -1412,6 +1412,8 @@ impl Core {
     }
 
     fn handle(&mut self, msg: CoreMsg) {
+        // Its reads of a group share one view of what was applied before it.
+        let _reads = chimaera_raft::ReadPass::begin();
         match msg {
             CoreMsg::Raft(ev) => {
                 for e in ev.events {
