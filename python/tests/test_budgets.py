@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 
 import pytest
@@ -29,18 +30,16 @@ def test_a_subtree_over_its_budget_stops_with_an_error_naming_the_budget():
     assert time.monotonic() - start < 20, "stopped while the children ran, not after all 24 CPU-seconds"
 
 
-def test_each_budgeted_call_charges_its_own_budget():
-    # A worker reuses a function's options across calls, and the budget a call
-    # inherits was cached with them: in a worker that had run one budgeted
-    # call, later budgeted calls' children charged the first one's budget,
-    # which had ended, so they were never stopped. With hosting off the
-    # children run in workers of their own, so only their charges count.
+@contextlib.contextmanager
+def _peer_without_hosting():
+    """A peer of its own whose waiting calls host no others: each child runs
+    in a worker of its own, beside the others."""
     import os
     import subprocess
     import tempfile
 
     from chimaera._native import socket_path
-    from conftest import BIN, run_script
+    from conftest import BIN
 
     home = tempfile.mkdtemp(prefix="cha", dir="/tmp")
     subprocess.Popen(
@@ -52,6 +51,20 @@ def test_each_budgeted_call_charges_its_own_budget():
     while not os.path.exists(socket_path(home, "peer.sock")) and time.monotonic() < deadline:
         time.sleep(0.05)
     try:
+        yield home
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+
+
+def test_each_budgeted_call_charges_its_own_budget():
+    # A worker reuses a function's options across calls, and the budget a call
+    # inherits was cached with them: in a worker that had run one budgeted
+    # call, later budgeted calls' children charged the first one's budget,
+    # which had ended, so they were never stopped. With hosting off the
+    # children run in workers of their own, so only their charges count.
+    from conftest import run_script
+
+    with _peer_without_hosting() as home:
         r = run_script(
             """
             import time
@@ -82,8 +95,44 @@ def test_each_budgeted_call_charges_its_own_budget():
         )
         assert r.returncode == 0, r.stderr
         assert r.stdout.split() == ["RAISED"] * 3, r.stdout
-    finally:
-        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+
+
+def test_calls_that_end_together_are_charged_before_their_caller_returns():
+    # Warm workers let every trial end within a moment, and the caller return
+    # just after: their charges, sent with the next periodic pass, came after
+    # it had finished, and a call 2x over its budget returned its value.
+    from conftest import run_script
+
+    with _peer_without_hosting() as home:
+        r = run_script(
+            """
+            import time
+            import chimaera as ch
+
+            @ch.remote(cpus=1)
+            def burn(seconds):
+                end = time.process_time() + seconds
+                while time.process_time() < end:
+                    pass
+                return seconds
+
+            @ch.remote(cpus=0.1)
+            def sweep(n, each):
+                return sum(ch.get([burn.remote(each) for _ in range(n)]))
+
+            ch.get([burn.remote(0.3) for _ in range(4)])  # four warm workers
+            for _ in range(3):
+                try:
+                    sweep.options(budget={"cpu_seconds": 1}).remote(4, 0.5).result(timeout=120)
+                    print("NOT-RAISED")
+                except ch.errors.BudgetExceeded:
+                    print("RAISED")
+            """,
+            home=home,
+            timeout=240,
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.split() == ["RAISED"] * 3, r.stdout
 
 
 def test_work_within_its_budget_finishes():

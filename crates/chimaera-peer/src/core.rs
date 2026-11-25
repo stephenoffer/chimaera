@@ -4371,7 +4371,9 @@ impl Core {
         let started = (start.map(|r| r.cpu_ns), self.running[idx].started);
         let share = self.running[idx].cpus / batch_len as f64;
         let measured = end.filter(|_| batch_len == 1).map(|r| r.cpu_ns);
-        self.budgets.charge(exec, tk, done.attempt, &work.policy, started, measured, share, true);
+        if self.budgets.charge(exec, tk, done.attempt, &work.policy, started, measured, share, true) {
+            self.send_charges(); // before its result: else its caller may finish, and drop them, first
+        }
         let sampled_peak = self.running[idx].peak;
         let hwm_reset = self.running[idx].hwm_reset && finished && alone && !sliced;
         let mut unlearned = Vec::new();
@@ -4624,6 +4626,10 @@ impl Core {
             }
         }
         self.budgets.keep(&live);
+        self.send_charges();
+    }
+
+    fn send_charges(&mut self) {
         for (root, charge) in self.budgets.take() {
             self.propose(root.v(), pb::shard_cmd::Body::Charge(charge));
         }

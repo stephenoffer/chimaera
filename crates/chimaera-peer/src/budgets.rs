@@ -17,6 +17,11 @@ use chimaera_core::shard::Tk;
 /// How often a running call is charged.
 pub const EVERY: Duration = Duration::from_secs(1);
 
+/// Usage not yet sent of at least this fraction of a limit goes out when the
+/// call ends, not with the next pass: calls that end together would otherwise
+/// see their caller return, and the charges dropped, before they arrive.
+const SEND_NOW: f64 = 0.1;
+
 #[derive(Default)]
 pub struct Budgets {
     /// Per running attempt (executor, call, attempt): the worker's CPU counter
@@ -38,7 +43,8 @@ impl Budgets {
     /// Charge one running (or just ended) attempt for the time since its last
     /// charge. `started` is its CPU counter and time at dispatch; `cpu_ns` the
     /// counter now (None when the worker is shared); `cpus` its grant. Unless
-    /// `ended`, nothing is charged within `EVERY` of the last charge.
+    /// `ended`, nothing is charged within `EVERY` of the last charge. True when
+    /// the usage due to its budgeted call is `SEND_NOW` of a limit or more.
     #[allow(clippy::too_many_arguments)]
     pub fn charge(
         &mut self,
@@ -50,14 +56,14 @@ impl Budgets {
         cpu_ns: Option<u64>,
         cpus: f64,
         ended: bool,
-    ) {
-        let Some(root) = root_of(tk, policy) else { return };
+    ) -> bool {
+        let Some(root) = root_of(tk, policy) else { return false };
         let mark = (exec, tk, attempt);
         let (last_cpu, last_at) = self.marks.get(&mark).copied().unwrap_or(started);
         let now = Instant::now();
         let dt = now.duration_since(last_at);
         if !ended && dt < EVERY {
-            return;
+            return false;
         }
         let cpu_s = match (last_cpu, cpu_ns) {
             (Some(a), Some(b)) => b.saturating_sub(a) as f64 / 1e9,
@@ -76,6 +82,9 @@ impl Budgets {
         });
         due.cpu_seconds += cpu_s;
         due.gpu_seconds += policy.gpus.max(0.0) * dt.as_secs_f64();
+        [(due.cpu_seconds, due.limit_cpu_seconds), (due.gpu_seconds, due.limit_gpu_seconds)]
+            .into_iter()
+            .any(|(used, limit)| limit > 0.0 && used >= limit * SEND_NOW)
     }
 
     /// The charges to send now, one per budgeted call.
@@ -150,5 +159,15 @@ mod tests {
         b.charge(2, tk(3), 1, &p, started, None, 1.0, false);
         b.keep(&std::collections::HashSet::new()); // that attempt's worker died
         assert!(b.marks.is_empty());
+    }
+
+    #[test]
+    fn usage_large_next_to_its_limit_is_sent_at_once() {
+        let mut b = Budgets::default();
+        let p = budget(10.0, 0.0, 0.0, Some(tk(9))); // children of one budgeted call
+        let started = (Some(0), Instant::now());
+        assert!(!b.charge(1, tk(1), 1, &p, started, Some(500_000_000), 1.0, true), "0.5 of 10 s waits for the pass");
+        assert!(b.charge(2, tk(2), 1, &p, started, Some(600_000_000), 1.0, true), "1.1 of 10 s is due now");
+        assert!(!b.charge(3, tk(3), 1, &pb::Policy::default(), started, Some(9_000_000_000), 1.0, true));
     }
 }
