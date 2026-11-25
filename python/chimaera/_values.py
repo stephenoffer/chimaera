@@ -172,6 +172,7 @@ def store(
     keep_local: bool = False,
     files: list[bytes] | None = None,
     ephemeral: bool = False,
+    lazy: list[bytes] | None = None,
 ) -> tuple[bytes, bytes | None, int, list[str]]:
     """Store one value (``ch.put``): (object id, inline bytes or None, size,
     files that only this value uses). Local ids start with `prefix`: a put
@@ -182,7 +183,9 @@ def store(
     With `keep_local` the peer makes no background copy of its files (a
     durability class other than the default); `files` gets the ids of the
     files the value is stored in. With `ephemeral`, a shared CUDA tensor is
-    stored without its host copy (see tensor_shared_only).
+    stored without its host copy (see tensor_shared_only). `lazy` gets the
+    ids of host copies kept for readers that cannot take a CUDA tensor GPU to
+    GPU: a call reads such a file only if it needs it (see tensor_from_gpu).
 
     Locally nothing is hashed: arena arrays are linked in place (no copy, see
     _objects), everything else is written once by the native writer, and the
@@ -207,6 +210,8 @@ def store(
                 _objects.mark_local(path)
             _serde.write_file(path, [view])
             owned.append(path)
+            if lazy is not None:
+                lazy.append(blob)
             return run, blob
 
         if device_holds is not None:

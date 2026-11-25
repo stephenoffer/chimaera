@@ -196,8 +196,9 @@ of the three (1 GiB in 3.0 s, against 1.9 s over NCCL and 1.2 s for the host
 copy, between two g5 nodes), so it is for RDMA networks. Between two EFA
 nodes (p4d.24xlarge) in Anyscale's standard image no NIXL read completed.
 NCCL goes GPU to GPU over EFA once torch is a CUDA 12 build, as the image's
-aws-ofi-nccl plugin needs (1 GiB in 1.04 s against 1.26 s for the host
-copy; bench/objects/RESULTS.md). A read that fails once it
+aws-ofi-nccl plugin needs: 1 GiB in 0.14–0.15 s against 0.93–0.95 s for
+the host copy, which such a read never fetches (bench/objects/RESULTS.md).
+A read that fails once it
 has begun falls back after a few seconds, with a warning, and that
 process reads the same holder's host copies from then on.
 

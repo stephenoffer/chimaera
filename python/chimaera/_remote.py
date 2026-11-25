@@ -179,9 +179,14 @@ def build_call(
                 for path in x._owned or ():
                     # Files it links (Linux arena arrays) are inputs too, even
                     # when the handle itself is inline: placed by and fetched
-                    # before the call, not on first read inside it.
+                    # before the call, not on first read inside it. Not a CUDA
+                    # tensor's host copy: a call that takes the tensor GPU to
+                    # GPU never reads it (fetching 1 GiB first took most of a
+                    # second of a 1.04 s read over EFA, where NCCL takes 0.12).
                     try:
-                        stored[bytes.fromhex(os.path.basename(path))] = os.stat(path).st_size
+                        bid = bytes.fromhex(os.path.basename(path))
+                        if bid not in x._lazy:
+                            stored[bid] = os.stat(path).st_size
                     except (OSError, ValueError):
                         pass
                 if inline is not None:

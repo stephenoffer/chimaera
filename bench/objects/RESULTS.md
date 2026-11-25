@@ -339,8 +339,14 @@ host copy stays the default there too:
   (2.11, cu128) on the same two nodes, NCCL selects it and goes GPU to GPU
   over EFA (`NET/Libfabric/0/GDRDMA`): 256 MiB in 289 ms against 348 ms for
   the host copy, and 1 GiB in 1.04 s against 1.26 s (one read each, after
-  the first, which sets the pair up). That is far below what EFA carries,
-  so most of the time is not the transfer.
+  the first, which sets the pair up). NCCL itself moves 1 GiB in 117 ms
+  there (8.5 GiB/s, send to receive between the two GPUs). The rest was the
+  reader's peer fetching the tensor's 1 GiB host copy before the call, as an
+  input of a put it is passed, though a call that takes the tensor GPU to
+  GPU never reads it. A host copy is no longer such an input (it is read
+  only if the GPU path fails): on the same nodes and build, 1 GiB took
+  139–151 ms instead of 740–754 ms, against 928–954 ms for the host copy
+  (`CHIMAERA_CUDA_NET=0`), so 6.3x faster.
 - **NIXL**'s LIBFABRIC backend found the EFA device and the two agents
   connected, but no read completed. At first, Libfabric's EFA provider had
   no GPU memory support (`FI_HMEM`): it loads the CUDA runtime as
@@ -348,7 +354,12 @@ host copy stays the default there too:
   name added, the holder registered GPU memory, but reads still did not
   complete and each fell back to the host copy, with the CUDA 12 torch too.
   GPUDirect is there (`gdrdrv` and `efa` are loaded, and NCCL uses it), so
-  the cause is NIXL's own; it was not found. Each such read used to
+  the cause is NIXL's own. Outside Chimaera (two NIXL 1.5.2 agents, one
+  256 MiB transfer) every LIBFABRIC transfer fails at once with "Local key
+  (LKEY) invalid or does not match IOVA": READ and WRITE alike, GPU and
+  host memory alike. The wheel bundles no Libfabric; its plugin loads the
+  image's (2.1.0amzn3.0, API 2.1). The UCX backend works between the same
+  nodes (over TCP: 256 MiB in about 0.7 s). Each such read used to
   wait a minute before falling back; now it waits a few seconds, and the
   process reads that holder's host copies from then on (`_gpunet._give_up`).
 

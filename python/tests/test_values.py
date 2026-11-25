@@ -496,6 +496,29 @@ def test_an_ephemeral_cuda_put_keeps_no_host_copy_and_only_its_holder_serves_it(
     assert Tensor.to_host == 1, "the default keeps its host copy"
 
 
+def test_a_cuda_puts_host_copy_is_not_fetched_before_a_call_that_reads_it(monkeypatch):
+    # A call that takes the tensor GPU to GPU never reads its host copy; when
+    # it was a call input, its peer fetched 1 GiB first (bench/objects/RESULTS.md).
+    from chimaera._remote import build_call
+    from chimaera._runtime import CALL_FUNCTION
+
+    Tensor = _stand_in_cuda(monkeypatch)
+    sent = Tensor(np.arange(1 << 18, dtype=np.float64), "cuda:0")  # 2 MiB
+    net = {"addr": "127.0.0.1:9", "token": "00" * 16}
+    share = {"host": "another-machine", "pid": 1, "gpu": "gpu-0", "args": (), "net": net}
+    monkeypatch.setattr(_values, "_cuda_share", lambda t: dict(share))
+    f = ch.put(sent)
+    (host_copy,) = f._lazy
+    assert host_copy.hex() in {os.path.basename(p) for p in f._owned}, "stored with the put, and replicated with it"
+
+    @ch.remote
+    def nop(x):
+        return 0
+
+    spec, _ = build_call(Runtime.get(), nop._fn, (f,), {}, kind=CALL_FUNCTION, eff=nop.policy())
+    assert host_copy not in dict(spec["blobs"]), "not an input its peer fetches before the call"
+
+
 class _EphemeralElsewhere:
     """Pickles as an ephemeral CUDA put whose holder is on another machine."""
 

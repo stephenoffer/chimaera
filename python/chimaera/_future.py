@@ -39,7 +39,7 @@ class Future(Generic[T]):
 
     __slots__ = (
         "_rt", "key", "_outcome", "_value", "_has_value", "_exc", "_callbacks", "_site", "_escaped", "_arg_bytes", "_put",
-        "_returns", "_owned", "_device_holds", "_seen", "__weakref__",
+        "_returns", "_owned", "_lazy", "_device_holds", "_seen", "__weakref__",
     )
 
     def __init__(self, rt: Any, key: bytes, site: str | None = None) -> None:
@@ -60,6 +60,8 @@ class Future(Generic[T]):
         # Files of a ch.put value this handle owns: deleted with it unless it
         # escaped (was pickled or passed by reference to a call).
         self._owned: list[str] | None = None
+        # Owned files a call reads only if it needs them (see _values.store).
+        self._lazy: frozenset[bytes] = frozenset()
         self._device_holds: list[Any] | None = None  # CUDA tensors a put shares (see _values._cuda_share)
         self._seen = False  # its outcome was read, or handed to a call or callback (see _unread_error)
 
@@ -673,8 +675,9 @@ def put(value: T, *, durability: Literal["default", "ephemeral", "retained"] | N
     limit = min(rt.inline_limit, PUT_INLINE)
     files: list[bytes] = []
     keep_local = durability in ("ephemeral", "retained")  # retained: copied below, not in the background
+    lazy: list[bytes] = []
     object_id, inline, size, owned = _values.store(
-        value, run, rt.blob_sink, limit, prefix, holds, keep_local, files, ephemeral=durability == "ephemeral"
+        value, run, rt.blob_sink, limit, prefix, holds, keep_local, files, ephemeral=durability == "ephemeral", lazy=lazy
     )
     if durability == "retained" and files:
         try:
@@ -690,6 +693,7 @@ def put(value: T, *, durability: Literal["default", "ephemeral", "retained"] | N
     f = _resolved_future(run, object_id, inline, size, tuple(files), kind)
     if holds:
         f._device_holds = holds  # readers on this machine may map them while the future lives
+    f._lazy = frozenset(lazy)
     if type(value) in _values._COLLECTIONS:
         caller = sys._getframe(1)
         _values.collection_lint.note(f"{caller.f_code.co_filename}:{caller.f_lineno}", type(value).__name__, size, 3)
