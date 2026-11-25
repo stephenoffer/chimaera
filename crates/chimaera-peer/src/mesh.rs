@@ -1640,7 +1640,7 @@ async fn replica_into(
     r: &pb::ReplicateRequest,
     dest: &Path,
 ) -> Result<(), String> {
-    if tokio::fs::symlink_metadata(dest).await.is_ok() {
+    if held_whole(dest, r.size).await {
         return Ok(());
     }
     let disk = objects.spill_path(&r.run, &r.object_id);
@@ -1661,6 +1661,13 @@ async fn replica_into(
         }
     }
     Ok(())
+}
+
+/// Whether `dest` holds a whole copy of an object of `size` bytes (0: not
+/// known). A spilled copy is a link to its disk file, which may be gone; a
+/// drain's hand-off counts what this says is here.
+async fn held_whole(dest: &Path, size: u64) -> bool {
+    tokio::fs::metadata(dest).await.is_ok_and(|m| size == 0 || m.len() == size)
 }
 
 /// The first `n` of `ids` after `me` going round the ring of node ids.
@@ -1716,6 +1723,23 @@ mod tests {
         assert_eq!(check.call(with(&bearer)).unwrap_err().code(), tonic::Code::Unauthenticated);
         let admin = clients.call(with("Bearer secret")).unwrap();
         assert_eq!(admin.extensions().get::<crate::auth::Caller>(), Some(&crate::auth::Caller::Admin));
+    }
+
+    #[tokio::test]
+    async fn only_a_whole_copy_counts_as_a_replica_already_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let (file, disk, link) = (dir.path().join("a"), dir.path().join("disk-b"), dir.path().join("b"));
+        std::fs::write(&file, vec![1u8; 100]).unwrap();
+        assert!(super::held_whole(&file, 100).await);
+        assert!(super::held_whole(&file, 0).await, "size not known: any copy counts");
+        assert!(!super::held_whole(&file, 200).await, "another size is not this object");
+        std::fs::write(&disk, vec![2u8; 300]).unwrap();
+        std::os::unix::fs::symlink(&disk, &link).unwrap();
+        assert!(super::held_whole(&link, 300).await, "a spilled copy: the link to its disk file");
+        std::fs::remove_file(&disk).unwrap();
+        assert!(!super::held_whole(&link, 300).await, "a link whose disk copy is gone holds nothing");
+        assert!(!super::held_whole(&link, 0).await);
+        assert!(!super::held_whole(&dir.path().join("missing"), 0).await);
     }
 
     #[tokio::test]
