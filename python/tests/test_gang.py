@@ -775,13 +775,14 @@ def test_a_rank_reads_the_store_as_often_however_large_its_gang(monkeypatch):
         def barrier(self, key, parties):
             with lock:
                 b = barriers.setdefault(f"{self.ns}/{key}", threading.Barrier(parties))
-            return types.SimpleNamespace(wait=b.wait)
+            return types.SimpleNamespace(wait=lambda timeout=None, check=None: b.wait(timeout))
 
     monkeypatch.setattr(_store, "Store", CountingStore)
     monkeypatch.setattr(_context, "context", lambda: types.SimpleNamespace(node=here.node))
     reads_by_world = {}
     for world in (2, 4, 8, 16):
         gang = f"count-{world}"
+        here.reads = 0  # the supervisor's reads, deciding the record: not a rank's
         _gang._record(CountingStore(f"gang/{gang}"), 1, [None] * world, timeout=30)
         envs, reads = [None] * world, [0] * world
 

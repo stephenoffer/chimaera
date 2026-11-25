@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import timedelta
 from typing import Any, NamedTuple
 
@@ -297,9 +297,10 @@ class Barrier:
             raise ValueError(f"parties: expected an integer >= 1, got {parties!r}")
         self._store, self._key, self._parties = store, key, parties
 
-    def wait(self, timeout: float | None = None) -> int:
+    def wait(self, timeout: float | None = None, check: Callable[[], None] | None = None) -> int:
         """Arrive and wait for the rest; return the round number that completed.
-        On timeout the arrival still counts toward that round."""
+        On timeout the arrival still counts toward that round. `check` runs
+        while waiting and may raise to stop the wait."""
         r = self._store._write("arrive", self._key, parties=self._parties)
         if not r["ok"]:
             _raise(r)
@@ -314,6 +315,8 @@ class Barrier:
                 return generation + 1
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"barrier {self._key!r}: {state[1] if state else 0} of {self._parties} arrived")
+            if check is not None:
+                check()
             with waiting():
                 time.sleep(pause)
             pause = min(pause * 2, 0.2)

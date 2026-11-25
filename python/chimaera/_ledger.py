@@ -128,6 +128,13 @@ class Holds:
         threading.Thread(target=self._renew, name=f"hold-{self.owner}", daemon=True).start()
         return None
 
+    def resume(self) -> None:
+        """Carry on renewing the holds an earlier holder of this generation
+        took, as far as the peers still hold them."""
+        for peer, slots in self._slots.items():
+            self._ask(peer, slots, renew=True)
+        threading.Thread(target=self._renew, name=f"hold-{self.owner}", daemon=True).start()
+
     def _renew(self) -> None:
         while not self._stop.wait(self.ttl / 3):
             for peer, slots in self._slots.items():

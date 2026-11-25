@@ -89,7 +89,7 @@ import cloudpickle
 from . import _ledger
 from ._errors import InfrastructureFailure, VersionConflict
 from ._future import Future
-from ._native import blake3_digest
+from ._native import blake3_digest, child_id
 from ._options import Auto, Placement, _pos_float
 from ._remote import Actor, remote
 
@@ -622,14 +622,36 @@ def _host_addr() -> str:
 
 
 def _record(
-    store: Any, generation: int, peers: Sequence[str | None], timeout: float, collective: float = COLLECTIVE_S
-) -> None:
-    """Commit a generation's rendezvous record: its ranks' peers, its
-    deadlines (to meet, and in each collective), and rank 0's endpoint once
-    it adds it. Its successor's record replacing it makes every rank of it
-    stale."""
-    record = {"ranks": peers, "timeout": timeout, "collective_timeout": collective, "endpoint": None}
-    store.put(f"{generation}/record", record, ttl=TTL)
+    store: Any,
+    generation: int,
+    peers: Sequence[str | None],
+    timeout: float,
+    collective: float = COLLECTIVE_S,
+    keys: Sequence[bytes] = (),
+) -> dict[str, Any] | None:
+    """Decide a generation, once: its ranks' peers, their calls' keys (so a
+    supervisor's retry can finish or undo the launch), its deadlines (to
+    meet, and in each collective), and rank 0's endpoint once it adds it.
+    Its successor's record replacing it makes every rank of it stale.
+    Returns None, or the record another writer decided this generation with
+    first (it replaces only the slot's marker of a lost predecessor)."""
+    record = {"ranks": list(peers), "timeout": timeout, "collective_timeout": collective, "endpoint": None}
+    record["keys"] = [k.hex() for k in keys]
+    while True:
+        current, version = store.get_versioned(f"{generation}/record")
+        if current is not None and "lost" not in current:
+            return current
+        try:
+            store.put(f"{generation}/record", record, if_version=version, ttl=TTL)
+            return None
+        except VersionConflict:
+            continue
+
+
+def _rank_key(run: bytes, supervisor: bytes, generation: int, rank: int) -> bytes:
+    """A rank's call key: the same in every attempt of its supervisor (whose
+    call counter starts over), and different for each generation."""
+    return run + child_id(supervisor, [run, b"gang-rank", generation.to_bytes(8, "little"), rank.to_bytes(4, "little")])
 
 
 def _rendezvous(gang: str, generation: int, rank: int, world: int, collective: float = COLLECTIVE_S) -> dict[str, str]:
@@ -671,8 +693,15 @@ def _rendezvous(gang: str, generation: int, rank: int, world: int, collective: f
     row = {"rank": rank, "node": node, "devices": [d["id"] for d in granted], "visible": [d["index"] for d in granted]}
     store.put(f"{generation}/host/{node}/{rank:06d}", row, ttl=TTL)
     timeout = record["timeout"]
+    fenced = [time.monotonic()]
+
+    def fence() -> None:  # at most once a second: a gang's ranks all poll at once
+        if time.monotonic() - fenced[0] >= 1.0:
+            fenced[0] = time.monotonic()
+            _fence(store, gang, generation)
+
     try:
-        store.barrier(f"{generation}/start", world).wait(timeout)
+        store.barrier(f"{generation}/start", world).wait(timeout, check=fence)
     except TimeoutError:
         missing = [r for r, p in enumerate(_positions(store, generation, world)) if p is None]
         raise InfrastructureFailure(
@@ -768,9 +797,11 @@ def _supervise(
     ``Gang.generation``, ``decisions`` and ``explain``.
 
     If the supervisor itself is lost with its peer, its retry carries on: the
-    gang is named by this call and its generations are counted in the
-    replicated store, so the next one never reuses a rendezvous, and its holds
-    replace the lost one's (or those expire)."""
+    gang is named by this call, its generations are counted in the
+    replicated store, and each generation's record holds its ranks' call
+    keys. A retry supervises the generation the lost supervisor decided, its
+    ranks started already running on (each is started once, under its key);
+    a generation given up, or replaced, is followed by the next."""
     from ._context import context
     from ._future import wait
     from ._runtime import Runtime
@@ -780,36 +811,36 @@ def _supervise(
     gang = blake3_digest(ctx.run + ctx.task)[:8].hex()
     store = Store(f"gang/{gang}")
     generations = store.counter("generation")
+    owner = f"{rt.tenant}/gang/{gang}"
+    # A retry after this supervisor was lost: the generation it decided runs
+    # on, so carry on supervising it.
+    generation = generations.value() if ctx.attempt > 1 else 0
+    decided = store.get(f"{generation}/record") if generation else None
+    if decided is not None and ("keys" not in decided or _ended(store, gang, generation) is not None):
+        decided = None
     while True:
-        generation = generations.add(1)
-        # A supervisor lost with its peer left its generation's ranks waiting
-        # in a collective, holding their CPUs: end them before the next.
-        for k in store.get(f"ranks/{generation - 1}", []) if generation > 1 else []:
-            rt.client.cancel(bytes.fromhex(k), True)
-        size, why = _size(want, rank_opts, first=generation == 1)
-        waits: list[str] = []
-
-        def note(reason: str, generation: int = generation) -> None:
-            if reason not in waits[-1:]:  # one report per new reason
-                waits.append(reason)
-                ctx.report(gang=gang, generation=generation, ranks=[], admission=reason)
-
-        def rank(r: int, size: int = size) -> str:
-            return f"rank {r} of {size}"
-
-        holds = _ledger.admit(
-            f"{rt.tenant}/gang/{gang}",
-            generation,
-            [_ledger.shape(rank_opts)] * size,
-            name=rank,
-            require=_require(rank_opts),
-            note=note,
-        )
-        assert holds is not None  # admit returns None only when told to stop
+        if decided is not None:
+            size, why = len(decided["keys"]), "resumed after its supervisor was lost"
+            holds = _ledger.Holds(owner, generation, decided["ranks"], [_ledger.shape(rank_opts)] * size, _ledger.TTL)
+            holds.resume()  # slots its ranks took stay theirs; one not taken yet is refused if its hold expired
+            keys, decided = [bytes.fromhex(k) for k in decided["keys"]], None
+        else:
+            generation = generations.add(1)
+            # Ranks of the last generation still waiting in a collective, or
+            # never started, hold CPUs: end them before the next.
+            for k in (store.get(f"{generation - 1}/record") or {}).get("keys", []) if generation > 1 else []:
+                rt.client.cancel(bytes.fromhex(k), True)
+            size, why = _size(want, rank_opts, first=generation == 1)
+            holds = _admit(ctx, gang, generation, size, rank_opts)
+            keys = [_rank_key(ctx.run, ctx.task, generation, r) for r in range(size)]
+            decided = _record(store, generation, holds.peers, timeout, collective, keys)
+            if decided is not None:  # another attempt decided this generation first: supervise its ranks
+                holds.release()
+                decided = decided if "keys" in decided else None  # a record without them: go on to the next
+                continue
         try:
-            _record(store, generation, holds.peers, timeout, collective)
-            futures = [_launch(fn, gang, generation, r, size, args, kwargs, rank_opts, holds) for r in range(size)]
-            store.put(f"ranks/{generation}", [f.key.hex() for f in futures], ttl="24h")
+            call = (fn, gang, generation)
+            futures = [_launch(*call, r, size, args, kwargs, rank_opts, holds, keys[r]) for r in range(size)]
             report = {"gang": gang, "generation": generation, "size": size, "ranks": [f.key.hex() for f in futures]}
             ctx.report(**report, **({"decision": f"generation {generation}: {why}"} if why else {}))
             lost: BaseException | None = None
@@ -845,16 +876,51 @@ def _supervise(
             holds.release()
 
 
+def _admit(ctx: Any, gang: str, generation: int, size: int, rank_opts: dict) -> Any:
+    """Hold a slot for every rank of the generation (all or none), reporting
+    each new reason the gang waits."""
+    from ._runtime import Runtime
+
+    waits: list[str] = []
+
+    def note(reason: str) -> None:
+        if reason not in waits[-1:]:  # one report per new reason
+            waits.append(reason)
+            ctx.report(gang=gang, generation=generation, ranks=[], admission=reason)
+
+    holds = _ledger.admit(
+        f"{Runtime.get().tenant}/gang/{gang}",
+        generation,
+        [_ledger.shape(rank_opts)] * size,
+        name=lambda r: f"rank {r} of {size}",
+        require=_require(rank_opts),
+        note=note,
+    )
+    assert holds is not None  # admit returns None only when told to stop
+    return holds
+
+
 def _launch(
-    fn: Any, gang: str, generation: int, rank: int, world: int, args: tuple, kwargs: dict, rank_opts: dict, holds: Any
+    fn: Any,
+    gang: str,
+    generation: int,
+    rank: int,
+    world: int,
+    args: tuple,
+    kwargs: dict,
+    rank_opts: dict,
+    holds: Any,
+    key: bytes,
 ) -> Future[Any]:
-    """Start a rank on its peer, with its slot's launch token."""
+    """Start a rank on its peer, with its slot's launch token, under its
+    recorded key: a rank started already is not started again."""
     from ._remote import CALL_FUNCTION, Runtime, submit_call
 
     view = _rank.options(**_pinned(rank_opts, holds.peers[rank]))
     call = (fn, gang, generation, rank, world, args, kwargs)
     extra = {"launch": holds.tokens[rank]}
-    return submit_call(Runtime.get(), _rank._fn, call, {}, kind=CALL_FUNCTION, eff=view.policy(), policy_extra=extra)
+    eff = view.policy()
+    return submit_call(Runtime.get(), _rank._fn, call, {}, kind=CALL_FUNCTION, eff=eff, policy_extra=extra, key=key)
 
 
 class Gang(Future[list[R]]):

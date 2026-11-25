@@ -42,6 +42,13 @@ is how long the ranks of a generation have to meet once it starts, and
 collective (see [Survive a lost rank](#survive-a-lost-rank)). The gang's
 supervisor is a small call (0.01 CPU) on your script's own peer.
 
+Each generation is decided once, in the cluster's replicated store: which
+peer holds each rank's slot, and each rank's call. If the supervisor itself
+is lost (its worker, or its peer while the run goes on), its retry carries on
+with the generation it was supervising: ranks already running keep running,
+and none starts twice. Ranks of a generation that was given up leave its
+rendezvous within a second rather than at `rendezvous_timeout`.
+
 `gang()` without `ranks=` raises `TypeError`, and `.remote()` with `ranks=`
 raises `ch.OptionsError`.
 
