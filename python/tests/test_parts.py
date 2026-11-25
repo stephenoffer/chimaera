@@ -130,7 +130,7 @@ def test_a_consumer_at_scale_fetches_only_its_value_and_parts_go_with_their_resu
 
         open(looked, "w").close()
         assert line("WHOLE") == [[0, 2 << 20], [1, 2 << 20], [2, 2 << 20]], "the whole result rebuilds from its parts"
-        gone = glob.glob(os.path.join(c.root, "p*", "objects", "*", part_names[0]))
+        gone = [p for i in range(3) for p in glob.glob(os.path.join(c.objects(i), "*", part_names[0]))]
         assert gone, "the part is stored somewhere"
         for path in gone:
             os.unlink(path)

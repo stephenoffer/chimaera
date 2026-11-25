@@ -262,9 +262,12 @@ def test_the_cli_lists_every_peers_object_store(zoned):
     assert len({x["object_dir"] for x in stores}) == 3, "each peer reported its own store"
 
 
-def test_a_peer_on_the_same_machine_takes_an_object_from_the_holders_store():
+def test_a_peer_on_the_same_machine_takes_an_object_from_the_holders_store(monkeypatch):
     # Peers on one machine: a value p1 needs from p0 is linked from p0's
-    # store (one file, no bytes streamed), not sent over the network.
+    # store (one file, no bytes streamed), not sent over the network. No
+    # background copies: one reaching p1 first is kept in its spill directory,
+    # a copy where the read would have linked (see test_cluster for replicas).
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
     c = Cluster(3, labels={0: "zone=a", 1: "zone=b", 2: "zone=c"}, one_machine=True)
     try:
         _same_machine_read(c)

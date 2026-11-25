@@ -1772,7 +1772,29 @@ except ch.errors.DataLost as e:
         c.close()
 
 
-LOSE_THE_WRITER = """
+# A driver's `files(v)`: the ids of the files a finished value is stored in.
+# Its object file, or, for a frame held inline, the files that frame names:
+# with the Linux arena a large buffer is linked under an id of its own, and
+# the value has no file named for it.
+FILES_OF = """
+from chimaera import _serde as _files_serde
+
+def files(v):
+    if v._put:
+        obj, inline = v._put[1], v._put[2]
+    else:
+        _, inline, _, obj, _, _ = v._outcome
+    ids = [obj] + (list(_files_serde.external_blobs(inline)) if inline is not None else [])
+    return ",".join(i.hex() for i in ids)
+"""
+
+
+def _holds(c: Cluster, i: int, ids: str) -> bool:
+    """Whether peer `i` stores any of a value's files (`files(v)` in a driver)."""
+    return any(glob.glob(os.path.join(c.objects(i), "*", oid)) for oid in ids.split(","))
+
+
+LOSE_THE_WRITER = FILES_OF + """
 import os, time
 import chimaera as ch
 
@@ -1812,7 +1834,7 @@ value = (make if PUT is None else stash).options(placement=there).remote(1 << 20
 ch.wait([value], timeout=60)
 if PUT is not None:
     value = value.result(timeout=60)  # the put's handle (small); its value stays where it was made
-print("READY", value._put[1].hex() if value._put else value._outcome[3].hex(), flush=True)
+print("READY", files(value), flush=True)
 while not os.path.exists({go!r}):
     time.sleep(0.05)
 try:
@@ -1836,7 +1858,7 @@ def _lose_the_writer(c: Cluster, driver: int, killed: list[int], **kw) -> tuple[
     proc = c.driver(driver, LOSE_THE_WRITER.format(marks=marks, go=go, **kw))
     ready = proc.stdout.readline().split()
     assert ready[:1] == ["READY"], proc.stderr.read()[-3000:]
-    held = [i for i in range(len(c.addrs)) if glob.glob(os.path.join(c.objects(i), "*", ready[1]))]
+    held = [i for i in range(len(c.addrs)) if _holds(c, i, ready[1])]
     for i in killed:
         c.signal(i, signal.SIGKILL)
     open(go, "w").close()
@@ -1896,7 +1918,7 @@ def test_a_retained_value_outlives_its_writers_rack(monkeypatch):
         c.close()
 
 
-ACTOR_DURABILITY = """
+ACTOR_DURABILITY = FILES_OF + """
 import os, time
 import chimaera as ch
 from chimaera import _direct
@@ -1926,7 +1948,7 @@ retained = m.big.options(durability="retained").remote()
 ephemeral = b.many.options(durability="ephemeral").remote(1)
 ch.wait([retained, ephemeral], timeout=60)
 after = _direct._counter["direct"] - before - direct
-print("IDS", direct, after, retained._outcome[3].hex(), ephemeral._outcome[3].hex(), flush=True)
+print("IDS", direct, after, files(retained), files(ephemeral), flush=True)
 time.sleep(2)  # a background copy would be made by now
 """
 
@@ -1944,8 +1966,8 @@ def test_an_actors_results_are_kept_as_their_durability_says():
         direct, after, retained, ephemeral = line[1:]
         assert (direct, after) == ("1", "0"), "a default call went direct, the retained one did not"
 
-        def held(oid: str) -> list[int]:
-            return [i for i in range(3) if glob.glob(os.path.join(c.objects(i), "*", oid))]
+        def held(ids: str) -> list[int]:
+            return [i for i in range(3) if _holds(c, i, ids)]
 
         assert len(held(retained)) == 2 and 0 in held(retained), f"a copy before success: {held(retained)}"
         out, err = proc.communicate(timeout=60)
