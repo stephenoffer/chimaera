@@ -433,8 +433,10 @@ impl Summary {
 
 /// Calls per arm before a window closes.
 const TRIAL_WINDOW_CALLS: u32 = 5;
-/// Shortest window, in seconds.
-const TRIAL_WINDOW_S: f64 = 1.0;
+/// Shortest window: three median calls, so one window's calls did not start
+/// in the window before, within these bounds in seconds. A fixed second held
+/// 100 ms waits at whole cores for 3 s before the first pair's +300% counted.
+const TRIAL_WINDOW_S: (f64, f64) = (0.25, 1.0);
 /// Tail-latency differences smaller than this are not a regression.
 const TRIAL_JITTER_S: f64 = 0.010;
 
@@ -470,12 +472,23 @@ pub struct CpuTrial {
     next_canary: bool,
     arms: [Arm; 2],
     pairs: Vec<(Window, Window)>,
+    window_s: f64,
     window_start_s: f64,
 }
 
 impl CpuTrial {
-    pub fn new(from: f64, to: f64, now_s: f64) -> CpuTrial {
-        CpuTrial { from, to, next_canary: false, arms: Default::default(), pairs: Vec::new(), window_start_s: now_s }
+    /// `call_s`: the function's median call, which sets the window length.
+    pub fn new(from: f64, to: f64, call_s: f64, now_s: f64) -> CpuTrial {
+        let window_s = (3.0 * call_s).clamp(TRIAL_WINDOW_S.0, TRIAL_WINDOW_S.1);
+        CpuTrial {
+            from,
+            to,
+            next_canary: false,
+            arms: Default::default(),
+            pairs: Vec::new(),
+            window_s,
+            window_start_s: now_s,
+        }
     }
 
     /// CPU for the next attempt, and whether it is the canary.
@@ -502,7 +515,7 @@ impl CpuTrial {
         let [control, canary] = &self.arms;
         let ready = control.done >= TRIAL_WINDOW_CALLS && canary.done >= TRIAL_WINDOW_CALLS;
         let oom = canary.ooms > control.ooms;
-        if !(oom || ready && now_s - self.window_start_s >= TRIAL_WINDOW_S) {
+        if !(oom || ready && now_s - self.window_start_s >= self.window_s) {
             return None;
         }
         let (control, mut canary) = (control.window(), canary.window());
@@ -821,9 +834,10 @@ mod tests {
         assert!(w.after_call(800 * MIB).is_some(), "over 2× the first plus 512 MiB");
     }
 
-    /// Run a CPU trial where an attempt at `cpus` takes `wall(cpus, i)`.
-    fn run_trial(wall: impl Fn(f64, u64) -> f64) -> Verdict {
-        let mut t = CpuTrial::new(1.0, 0.25, 0.0);
+    /// Run a CPU trial where an attempt at `cpus` takes `wall(cpus, i)`, four
+    /// at a time; the verdict and the trial time it took.
+    fn run_trial(wall: impl Fn(f64, u64) -> f64) -> (Verdict, f64) {
+        let mut t = CpuTrial::new(1.0, 0.25, wall(1.0, 0), 0.0);
         let mut now = 0.0;
         for i in 0..400u64 {
             let (cpus, canary) = t.assign();
@@ -831,7 +845,7 @@ mod tests {
             now += w / 4.0;
             t.observe(canary, w, false);
             if let Some(v) = t.tick(now) {
-                return v;
+                return (v, now);
             }
         }
         panic!("no verdict after 400 calls ({} pairs)", t.pairs());
@@ -840,24 +854,26 @@ mod tests {
     #[test]
     fn a_waiting_function_is_adopted_at_a_quarter_core() {
         // Sleeps 200 ms ± 10% whatever its grant.
-        let v = run_trial(|_, i| 0.2 * (1.0 + 0.1 * noise(i)));
+        let (v, _) = run_trial(|_, i| 0.2 * (1.0 + 0.1 * noise(i)));
         assert!(matches!(v, Verdict::Adopt { mean_gain, .. } if mean_gain > 2.0), "{v:?}");
         // A 100 ms sleep whose canary wakes up to 8 ms late (more processes
-        // share the cores) is still a win, not a latency regression.
-        let v = run_trial(|cpus, i| 0.1 + if cpus < 1.0 { 0.004 + 0.004 * noise(i) } else { 0.0 });
+        // share the cores) is still a win, not a latency regression. Its
+        // three windows last three calls each, not a second each.
+        let (v, took) = run_trial(|cpus, i| 0.1 + if cpus < 1.0 { 0.004 + 0.004 * noise(i) } else { 0.0 });
         assert!(matches!(v, Verdict::Adopt { .. }), "{v:?}");
+        assert!(took < 1.5, "the trial took {took:.2} s");
     }
 
     #[test]
     fn a_computing_function_is_reverted() {
         // Needs a full core: at a quarter core it shares and takes 4× longer.
-        let v = run_trial(|cpus, i| 0.2 / cpus.min(1.0) * (1.0 + 0.1 * noise(i)));
+        let (v, _) = run_trial(|cpus, i| 0.2 / cpus.min(1.0) * (1.0 + 0.1 * noise(i)));
         assert!(matches!(v, Verdict::Revert { .. }), "{v:?}");
     }
 
     #[test]
     fn an_oom_in_the_canary_reverts_at_once() {
-        let mut t = CpuTrial::new(1.0, 0.25, 0.0);
+        let mut t = CpuTrial::new(1.0, 0.25, 0.2, 0.0);
         t.observe(false, 0.2, false);
         t.observe(true, 0.2, true);
         assert!(matches!(t.tick(0.1), Some(Verdict::Revert { .. })));

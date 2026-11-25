@@ -355,7 +355,7 @@ impl Profiles {
             && let Some(to) = s.cpu_shrink(kills_recent)
             && to < current
         {
-            e.trial = Some(CpuTrial::new(current, to, now_s));
+            e.trial = Some(CpuTrial::new(current, to, s.wall_p50_s, now_s));
             out.push(decision(
                 "cpu-sizing",
                 "cpus",
