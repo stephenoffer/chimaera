@@ -1161,3 +1161,45 @@ def test_calls_run_in_the_programs_directory_so_relative_paths_work():
     )
     assert r.returncode == 0, r.stderr
     assert r.stdout.split() == ["True", "a,b"], r.stdout
+
+
+def test_a_peer_allowed_less_than_one_cpu_still_runs_calls_and_actors():
+    # A pod limited to 900m: Ray truncates num_cpus to 0 and nothing is ever
+    # scheduled. Here a call and an actor that ask for the default CPU run on
+    # the 0.9 the peer is allowed (with 0 they fail at once as Infeasible).
+    import subprocess
+    import tempfile
+
+    from chimaera._native import socket_path
+
+    home = tempfile.mkdtemp(prefix="cha", dir="/tmp")
+    subprocess.Popen(
+        [BIN, "--dir", home, "peer", "start", "--cpus", "0.9", "--idle-timeout", "60"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    deadline = time.monotonic() + 30
+    while not os.path.exists(socket_path(home, "peer.sock")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    try:
+        r = run_script(
+            """
+            import chimaera as ch
+
+            @ch.remote
+            def f(i):
+                return i + 1
+
+            @ch.remote
+            class A:
+                def get(self):
+                    return 7
+
+            print(f.remote(1).result(timeout=60), A.remote().get.remote().result(timeout=60))
+            """,
+            home=home,
+            timeout=120,
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.split() == ["2", "7"], r.stdout
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
