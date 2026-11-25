@@ -313,6 +313,7 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     let (node, _lock) = Node::open_with(&cfg.dir, cfg.cpus, || {
         crate::durability::guard(&cfg.dir, durability, |raft| others_lead(raft, &cfg))
     })?;
+    chimaera_raft::set_divergence_hook(crate::durability::on_divergence(cfg.dir.clone()));
     let me = pb::Member {
         peer: node.identity.peer.to_vec(),
         incarnation: node.identity.incarnation,

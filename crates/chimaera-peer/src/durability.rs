@@ -20,6 +20,11 @@
 //! service is degraded. Keeping commits in the page cache only (`none`) is
 //! always an explicit choice.
 //!
+//! A voter told to drop entries it committed (a majority of its group lost
+//! entries they had acknowledged unsynced, together) marks its raft state
+//! untrusted and exits ([`on_divergence`]), so it never serves a state the
+//! group no longer has and rejoins as a new member.
+//!
 //! What a commit survives is a property of its group, not of one peer: each
 //! peer advertises how it writes its log, and status reports the guarantee
 //! asked for next to the one the groups' voters give
@@ -283,6 +288,38 @@ pub fn guard(dir: &Path, durability: DiskDurability, others_lead: impl FnOnce(&P
     write_synced(&dir.join(MARKER), now.encode().as_bytes())
 }
 
+/// A boot id no machine has: a marker carrying it is never trusted.
+const DIVERGED_BOOT: &str = "diverged";
+/// The exit code of a peer that left its group's history (see `on_divergence`).
+pub const DIVERGED_EXIT: i32 = 3;
+
+/// Record that the raft state under `dir` holds entries its group no longer
+/// has: the next start treats it as lost after an unclean reboot (`guard`).
+fn mark_diverged(dir: &Path) -> io::Result<()> {
+    let m = Marker { boot: DIVERGED_BOOT.into(), unsynced: true, clean: false };
+    write_synced(&dir.join(MARKER), m.encode().as_bytes())
+}
+
+/// The hook for `chimaera_raft::set_divergence_hook`, for the peer under
+/// `dir`: this voter was told to drop entries it committed, which happens
+/// only after a majority of the group lost entries they had acknowledged
+/// unsynced, together (a correlated power loss under `none`). It marks its
+/// raft state untrusted, so the next start discards it and rejoins as a new
+/// member while the others lead, and exits.
+pub fn on_divergence(dir: std::path::PathBuf) -> impl Fn(u32) + Send + Sync + 'static {
+    move |group| {
+        tracing::error!(
+            "group {group}: this voter was told to drop raft entries it had committed, so a majority of the \
+             group's voters lost entries they had acknowledged before syncing them (their machines restarted \
+             together); exiting, to rejoin as a new member"
+        );
+        if let Err(e) = mark_diverged(&dir) {
+            tracing::error!("{}: could not mark its raft state untrusted: {e}", dir.display());
+        }
+        std::process::exit(DIVERGED_EXIT);
+    }
+}
+
 /// After a clean shutdown: sync the raft files, then record that they are.
 pub fn mark_clean(dir: &Path) -> io::Result<()> {
     let Some(mut m) = std::fs::read_to_string(dir.join(MARKER)).ok().and_then(|s| Marker::parse(&s)) else {
@@ -392,6 +429,20 @@ mod tests {
         assert_eq!(parse("none").unwrap(), DiskDurability::Process);
         assert_eq!(parse("fsync").unwrap(), DiskDurability::Os);
         assert!(parse("off").is_err());
+    }
+
+    #[test]
+    fn a_voter_that_diverged_rejoins_as_a_new_member_at_its_next_start() {
+        // Even a peer that syncs every entry: its log holds entries its group lost.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("raft")).unwrap();
+        std::fs::write(d.path().join("peer-id"), b"old").unwrap();
+        guard(d.path(), DiskDurability::Os, |_| panic!("a new directory needs no probe")).unwrap();
+        mark_diverged(d.path()).unwrap();
+        let m = Marker::parse(&std::fs::read_to_string(d.path().join(MARKER)).unwrap()).unwrap();
+        assert!(!trusted(Some(&m), boot_id().as_deref()), "{m:?}");
+        guard(d.path(), DiskDurability::Os, |_| true).unwrap();
+        assert!(!d.path().join("raft").exists() && !d.path().join("peer-id").exists(), "identity discarded");
     }
 
     #[test]

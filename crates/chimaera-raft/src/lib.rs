@@ -5,6 +5,7 @@
 //! [`Group::read`]; openraft stays an implementation detail of this crate.
 
 mod backend;
+mod diverge;
 mod local;
 mod log_store;
 mod network;
@@ -48,6 +49,7 @@ openraft::declare_raft_types!(
 
 pub type Raft = openraft::Raft<TypeConfig, StateMachine>;
 pub type NodeId = u64;
+pub use diverge::set_divergence_hook;
 pub use openraft::BasicNode;
 
 #[derive(Debug, thiserror::Error)]
@@ -261,12 +263,13 @@ impl RaftHost {
             due.last_size.store(size, std::sync::atomic::Ordering::Relaxed);
         }
         let net = NetworkFactory::new(id, self.transport.clone());
-        let raft = Raft::new(self.node_id, self.config.clone(), net, log, sm).await.map_err(log_store::io_err)?;
+        let raft =
+            Raft::new(self.node_id, self.config.clone(), net, log.clone(), sm).await.map_err(log_store::io_err)?;
         if bootstrap && !raft.is_initialized().await.map_err(log_store::io_err)? {
             raft.initialize(members).await.map_err(log_store::io_err)?;
         }
         tokio::spawn(snapshot_when_due(raft.clone(), due, self.snapshot_min_log_bytes));
-        Ok(Group { id, node_id: self.node_id, raft, db: self.sm_db.clone(), local: None })
+        Ok(Group { id, node_id: self.node_id, raft, db: self.sm_db.clone(), log, local: None })
     }
 
     /// Turn a local peer's single-member group into one that applies commands
@@ -368,6 +371,8 @@ pub struct Group {
     node_id: NodeId,
     pub raft: Raft,
     db: Arc<Database>,
+    /// This replica's log, to check a leader's appends against what it committed.
+    log: LogStore,
     /// Set for a local peer's group after recovery: commands apply without a
     /// log (see [`RaftHost::without_log`]) and `raft` is shut down.
     local: Option<Arc<local::Applier>>,

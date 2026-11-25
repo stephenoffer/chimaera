@@ -305,18 +305,25 @@ fn checkpoint(db: &Database, wal: Option<&mut Wal>) {
 /// Log storage handle for one group.
 #[derive(Clone)]
 pub struct LogStore {
-    group: u32,
+    pub(crate) group: u32,
     db: Arc<Database>,
     writer: DiskWriter,
     tail: Tail,
     /// Bytes appended since the group's last snapshot (shared with its state machine).
     pub(crate) due: Arc<crate::state_machine::SnapshotDue>,
+    /// The furthest commit point openraft has saved, kept in memory (read
+    /// from disk at start): nothing at or below it may be truncated.
+    pub(crate) committed: Arc<Mutex<Option<LogIdOf<TypeConfig>>>>,
 }
 
 impl LogStore {
     pub fn new(group: u32, db: Arc<Database>, writer: DiskWriter) -> LogStore {
         let tail = writer.tail(group);
-        LogStore { group, db, writer, tail, due: Arc::default() }
+        let store = LogStore { group, db, writer, tail, due: Arc::default(), committed: Arc::default() };
+        // A store that cannot read it fails openraft's own read at start.
+        let saved = store.read_meta("committed").ok().flatten().and_then(|b| dec(&b).ok());
+        *store.committed.lock().expect("committed lock") = saved;
+        store
     }
 
     fn read_meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -438,6 +445,12 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn save_committed(&mut self, committed: Option<LogIdOf<TypeConfig>>) -> Result<(), io::Error> {
+        if let Some(c) = &committed {
+            let mut known = self.committed.lock().expect("committed lock");
+            if known.as_ref().is_none_or(|k| k.index <= c.index) {
+                *known = Some(*c);
+            }
+        }
         let value = committed.as_ref().map(enc).transpose()?;
         let group = self.group;
         self.writer.call(|done| Op::Meta { group, key: "committed", value, done }).await
@@ -471,6 +484,15 @@ impl RaftLogStorage<TypeConfig> for LogStore {
 
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<TypeConfig>>) -> Result<(), io::Error> {
         let from = last_log_id.map_or(0, |l| l.index + 1);
+        let committed = self.committed.lock().expect("committed lock").as_ref().map(|c| c.index);
+        if let Some(c) = committed.filter(|c| from <= *c) {
+            crate::diverge::diverged(self.group);
+            return Err(io_err(format!(
+                "group {}: told to drop entries from index {from}, at or below its commit index {c}, which only a \
+                 majority losing entries it acknowledged unsynced can cause; this voter leaves the group",
+                self.group
+            )));
+        }
         self.tail.lock().expect("tail lock").retain(|idx, _| *idx < from);
         let group = self.group;
         self.writer.call(|done| Op::Truncate { group, from, done }).await

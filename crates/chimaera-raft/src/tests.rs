@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod diverge;
+
 struct Builder;
 
 impl openraft::testing::log::StoreBuilder<TypeConfig, LogStore, StateMachine, tempfile::TempDir> for Builder {

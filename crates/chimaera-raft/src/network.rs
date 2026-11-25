@@ -215,6 +215,7 @@ impl RaftNetworkV2<TypeConfig> for Network {
 /// replica keeps the state it had.
 pub async fn handle_snapshot(group: &Group, header: &[u8], path: &std::path::Path) -> io::Result<Vec<u8>> {
     let (vote, meta): (VoteOf<TypeConfig>, SnapshotMetaOf<TypeConfig>) = dec(header)?;
+    crate::diverge::refuse_snapshot(&group.log, &meta).await?;
     let (id, file, m) = (group.id, path.to_path_buf(), meta.clone());
     let checked =
         tokio::task::spawn_blocking(move || crate::snapshot_file::verify(&file, id, &m)).await.map_err(io_err)?;
@@ -234,7 +235,11 @@ pub async fn handle_rpc(group: &Group, kind: RpcKind, body: &[u8]) -> io::Result
         enc(&r.map_err(|e| e.to_string()))
     }
     match kind {
-        RpcKind::Append => wrap(group.raft.append_entries(dec(body)?).await.map(AppendWire::from)),
+        RpcKind::Append => {
+            let req = dec(body)?;
+            crate::diverge::refuse_rewrite(&group.log, &req).await?;
+            wrap(group.raft.append_entries(req).await.map(AppendWire::from))
+        }
         RpcKind::Vote => wrap(group.raft.vote(dec(body)?).await),
         RpcKind::PreVote => wrap(group.raft.pre_vote(dec(body)?).await),
         RpcKind::TransferLeader => wrap(group.raft.handle_transfer_leader(dec(body)?).await),
