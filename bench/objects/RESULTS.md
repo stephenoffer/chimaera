@@ -96,7 +96,6 @@ barely faster:
 |---|---:|---|---|
 | writing 3x the memory limit (spill), 16 MB objects on `/dev/shm` | 0.82–0.89x (5.5–5.8 s against 4.8–4.9 s) | Each new array is allocated in shared memory, on pages the kernel allocates and zeroes, while Ray reuses its heap's pages for each new array and copies it into its store on several threads: making and filling each 16 MB array took 2.8 ms against Ray's 1.2 ms. Measured on 2026-11-24 (4 GiB of 64 MiB objects into `/dev/shm`, two runs): fresh tmpfs pages 2.6 s (1.7 GB/s), a heap array copied into warm shared memory as Ray does 1.5 s (2.9 GB/s), and pages already in a tmpfs file, mapped with `MAP_POPULATE`, 0.95 s (4.5 GB/s). Those faults cost the most on `/dev/shm`, with shared-memory huge pages off (`shmem_enabled=never`, the usual default): on a huge-page tmpfs the same writes are 1.4x faster than Ray's, and 256 MB objects are faster on `/dev/shm` too. 8 or 16 spill threads did no better than 4. | A huge-page tmpfs (`mount -t tmpfs -o huge=within_size`; the peer uses one it finds, and nodes Chimaera provisions mount one), a larger memory limit, or reusing arrays. Handing a spilled object's pages to the next array would not help: a 16 MiB array on pages that already exist cost 2.95 ms to map and fill, against 3.08 ms from the pre-zeroed reserve, because the cost is mapping the block and writing pages that are cold in the cache (the same mapping again costs 0.9 ms), and a stored array's block is remapped copy-on-write, so its mapping cannot be kept. Storing a copy instead (`CHIMAERA_ARENA=0`: arrays on the heap) took the 16 MB writes to 5.0–5.1 s, but the 256 MB ones to 11.3–11.6 s. |
 | first touch of a value's pages just after `get`, on `/dev/shm` | pandas 16 MiB 0.4x (747–751 µs against 291–313), Arrow 1 MiB 0.5x (84–87 µs against 46) | A value read in place is a mapping of its file, whose pages fault in when first touched. Ray's touch is cheap in this test because it puts and frees one value over and over: its store hands out the same pages again, which the reader has mapped already. Mapping the pages at `get` instead (`MADV_POPULATE_READ`) only moves the cost (16 MiB: 513 µs faulting them in as they are read, 566 µs populating, then reading). `get` and the touch together are faster than Ray's: pandas 16 MiB 37.2–37.6 ms against 42.2–43.3, Arrow 1 MiB 186–195 µs against 201–206. Measured again on 2026-11-24, two runs. | A huge-page tmpfs: pandas 16 MiB 0.9x (345 µs against 301–304), Arrow 16 MiB 2.4x faster (277–282 µs against 674); objects under 2 MiB still use 4 KiB pages there (Arrow 1 MiB 0.6x). |
-| pandas with object columns, get of 1 MiB | 1.0x (1.73–1.75 ms against 1.66–1.68) | Unpickling the frame's structure is most of the time in both (put is 2.0–2.1x, return and pipeline 1.3–1.5x). | NumPy or Arrow columns, or `category` dtype. |
 | Arrow tables, `return` and `pipeline` of 1 MiB | 0.9–1.4x | Arrow buffers are copied once into shared memory: the zero-copy allocator covers NumPy. From 16 MiB 1.2–2.1x; put and get are 1.2–1.9x. | - |
 | 1 MiB `str` | 0.9–1.7x over four runs (put 425–541 µs against 486–749) | Encoding to and decoding from UTF-8 is most of the time in both, and Ray's own time varies most. From 16 MiB, put, return and pipeline are 1.9–2.4x. | - |
 | `str` get of 16 MiB; many 1 MB values read in one call | 1.1x (2.85–2.91 ms against 3.02–3.09; 475–482 µs against 503–514 each) | Decoding the UTF-8 into a new `str`, and one copy per value, are the cost in both. | Batch small values into one array. |
@@ -152,6 +151,16 @@ on that for its memory):
 | pandas get, 16 / 256 MiB | 39 / 836 ms | 47 / 802 ms (0.83x / 1.04x) | 36 / 740 ms (**1.08x / 1.13x**) |
 | pandas return, 16 / 256 MiB | 193 / 4,734 ms | 167 / 4,323 ms | 139 / 2,946 ms (**1.4x / 1.6x**) |
 | pandas pipeline, 16 / 256 MiB | 192 / 4,715 ms | 158 / 4,218 ms | 143 / 2,932 ms (**1.3x / 1.6x**) |
+
+Since 2026-11-25 the decoded column is filled from its list as unpickling
+fills an object array (`ndarray.__setstate__`), not through `np.fromiter`:
+43,690 strings in 0.29 ms instead of 0.51. Measured the same day against
+Ray on one workspace node, two runs of each:
+
+| pandas get | Ray | Chimaera before | Chimaera now |
+|---|---:|---:|---:|
+| 1 MiB | 1.62–1.66 ms | 1.75 ms (0.9x) | 1.49–1.50 ms (**1.1x**) |
+| 16 MiB | 41.8–43.1 ms | 36.3–36.7 ms | 33.0–33.2 ms (**1.3x**) |
 
 Fixed on 2026-11-22: large `bytes` and `str`. New arena blocks of 8 MiB or
 more are now populated on several threads as they are handed out, so the

@@ -172,6 +172,9 @@ def test_object_arrays_of_plain_values_round_trip_with_shape_order_and_sharing(o
     assert got.flags.f_contiguous == a.flags.f_contiguous
     flat = got.ravel(order="K")
     assert flat[0] is flat[5] and flat[1] is flat[6], "repeated strings stay one object"
+    assert got.flags.writeable
+    got[0, 0] = "changed"
+    assert got[0, 0] == "changed" and a[0, 0] == "NY"
 
 
 def test_other_arrays_reduce_as_numpys_own():
