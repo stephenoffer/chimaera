@@ -113,6 +113,13 @@ print(json.dumps({"small": small_runs, "wide": wide.remote().result(timeout=120)
 """
 
 
+def _offered(home: str) -> int:
+    """Whole CPUs the peer offers: a CPU quota (a container's) can be below the
+    CPUs it may run on."""
+    out = subprocess.run([BIN, "--dir", home, "status", "--json"], capture_output=True, text=True, timeout=60)
+    return int(json.loads(out.stdout)["cpus"])
+
+
 def _affinity(home: str, wide: int) -> tuple[dict[int, list[int]], list[int]]:
     r = run_script(AFFINITY.replace("WIDE", str(wide)), home=home, timeout=180)
     assert r.returncode == 0, r.stderr
@@ -123,12 +130,14 @@ def _affinity(home: str, wide: int) -> tuple[dict[int, list[int]], list[int]]:
 @pytest.mark.parametrize("peer", [("halves", {})], indirect=True)
 def test_workers_run_on_one_node_each_and_spread_over_the_nodes(peer):
     nodes = _halves()
-    small, wide = _affinity(peer, len(_allowed()))
+    width = min(len(_allowed()), _offered(peer))
+    small, wide = _affinity(peer, width)
     assert len(small) >= 2, small
     for pid, cpus in small.items():
         assert cpus in nodes, f"worker {pid} may run on {cpus}, not on one node of {nodes}"
     assert {tuple(c) for c in small.values()} == {tuple(n) for n in nodes}, "both nodes take workers"
-    assert wide == _allowed(), "a worker with more threads than a node holds is not bound"
+    if width > max(len(n) for n in nodes):  # a peer offering one node's CPUs or fewer has no wider worker
+        assert wide == _allowed(), "a worker with more threads than a node holds is not bound"
 
 
 @pytest.mark.parametrize("peer", [("halves", {"CHIMAERA_NUMA_BIND": "0"})], indirect=True)
