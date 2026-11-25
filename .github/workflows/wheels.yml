@@ -1,0 +1,68 @@
+# The release wheels: one abi3 wheel for each supported OS and CPU (macOS on
+# arm64 and x86_64, Linux with glibc 2.28 or newer on x86_64 and aarch64).
+# `make wheel` refuses a wheel whose peer binary and extension module are not
+# one build (deploy/dev/wheel-check.py); each wheel is then installed into a
+# fresh venv and runs a task, an actor and a 64 MiB result on CPython 3.11,
+# 3.12, 3.13 and 3.14 (deploy/dev/wheel-smoke.sh).
+name: wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - Makefile
+      - pyproject.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - deploy/dev/wheel-*
+      - .github/workflows/wheels.yml
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
+      - name: Install protoc
+        run: brew install protobuf
+      - name: Build and check the wheel
+        run: |
+          python3.12 -m venv .venv
+          .venv/bin/pip install -q "maturin>=1.9,<2"
+          make wheel
+      - name: Install and run it on each CPython
+        run: deploy/dev/wheel-smoke.sh python3.11 python3.12 python3.13 python3.14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.runner }}
+          path: dist/*.whl
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, check, install and run it on each CPython (manylinux_2_28 image)
+        run: make wheel-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.runner }}
+          path: dist/*.whl

@@ -1,0 +1,96 @@
+# The quick lane, on every push to main and every pull request: `make check`
+# (fmt, clippy, the Rust tests and the Python tests) on Linux and macOS, and
+# the pinned regression run on Linux (`make regress`, bench/evals/regress.py),
+# which fails on a wrong result, a changed output digest or a median past its
+# tolerance of the runner's baseline in bench/evals/baselines. Run by hand with
+# record_baseline to record that baseline: the job uploads it to commit. Each
+# job uploads its lane record (outcome, source digest, run link, log) as an
+# artifact named lane-*, which the release's qualification manifest collects
+# (bench/qualification/build_manifest.py, docs/qualification.md).
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      record_baseline:
+        description: Record the runner's regression baseline instead of checking against it
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install protoc
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install protobuf
+          else sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler; fi
+      - name: Python environment (the package's dev extras)
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q "maturin>=1.9,<2"
+          VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop -q -E dev
+      - name: make check, recorded as a lane (bench/qualification)
+        run: >-
+          python bench/qualification/build_manifest.py lane
+          ${{ runner.os == 'Linux' && 'quick' || 'quick-macos' }} -- make check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lane-${{ matrix.runner }}
+          path: dist/qualification/lanes
+
+  regress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - name: Python environment (the package's dev extras)
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q "maturin>=1.9,<2"
+          VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop -q --release -E dev
+      - name: Pinned regression run, recorded as a lane
+        run: >-
+          python bench/qualification/build_manifest.py lane regress --
+          make ${{ inputs.record_baseline && 'regress-record' || 'regress' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lane-regress
+          path: dist/qualification/lanes
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regress
+          path: |
+            dist/regress
+            bench/evals/baselines

@@ -1,0 +1,117 @@
+# The slower lanes, nightly and by hand. Native: fmt, clippy and the Rust tests
+# in the Linux dev image, then the Python tests there with cgroup accounting.
+# Integration: each launcher gate runs a real cluster in Docker (kind, Slurm,
+# SSH), and kind-mutant-test passes only if kind-test refuses an image whose
+# render moves the peers' volume. Fleet: the fleet emulator's gates at 100,000
+# and 262,144 peers (chimaera-fleet, which exits 1 when one fails). Hardware,
+# by hand with `hardware` only (it costs money): the GPU check and the 4-node
+# Ray comparison as Anyscale jobs, which need the ANYSCALE_CLI_TOKEN secret;
+# each job prints its raw results into its log, and its lane rebuilds them as
+# files of the lane record and fails without them. Each job uploads its lane
+# record as an artifact named lane-*, for the release's qualification manifest
+# (bench/qualification).
+name: integration
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      hardware:
+        description: Also run the Anyscale GPU check and the 4-node comparison
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: make linux-check linux-pytest, recorded as a lane (bench/qualification)
+        run: python3 bench/qualification/build_manifest.py lane native --tier linux -- make linux-check linux-pytest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lane-native
+          path: dist/qualification/lanes
+
+  launchers:
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [kind-test, kind-mutant-test, slurm-test, ssh-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kind (kubectl is on the runner)
+        if: startsWith(matrix.gate, 'kind')
+        run: |
+          curl -sSLo kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c
+          sudo install -m 755 kind /usr/local/bin/kind
+      - run: >-
+          python3 bench/qualification/build_manifest.py lane ${{ matrix.gate }} --tier launchers
+          -- make ${{ matrix.gate }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lane-${{ matrix.gate }}
+          path: dist/qualification/lanes
+
+  fleet:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - name: The fleet emulator's gates, recorded as a lane
+        run: >-
+          python3 bench/qualification/build_manifest.py lane fleet --tier emulation
+          -- cargo run -q --release -p chimaera-fleet -- --weak-scaling
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lane-fleet
+          path: dist/qualification/lanes
+
+  hardware:
+    if: github.event_name == 'workflow_dispatch' && inputs.hardware
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job: gpu-check
+            tier: gpu
+            expect: --expect checks.jsonl
+          - job: eval-4node
+            tier: cluster
+            # multi_cost.json too when every machine is priced (cost.py recomputes it from the results).
+            expect: --expect multi_results.json --expect multi_report.md
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ANYSCALE_CLI_TOKEN: ${{ secrets.ANYSCALE_CLI_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q anyscale
+      - name: Submit and wait, recorded as a lane (which rebuilds the raw results the job printed into its log)
+        run: >-
+          python bench/qualification/build_manifest.py lane ${{ matrix.job }}
+          --tier ${{ matrix.tier }} ${{ matrix.expect }}
+          -- anyscale job submit -f deploy/anyscale/${{ matrix.job }}.job.yaml --wait
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lane-${{ matrix.job }}
+          path: dist/qualification/lanes
