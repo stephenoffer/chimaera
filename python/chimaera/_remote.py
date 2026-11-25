@@ -17,7 +17,7 @@ import weakref
 from collections.abc import AsyncIterable, AsyncIterator, Callable, Coroutine, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, ParamSpec, Protocol, TypeVar, Unpack, overload
 
-from . import _context, _direct, _leases, _serde, _values, _width, _workflow
+from . import _context, _direct, _graph, _leases, _serde, _values, _width, _workflow
 from ._errors import ActorDied, ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
 from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part, start_pending
 from ._native import blake3_digest, child_id, derive_id
@@ -907,6 +907,8 @@ class RemoteMethod(Generic[P, R]):
 
     def remote(self, *args: P.args, **kwargs: P.kwargs) -> Future[R]:
         self._check(args, kwargs)
+        if _graph.tracing():  # inside ch.dist.graph's compile(): record the call
+            return _graph.bind(self, args, kwargs)  # type: ignore[return-value]
         a = self._actor
         return submit_call(
             a._rt,

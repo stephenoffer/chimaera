@@ -150,8 +150,8 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | `ray.get_gpu_ids()`, `get_accelerator_ids()` | `ch.dist.devices()`, `ch.dist.device()` | Today (`ch.dist.devices()`, `ch.dist.device()`) |
 | `ray.util.collective` (NCCL, GLOO; allreduce, allgather, broadcast, reduce, reducescatter, send/recv, barrier, multi-GPU variants, custom backends) | `ch.context().gang` and `ch.dist.group(*actors)` with the same operations; `reduce`, multi-GPU variants and `ext.CollectiveBackend` | Today (barrier, all_gather, all_reduce, broadcast; the shim adds reduce) / P5 (reducescatter, send/recv, multi-GPU, `ext.CollectiveBackend`) |
 | Placement-group SPMD by hand | `.gang()` with rank variables for PyTorch, JAX and DeepSpeed; elastic `ranks=ch.auto(...)` | Today (`.gang()` with elastic ranks; each generation admitted all or none) |
-| `ray.dag`, Compiled Graphs (`experimental_compile`, NCCL channels) | `@ch.graph`, `.compile(max_in_flight=)` | P5 |
-| `visualize()` | `graph.explain()` renders the compiled plan | New (P5) |
+| `ray.dag`, Compiled Graphs (`experimental_compile`, NCCL channels) | `@ch.dist.graph`, `.compile(max_in_flight=)` | Today (values over Unix or TCP links between actors) / P5 (NCCL channels for device tensors) |
+| `visualize()` | `graph.explain()` renders the compiled plan | Today (text) |
 | `register_tensor_transport`, NIXL memory registration | `ext.Transport`; NIXL and UCX registration are admission resources | New (P5) |
 
 ### Observability and debugging

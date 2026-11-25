@@ -213,6 +213,14 @@ replay = "anyscale job submit -f deploy/anyscale/gpu-check.job.yaml --wait (CPU 
 limit = { what = "GPUs in one gang (NVIDIA A10G, one node)", value = 4 }
 
 [[claim]]
+id = "compiled-graphs"
+kind = "function"
+tier = "local"
+quotes = ["| Compiled actor graphs (`ch.dist.graph`) | Working on localhost clusters, over Unix and TCP links; no device-tensor channels |"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_graph.py -q"
+
+[[claim]]
 id = "shuffle-speed"
 kind = "speed"
 tier = "cluster"

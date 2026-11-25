@@ -16,7 +16,7 @@ The other examples show planned API and say which phase adds it.
 | P2 (today) | The rest of Tier 1: forwarding, multiple returns, per-call actor options, concurrency groups, `ch.actor`, subtree cancel, `Run.cancel`, priority, `ch.coord.Queue`, `ch.coord.Topic`. |
 | P3 | Several machines: clusters on SSH, Kubernetes, Slurm and clouds, `ch.coord.Store`, placement, `ch.runs.cluster()`, shipped environments. |
 | P4 | CPU at scale: sources, sinks and shuffle, autoscaled and shared pools, metrics. |
-| P5 | Accelerators and gangs: device plugins, rank groups and collectives, reservations, compiled graphs. |
+| P5 | Accelerators and gangs: device plugins, rank groups and collectives, reservations. |
 | P6 | Elastic infrastructure: autoscaling providers, tenants, budgets. |
 
 ## Rules the API follows
@@ -1015,18 +1015,56 @@ else:
     raise AssertionError("16 CPU-seconds of trials should not fit a 2-second budget")
 ```
 
-### Device transport, compiled graphs (P5)
+### Device transport (P5)
 
 ```python
 @ch.remote(transport="device")     # tensors move GPU to GPU, not through host memory
 def stage(t): ...
+```
 
-@ch.graph
+### Compiled graphs
+
+`ch.dist.graph` makes a function of actor method calls a graph. `.remote(...)`
+runs it as written, each call through the peers. `.compile()` traces it once
+and sets up each actor to run its part of every invocation itself: an
+invocation submits, schedules and commits nothing, its inputs go from the
+driver to the actors that read them, and each value goes straight from the
+actor that made it to the actors that use it and, for the graph's results,
+back to the driver. `max_in_flight` invocations run at once (`remote()`
+waits for a free one), each actor starting on the next while the actors after
+it finish the last. `explain()` prints the plan.
+
+A graph's values are passed only as direct arguments of actor method calls,
+and the function cannot branch on them: it runs once, at compile time, on
+placeholders. Actors on one host are linked by Unix sockets in their peer's
+socket directory. Links between hosts are TCP, authenticated with a key made
+for the graph but not encrypted, so they need `compile(cross_host=True)`. While
+a graph is compiled its actors are busy with it, and their other calls wait
+until `close()` (or the end of a `with` block). An actor that dies or restarts
+breaks the graph: its invocations raise `ch.errors.ActorDied`, and it must be
+compiled again. **Runs today:**
+
+```python run
+@ch.remote
+class Tokenizer:
+    def encode(self, text):
+        return text.split()
+
+@ch.remote
+class Model:
+    def generate(self, tokens):
+        return " ".join(reversed(tokens))
+
+tokenizer, model = Tokenizer.remote(), Model.remote()
+
+@ch.dist.graph
 def serve(request):
-    tokens = tokenizer.encode.remote(request)
-    return model.generate.remote(tokens)
-fast = serve.compile(max_in_flight=2)        # reusable channels, no per-call bookkeeping
-reply = fast.remote("hello").result()
+    return model.generate.remote(tokenizer.encode.remote(request))
+
+assert serve.remote("hello world").result() == "world hello"  # as written: two calls through the peers
+with serve.compile(max_in_flight=2) as fast:                   # each actor runs its own part
+    replies = [fast.remote(f"hello {i}") for i in range(100)]
+    assert [r.result() for r in replies][7] == "7 hello"
 ```
 
 ## Tier 4: extending Chimaera (`chimaera.ext`)
@@ -1093,7 +1131,7 @@ class QueueDepth(ext.Controller):             # proposals go through canary and 
 | Parameter server | keyed actors or `Pool.route` shards, concurrency groups, `put` |
 | Data, tensor, pipeline and expert parallel training | `.gang()`, `Group.mesh(...)`, collectives, `pack="nvlink"` |
 | Elastic training | `ranks=ch.auto(...)`, `generation`, `GangFailed`, checkpoints |
-| Model serving with batching | keyed `Pool`, `batch=`, `replicas=ch.auto`, `deadline`, `Overloaded`, generator methods, `upgrade`, `ch.graph` |
+| Model serving with batching | keyed `Pool`, `batch=`, `replicas=ch.auto`, `deadline`, `Overloaded`, generator methods, `upgrade`, `ch.dist.graph` |
 | Work queues | `Queue` with `claim` |
 | RL rollout loops | generator-method rollout pool, learner gang, `ch.dist.group().broadcast` |
 | Hyperparameter search with early stopping | trials as calls or gangs, `context().report()`, `Topic`, `as_completed`, subtree `cancel`, `budget` |

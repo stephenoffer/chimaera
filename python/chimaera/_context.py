@@ -11,6 +11,8 @@ from typing import Any, NoReturn
 # The built-in actor method that ``close(drain=True)`` calls last (see
 # ``Executor.shut_down``).
 SHUTDOWN_METHOD = "__chimaera_shutdown__"
+# The built-in actor method a compiled graph runs its actors through (``_graph.serve``).
+GRAPH_METHOD = "__chimaera_graph__"
 
 
 @dataclass

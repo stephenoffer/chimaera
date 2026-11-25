@@ -168,6 +168,7 @@ Chimaera is early software. This is what works today:
 | Durable actors (`ch.durable.State`) and durable workflows | Working |
 | Streaming generators (`ch.typing.Stream`) | Working |
 | Gangs and collectives (`ch.dist.group`, `.gang()`) | Working on CPU; NCCL checked on one node of 4 NVIDIA A10Gs |
+| Compiled actor graphs (`ch.dist.graph`) | Working on localhost clusters, over Unix and TCP links; no device-tensor channels |
 | Shuffles (`reduce_by_key`) | Working |
 | Kubernetes, Slurm and SSH launchers | Working in container tests (kind, slurmd, sshd); real clouds unverified |
 

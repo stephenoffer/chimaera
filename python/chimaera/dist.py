@@ -3,9 +3,11 @@ hold resources before work runs, placement, and accelerators."""
 
 from ._devices import device, devices
 from ._gang import Gang, GangActor, GangFailed, Group, GroupHandle, group
+from ._graph import CompiledGraph, Graph, GraphFuture, graph
 from ._options import Placement
 from ._reserve import Reservation, reserve
 
 __all__ = [
-    "Gang", "GangActor", "GangFailed", "Group", "GroupHandle", "Placement", "Reservation", "device", "devices", "group", "reserve",
+    "CompiledGraph", "Gang", "GangActor", "GangFailed", "Graph", "GraphFuture", "Group", "GroupHandle", "Placement",
+    "Reservation", "device", "devices", "graph", "group", "reserve",
 ]

@@ -31,7 +31,7 @@ from typing import Any
 
 import cloudpickle
 
-from . import _batch, _direct, _context, _future, _leases, _objects, _project, _serde, _statecodec, _workflow
+from . import _batch, _direct, _context, _future, _graph, _leases, _objects, _project, _serde, _statecodec, _workflow
 from ._errors import ActorDied, NonRetryable
 from . import _native
 from ._native import ExecConn, blake3_digest, child_id
@@ -809,6 +809,8 @@ class Executor:
                 raise RuntimeError("actor method called before its constructor ran")
             if msg["method"] == _context.SHUTDOWN_METHOD:
                 return self.shut_down()
+            if msg["method"] == _context.GRAPH_METHOD:
+                return _graph.serve(self, *args)
             result = getattr(self.instance, msg["method"])(*args, **kwargs)
             # A returned future is forwarded by run_one, never awaited here:
             # awaiting would hold this worker until the other call finishes.
