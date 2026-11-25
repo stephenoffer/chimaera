@@ -435,7 +435,7 @@ assert any(str(w.message).startswith("CH101") for w in caught)
 |---|---|---|---|
 | CH101 | warning | Calls from one line ran 200 times one at a time: each result was awaited before the next call was submitted | Submit them all first, or use `fn.map(items)` |
 | CH103 | warning | A large value fetched with `.result()` was passed straight back into `.remote()`, a round trip through your script | Pass the future itself |
-| CH107 | warning | The same large value (1 MiB or more) was passed from one line at least 20 times, and encoding it took 0.1 s or more in total; it is stored once but encoded every time | `ch.put(value)` once, or `fn.partial(value)` |
+| CH107 | warning | The same large value (1 MiB or more) was passed from one line at least 20 times, and encoding it took 0.1 s or more in total; it is stored once but encoded every time | `ch.put(value)` once, or `fn.partial(value)`; for an array made before the first call, `ch.init()` before making it |
 | CH108 | warning | A function captures a variable over 1 MiB; it is snapshotted on first submission and shipped once per peer | Pass it with `ch.put(...)` if it changes (over 256 MiB is an error) |
 | CH110 | warning | Calls are submitted faster than they finish, and `.remote()` now waits for room | `fn.map(items)`, or consume results with `ch.as_completed` |
 | CH111 | warning | The local peer runs a different `chimaera` binary than this program would start (rebuilt or upgraded) | `chimaera stop`; the next call starts the new one |
@@ -447,6 +447,7 @@ assert any(str(w.message).startswith("CH101") for w in caught)
 | CH118 | warning | A list, dict, set or tuple shared with calls pickles to 8 MiB or more; every reader unpickles its own copy | Use a NumPy array or an Arrow table, which readers map instead |
 | CH119 | note on the error | A call that asked for no GPU hit a CUDA error on a machine that has GPUs | `@ch.remote(gpus=1)` or `fn.options(gpus=1)` |
 | CH120 | warning | The same code was wrapped as a new remote function 100 times (for example `ch.remote(lambda ...)` in a loop) | Define the remote function once, outside the loop |
+| CH124 | warning | A CUDA tensor of 64 MiB or more was passed straight to calls from one line; each call copies it to host memory | `ch.put(t)` once and pass the future: copied once, and readers on its machine read it from GPU memory |
 
 Seen enough of one code? Silence it by filtering on the start of its
 message:

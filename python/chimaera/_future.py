@@ -647,7 +647,9 @@ def put(value: T, *, durability: Literal["default", "ephemeral", "retained"] | N
 
     ``durability`` is what the value survives. By default it is copied to
     another peer in the background. ``"ephemeral"`` makes no copy: it is lost
-    with the peer that holds it. ``"retained"`` returns only once copies on
+    with the peer that holds it, and a CUDA tensor shared with this machine's
+    readers keeps no host copy either: only readers that see its GPU can read
+    it, while this process lives. ``"retained"`` returns only once copies on
     other peers, in other zones, racks and machines first, are made, and
     raises ``Infeasible`` where there is no other peer. A put has no call to
     run again, so it cannot be ``"replayable"``."""
@@ -671,7 +673,9 @@ def put(value: T, *, durability: Literal["default", "ephemeral", "retained"] | N
     limit = min(rt.inline_limit, PUT_INLINE)
     files: list[bytes] = []
     keep_local = durability in ("ephemeral", "retained")  # retained: copied below, not in the background
-    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, limit, prefix, holds, keep_local, files)
+    object_id, inline, size, owned = _values.store(
+        value, run, rt.blob_sink, limit, prefix, holds, keep_local, files, ephemeral=durability == "ephemeral"
+    )
     if durability == "retained" and files:
         try:
             rt.client.retain(run, files)

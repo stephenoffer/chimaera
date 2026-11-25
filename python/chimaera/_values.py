@@ -35,6 +35,9 @@ PROMOTE_BYTES = 1 << 20
 # CH118: a Python collection that pickles to at least this much, read by
 # calls: every reader unpickles a full copy of it.
 COLLECTION_WARN_BYTES = 8 << 20
+# CH124: a CUDA tensor at least this large passed straight to calls is copied
+# to host memory by every call that passes it.
+CUDA_ARG_WARN_BYTES = 64 << 20
 _COLLECTIONS = (list, dict, set, frozenset, tuple)
 # CH107: the same blob from one call site this many times...
 REPEAT_WARN_CALLS = 20
@@ -133,7 +136,7 @@ class InlineRef:
 class Encoded:
     """An encoded call frame and the blobs it reads."""
 
-    __slots__ = ("parts", "size", "oob", "blobs", "seconds", "holds", "collection")
+    __slots__ = ("parts", "size", "oob", "blobs", "seconds", "holds", "collection", "hashed", "cuda")
 
     def __init__(
         self,
@@ -148,6 +151,10 @@ class Encoded:
         self.holds = holds or []
         # The largest Python collection stored for the call: (type name, bytes).
         self.collection: tuple[str, int] | None = None
+        # Blobs whose buffers were hashed here, not linked from the arena.
+        self.hashed: set[bytes] = set()
+        # Bytes of the largest CUDA tensor copied to host memory for the call.
+        self.cuda = 0
 
     @property
     def total_bytes(self) -> int:
@@ -164,6 +171,7 @@ def store(
     device_holds: list[Any] | None = None,
     keep_local: bool = False,
     files: list[bytes] | None = None,
+    ephemeral: bool = False,
 ) -> tuple[bytes, bytes | None, int, list[str]]:
     """Store one value (``ch.put``): (object id, inline bytes or None, size,
     files that only this value uses). Local ids start with `prefix`: a put
@@ -173,7 +181,8 @@ def store(
     this machine (see _cuda_share) and added to it, for the caller to keep.
     With `keep_local` the peer makes no background copy of its files (a
     durability class other than the default); `files` gets the ids of the
-    files the value is stored in.
+    files the value is stored in. With `ephemeral`, a shared CUDA tensor is
+    stored without its host copy (see tensor_shared_only).
 
     Locally nothing is hashed: arena arrays are linked in place (no copy, see
     _objects), everything else is written once by the native writer, and the
@@ -203,11 +212,12 @@ def store(
         if device_holds is not None:
             _put_holds.list = device_holds
             _put_holds.write_blob = write_blob
+            _put_holds.ephemeral = ephemeral
         try:
             parts, size, _ = _serde.dumps_parts(value, external=claim)
         finally:
             if device_holds is not None:
-                del _put_holds.list, _put_holds.write_blob
+                del _put_holds.list, _put_holds.write_blob, _put_holds.ephemeral
         object_id = prefix + os.urandom(16 - len(prefix))
         if size > inline_limit:
             path = _serde.object_path(sink.object_dir, run, object_id)
@@ -422,6 +432,8 @@ def encode_frame(
     t0 = time.perf_counter()
     blobs: dict[bytes, int] = {}
     holds: list[ClaimHold] = []
+    hashed: set[bytes] = set()
+    _cuda_copied.n = 0
 
     local_dir = _serde.run_dir(sink.object_dir, run) if isinstance(sink, LocalBlobSink) else None
 
@@ -443,6 +455,7 @@ def encode_frame(
             hold.held_by(view.obj)
             holds.append(hold)
         blobs[bid] = view.nbytes
+        hashed.add(bid)
         return bid
 
     parts, size, oob = _serde.dumps_parts(frame, external=external)
@@ -456,8 +469,10 @@ def encode_frame(
         parts, size, oob = _serde.dumps_parts(frame, external=external)
         enc = Encoded(parts, size, oob, blobs, time.perf_counter() - t0, holds)
         enc.collection = max(collections, key=lambda c: c[1], default=None)
-        return enc
-    return Encoded(parts, size, oob, blobs, time.perf_counter() - t0, holds)
+    else:
+        enc = Encoded(parts, size, oob, blobs, time.perf_counter() - t0, holds)
+    enc.hashed, enc.cuda = hashed, _cuda_copied.n
+    return enc
 
 
 def _promoter(
@@ -532,12 +547,40 @@ class RepeatTracker:
         if entry[0] >= REPEAT_WARN_CALLS and entry[1] >= REPEAT_WARN_S:
             self._warned.add(site)
             self._seen = {k: v for k, v in self._seen.items() if k[0] != site}
+            # Made before the arena was installed (the first call starts it),
+            # an array is hashed on every call instead of linked.
+            early = bid in enc.hashed and _objects._state["installed"]
             warnings.warn(
                 f"CH107: calls from {site} passed the same {enc.blobs[bid] >> 20} MiB value {int(entry[0])} times; "
                 f"it is stored once automatically, but encoding it took {entry[1]:.2f} s in total. "
-                "Pass ch.put(value) instead, or bind it once with fn.partial(value).",
+                "Pass ch.put(value) instead, or bind it once with fn.partial(value)"
+                + (", or call ch.init() before making it." if early else "."),
                 stacklevel=4,
             )
+
+
+class CudaArgLint:
+    """CH124: a large CUDA tensor passed straight to calls. Each call copies
+    it to host memory: the copy a reader on another machine, or after the
+    caller exits, reads. ch.put copies it once, and readers on this machine
+    read it from GPU memory."""
+
+    def __init__(self) -> None:
+        self._warned: set[str] = set()
+
+    def note(self, site: str | None, nbytes: int, stacklevel: int = 4) -> None:
+        if site is None or nbytes < CUDA_ARG_WARN_BYTES or site in self._warned:
+            return
+        self._warned.add(site)
+        warnings.warn(
+            f"CH124: calls from {site} pass a {nbytes >> 20} MiB CUDA tensor; each call copies it to host memory. "
+            "Put it once with ch.put(t) and pass the future: it is copied once, and readers on this machine "
+            "read it straight from GPU memory.",
+            stacklevel=stacklevel,
+        )
+
+
+cuda_args = CudaArgLint()
 
 
 class FetchedTracker:
@@ -593,12 +636,17 @@ def torch_reducers() -> dict[type, Callable[[Any], Any]]:
 
     def reduce_tensor(t: Any) -> Any:
         if t.device.type == "cuda" and not t.requires_grad and not t.is_sparse:
+            share = _cuda_share(t)
+            if share is not None and getattr(_put_holds, "ephemeral", False):
+                # An ephemeral put keeps no host copy: see tensor_shared_only.
+                return (tensor_shared_only, (tuple(t.shape), str(t.dtype).rsplit(".", 1)[-1], share))
             host = t.detach().cpu()
             try:
                 payload: Any = host.contiguous().numpy()
             except (TypeError, RuntimeError):  # dtypes NumPy lacks: torch pickles the host copy
                 payload = host
-            share = _cuda_share(t)
+            if getattr(_put_holds, "list", None) is None:  # a call's argument, not a put: see CH124
+                _cuda_copied.n = max(getattr(_cuda_copied, "n", 0), getattr(payload, "nbytes", 0))
             write_blob = getattr(_put_holds, "write_blob", None)
             if share and share.get("net") and write_blob is not None and not isinstance(payload, torch.Tensor):
                 run, blob = write_blob(memoryview(payload).cast("B"))
@@ -623,6 +671,11 @@ _device_warned: set[str] = set()
 _put_holds = threading.local()
 # Shared tensors whose future was passed on: kept for this process's life.
 _kept_device: list[Any] = []
+# This process's own shared tensors, by the token their share carries: the
+# putting process cannot open its own IPC handle (see tensor_shared_only).
+_own_shares: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+# While a call's arguments are encoded: the largest CUDA tensor copied to host.
+_cuda_copied = threading.local()
 _SHARE_MIN = 1 << 20
 # Tensors this process read straight from another process's GPU memory.
 cuda_shared_reads = 0
@@ -660,7 +713,9 @@ def _cuda_share(t: Any) -> dict[str, Any] | None:
     holds.append(t)
     from . import _gpunet
 
-    share = {"host": host, "pid": os.getpid(), "gpu": gpu, "args": args}
+    token = os.urandom(8).hex()
+    _own_shares[token] = t
+    share = {"host": host, "pid": os.getpid(), "gpu": gpu, "args": args, "own": token}
     net = _gpunet.offer(t)
     if net is not None:
         share["net"] = net  # read GPU to GPU from another machine
@@ -692,6 +747,56 @@ def _from_cuda_share(share: dict[str, Any], target: str | None) -> Any:
         return out
     except Exception:  # noqa: BLE001 -- the owner exited, or IPC is unavailable: the host copy
         return None
+
+
+def tensor_shared_only(shape: tuple[int, ...], dtype: str, share: dict[str, Any]) -> Any:
+    """A CUDA tensor that ``ch.put(t, durability="ephemeral")`` stored with no
+    host copy. It is read from its holder's GPU memory: by the putting process
+    itself, by another process on that machine that sees that GPU, or GPU to
+    GPU from another machine with ``CHIMAERA_CUDA_NET``. Any other reader, or
+    any reader once the putting process is gone, gets DataLost naming its
+    durability (there is no copy to fall back on)."""
+    from ._devices import device
+    from ._errors import DataLost
+
+    granted = device()
+    target = granted if granted.startswith("cuda") else None
+    here = _boot_id()
+    if share.get("pid") == os.getpid() and share.get("host") == here:
+        own = _own_shares.get(share.get("own", ""))
+        if own is not None:  # a copy, so a write stays in the reader as for every value
+            return own.to(target or own.device, copy=True)
+    direct = _from_cuda_share(share, target)
+    if direct is not None:
+        return direct
+    if target is not None and share.get("net"):
+        from . import _gpunet
+
+        got = _gpunet.fetch(share["net"], target)
+        if got is not None:
+            return got
+    if share.get("host") != here:
+        why = "this reader is on another machine"
+    elif not _sees_gpu(share.get("gpu", "")):
+        why = "this process cannot see the GPU it is on (each call sees only the GPUs it was granted)"
+    else:
+        why = "the putting process has exited"
+    raise DataLost(
+        f"a {dtype} CUDA tensor of shape {tuple(shape)} was put with durability='ephemeral', which keeps no host "
+        "copy: it is read only from its holder's GPU memory, on that machine while the putting process lives "
+        f"(or GPU to GPU with CHIMAERA_CUDA_NET), and {why}. Put it with the default durability to keep a copy "
+        "any reader can use."
+    )
+
+
+def _sees_gpu(uuid: str) -> bool:
+    """Whether this process can see the GPU whose UUID is `uuid`."""
+    try:
+        import torch
+
+        return any(str(torch.cuda.get_device_properties(i).uuid) == uuid for i in range(torch.cuda.device_count()))
+    except Exception:  # noqa: BLE001 -- no torch, or no CUDA here
+        return False
 
 
 def keep_device_holds(holds: list[Any]) -> None:

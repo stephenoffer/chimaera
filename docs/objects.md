@@ -194,8 +194,10 @@ sides need the `nixl` package (`pip install nixl nixl-cu12`); a holder
 without it leaves the reader the host copy. On plain TCP it was the slowest
 of the three (1 GiB in 3.0 s, against 1.9 s over NCCL and 1.2 s for the host
 copy, between two g5 nodes), so it is for RDMA networks. Between two EFA
-nodes (p4d.24xlarge) in Anyscale's standard image no NIXL read completed,
-and NCCL used sockets (bench/objects/RESULTS.md). A read that fails once it
+nodes (p4d.24xlarge) in Anyscale's standard image no NIXL read completed.
+NCCL goes GPU to GPU over EFA once torch is a CUDA 12 build, as the image's
+aws-ofi-nccl plugin needs (1 GiB in 1.04 s against 1.26 s for the host
+copy; bench/objects/RESULTS.md). A read that fails once it
 has begun falls back after a few seconds, with a warning, and that
 process reads the same holder's host copies from then on.
 
@@ -294,6 +296,12 @@ and any blobs it names) to this host before returning, as Ray's
   | `"ephemeral"` | none | `DataLost`, saying it was ephemeral |
   | `"replayable"` | none | made again by running its call (functions and map items without external effects, not declared `deterministic=False`) |
   | `"retained"` | made before the call succeeds (or `ch.put` returns), `CHIMAERA_OBJECT_REPLICAS` of them, at least one; the result's record names them | made again by running its call, where it can |
+
+  A CUDA tensor `ch.put` with `"ephemeral"` keeps no host copy either: it
+  is read from the putting process's GPU memory, by processes on its
+  machine that see that GPU while that process lives (a call granted another
+  GPU does not), or GPU to GPU with `CHIMAERA_CUDA_NET`. Any other reader
+  gets `DataLost` naming the class and why.
 
   A writer that wants no background copy leaves an empty
   `<object>.tmp-local` file beside the object before writing it, which the

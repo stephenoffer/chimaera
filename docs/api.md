@@ -269,7 +269,12 @@ assert ch.get([count.remote(words, "blue"), count.remote(words, "sky")]) == [50_
 type everywhere: pass it like any other future. `durability="ephemeral"`
 skips the background copy on another peer (the value is lost with its
 peer); `durability="retained"` returns only once copies on other peers
-exist. **Runs today:**
+exist. A CUDA tensor put with `durability="ephemeral"` keeps no host copy
+either: it is read from the putting process's GPU memory, by that process
+and by processes on its machine that see that GPU, while it lives (or GPU to
+GPU from another machine with `CHIMAERA_CUDA_NET`). Any other reader gets
+`DataLost`; a call granted another GPU of that machine cannot see it.
+**Runs today:**
 
 ```python run
 scratch = ch.put(["blue"] * 50_000, durability="ephemeral")

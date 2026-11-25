@@ -649,6 +649,8 @@ class Runtime:
         _values.repeats.note(site, enc)
         if enc.collection is not None:
             _values.collection_lint.note(site, *enc.collection)
+        if enc.cuda:
+            _values.cuda_args.note(site, enc.cuda)
         packed = {
             "args_size": enc.size,
             "args_oob": enc.oob,

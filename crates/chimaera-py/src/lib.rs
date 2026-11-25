@@ -1142,9 +1142,20 @@ impl Client {
         let rec = py.detach(|| runtime().block_on(async move { peer.get_task(k).await }));
         match rec {
             Ok(r) => match r.into_inner().outcome.and_then(|o| o.value) {
-                Some(pb::outcome::Value::Ok(obj)) if !obj.inline_data.is_empty() => Ok(Some((vec![], obj.size, true))),
+                Some(pb::outcome::Value::Ok(obj)) if !obj.inline_data.is_empty() && obj.blobs.is_empty() => {
+                    Ok(Some((vec![], obj.size, true)))
+                }
                 Some(pb::outcome::Value::Ok(obj)) => {
-                    Ok(Some((obj.locations.iter().map(|l| hex(&l.peer)).collect(), obj.size, false)))
+                    // A frame that names files (a result's large buffers, on Linux
+                    // linked from the arena) is stored where those files are.
+                    let mut peers: Vec<String> = Vec::new();
+                    for l in obj.locations.iter().chain(obj.blobs.iter().flat_map(|b| b.locations.iter())) {
+                        let p = hex(&l.peer);
+                        if !peers.contains(&p) {
+                            peers.push(p);
+                        }
+                    }
+                    Ok(Some((peers, obj.size + obj.blobs.iter().map(|b| b.size).sum::<u64>(), false)))
                 }
                 _ => Ok(None),
             },

@@ -30,7 +30,7 @@ in [qualification.md](qualification.md) shows it; "partly" says what is missing;
 | Medium results (100–500 KB) of short tasks | A result is stored on the peer that produced it (in memory on Linux) and read there by the next call, without a copy through the driver | Handled (no setting to tune) |
 | NumPy arrays from the object store are read-only: writing to an argument fails (`numpy-array-from-plasma-is-read-only`) | Arrays arrive writable and still zero-copy: a write copies only the pages touched and never changes the stored value | Handled (`test_values.py`) |
 | Non-contiguous arrays (slices, transposes) lose zero-copy (guides: object-store) | A transposed array travels in its own order and a strided slice is made contiguous once when sent; both arrive as zero-copy views (128 MiB strided slice measured) | Handled (measured, no test) |
-| Passing CUDA tensors between tasks | CPU tensors travel zero-copy. A CUDA tensor is copied through host memory, as torch's own pickling does, but it is rebuilt on the reader's granted GPU, or in a driver on its current GPU. Torch's pickling names the writer's device index, which fails to load where there is no GPU and can name a missing or wrong device where other GPUs are visible. A reader with no GPU gets the tensor on the CPU with a warning (CH112) | Handled; checked with a stand-in torch module (`test_values.py`), not yet on a GPU |
+| Passing CUDA tensors between tasks | CPU tensors travel zero-copy. A CUDA tensor is copied through host memory, as torch's own pickling does, but it is rebuilt on the reader's granted GPU, or in a driver on its current GPU. Torch's pickling names the writer's device index, which fails to load where there is no GPU and can name a missing or wrong device where other GPUs are visible. A reader with no GPU gets the tensor on the CPU with a warning (CH112). A tensor of 64 MiB or more passed straight to calls warns once per line (CH124): `ch.put(t)` copies it to host memory once, and readers on its machine read it from GPU memory | Handled; checked with a stand-in torch module (`test_values.py`) and on two p4d.24xlarge nodes |
 | A task receiving a list of unready references blocks and grows | Futures passed directly, or one level inside a list, tuple or dict argument, are dependencies: the call starts when they are ready and receives their values. `ch.handles(x)` passes them as futures instead | Handled (`test_api.py`) |
 
 ## Scheduling and resources
@@ -111,6 +111,5 @@ in [qualification.md](qualification.md) shows it; "partly" says what is missing;
 ## What is still open
 
 - Speculative re-execution of stragglers.
-- A warning when CUDA tensors are passed between calls.
 - Fork-based multiprocessing inside tasks keeps Python's default start method.
 - On Linux, a replica copy that races the first reader's fetch of the same object.

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from typing import Any
 
+from . import _serde
 from ._future import Future
 
 
@@ -23,6 +25,8 @@ def object_locations(futures: Iterable[Future[Any]]) -> dict[Future[Any], dict[s
     out: dict[Future[Any], dict[str, Any]] = {}
     for f in futures:
         got = f._rt.client.object_locations(f.key) if f.done() else None
+        if got is None and f._put is not None:
+            got = _put_files_here(f)
         if got is not None:
             peers, size, inline = got
             out[f] = {"peers": list(peers), "size": size, "inline": inline}
@@ -31,3 +35,18 @@ def object_locations(futures: Iterable[Future[Any]]) -> dict[Future[Any], dict[s
         else:
             out[f] = {"peers": [], "size": 0, "inline": False}
     return out
+
+
+def _put_files_here(f: Future[Any]) -> tuple[list[str], int, bool] | None:
+    """A put made here whose frame travels in its handle but names files (on
+    Linux, a large buffer linked from the arena): this peer's while those files
+    are in its store, with their bytes counted. None for anything else."""
+    run, _, inline, _, files = f._put[:5]
+    if not files:
+        return None
+    rt = f._rt
+    try:
+        stored = sum(os.path.getsize(_serde.object_path(rt.object_dir, run, fid)) for fid in files)
+    except OSError:
+        return None  # not (or no longer) in this peer's store
+    return [rt.client.info["peer"].hex()], (len(inline) if inline is not None else 0) + stored, False

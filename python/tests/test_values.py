@@ -418,6 +418,135 @@ def test_a_cuda_tensor_is_rebuilt_where_its_reader_is(monkeypatch):
     assert received().where == "cuda", "a driver with a GPU gets it on its current one"
 
 
+def _stand_in_cuda(monkeypatch):
+    """A stand-in torch module (no GPU here), as in the test above; its
+    Tensor counts the copies made to host memory."""
+
+    class Tensor:
+        requires_grad = False
+        is_sparse = False
+        to_host = 0
+
+        def __init__(self, arr, where="cpu"):
+            self.arr, self.where = arr, where
+            self.device = types.SimpleNamespace(type=where.split(":")[0])
+            self.shape, self.dtype = arr.shape, f"torch.{arr.dtype}"
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            Tensor.to_host += 1
+            return Tensor(self.arr)
+
+        def contiguous(self):
+            return self
+
+        def is_contiguous(self):
+            return True
+
+        def numpy(self):
+            assert self.where == "cpu", "a CUDA tensor has no array view"
+            return self.arr
+
+        def to(self, where, copy=False):
+            return Tensor(self.arr.copy() if copy else self.arr, where if isinstance(where, str) else self.where)
+
+    fake = types.ModuleType("torch")
+    fake.Tensor, fake.from_numpy = Tensor, Tensor
+    fake.cuda = types.SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake)
+    monkeypatch.delenv("CHIMAERA_DEVICES", raising=False)
+    monkeypatch.setattr(_values, "_device_warned", set())
+    return Tensor
+
+
+def test_an_ephemeral_cuda_put_keeps_no_host_copy_and_only_its_holder_serves_it(monkeypatch):
+    Tensor = _stand_in_cuda(monkeypatch)
+    sent = Tensor(np.arange(1 << 18, dtype=np.float64), "cuda:0")
+    here = _values._boot_id()
+    share = {"host": here, "pid": os.getpid(), "gpu": "gpu-0", "args": (), "own": "own-token"}
+    monkeypatch.setattr(_values, "_cuda_share", lambda t: dict(share))
+    monkeypatch.setitem(_values._own_shares, "own-token", sent)
+
+    def stored(ephemeral):  # what ch.put stores (store() sets these around its encoding)
+        _values._put_holds.list, _values._put_holds.write_blob, _values._put_holds.ephemeral = [], None, ephemeral
+        try:
+            return _serde.dumps(sent)[0]
+        finally:
+            del _values._put_holds.list, _values._put_holds.write_blob, _values._put_holds.ephemeral
+
+    Tensor.to_host = 0
+    data = stored(True)
+    assert Tensor.to_host == 0 and len(data) < 4096, "no host copy: the value names its share"
+    got = _serde.loads(data)  # the putting process reads its own tensor
+    assert np.array_equal(got.arr, sent.arr) and got.arr is not sent.arr, "a copy, as for every value"
+    share["host"] = "another-machine"
+    with pytest.raises(ch.errors.DataLost, match=r"durability='ephemeral'.*another machine"):
+        _serde.loads(stored(True))
+    share.update(host=here, pid=os.getpid() + 1)  # another process on this machine
+    with pytest.raises(ch.errors.DataLost, match="cannot see the GPU it is on"):
+        _serde.loads(stored(True))  # no GPU here: it cannot see the holder's
+    monkeypatch.setattr(_values, "_sees_gpu", lambda uuid: True)  # it sees that GPU: its holder is gone
+    with pytest.raises(ch.errors.DataLost, match="putting process has exited"):
+        _serde.loads(stored(True))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # CH112: no GPU here
+        assert np.array_equal(_serde.loads(stored(False)).arr, sent.arr)
+    assert Tensor.to_host == 1, "the default keeps its host copy"
+
+
+class _EphemeralElsewhere:
+    """Pickles as an ephemeral CUDA put whose holder is on another machine."""
+
+    def __reduce__(self):
+        share = {"host": "another-machine", "pid": 1, "gpu": "gpu-0", "args": ()}
+        return (_values.tensor_shared_only, ((4,), "float32", share))
+
+
+def test_a_call_that_cannot_reach_an_ephemeral_cuda_tensor_fails_with_data_lost():
+    @ch.remote
+    def read(x):
+        return x
+
+    with pytest.raises(ch.errors.DataLost, match="durability='ephemeral'"):
+        read.remote(_EphemeralElsewhere()).result(timeout=60)
+
+
+def test_a_large_cuda_tensor_passed_straight_to_calls_warns_once_per_line(monkeypatch, tmp_path):
+    Tensor = _stand_in_cuda(monkeypatch)
+    monkeypatch.setattr(_values, "CUDA_ARG_WARN_BYTES", 1 << 20)
+    # Hashed into tmp_path, not linked from the arena (on another filesystem there).
+    monkeypatch.setitem(_values._objects._state, "installed", False)
+    big = Tensor(np.zeros(1 << 18, dtype=np.float64), "cuda:0")  # 2 MiB
+    sink, run = _values.LocalBlobSink(str(tmp_path)), os.urandom(16)
+    assert _values.encode_frame(((big,), {}), run, sink).cuda == big.arr.nbytes, "its copy to host is counted"
+    assert _values.encode_frame(((1,), {}), run, sink).cuda == 0
+    lint = _values.CudaArgLint()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            lint.note("job.py:7", big.arr.nbytes)
+        lint.note("job.py:9", 1 << 10)  # small: no warning
+    msgs = [str(w.message) for w in caught]
+    assert len(msgs) == 1 and msgs[0].startswith("CH124: calls from job.py:7 pass a 2 MiB CUDA tensor"), msgs
+    assert "ch.put(t)" in msgs[0]
+
+
+@pytest.mark.parametrize("installed, hashed, hint", [(True, True, True), (False, True, False), (True, False, False)])
+def test_ch107_names_ch_init_only_for_a_value_made_before_the_arena(monkeypatch, installed, hashed, hint):
+    monkeypatch.setitem(_values._objects._state, "installed", installed)
+    tracker, bid = _values.RepeatTracker(), b"b" * 16
+    enc = _values.Encoded([], 0, 0, {bid: 2 << 20}, 0.01)
+    enc.hashed = {bid} if hashed else set()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(_values.REPEAT_WARN_CALLS):
+            tracker.note("job.py:3", enc)
+    (msg,) = [str(w.message) for w in caught]
+    assert msg.startswith("CH107") and ("call ch.init() before making it" in msg) == hint
+
+
 def test_an_instance_of_a_class_defined_in_the_script_reaches_the_task():
     from conftest import run_script
 

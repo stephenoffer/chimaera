@@ -332,13 +332,23 @@ host copy stays the default there too:
 
 - **NCCL** used its socket transport in every run, even with the
   aws-ofi-nccl plugin's directory on the library path and
-  `NCCL_NET_PLUGIN=ofi`; why the plugin did not load was not found.
+  `NCCL_NET_PLUGIN=ofi`. The cause, found on 2026-11-25: the image's
+  plugin (aws-ofi-nccl 1.15.0) links the CUDA 12 runtime
+  (`libcudart.so.12`), and the torch installed (2.15, CUDA 13) brings only
+  `libcudart.so.13`, so the plugin does not load. With a CUDA 12 torch
+  (2.11, cu128) on the same two nodes, NCCL selects it and goes GPU to GPU
+  over EFA (`NET/Libfabric/0/GDRDMA`): 256 MiB in 289 ms against 348 ms for
+  the host copy, and 1 GiB in 1.04 s against 1.26 s (one read each, after
+  the first, which sets the pair up). That is far below what EFA carries,
+  so most of the time is not the transfer.
 - **NIXL**'s LIBFABRIC backend found the EFA device and the two agents
   connected, but no read completed. At first, Libfabric's EFA provider had
   no GPU memory support (`FI_HMEM`): it loads the CUDA runtime as
   `libcudart.so`, and the image has only torch's versioned copy. With that
   name added, the holder registered GPU memory, but reads still did not
-  complete and each fell back to the host copy. Each such read used to
+  complete and each fell back to the host copy, with the CUDA 12 torch too.
+  GPUDirect is there (`gdrdrv` and `efa` are loaded, and NCCL uses it), so
+  the cause is NIXL's own; it was not found. Each such read used to
   wait a minute before falling back; now it waits a few seconds, and the
   process reads that holder's host copies from then on (`_gpunet._give_up`).
 
