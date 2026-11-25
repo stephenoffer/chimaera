@@ -377,19 +377,22 @@ never work. It runs outside the peers, so user code never sits next to the
 credentials that scale the cluster.
 
 - **Grow:** after calls have been queued for `--up-after` seconds (default 30), by as many peers as the queue needs at the current peers' size.
-- **Shrink:** by one after the cluster has been mostly idle for `--down-after` seconds (default 300), once the peer that would go (the highest pod; under `--slurm`, the newest spare's peer) holds no calls, actors or stored values. Kubernetes removes the highest pod, and its SIGTERM drains it: it hands the groups it leads, and its voter seats, to other peers before it stops.
+- **Shrink:** by one after the cluster has been mostly idle for `--down-after` seconds (default 300), and only once it knows what the unit that would go (the highest pod; under `--slurm` or `--sky`, the newest spare) holds. Its peer is the member that names it (a pod's `host` label is the pod's name; a spare's peer carries `slurm.job=<id>` or `chimaera.spare=<name>`), whatever address it advertises. It goes when that peer holds no calls, actors or stored values, or when the provider shows it never started (a Pending pod none of whose containers ran, a pending job, no such SkyPilot cluster). When neither can be shown (it started but no peer from it joined, or its peer stopped answering) the pool keeps its size and prints why, once. It checks again just before the change, and a Kubernetes change is made on top of the StatefulSet version it read, so it fails rather than undo another writer. Kubernetes removes the highest pod, and its SIGTERM drains it: it hands the groups it leads, and its voter seats, to other peers before it stops.
 - **Hold:** while peers it asked for are still starting.
 
-Each change prints one JSON line with its reason. In the cluster,
+Each change, each failed look and each new reason a shrink is held prints one JSON line, with the peers asked for, up and usable. In the cluster,
 `chimaera k8s render --namespace NS --provisioner MAX` adds it as a
 one-replica Deployment that scales between `--replicas` and `MAX`, with a
 ServiceAccount whose Role may only read this StatefulSet and patch its
-`scale` (the peers still get no service-account token). Run by hand, it drives
+`scale`, and read (never change) its own pods (the peers still get no
+service-account token). Run by hand, it drives
 `kubectl` with your current context.
 
 Inside a `slurm-launch` job, `--slurm` grows the cluster with spare one-node
-jobs instead. Each spare `sbatch` job runs a peer that joins the running
-cluster. Shrinking cancels the newest spare job, whose peer drains on the
+jobs instead. Each spare `sbatch` job, named `chimaera-spare-<the cluster's job id>`,
+runs a peer that joins the running cluster; only this user's jobs of that
+name count, so clusters sharing an account never cancel each other's
+spares. Shrinking cancels the newest spare job, whose peer drains on the
 SIGTERM `scancel` sends. Spares join with the cluster's token, so submit the
 job with `CHIMAERA_CLUSTER_TOKEN` set (`slurm-launch` then uses it too).
 `deploy/slurm/slurm-autoscale-test.sh` checks this.

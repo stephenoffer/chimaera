@@ -544,7 +544,7 @@ chimaera k8s render [OPTIONS] --image <IMAGE>
 | `--memory <MEMORY>` | Memory per pod, request and limit, e.g. 8Gi |
 | `--storage <STORAGE>` | Size of each pod's data volume (Raft logs, code, results) [default: 10Gi] |
 | `--token-secret <TOKEN_SECRET>` | Secret holding the cluster token under the key `token` (default: NAME-token) |
-| `--provisioner <MAX>` | Also run the provisioner in the cluster, growing the pool from --replicas up to MAX peers under load (a Deployment whose Role may only read this StatefulSet and change its scale). Needs --namespace |
+| `--provisioner <MAX>` | Also run the provisioner in the cluster, growing the pool from --replicas up to MAX peers under load (a Deployment whose Role may only read this StatefulSet and its pods and change its scale). Needs --namespace |
 
 With fewer than 3 founders it warns on stderr: losing one peer can then
 halt the cluster's groups until it returns.

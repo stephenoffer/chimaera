@@ -2,9 +2,11 @@
 # Gate (plan P6): queued work grows a Kubernetes pool, and a quiet pool shrinks
 # after its peers drain. A one-pod StatefulSet (1 CPU per pod) on kind, the
 # in-cluster provisioner from `chimaera k8s render --provisioner 3` (its own
-# ServiceAccount, allowed only this StatefulSet's scale), and a 40-call map
-# from inside pod 0: the pool must grow to 3, every result must come back with
-# work on the new pods, and the pool must shrink back to 1. Uses its own kind
+# ServiceAccount, allowed only this StatefulSet's scale and reading its own
+# pods), and a 40-call map from inside pod 0: the pool must grow to 3, every
+# result must come back with work on the new pods, the pool must not shrink
+# while its highest pod holds an actor, and must shrink back to 1 once it does
+# not. Uses its own kind
 # cluster and kubeconfig, and deletes the cluster at the end. Needs docker,
 # kind and kubectl.
 set -euo pipefail
@@ -55,6 +57,13 @@ for _ in $(seq 150); do kubectl get pod chimaera-0 >/dev/null 2>&1 && break; sle
 kubectl wait --for=condition=Ready pod/chimaera-0 --timeout=300s
 kubectl rollout status deployment/chimaera-provisioner --timeout=300s
 
+echo "--- the provisioner may read its own pods, and nothing else"
+as=system:serviceaccount:default:chimaera-provisioner
+[ "$(kubectl auth can-i get pod/chimaera-2 --as=$as)" = yes ] || { echo "FAIL: cannot read its pod" >&2; exit 1; }
+for no in "get pod/chimaera-3" "get pod/other" "list pods" "delete pod/chimaera-2" "patch pod/chimaera-2"; do
+  if [ "$(kubectl auth can-i $no --as=$as || true)" != no ]; then echo "FAIL: it may $no" >&2; exit 1; fi
+done
+
 echo "--- a map that needs more than one pod"
 kubectl exec -i chimaera-0 -- sh -c 'cat > /tmp/driver.py' <<'EOF'
 import collections, socket, time
@@ -77,6 +86,34 @@ if [ "${total:-0}" != 40 ] || [ "${hosts:-0}" -lt 2 ]; then
   exit 1
 fi
 kubectl logs deploy/chimaera-provisioner | grep -q '"to": 3' || { echo "FAIL: the pool never grew to 3" >&2; exit 1; }
+
+echo "--- an actor on the highest pod keeps it"
+kubectl exec -i chimaera-0 -- sh -c 'cat > /tmp/keep.py' <<'EOF'
+import socket, time
+import chimaera as ch
+
+@ch.remote
+class Keep:
+    def host(self):
+        return socket.gethostname()
+
+k = Keep.options(placement=ch.dist.Placement(require={"host": "chimaera-2"})).remote()
+print("ACTOR", k.host().result(), flush=True)
+time.sleep(3600)
+EOF
+kubectl exec chimaera-0 -- sh -c 'CHIMAERA_HOME=/data nohup python3 /tmp/keep.py > /tmp/keep.log 2>&1 & echo $! > /tmp/keep.pid'
+for _ in $(seq 60); do kubectl exec chimaera-0 -- grep -q '^ACTOR chimaera-2' /tmp/keep.log 2>/dev/null && break; sleep 2; done
+kubectl exec chimaera-0 -- cat /tmp/keep.log
+for _ in $(seq 60); do
+  kubectl logs deploy/chimaera-provisioner | grep '"holding": 3' | grep -q 'holds 1 actors' && break
+  sleep 2
+done
+kubectl logs deploy/chimaera-provisioner
+if [ "$(replicas)" != 3 ] || ! kubectl logs deploy/chimaera-provisioner | grep '"holding": 3' | grep -q 'holds 1 actors'; then
+  echo "FAIL: expected the pool held at 3 while chimaera-2 hosts an actor, got $(replicas) replicas" >&2
+  exit 1
+fi
+kubectl exec chimaera-0 -- sh -c 'kill $(cat /tmp/keep.pid)'
 
 echo "--- waiting for the quiet pool to shrink to 1"
 for _ in $(seq 120); do

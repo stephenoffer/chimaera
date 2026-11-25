@@ -3,7 +3,11 @@
 # with spare Slurm jobs and shrinks back. Slurm in containers (slurmctld + 3
 # slurmd); the job runs the provisioner (`--slurm`) beside a map that needs
 # more than one node: spares must join and take work, then be cancelled once
-# the cluster is quiet. Needs only docker; removes its containers at the end.
+# the cluster is quiet. Another cluster's spare (a job of the same user, named
+# as spares were before they were named per cluster) holds one node: it must
+# be neither counted nor cancelled, and the spare that cannot start beside it
+# must be cancelled as one that never joined. Needs only docker; removes its
+# containers at the end.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 # CHIMAERA_IMAGE names an already built runtime image to use instead of building one.
@@ -58,7 +62,7 @@ put() {
 }
 put chimaera.sbatch < "$here/chimaera.sbatch"
 put driver.py <<'EOF'
-import collections, socket, subprocess, sys, time
+import collections, os, socket, subprocess, sys, time
 import chimaera as ch
 
 log = open("/shared/provisioner.log", "w")
@@ -78,7 +82,8 @@ print("HOSTS", sum(hosts.values()), len(hosts), dict(hosts), flush=True)
 spares = ["?"]
 deadline = time.time() + 240
 while time.time() < deadline:
-    spares = subprocess.run(["squeue", "-h", "-n", "chimaera-spare", "-o", "%i"], capture_output=True, text=True).stdout.split()
+    mine = f"chimaera-spare-{os.environ['SLURM_JOB_ID']}"
+    spares = subprocess.run(["squeue", "-h", "-n", mine, "-o", "%i"], capture_output=True, text=True).stdout.split()
     if not spares:
         break
     time.sleep(3)
@@ -87,6 +92,8 @@ prov.terminate()
 EOF
 
 token=$(on slurmctld chimaera cluster token)
+other=$(docker exec -u chimaera -w /shared "$net-slurmctld" \
+  sbatch --parsable --nodes=1 --exclusive --job-name chimaera-spare --wrap 'sleep 900')
 job=$(docker exec -u chimaera -w /shared "$net-slurmctld" \
   sbatch --parsable --nodes=1 --export=ALL,CHIMAERA_CLUSTER_TOKEN="$token" chimaera.sbatch python3 /shared/driver.py)
 echo "submitted job $job"
@@ -108,6 +115,10 @@ if [ "$state" != COMPLETED ] || [ "${total:-0}" != 16 ] || [ "${hosts:-0}" -lt 2
 fi
 if ! echo "$out" | grep -q "^SPARES_LEFT 0$"; then
   echo "FAIL: spare jobs were not cancelled after the work ended" >&2
+  exit 1
+fi
+if [ -z "$(on slurmctld squeue -h -j "$other" -o %i 2>/dev/null)" ]; then
+  echo "FAIL: another cluster's spare job $other was cancelled" >&2
   exit 1
 fi
 echo "slurm-autoscale-test: PASS"

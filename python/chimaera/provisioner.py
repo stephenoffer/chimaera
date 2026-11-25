@@ -13,9 +13,12 @@ JSON line saying what it saw.
   peers as the queue needs at the current peers' size, at least one.
 - **Shrink** by one when the cluster has been mostly idle (the CPU in use
   would fit on one peer fewer, at most half full) for ``--down-after``
-  seconds, and the peer that would go is idle: no calls, no actors and no
-  stored values (its drain hands its group seats on, not those). Kubernetes
-  removes the highest pod, whose SIGTERM drains it.
+  seconds, and the unit that would go (the highest pod, the newest spare) is
+  known to hold nothing: its peer has no calls, no actors and no stored
+  values (its drain hands its group seats on, not those), or the provider
+  says it never started. When neither can be shown (no peer from it has
+  joined, yet it has started; its peer stopped answering) it holds, and
+  prints why. Kubernetes removes the highest pod, whose SIGTERM drains it.
 - **Hold** while peers it asked for are still starting, for up to
   ``--start-grace`` seconds; peers still not up then (no room for their pods)
   count as unavailable: it stops growing and may shrink them away.
@@ -31,6 +34,7 @@ clusters on any cloud (see ``SkySpares``).
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import math
 import os
@@ -41,9 +45,12 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
-from typing import Any
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import cache
+from typing import Any, NamedTuple
 
 import chimaera as ch
 
@@ -66,7 +73,39 @@ class Memory:
     busy_since: float | None = None
     idle_since: float | None = None
     starting_since: float | None = None
-    decisions: list[dict[str, Any]] = field(default_factory=list)
+    held: str | None = None  # why the last shrink it wanted did not happen
+
+
+class Victim(NamedTuple):
+    """The unit a shrink removes, as its pool resolved it. ``joined``: its
+    peer, `node`, is a live member. ``never_joined``: the provider shows it
+    never started, so nothing on it can be lost. ``unknown``: neither can be
+    shown (`why`), and a shrink holds."""
+
+    state: str
+    target: str  # what the provider removes: a pod, a Slurm job, a SkyPilot cluster
+    why: str = ""
+    node: Any = None  # the live member, when joined
+    uid: str = ""  # the provider's identity for it, when it has one
+
+
+UNRESOLVED = Victim("unknown", "", "the pool did not say which unit a shrink removes")
+
+
+def blocked(victim: Victim) -> str | None:
+    """Why removing `victim` now could lose work, or None."""
+    if victim.state == "never_joined":
+        return None
+    if victim.state == "joined":
+        holding = busy(victim.node)
+        return holding and f"{victim.node.address}, the peer a shrink removes, holds {holding}"
+    return f"cannot tell what removing {victim.target or 'a unit'} would lose: {victim.why}"
+
+
+def same(a: Victim, b: Victim) -> bool:
+    """`a` and `b` are one resolution of one unit (checked again just before removing it)."""
+    peer = lambda v: v.node.peer if v.node is not None else None  # noqa: E731
+    return (a.state, a.target, a.uid, peer(a)) == (b.state, b.target, b.uid, peer(b))
 
 
 def busy(victim: Any) -> str | None:
@@ -85,10 +124,17 @@ def busy(victim: Any) -> str | None:
 
 
 def decide(
-    nodes: list[Any], replicas: int, rules: Rules, memory: Memory, now: float, victim: Any = None
+    nodes: list[Any],
+    replicas: int,
+    rules: Rules,
+    memory: Memory,
+    now: float,
+    victim: Victim | Callable[[], Victim] = UNRESOLVED,
 ) -> tuple[int, str]:
     """The replica count to ask for, and why. `nodes` are ``ch.runs.cluster().nodes()``;
-    `victim` is the one a shrink would remove, when the pool knows it."""
+    `victim` is the unit a shrink would remove (or how to find it, asked only
+    when a shrink is due). Without one, nothing shrinks."""
+    memory.held = None
     live = [n for n in nodes if n.alive]
     stuck = False
     if len(live) < replicas:
@@ -118,13 +164,13 @@ def decide(
     if replicas > rules.min and used <= 0.5 * per_peer * (replicas - 1):
         memory.idle_since = memory.idle_since if memory.idle_since is not None else now
         quiet = now - memory.idle_since
-        holding = busy(victim) if victim is not None else None
-        if quiet >= rules.down_after and holding:
-            return replicas, f"quiet for {quiet:.0f} s, but {victim.address}, the peer a shrink removes, holds {holding}"
-        if quiet >= rules.down_after:
-            memory.idle_since = None
-            return replicas - 1, f"shrink: {used:.1f} of {cpus:.0f} CPUs in use for {quiet:.0f} s"
-        return replicas, f"quiet for {quiet:.0f} s"
+        if quiet < rules.down_after:
+            return replicas, f"quiet for {quiet:.0f} s"
+        memory.held = blocked(victim() if callable(victim) else victim)
+        if memory.held:
+            return replicas, f"quiet for {quiet:.0f} s, but {memory.held}"
+        memory.idle_since = None
+        return replicas - 1, f"shrink: {used:.1f} of {cpus:.0f} CPUs in use for {quiet:.0f} s"
     memory.idle_since = None
     return replicas, "steady"
 
@@ -140,12 +186,16 @@ class StatefulSet:
     def __init__(self, name: str, namespace: str | None = None, sa_dir: str = SERVICE_ACCOUNT) -> None:
         self.name, self.namespace, self.sa_dir = name, namespace, sa_dir
         self.in_cluster = os.path.exists(os.path.join(sa_dir, "token")) and "KUBERNETES_SERVICE_HOST" in os.environ
+        # The size last read: a change is sent only on top of it, so it fails
+        # rather than undo someone else's change of the size.
+        self._seen: int | None = None
 
     def _kubectl(self, *args: str) -> str:
         ns = ["--namespace", self.namespace] if self.namespace else []
         return subprocess.run(["kubectl", *ns, *args], check=True, capture_output=True, text=True).stdout
 
-    def _api(self, method: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _api(self, method: str, body: Any = None, core: str = "") -> dict[str, Any]:
+        """The StatefulSet's scale, or with `core` (``pods/NAME``) that object in its namespace."""
         with open(os.path.join(self.sa_dir, "token")) as f:
             token = f.read().strip()
         ns = self.namespace
@@ -153,32 +203,89 @@ class StatefulSet:
             with open(os.path.join(self.sa_dir, "namespace")) as f:
                 ns = f.read().strip()
         host, port = os.environ["KUBERNETES_SERVICE_HOST"], os.environ.get("KUBERNETES_SERVICE_PORT", "443")
-        url = f"https://{host}:{port}/apis/apps/v1/namespaces/{ns}/statefulsets/{self.name}/scale"
+        path = f"/api/v1/namespaces/{ns}/{core}" if core else f"/apis/apps/v1/namespaces/{ns}/statefulsets/{self.name}/scale"
         req = urllib.request.Request(
-            url,
+            f"https://{host}:{port}{path}",
             method=method,
             data=None if body is None else json.dumps(body).encode(),
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/merge-patch+json"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json-patch+json"},
         )
         tls = ssl.create_default_context(cafile=os.path.join(self.sa_dir, "ca.crt"))
         with urllib.request.urlopen(req, context=tls, timeout=10) as r:
             return json.load(r)
 
-    def victim(self, nodes: list[Any], replicas: int) -> Any:
-        """The highest pod's peer: the one a smaller StatefulSet loses."""
-        prefix = f"{self.name}-{replicas - 1}."
-        return next((n for n in nodes if n.alive and n.address.startswith(prefix)), None)
+    def pod(self, name: str) -> dict[str, Any] | None:
+        """Pod `name`'s object, or None when there is no such pod."""
+        if self.in_cluster:
+            try:
+                return self._api("GET", core=f"pods/{name}")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return None
+                raise
+        out = self._kubectl("get", "pod", name, "--ignore-not-found", "-o", "json")
+        return json.loads(out) if out.strip() else None
+
+    def victim(self, nodes: list[Any], replicas: int) -> Victim:
+        """The highest pod, the one a smaller StatefulSet loses. Its peer is
+        the member whose ``host`` label (the pod's hostname) is the pod's name."""
+        pod = f"{self.name}-{replicas - 1}"
+        mine = [n for n in nodes if n.labels.get("host") == pod or n.address.startswith(f"{pod}.")]
+        live = [n for n in mine if n.alive]
+        if len(live) == 1:
+            return Victim("joined", pod, node=live[0])
+        if live:
+            return Victim("unknown", pod, f"{len(live)} live peers say they run in {pod}")
+        if mine:
+            return Victim("unknown", pod, f"its peer {mine[0].peer[:12]} stopped answering")
+        obj = self.pod(pod)
+        if obj is None:
+            return Victim("never_joined", pod, "there is no such pod")
+        status, uid = obj.get("status") or {}, (obj.get("metadata") or {}).get("uid", "")
+        phase = status.get("phase", "")
+        started = [
+            c.get("name", "")
+            for c in status.get("containerStatuses") or []
+            if c.get("restartCount") or c.get("lastState") or {"running", "terminated"} & set(c.get("state") or {})
+        ]
+        if phase == "Pending" and not started:
+            return Victim("never_joined", pod, "it is Pending and none of its containers has started", uid=uid)
+        return Victim("unknown", pod, f"it is {phase or 'in no phase'} but no peer from it has joined", uid=uid)
 
     def replicas(self) -> int:
         if self.in_cluster:
-            return int(self._api("GET")["spec"].get("replicas", 0))
-        return int(self._kubectl("get", "statefulset", self.name, "-o", "jsonpath={.spec.replicas}") or 0)
+            n = int(self._api("GET")["spec"].get("replicas", 0))
+        else:
+            n = int(self._kubectl("get", "statefulset", self.name, "-o", "jsonpath={.spec.replicas}") or 0)
+        self._seen = n
+        return n
 
     def scale(self, n: int) -> None:
+        """Ask for `n` replicas, on top of the size last read: if another writer
+        changed the size since, the change fails (422) and the next look starts
+        over. Only the size is compared, not the object's version: the
+        controller's status updates change that all the time."""
+        seen = self._seen if self._seen is not None else self.replicas()
         if self.in_cluster:
-            self._api("PATCH", {"spec": {"replicas": n}})
+            path = "/spec/replicas"
+            self._api("PATCH", [{"op": "test", "path": path, "value": seen}, {"op": "replace", "path": path, "value": n}])
         else:
-            self._kubectl("scale", "statefulset", self.name, f"--replicas={n}")
+            self._kubectl("scale", "statefulset", self.name, f"--current-replicas={seen}", f"--replicas={n}")
+
+    def shrink(self, victim: Victim) -> str | None:
+        """Remove the highest pod if it is still `victim` and still holds nothing; else why not.
+        shortcut: a pod that starts between this check and the change is
+        sent SIGTERM before it can hold work; revisit if a peer can take work
+        within one API round trip of starting."""
+        replicas = self.replicas()
+        now = self.victim(ch.runs.cluster().nodes(), replicas)
+        if not same(now, victim):
+            return f"{victim.target} changed before the shrink: {now.state} ({now.why or 'live'})"
+        held = blocked(now)
+        if held:
+            return held
+        self.scale(replicas - 1)
+        return None
 
 
 def _seeds() -> tuple[str, str]:
@@ -194,47 +301,78 @@ class SlurmSpares:
     one-node jobs whose peers join it. The pool is the original job's nodes
     plus the spares; growing submits spares (``sbatch``), shrinking cancels the
     newest (``scancel``: its peers get SIGTERM and drain). Spares join with the
-    cluster's token, so the job must run with ``CHIMAERA_CLUSTER_TOKEN`` set."""
+    cluster's token, so the job must run with ``CHIMAERA_CLUSTER_TOKEN`` set.
+
+    A spare is this cluster's when it is this user's job named for the
+    cluster's own job (``chimaera-spare-<SLURM_JOB_ID>``), so two clusters
+    sharing an account and partition never count or cancel each other's. Its
+    peer carries the label ``slurm.job=<its job id>``, which is how a shrink
+    knows which peer it would stop."""
 
     NAME = "chimaera-spare"
 
     def __init__(self, base: int, partition: str | None = None) -> None:
         if not os.environ.get("CHIMAERA_CLUSTER_TOKEN"):
             raise SystemExit("--slurm needs CHIMAERA_CLUSTER_TOKEN in the job's environment: spares join with it")
+        if not os.environ.get("SLURM_JOB_ID"):
+            raise SystemExit("--slurm runs inside the cluster's own job (slurm-launch): SLURM_JOB_ID is not set")
         self.base, self.partition = base, partition
+        self.job = f"{self.NAME}-{os.environ['SLURM_JOB_ID']}"
 
     @staticmethod
     def _run(*args: str) -> str:
         return subprocess.run(args, check=True, capture_output=True, text=True).stdout
 
-    def _spares(self) -> list[str]:
-        return sorted(self._run("squeue", "-h", "-n", self.NAME, "-o", "%i").split(), key=int)
+    def _spares(self) -> list[tuple[str, str]]:
+        """This cluster's spare jobs, oldest first: (job id, state)."""
+        out = self._run("squeue", "-h", "-u", getpass.getuser(), "-n", self.job, "-o", "%i %T")
+        jobs = [line.split() for line in out.splitlines() if len(line.split()) >= 2]
+        return sorted(((j[0], j[1]) for j in jobs), key=lambda j: int(j[0]))
 
     def replicas(self) -> int:
         return self.base + len(self._spares())
 
-    def victim(self, nodes: list[Any], replicas: int) -> Any:
-        """The newest spare job's peer: the one a shrink cancels."""
+    def victim(self, nodes: list[Any], replicas: int) -> Victim:
+        """The newest spare job: the one a shrink cancels."""
         spares = self._spares()
         if not spares:
-            return None
-        host = self._run("squeue", "-h", "-j", spares[-1], "-o", "%N").strip().split(".")[0]
-        return next((n for n in nodes if n.alive and n.address.rsplit(":", 1)[0].split(".")[0] == host), None)
+            return Victim("unknown", "", "no spare jobs: the cluster's own job's nodes are not removed")
+        job, state = spares[-1]
+        if state == "PENDING":
+            return Victim("never_joined", job, "the job is pending: it has not started", uid=job)
+        mine = [n for n in nodes if n.labels.get("slurm.job") == job]
+        live = [n for n in mine if n.alive]
+        if len(live) == 1:
+            return Victim("joined", job, node=live[0], uid=job)
+        if live:
+            return Victim("unknown", job, f"{len(live)} live peers say they run in job {job}", uid=job)
+        if mine:
+            return Victim("unknown", job, f"its peer {mine[0].peer[:12]} stopped answering", uid=job)
+        return Victim("unknown", job, f"the job is {state.lower()} but its peer has not joined", uid=job)
 
     def scale(self, n: int) -> None:
-        spares, want = self._spares(), max(0, n - self.base)
-        for _ in range(want - len(spares)):
+        for _ in range(max(0, n - self.base) - len(self._spares())):
             self._submit()
-        for job in spares[want:]:  # the newest go first
-            self._run("scancel", job)
+
+    def shrink(self, victim: Victim) -> str | None:
+        """Cancel `victim`'s job if it is still the newest spare and holds nothing; else why not."""
+        now = self.victim(ch.runs.cluster().nodes(), self.replicas())
+        if not same(now, victim):
+            return f"job {victim.target} changed before the shrink: {now.state} ({now.why or 'live'})"
+        held = blocked(now)
+        if held:
+            return held
+        self._run("scancel", now.target)
+        return None
 
     def _submit(self) -> None:
         seeds, port = _seeds()
         peer = (
+            'export CHIMAERA_LABELS="${CHIMAERA_LABELS:+$CHIMAERA_LABELS,}slurm.job=$SLURM_JOB_ID"; '
             f'exec chimaera --dir "${{TMPDIR:-/tmp}}/{self.NAME}-$SLURM_JOB_ID" peer start --provider static '
             f'--listen 0.0.0.0:{port} --advertise "$(hostname):{port}" --seeds {seeds}'
         )
-        args = ["sbatch", "--parsable", "--job-name", self.NAME, "--nodes=1", "--ntasks-per-node=1", "--exclusive"]
+        args = ["sbatch", "--parsable", "--job-name", self.job, "--nodes=1", "--ntasks-per-node=1", "--exclusive"]
         if self.partition:
             args += ["--partition", self.partition]
         self._run(*args, "--wrap", f"srun sh -c '{peer}'")
@@ -280,6 +418,7 @@ class SkySpares:
         self._work = tempfile.mkdtemp(prefix="chimaera-sky-")
         self._store = ch.coord.Store("provisioner/sky")
         self._children: list[subprocess.Popen[bytes]] = []
+        self._launching: dict[str, subprocess.Popen[bytes]] = {}  # spare name -> its `sky launch`
 
     def _task(self, name: str, peer: str) -> str:
         """A SkyPilot task file for spare `name`: its own certificate, issued
@@ -318,39 +457,108 @@ class SkySpares:
         names, want = self._names(), max(0, n - self.base)
         while len(names) < want:
             seeds, port = _seeds()
+            name = f"{self.PREFIX}-{max((int(x.rsplit('-', 1)[1]) for x in names), default=0) + 1}"
+            # The label is how a shrink finds this spare's peer among the members.
             peer = (
-                f"{HUGE_OBJECTS}; chimaera peer start --provider static --listen 0.0.0.0:{port} "
+                f'{HUGE_OBJECTS}; export CHIMAERA_LABELS="${{CHIMAERA_LABELS:+$CHIMAERA_LABELS,}}chimaera.spare={name}"; '
+                f"chimaera peer start --provider static --listen 0.0.0.0:{port} "
                 f'--advertise "$(hostname -I | cut -d" " -f1):{port}" --seeds {seeds}'
             )
-            name = f"{self.PREFIX}-{max((int(x.rsplit('-', 1)[1]) for x in names), default=0) + 1}"
             names.append(name)
             self._store.put("spares", names)  # first: a launch that never comes up is shrunk away like any stuck peer
             launch = ["sky", "launch", "-c", name, "-y", "-d", "--secret", "CHIMAERA_CLUSTER_TOKEN"]
             task = self._task(name, peer) if self.ca else peer
             self._spawn([*launch, *self.launch_args, task])
-        while len(names) > want:
-            name = names.pop()
-            self._store.put("spares", names)
-            q = shlex.quote(name)
-            self._spawn(["sh", "-c", f"ssh {q} pkill -USR1 -x chimaera; sleep {self.drain_s:g}; sky down -y {q}"])
+            self._launching[name] = self._children[-1]
+
+    def _sky_has(self, name: str) -> bool | None:
+        """Whether SkyPilot has a running (not stopped) cluster `name`; None when it cannot say.
+        shortcut: reads `sky status`'s table, unverified against a real install."""
+        r = subprocess.run(["sky", "status", name], capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return None
+        rows = [line.split() for line in r.stdout.splitlines() if line.split()[:1] == [name]]
+        return any("STOPPED" not in row for row in rows)
+
+    def victim(self, nodes: list[Any], replicas: int) -> Victim:
+        """The newest spare: the one a shrink tears down. Its peer carries the
+        label ``chimaera.spare=<name>``."""
+        names = self._names()
+        if not names:
+            return Victim("unknown", "", "no spares: the peers that are not spares are not removed")
+        name = names[-1]
+        mine = [n for n in nodes if n.labels.get("chimaera.spare") == name]
+        live = [n for n in mine if n.alive]
+        if len(live) == 1:
+            return Victim("joined", name, node=live[0])
+        if live:
+            return Victim("unknown", name, f"{len(live)} live peers say they are spare {name}")
+        if mine:
+            return Victim("unknown", name, f"its peer {mine[0].peer[:12]} stopped answering")
+        launching = self._launching.get(name)
+        if launching is not None and launching.poll() is None:
+            return Victim("unknown", name, "its sky launch is still running")
+        has = self._sky_has(name)
+        if has is None:
+            return Victim("unknown", name, "sky status failed")
+        if has:
+            return Victim("unknown", name, "SkyPilot runs it but its peer has not joined")
+        return Victim("never_joined", name, "SkyPilot has no running cluster by that name")
+
+    def shrink(self, victim: Victim) -> str | None:
+        """Tear down `victim` if it is still the newest spare and holds nothing
+        (draining its peer first when it has one); else why not."""
+        now = self.victim(ch.runs.cluster().nodes(), self.replicas())
+        if not same(now, victim):
+            return f"spare {victim.target} changed before the shrink: {now.state} ({now.why or 'live'})"
+        held = blocked(now)
+        if held:
+            return held
+        names = self._names()
+        names.remove(now.target)
+        self._store.put("spares", names)
+        q = shlex.quote(now.target)
+        drain = f"ssh {q} pkill -USR1 -x chimaera; sleep {self.drain_s:g}; " if now.state == "joined" else ""
+        # `sky down` also for one that never joined: a cluster it could not see is torn down, never left running.
+        self._spawn(["sh", "-c", f"{drain}sky down -y {q}"])
+        return None
+
+
+def step(pool: Any, rules: Rules, memory: Memory, now: float) -> dict[str, Any] | None:
+    """One look and the change it calls for: what to print, if anything. A
+    shrink removes only the unit the pool named, checked again just before."""
+    nodes, replicas = ch.runs.cluster().nodes(), pool.replicas()
+    victim = cache(lambda: pool.victim(nodes, replicas))  # asked only when a shrink is due, then reused
+    was = memory.held
+    want, why = decide(nodes, replicas, rules, memory, now, victim)
+    removes = None
+    if want < replicas:
+        memory.held = pool.shrink(victim())
+        if memory.held:
+            want, why = replicas, f"shrink stopped: {memory.held}"
+        else:
+            removes = {"unit": victim().target, "as": victim().state}
+    elif want > replicas:
+        pool.scale(want)
+    live = [n for n in nodes if n.alive]
+    peers = {"asked": replicas, "up": len(live), "usable": sum(not n.draining for n in live)}
+    if want != replicas:
+        return {"at": time.time(), "from": replicas, "to": want, "why": why, "peers": peers} | (
+            {"removes": removes} if removes else {}
+        )
+    if memory.held and memory.held != was:  # each new reason a shrink is held, once
+        return {"at": time.time(), "holding": replicas, "why": why, "peers": peers}
+    return None
 
 
 def run(pool: Any, rules: Rules, interval: float, out: Any = sys.stdout) -> None:
     memory = Memory()
-    view = ch.runs.cluster()
     while True:
         try:
-            nodes, replicas = view.nodes(), pool.replicas()
-        except Exception as e:  # noqa: BLE001 - a missed look is retried; scaling never acts on stale data
-            print(json.dumps({"at": time.time(), "error": str(e)}), file=out, flush=True)
-            time.sleep(interval)
-            continue
-        victim = pool.victim(nodes, replicas) if hasattr(pool, "victim") else None
-        want, why = decide(nodes, replicas, rules, memory, time.monotonic(), victim)
-        if want != replicas:
-            pool.scale(want)
-            record = {"at": time.time(), "from": replicas, "to": want, "why": why}
-            memory.decisions.append(record)
+            record = step(pool, rules, memory, time.monotonic())
+        except Exception as e:  # noqa: BLE001 - a failed look or change is retried; nothing acts on stale data
+            record = {"at": time.time(), "error": str(e)}
+        if record:
             print(json.dumps(record), file=out, flush=True)
         time.sleep(interval)
 

@@ -41,7 +41,7 @@ from typing import Any
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python"))
 
 from chimaera._planner import Pool, Startup, Target, arrival_rate, plan  # noqa: E402
-from chimaera.provisioner import Memory, Rules, decide  # noqa: E402
+from chimaera.provisioner import Memory, Rules, Victim, decide  # noqa: E402
 
 GiB = 1 << 30
 BUCKETS = (1.0, 4.0, 16.0, 64.0, 256.0)
@@ -312,7 +312,11 @@ class Sim:
         nodes = self.nodes()
         active = self.active()
         replicas = len(active)
-        victim = next((n for n in nodes if n.peer == f"p{replicas - 1}"), None)
+        # The unit a shrink removes is the highest ordinal: its peer if it
+        # shows, else one whose pod never started (the replay knows).
+        last = f"p{replicas - 1}"
+        node = next((n for n in nodes if n.peer == last), None)
+        victim = Victim("joined", last, node=node) if node is not None else Victim("never_joined", last, "not up yet")
         want, _ = decide(nodes, replicas, self.rules, self.memory, self.now, victim)
         if self.policy == "forecast":
             self.history = [h for h in self.history if h[0] >= self.now - 300.0] + [(self.now, nodes)]

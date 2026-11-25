@@ -45,7 +45,8 @@ pub struct Spec {
     pub tls_secret: Option<String>,
     /// Also run the provisioner in the cluster, growing the pool from
     /// --replicas up to MAX peers under load (a Deployment whose Role may only
-    /// read this StatefulSet and change its scale). Needs --namespace.
+    /// read this StatefulSet and its pods and change its scale). Needs
+    /// --namespace.
     #[arg(long, value_name = "MAX")]
     pub provisioner: Option<u32>,
 }
@@ -277,7 +278,8 @@ spec:
 }
 
 /// The in-cluster provisioner: a ServiceAccount whose Role may only read this
-/// StatefulSet and change its scale, and a one-replica Deployment running
+/// StatefulSet and its pods (to see that a pod a shrink removes never started)
+/// and change its scale, and a one-replica Deployment running
 /// `python -m chimaera.provisioner` as a remote driver of the cluster.
 #[allow(clippy::too_many_arguments)]
 fn provisioner(
@@ -291,6 +293,7 @@ fn provisioner(
     max: u32,
 ) -> String {
     let who = format!("{name}-provisioner");
+    let pods = (0..max).map(|i| format!("\"{name}-{i}\"")).collect::<Vec<_>>().join(", ");
     let labels = |indent: &str| {
         format!("{indent}app.kubernetes.io/name: chimaera-provisioner\n{indent}app.kubernetes.io/instance: {name}")
     };
@@ -308,11 +311,16 @@ metadata:
   name: {who}
   namespace: {ns}
 rules:
-  # This StatefulSet and its size, nothing else.
+  # This StatefulSet and its size.
   - apiGroups: ["apps"]
     resources: ["statefulsets", "statefulsets/scale"]
     resourceNames: ["{name}"]
     verbs: ["get", "patch"]
+  # Its pods, read only: whether the one a shrink removes ever started.
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: [{pods}]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -412,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn the_provisioner_gets_only_its_statefulsets_scale() {
+    fn the_provisioner_gets_only_its_statefulsets_scale_and_reads_its_pods() {
         let mut s = spec();
         s.replicas = 2;
         s.provisioner = Some(8);
@@ -422,6 +430,7 @@ mod tests {
         for want in [
             "kind: ServiceAccount\nmetadata:\n  name: chimaera-provisioner\n  namespace: ml",
             "resources: [\"statefulsets\", \"statefulsets/scale\"]\n    resourceNames: [\"chimaera\"]\n    verbs: [\"get\", \"patch\"]",
+            "resources: [\"pods\"]\n    resourceNames: [\"chimaera-0\", \"chimaera-1\", \"chimaera-2\", \"chimaera-3\", \"chimaera-4\", \"chimaera-5\", \"chimaera-6\", \"chimaera-7\"]\n    verbs: [\"get\"]",
             "serviceAccountName: chimaera-provisioner",
             "\"--min\", \"2\", \"--max\", \"8\"",
             "value: \"chimaera:7710\"",
