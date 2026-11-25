@@ -262,6 +262,30 @@ def test_the_cli_lists_every_peers_object_store(zoned):
     assert len({x["object_dir"] for x in stores}) == 3, "each peer reported its own store"
 
 
+def test_a_program_lists_every_peers_object_store_as_the_cli_does(zoned):
+    out = zoned.run(
+        0,
+        WHERE
+        + """
+import json
+import numpy as np
+
+x = ch.put(np.ones(4 << 20))  # 32 MiB, stored on p0
+run = ch.runs.current_run().id
+stores = ch.runs.objects()
+print("STORES", json.dumps([[s.get("error"), s["addr"], s["object_dir"]] for s in stores]))
+here = stores[0]
+print("RUN", json.dumps([r["objects"] for r in here["runs"] if r["run"] == run]))
+print("LARGEST", json.dumps([o["bytes"] for o in here["largest"] if o["object"].startswith(run + "/")]))
+""",
+    )
+    stores = json.loads(lines(out, "STORES")[0])
+    assert len(stores) == 3 and [s[0] for s in stores] == [None] * 3, stores
+    assert stores[0][1] == "this peer" and len({s[2] for s in stores}) == 3, "each peer's own store, this one first"
+    assert json.loads(lines(out, "RUN")[0])[0] >= 1, out.stdout
+    assert max(json.loads(lines(out, "LARGEST")[0])) >= 32 << 20, "the put is among this store's largest"
+
+
 def test_a_peer_on_the_same_machine_takes_an_object_from_the_holders_store(monkeypatch):
     # Peers on one machine: a value p1 needs from p0 is linked from p0's
     # store (one file, no bytes streamed), not sent over the network. No

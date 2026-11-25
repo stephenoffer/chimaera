@@ -1168,6 +1168,15 @@ impl Client {
         }
     }
 
+    /// What every live peer's object store holds, the connected peer's first:
+    /// one objplane inventory each, as JSON (`chimaera objects --cluster --json`).
+    fn objects(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let mut peer = self.peer.clone();
+        let req = pb::StatusRequest { objects: true, ..Default::default() };
+        let r = py.detach(|| runtime().block_on(async move { peer.status(req).await })).map_err(rpc_err)?.into_inner();
+        Ok(r.objects)
+    }
+
     /// The cluster as the connected peer sees it: a list of node dicts.
     fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let mut peer = self.peer.clone();

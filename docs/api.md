@@ -641,6 +641,18 @@ where = ch.runs.object_locations([value])[value]
 assert where["peers"] and where["size"] >= 1 << 20
 ```
 
+`ch.runs.objects()` is what every live peer's object store holds, as
+`chimaera objects --cluster` prints it (Ray's `ray memory`): one dict per
+peer, the connected peer's first, with the objects and bytes in memory and
+on disk, the same per run, and its ten largest objects. **Runs today:**
+
+```python run
+stores = ch.runs.objects()
+here = stores[0]
+assert here["addr"] == "this peer" and here["in_memory"]["bytes"] >= 1 << 20
+assert any(r["run"] == ch.runs.current_run().id for r in here["runs"])
+```
+
 `ch.runs.cluster().events(kinds, start=)` streams what the cluster does: members
 joining and leaving (`member`), actors starting, restarting and dying
 (`actor`), calls failing for good (`task_failed`), controller `decision`s and
