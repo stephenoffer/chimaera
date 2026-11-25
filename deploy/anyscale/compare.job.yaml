@@ -1,0 +1,24 @@
+# Chimaera against Ray, Dask, multiprocessing and joblib on one machine
+# (c7i.16xlarge, 64 vCPU), every runtime on the image's Python.
+#   anyscale job submit -f deploy/anyscale/compare.job.yaml --wait
+name: chimaera-compare
+cloud: anyscale_v2_default_cloud
+compute_config:
+  cloud: anyscale_v2_default_cloud
+  head_node:
+    instance_type: c7i.16xlarge
+    # Schedulable head: this run has no workers.
+    resources:
+      CPU: 64
+  worker_nodes: []
+working_dir: .
+excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
+entrypoint: bash deploy/anyscale/run_compare.sh
+env_vars:
+  # Timed runs per cell after a warm-up; trials repeat every cell in a new order.
+  # One trial of the first 11 workloads took about 40 minutes here; with the
+  # release-suite rows, allow up to four hours for three trials.
+  COMPARE_MIN_SECONDS: "10"
+  COMPARE_TRIALS: "3"
+max_retries: 0
+timeout_s: 14400
