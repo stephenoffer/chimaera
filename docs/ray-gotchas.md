@@ -85,7 +85,7 @@ in [qualification.md](qualification.md) shows it; "partly" says what is missing;
 | `ray.cancel` is best-effort and cancelling a task leaves the tasks it started running (guides: antipatterns) | Cancelling a call cancels the calls it started; a call that does not stop by itself is interrupted after 2 s and its worker stopped after 5 s | Handled (`test_api_tier1.py`, `test_spread_cancel.py`) |
 | Actors dying, failing in `__init__`, or dying with their owner; restart failing when a creation argument was evicted; detached actors leaking | Creation arguments are kept until the run ends; actors end with their run unless detached | Handled for argument eviction; actor lifecycle is the actor API's |
 | Workers crashing | Calls lost to a dead worker are retried (three attempts); an external effect reports `OutcomeUnknown` | Handled |
-| Retrying transient application errors | `retry_exceptions` lists the exceptions to retry; your own exceptions are never retried otherwise | Handled (same choice as Ray) |
+| Retrying transient application errors: Ray retries no application exception unless told, so one network blip fails the job | Calls that may run again (`effects="none"` or `"idempotent"`, not actor calls or streams) retry a dropped connection or a timeout (`ConnectionError`, `TimeoutError`, and requests', aiohttp's and urllib3's equivalents) without being told, waiting 0.1 s, then 0.2 s; map items are retried one by one; other exceptions only when listed in `retry_exceptions`, and `retry_exceptions=()` turns the default off | Handled (`test_retry_policy.py`) |
 
 ## Setup, versions and configuration
 

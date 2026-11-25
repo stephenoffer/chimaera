@@ -162,21 +162,24 @@ ask ([actors.md](actors.md)).
 
 </details>
 
-### Your exceptions are not retried
+### Which of your exceptions are retried
 
-Just as in Ray, the call fails at once if your code raises, and only a lost
-worker or peer triggers a retry. The difference: `retry_exceptions=True` is
-rejected, so name the exceptions worth retrying as types:
+Unlike Ray, a dropped connection or a timeout (`ConnectionError`,
+`TimeoutError`, and requests', aiohttp's and urllib3's equivalents) is retried
+without being listed, in calls that may run again (not actor calls, streams or
+`effects="external"`). Any other exception fails the call at once, as in Ray.
+And `retry_exceptions=True` is rejected, so name the exceptions worth retrying
+as types:
 
 ```python run
 import os
 import tempfile
 
-@ch.remote(retry_exceptions=ConnectionError)
+@ch.remote(retry_exceptions=OSError)
 def flaky(marker: str) -> str:
     if not os.path.exists(marker):
         open(marker, "w").close()
-        raise ConnectionError("first attempt fails")
+        raise OSError("the disk is busy")
     return "ok"
 
 assert flaky.remote(tempfile.mktemp()).result() == "ok"     # retried once

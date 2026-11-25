@@ -18,7 +18,7 @@ from collections.abc import AsyncIterable, AsyncIterator, Callable, Coroutine, I
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, ParamSpec, Protocol, TypeVar, Unpack, overload
 
 from . import _context, _direct, _graph, _leases, _serde, _values, _width, _workflow
-from ._errors import ActorDied, ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
+from ._errors import TRANSIENT_ERRORS, ActorDied, ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
 from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part, start_pending
 from ._native import blake3_digest, child_id, derive_id
 from ._options import (
@@ -95,6 +95,15 @@ def _fn_name(target: Any, method: str) -> str:
 
 def _exc_name(t: type[BaseException]) -> str:
     return f"{t.__module__}.{t.__qualname__}"
+
+
+def _retry_types(eff: Effective, actor: bytes | None = None, stream: bool = False) -> list[str]:
+    """The errors a call retries: those in retry_exceptions or, left unset,
+    TRANSIENT_ERRORS in a call that may run again (no actor call or stream)."""
+    listed = [_exc_name(t) for t in eff.get("retry_exceptions") or ()]
+    if listed or eff.sources.get("retry_exceptions", "default") != "default" or actor is not None or stream:
+        return listed
+    return list(TRANSIENT_ERRORS) if eff.get("effects") in ("none", "idempotent") else []
 
 
 def build_call(
@@ -227,7 +236,7 @@ def build_call(
     durability = eff.get("durability")
     if durability not in (None, "default"):
         _check_durability(eff, durability, kind, durable, stream)
-    retry = eff.get("retry_exceptions") or ()
+    retry = _retry_types(eff, actor, stream)
     spec = {
         "key": key,
         "kind": kind,
@@ -245,7 +254,7 @@ def build_call(
         "item_index": item_index,
         "parent": (ctx.run + ctx.task) if ctx is not None else None,
         "speculation_allowed": effects == "none" and bool(eff.get("deterministic")),
-        "retry_exception_types": [_exc_name(t) for t in retry],
+        "retry_exception_types": retry,
         "max_oom_escalations": 2,
     }
     if stream:
@@ -487,7 +496,7 @@ class RemoteFunction(Generic[P, R]):
             and not inspect.isasyncgenfunction(self._fn)
             and not eff.get("cache")
         )
-        runner = _MapChunk(self._fn, star=not single)
+        runner = _MapChunk(self._fn, star=not single, retry=_retry_types(eff), attempts=int(eff.get("max_attempts")))
 
         # Chunks are profiled as the function itself, per item.
         inner = rt.code_digest(self._fn) if chunkable else b""
@@ -515,10 +524,11 @@ class RemoteFunction(Generic[P, R]):
 
 class _MapChunk:
     """Runs a map's function over a chunk of items. An item that raises keeps
-    its error to itself; the chunk's other items still return their values."""
+    its error to itself; the chunk's other items still return their values.
+    An item's retried error runs it again here, as the peer retries a call."""
 
-    def __init__(self, fn: Callable[..., Any], *, star: bool) -> None:
-        self.fn, self.star = fn, star
+    def __init__(self, fn: Callable[..., Any], *, star: bool, retry: list[str], attempts: int) -> None:
+        self.fn, self.star, self.retry, self.attempts = fn, star, retry, attempts
         self.__module__ = getattr(fn, "__module__", __name__)
         self.__qualname__ = f"{getattr(fn, '__qualname__', type(fn).__name__)}[map]"
 
@@ -526,12 +536,26 @@ class _MapChunk:
         out = _Chunk()
         start = time.perf_counter()
         for item in items:
-            try:
-                out.append(self.fn(*item) if self.star else self.fn(item))
-            except Exception as exc:  # the item's own error, reported at its position
-                out.append(ItemFailed(_item_error(exc)))
+            out.append(self._one(item))
         out.elapsed = time.perf_counter() - start
         return out
+
+    def _one(self, item: Any) -> Any:
+        import traceback
+
+        from ._executor import _matches
+
+        last = None
+        for attempt in range(1, self.attempts + 1):
+            try:
+                return self.fn(*item) if self.star else self.fn(item)
+            except Exception as exc:  # the item's own error, reported at its position
+                frames = [(f.filename, f.lineno) for f in traceback.extract_tb(exc.__traceback__)]
+                failure = (type(exc), str(exc), frames)
+                if attempt == self.attempts or failure == last or not _matches(exc, self.retry):
+                    return ItemFailed(_item_error(exc))
+                last = failure
+                time.sleep(min(2.0, 0.1 * 2 ** (attempt - 1)))
 
 
 def _item_error(exc: BaseException) -> tuple[Any, ...]:

@@ -78,7 +78,7 @@ Chimaera API work on them too.
 | `resources` | `resources`. CHR002: recorded, not yet used for placement (P3) |
 | `accelerator_type` | `device=`: NVIDIA names become `cuda:<model>`, `TPU-V4` becomes `tpu:v4` (`TPU-V5LITEPOD` is `tpu:v5e`), `AMD-Instinct-MI300A` becomes `rocm:MI300A`, `aws-neuron-core` becomes `neuron`, `Intel-GAUDI` becomes `hpu`, `Intel-GPU-Max-*` becomes `xpu`, Apple `M3-Pro` becomes `mps:M3 Pro`. Vendors without a Chimaera plugin (Ascend, MetaX, Furiosa, Mobilint) are `Unsupported`. As with `device=` alone, it asks for one device when `num_gpus` is unset |
 | `max_retries` | `max_attempts = max_retries + 1`. Unset means 4 attempts, Ray's default. `-1` becomes 100 attempts (CHR003) |
-| `retry_exceptions` | `retry_exceptions`. `True` means `(Exception,)` |
+| `retry_exceptions` | `retry_exceptions`. `True` means `(Exception,)`; `False` means `()`. Unset, a task retries a dropped connection or a timeout, where Ray retries no exception |
 | `num_returns=n` | `returns=n`; `.remote()` returns a list of `n` refs, one per value, as in Ray |
 | Generator tasks and methods, `num_returns="streaming"` | Supported: `.remote()` gives an `ObjectRefGenerator` with one resolved ref per item; an error raised mid-stream comes out as the next ref. Tasks stream as they yield; a generator method's items arrive once it returns |
 | `num_returns="dynamic"` | `Unsupported`: use `num_returns="streaming"` |

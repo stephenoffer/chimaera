@@ -120,6 +120,12 @@ const MAX_REBUILDS: u32 = 3;
 /// meanwhile wait and go in the next one, so under load each commit carries
 /// many results instead of one or two (a lone result still goes at once).
 const PUBLISH_IN_FLIGHT: u32 = 2;
+
+/// How long a retry waits after its attempt failed: 0.1 s, doubling, at most
+/// 2 s. A dropped connection or a busy service often needs a moment.
+fn retry_wait(attempt: u32) -> Duration {
+    Duration::from_millis(100 << attempt.saturating_sub(2).min(5)).min(Duration::from_secs(2))
+}
 const IDLE_EXECUTOR_TTL: Duration = Duration::from_secs(60);
 /// A running call told to stop that has not stopped by itself (the executor
 /// interrupts its main thread after 2 s) loses its executor after this long.
@@ -3212,6 +3218,10 @@ impl Core {
                 }
             };
             let w = &self.queue[i];
+            if w.attempt > 1 && w.ready_at.elapsed() < retry_wait(w.attempt) {
+                i += 1; // housekeeping dispatches again within 100 ms
+                continue;
+            }
             let (cpus, floor, waited) = (w.cpus, w.mem_floor, w.ready_at.elapsed());
             if cpus > self.capacity + 1e-9 {
                 let w = self.queue.remove(i).expect("index in range");

@@ -126,10 +126,17 @@ three).
 
 ## Retry what is safe to retry
 
-Calls lost with a worker or peer are retried for you. Your own exceptions? Only
-if you list them in `retry_exceptions` (a class or a tuple; subclasses match).
-Retries start at once, with no backoff, and stop early when an attempt fails
-exactly like the one before:
+Calls lost with a worker or peer are retried for you. So are a dropped
+connection and a timeout (`ConnectionError`, `TimeoutError`, and requests',
+aiohttp's and urllib3's equivalents) in calls that may run again:
+`effects="none"` or `"idempotent"`, not actor calls or streams. A map retries
+each such item on its own. A wait in the call that runs out
+(`.result(timeout=)`) is not retried, since a retry would start the calls it
+waited on again. Your other exceptions? Only if you list them in
+`retry_exceptions` (a class or a tuple; subclasses match), which replaces that
+default; `retry_exceptions=()` turns it off. A retry waits 0.1 s, doubling to
+at most 2 s, and retries stop early when an attempt fails exactly like the one
+before:
 
 ```python run
 class Throttled(Exception):

@@ -32,6 +32,19 @@ class NonRetryable(Exception):
     never retried, whatever the call's ``retry_exceptions`` says."""
 
 
+# Retried in calls that may run again when retry_exceptions is unset: a dropped
+# connection or a timeout reaching another service. Named, not imported, so the
+# libraries need not be installed; subclasses match.
+TRANSIENT_ERRORS = (
+    "builtins.ConnectionError",
+    "builtins.TimeoutError",
+    "requests.exceptions.ConnectionError",
+    "requests.exceptions.Timeout",
+    "aiohttp.client_exceptions.ClientConnectionError",
+    "urllib3.exceptions.ProtocolError",
+)
+
+
 class OutcomeUnknown(ChimaeraError):
     """A call with external effects may or may not have taken effect. From a
     durable workflow's activity (``ch.durable.record(activity, ...)``), ``key``

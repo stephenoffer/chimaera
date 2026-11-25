@@ -50,6 +50,7 @@ def test_resource_options_translate():
     assert out["cpus"] == 0.01 and out["memory"] == 1 << 20
     assert _options.translate({"retry_exceptions": True}, _options.TASK)["retry_exceptions"] == (Exception,)
     assert _options.translate({"retry_exceptions": [KeyError]}, _options.TASK)["retry_exceptions"] == (KeyError,)
+    assert _options.translate({"retry_exceptions": False}, _options.TASK)["retry_exceptions"] == ()
 
 
 @pytest.mark.parametrize(

@@ -126,10 +126,8 @@ def _attempts(name: str, value: Any, out: Out) -> None:
 
 
 def _retry_exceptions(name: str, value: Any, out: Out) -> None:
-    if value is True:
-        out["retry_exceptions"] = (Exception,)
-    elif value:
-        out["retry_exceptions"] = tuple(value)
+    # False, written out, also turns off the retry of a dropped connection or a timeout.
+    out["retry_exceptions"] = (Exception,) if value is True else tuple(value or ())
 
 
 def _num_returns(name: str, value: Any, out: Out) -> None:

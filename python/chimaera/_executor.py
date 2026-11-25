@@ -32,7 +32,7 @@ from typing import Any
 import cloudpickle
 
 from . import _batch, _direct, _context, _future, _graph, _leases, _objects, _project, _serde, _statecodec, _workflow
-from ._errors import ActorDied, NonRetryable
+from ._errors import TRANSIENT_ERRORS, ActorDied, NonRetryable
 from . import _native
 from ._native import ExecConn, blake3_digest, child_id
 from ._serde import Dep
@@ -748,7 +748,7 @@ class Executor:
                 error = ActorDied("the actor was closed while this call ran")
             if error is not None:
                 outcome = self.err(error)
-                retryable = _matches(error, msg["retry_exception_types"]) and not isinstance(error, NonRetryable)
+                retryable = _matches(error, msg["retry_exception_types"])
                 if retryable:
                     frames = "|".join(f"{f.filename}:{f.lineno}" for f in traceback.extract_tb(error.__traceback__))
                     fingerprint = blake3_digest(f"{outcome[2]}|{outcome[3]}|{frames}".encode())
@@ -1221,9 +1221,22 @@ async def _awaitable(x: Any) -> Any:
     return await x
 
 
+_PACKAGE = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
 def _matches(exc: BaseException, names: list[str]) -> bool:
-    if not names:
+    """Whether a call retries this error: its class or a base is named, and it
+    is not NonRetryable. The default names leave out a timeout Chimaera raised
+    (a wait in the call that ran out): a retry would submit what it waited on
+    again, beside the calls still running."""
+    if not names or isinstance(exc, NonRetryable):
         return False
+    if isinstance(exc, TimeoutError) and tuple(names) == TRANSIENT_ERRORS:
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        if tb is not None and tb.tb_frame.f_code.co_filename.startswith(_PACKAGE):
+            return False
     return any(f"{t.__module__}.{t.__qualname__}" in names for t in type(exc).__mro__)
 
 

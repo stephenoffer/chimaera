@@ -163,7 +163,7 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 | `effects` | `"none"` (default), `"idempotent"` or `"external"`. External calls start at most once. |
 | `deterministic` | `True` (default): the function returns the same value for the same inputs, so a result lost with every copy of it is made again by running its call. `False`: such a result is `DataLost`, saying why, and the call is never speculated or cached. |
 | `durability` | What the result survives if its peer is lost: by default a background copy on another peer, and the call runs again; `"ephemeral"` (no copy, lost with its peer), `"replayable"` (no copy, the call runs again) or `"retained"` (the call succeeds only once copies on other peers, other racks first, exist). See [objects](objects.md#fault-tolerance). |
-| `max_attempts`, `retry_exceptions` | Infrastructure failures are retried; your exceptions only when listed. |
+| `max_attempts`, `retry_exceptions` | Infrastructure failures are retried. Of your exceptions, a dropped connection or a timeout (`ConnectionError`, `TimeoutError`, and requests', aiohttp's and urllib3's equivalents) is retried in calls that may run again (`effects="none"` or `"idempotent"`, not actor calls or streams); others only when listed, and `retry_exceptions=()` turns the default off. A retry waits 0.1 s, doubling to at most 2 s. |
 | `deadline` | Relative (`"30s"`) or a `datetime`; children inherit the earliest one. |
 | `concurrency` | Calls an actor may run at once (default 1). |
 | `max_in_flight`, `max_in_flight_bytes` | Bounds for a map's window, and for how far a generator runs ahead of you. |
@@ -304,7 +304,7 @@ except ch.Infeasible as e:
 
 | You see | It means |
 |---|---|
-| Your own exception | Your code raised it; it ran once (unless listed in `retry_exceptions`). |
+| Your own exception | Your code raised it; it ran once, unless listed in `retry_exceptions` or a dropped connection or timeout in a call that may run again. |
 | `ch.InfrastructureFailure`, `ch.errors.WorkerCrashed` | Workers kept dying until the attempts ran out. |
 | `ch.OutOfMemory` | Over `memory_limit`; carries the peak and the limit. |
 | `ch.errors.OutOfDisk` | A value could not be stored: the disk holding objects is full. An `OSError` with `errno.ENOSPC`; the message names the directory and its free space. |
