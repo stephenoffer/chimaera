@@ -1,0 +1,322 @@
+{
+ "peers": 4,
+ "results": [
+  {
+   "runtime": "chimaera",
+   "workload": "tasks",
+   "result": {
+    "tasks_per_s": 14067,
+    "cpus": 64,
+    "metric": "tasks_per_s",
+    "reps": 5,
+    "p10": 12038,
+    "p90": 16090
+   },
+   "wall_s": 86.2,
+   "peer_cores": [
+    1.63,
+    1.5,
+    1.07,
+    1.0
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "cpu_scaling",
+   "result": {
+    "seconds": 2.799,
+    "efficiency": 0.705,
+    "cpus": 64,
+    "metric": "efficiency",
+    "reps": 22,
+    "p10": 0.697,
+    "p90": 0.758
+   },
+   "wall_s": 65.4,
+   "peer_cores": [
+    0.13,
+    0.11,
+    0.09,
+    0.04
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "map_small",
+   "result": {
+    "naive_items_per_s": 706537,
+    "metric": "naive_items_per_s",
+    "reps": 11,
+    "p10": 699234,
+    "p90": 713508
+   },
+   "wall_s": 68.0,
+   "peer_cores": [
+    1.43,
+    0.89,
+    0.79,
+    0.34
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "broadcast",
+   "result": {
+    "seconds": 0.045,
+    "nodes_reached": 1,
+    "readers": 128,
+    "metric": "seconds",
+    "reps": 307,
+    "p10": 0.038,
+    "p90": 0.055
+   },
+   "wall_s": 61.7,
+   "peer_cores": [
+    2.05,
+    1.55,
+    0.23,
+    0.15
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "naive_big_arg",
+   "result": {
+    "seconds": 0.053,
+    "nodes_reached": 2,
+    "calls": 128,
+    "metric": "seconds",
+    "reps": 942,
+    "p10": 0.043,
+    "p90": 0.059
+   },
+   "wall_s": 61.5,
+   "peer_cores": [
+    2.1,
+    1.76,
+    0.87,
+    0.64
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "follow_input",
+   "result": {
+    "seconds": 0.169,
+    "calls_on_one_host": 10,
+    "calls": 10,
+    "metric": "seconds",
+    "reps": 228,
+    "p10": 0.144,
+    "p90": 0.186
+   },
+   "wall_s": 61.2,
+   "peer_cores": [
+    1.74,
+    1.54,
+    0.09,
+    0.02
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "actors",
+   "result": {
+    "calls_per_s": 13017,
+    "actors": 32,
+    "hosts": 3,
+    "metric": "calls_per_s",
+    "reps": 8,
+    "p10": 11884,
+    "p90": 14367
+   },
+   "wall_s": 76.1,
+   "peer_cores": [
+    1.29,
+    0.83,
+    0.83,
+    0.09
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "nested",
+   "result": {
+    "seconds": 0.283,
+    "parents": 256,
+    "metric": "seconds",
+    "reps": 169,
+    "p10": 0.259,
+    "p90": 0.319
+   },
+   "wall_s": 64.9,
+   "peer_cores": [
+    2.08,
+    1.19,
+    1.1,
+    0.44
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "shuffle",
+   "result": {
+    "seconds": 0.175,
+    "pairs": 3200000,
+    "metric": "seconds",
+    "reps": 297,
+    "p10": 0.164,
+    "p90": 0.197
+   },
+   "wall_s": 60.5,
+   "peer_cores": [
+    1.53,
+    1.27,
+    1.13,
+    0.74
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "node_loss",
+   "result": {
+    "seconds": 9.835,
+    "tasks": 256,
+    "killed": "peer-0"
+   },
+   "wall_s": 10.9
+  },
+  {
+   "runtime": "ray",
+   "workload": "tasks",
+   "result": {
+    "tasks_per_s": 6930,
+    "cpus": 64,
+    "metric": "tasks_per_s",
+    "reps": 3,
+    "p10": 6898,
+    "p90": 7403
+   },
+   "wall_s": 115.1
+  },
+  {
+   "runtime": "ray",
+   "workload": "cpu_scaling",
+   "result": {
+    "seconds": 2.746,
+    "efficiency": 0.727,
+    "cpus": 64,
+    "metric": "efficiency",
+    "reps": 21,
+    "p10": 0.708,
+    "p90": 0.743
+   },
+   "wall_s": 67.4
+  },
+  {
+   "runtime": "ray",
+   "workload": "map_small",
+   "result": {
+    "naive_items_per_s": 7398,
+    "hand_batched_items_per_s": 3394645,
+    "metric": "naive_items_per_s",
+    "reps": 3,
+    "p10": 6917,
+    "p90": 7526
+   },
+   "wall_s": 115.7
+  },
+  {
+   "runtime": "ray",
+   "workload": "broadcast",
+   "result": {
+    "seconds": 0.024,
+    "nodes_reached": 1,
+    "readers": 128,
+    "metric": "seconds",
+    "reps": 108,
+    "p10": 0.022,
+    "p90": 0.027
+   },
+   "wall_s": 64.0
+  },
+  {
+   "runtime": "ray",
+   "workload": "naive_big_arg",
+   "result": {
+    "seconds": 0.208,
+    "nodes_reached": 1,
+    "calls": 128,
+    "metric": "seconds",
+    "reps": 282,
+    "p10": 0.199,
+    "p90": 0.217
+   },
+   "wall_s": 75.9
+  },
+  {
+   "runtime": "ray",
+   "workload": "follow_input",
+   "result": {
+    "seconds": 0.215,
+    "calls_on_one_host": 10,
+    "calls": 10,
+    "metric": "seconds",
+    "reps": 180,
+    "p10": 0.21,
+    "p90": 0.218
+   },
+   "wall_s": 63.9
+  },
+  {
+   "runtime": "ray",
+   "workload": "actors",
+   "result": {
+    "calls_per_s": 9395,
+    "actors": 32,
+    "hosts": 4,
+    "metric": "calls_per_s",
+    "reps": 7,
+    "p10": 8917,
+    "p90": 10466
+   },
+   "wall_s": 69.3
+  },
+  {
+   "runtime": "ray",
+   "workload": "nested",
+   "result": {
+    "seconds": 0.335,
+    "parents": 256,
+    "metric": "seconds",
+    "reps": 171,
+    "p10": 0.209,
+    "p90": 0.509
+   },
+   "wall_s": 64.6
+  },
+  {
+   "runtime": "ray",
+   "workload": "shuffle",
+   "result": {
+    "seconds": 0.14,
+    "pairs": 3200000,
+    "metric": "seconds",
+    "reps": 343,
+    "p10": 0.129,
+    "p90": 0.177
+   },
+   "wall_s": 63.9
+  },
+  {
+   "runtime": "ray",
+   "workload": "node_loss",
+   "result": {
+    "seconds": 18.352,
+    "tasks": 256,
+    "killed": "peer-0"
+   },
+   "wall_s": 19.6
+  }
+ ]
+}

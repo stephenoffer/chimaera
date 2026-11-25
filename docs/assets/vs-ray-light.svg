@@ -1,60 +1,68 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 422" width="820" height="422" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Chimaera against Ray on 64 machines: times faster per workload">
-<text x="440.0" y="22" text-anchor="end" font-size="13" fill="#59636e">◀ Ray faster</text>
-<text x="460.0" y="22" font-size="13" fill="#59636e">Chimaera faster ▶</text>
-<line x1="300.0" x2="300.0" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<line x1="337.5" x2="337.5" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="337.5" y="42" text-anchor="middle" font-size="11" fill="#59636e">8x</text>
-<line x1="375.0" x2="375.0" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="375.0" y="42" text-anchor="middle" font-size="11" fill="#59636e">4x</text>
-<line x1="412.5" x2="412.5" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="412.5" y="42" text-anchor="middle" font-size="11" fill="#59636e">2x</text>
-<line x1="450.0" x2="450.0" y1="48" y2="358" stroke="#818b98" stroke-width="1.5"/>
-<text x="450.0" y="42" text-anchor="middle" font-size="11" fill="#59636e">1x</text>
-<line x1="487.5" x2="487.5" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="487.5" y="42" text-anchor="middle" font-size="11" fill="#59636e">2x</text>
-<line x1="525.0" x2="525.0" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="525.0" y="42" text-anchor="middle" font-size="11" fill="#59636e">4x</text>
-<line x1="562.5" x2="562.5" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="562.5" y="42" text-anchor="middle" font-size="11" fill="#59636e">8x</text>
-<line x1="600.0" x2="600.0" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="600.0" y="42" text-anchor="middle" font-size="11" fill="#59636e">16x</text>
-<line x1="637.5" x2="637.5" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="637.5" y="42" text-anchor="middle" font-size="11" fill="#59636e">32x</text>
-<line x1="675.0" x2="675.0" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="675.0" y="42" text-anchor="middle" font-size="11" fill="#59636e">64x</text>
-<line x1="712.5" x2="712.5" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="712.5" y="42" text-anchor="middle" font-size="11" fill="#59636e">128x</text>
-<line x1="750.0" x2="750.0" y1="48" y2="358" stroke="#d1d9e0" stroke-width="1"/>
-<text x="286" y="78.0" text-anchor="end" font-size="14" fill="#1f2328">Map over tiny items, no hand batching</text>
-<path d="M450.0,65.0 H717.0 Q721.0,65.0 721.0,69.0 V77.0 Q721.0,81.0 717.0,81.0 H450.0 Z" fill="#2E5BDB"><title>Map over tiny items, no hand batching: Chimaera 150x faster</title></path>
-<text x="728.0" y="78.0" text-anchor="start" font-size="13" font-weight="600" fill="#1f2328">150x</text>
-<text x="286" y="108.0" text-anchor="end" font-size="14" fill="#1f2328">32 MiB array passed to 2,048 calls</text>
-<path d="M450.0,95.0 H532.2 Q536.2,95.0 536.2,99.0 V107.0 Q536.2,111.0 532.2,111.0 H450.0 Z" fill="#2E5BDB"><title>32 MiB array passed to 2,048 calls: Chimaera 4.9x faster</title></path>
-<text x="543.2" y="108.0" text-anchor="start" font-size="13" font-weight="600" fill="#1f2328">4.9x</text>
-<text x="286" y="138.0" text-anchor="end" font-size="14" fill="#1f2328">Independent no-op tasks</text>
-<path d="M450.0,125.0 H500.5 Q504.5,125.0 504.5,129.0 V137.0 Q504.5,141.0 500.5,141.0 H450.0 Z" fill="#2E5BDB"><title>Independent no-op tasks: Chimaera 2.7x faster</title></path>
-<text x="511.5" y="138.0" text-anchor="start" font-size="13" font-weight="600" fill="#1f2328">2.7x</text>
-<text x="286" y="168.0" text-anchor="end" font-size="14" fill="#1f2328">Recovery from a killed machine</text>
-<path d="M450.0,155.0 H481.6 Q485.6,155.0 485.6,159.0 V167.0 Q485.6,171.0 481.6,171.0 H450.0 Z" fill="#2E5BDB"><title>Recovery from a killed machine: Chimaera 1.9x faster</title></path>
-<text x="492.6" y="168.0" text-anchor="start" font-size="13" font-weight="600" fill="#1f2328">1.9x</text>
-<text x="286" y="198.0" text-anchor="end" font-size="14" fill="#1f2328">Nested tasks</text>
-<path d="M450.0,185.0 H470.2 Q474.2,185.0 474.2,189.0 V197.0 Q474.2,201.0 470.2,201.0 H450.0 Z" fill="#2E5BDB"><title>Nested tasks: Chimaera 1.6x faster</title></path>
-<text x="481.2" y="198.0" text-anchor="start" font-size="13" font-weight="600" fill="#1f2328">1.6x</text>
-<text x="286" y="228.0" text-anchor="end" font-size="14" fill="#1f2328">Actor calls</text>
-<path d="M450.0,215.0 H453.9 Q457.9,215.0 457.9,219.0 V227.0 Q457.9,231.0 453.9,231.0 H450.0 Z" fill="#2E5BDB"><title>Actor calls: Chimaera 1.2x faster</title></path>
-<text x="464.9" y="228.0" text-anchor="start" font-size="13" font-weight="600" fill="#1f2328">1.2x</text>
-<text x="286" y="258.0" text-anchor="end" font-size="14" fill="#1f2328">512 MiB value to 2,048 readers</text>
-<path d="M450.0,245.0 H450.4 Q454.4,245.0 454.4,249.0 V257.0 Q454.4,261.0 450.4,261.0 H450.0 Z" fill="#2E5BDB"><title>512 MiB value to 2,048 readers: Chimaera 1.1x faster</title></path>
-<text x="461.4" y="258.0" text-anchor="start" font-size="13" font-weight="600" fill="#1f2328">1.1x</text>
-<text x="286" y="288.0" text-anchor="end" font-size="14" fill="#1f2328">CPU scaling efficiency</text>
-<path d="M450.0,275.0 H449.6 Q445.6,275.0 445.6,279.0 V287.0 Q445.6,291.0 449.6,291.0 H450.0 Z" fill="#eb6834"><title>CPU scaling efficiency: Ray 1.1x faster</title></path>
-<text x="438.6" y="288.0" text-anchor="end" font-size="13" font-weight="600" fill="#1f2328">1.1x</text>
-<text x="286" y="318.0" text-anchor="end" font-size="14" fill="#1f2328">10 calls on a 256 MiB value just made</text>
-<path d="M450.0,305.0 H426.9 Q422.9,305.0 422.9,309.0 V317.0 Q422.9,321.0 426.9,321.0 H450.0 Z" fill="#eb6834"><title>10 calls on a 256 MiB value just made: Ray 1.6x faster</title></path>
-<text x="415.9" y="318.0" text-anchor="end" font-size="13" font-weight="600" fill="#1f2328">1.6x</text>
-<text x="286" y="348.0" text-anchor="end" font-size="14" fill="#1f2328">Shuffle, 3.2M pairs</text>
-<path d="M450.0,335.0 H355.0 Q351.0,335.0 351.0,339.0 V347.0 Q351.0,351.0 355.0,351.0 H450.0 Z" fill="#eb6834"><title>Shuffle, 3.2M pairs: Ray 6.2x faster</title></path>
-<text x="344.0" y="348.0" text-anchor="end" font-size="13" font-weight="600" fill="#1f2328">6.2x</text>
-<text x="24" y="382" font-size="11.5" fill="#59636e">64 × c7i.4xlarge machines, the same type for both runtimes. Log scale. Medians of at least 45 s of repetitions; machine loss is one run.</text>
-<text x="24" y="398" font-size="11.5" fill="#59636e">Ray's actor, nested and machine-loss figures come from a separate run. Source: docs/qualification.md.</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 428" width="820" height="428" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Chimaera against Ray on 1, 4, 16 and 64 machines: faster at every size on a map over tiny items (96x to 228x), a 32 MiB array passed to every call (3.9x to 5.2x), independent tasks (1.8x to 2.5x), recovery from a machine killed mid-run (1.9x to 2.1x, on 4 to 64 machines) and calls on a value just made (1.1x to 1.6x).">
+<text x="321.3" y="16" text-anchor="end" font-size="13" fill="#59636e">◀ Ray faster</text>
+<text x="341.3" y="16" font-size="13" fill="#59636e">Chimaera faster ▶</text>
+<text x="286" y="44" text-anchor="end" font-size="12" fill="#59636e">Chimaera against Ray on</text>
+<rect x="300" y="34" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="317" y="44" font-size="12" fill="#1f2328">1 machine</text>
+<rect x="391.4" y="34" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="408.4" y="44" font-size="12" fill="#1f2328">4 machines</text>
+<rect x="489.4" y="34" width="12" height="12" rx="3" fill="#1baf7a"/>
+<text x="506.4" y="44" font-size="12" fill="#1f2328">16 machines</text>
+<rect x="594.0" y="34" width="12" height="12" rx="3" fill="#eda100"/>
+<text x="611.0" y="44" font-size="12" fill="#1f2328">64 machines</text>
+<line x1="331.3" x2="331.3" y1="78" y2="420" stroke="#818b98" stroke-width="1.5"/>
+<text x="331.3" y="74" text-anchor="middle" font-size="11" fill="#59636e">1x</text>
+<line x1="404.4" x2="404.4" y1="78" y2="420" stroke="#d1d9e0" stroke-width="1"/>
+<text x="404.4" y="74" text-anchor="middle" font-size="11" fill="#59636e">3x</text>
+<line x1="484.5" x2="484.5" y1="78" y2="420" stroke="#d1d9e0" stroke-width="1"/>
+<text x="484.5" y="74" text-anchor="middle" font-size="11" fill="#59636e">10x</text>
+<line x1="557.7" x2="557.7" y1="78" y2="420" stroke="#d1d9e0" stroke-width="1"/>
+<text x="557.7" y="74" text-anchor="middle" font-size="11" fill="#59636e">30x</text>
+<line x1="637.8" x2="637.8" y1="78" y2="420" stroke="#d1d9e0" stroke-width="1"/>
+<text x="637.8" y="74" text-anchor="middle" font-size="11" fill="#59636e">100x</text>
+<line x1="710.9" x2="710.9" y1="78" y2="420" stroke="#d1d9e0" stroke-width="1"/>
+<text x="710.9" y="74" text-anchor="middle" font-size="11" fill="#59636e">300x</text>
+<text x="286" y="120.0" text-anchor="end" font-size="14" fill="#1f2328">Map over tiny items, no hand batching</text>
+<path d="M331.3,88 H688.6 Q692.6,88 692.6,92 V96 Q692.6,100 688.6,100 H331.3 Z" fill="#2a78d6"><title>Map over tiny items, no hand batching, against Ray on 1 machine: Chimaera 228x faster</title></path>
+<text x="698.6" y="98" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">228x</text>
+<path d="M331.3,102 H630.7 Q634.7,102 634.7,106 V110 Q634.7,114 630.7,114 H331.3 Z" fill="#eb6834"><title>Map over tiny items, no hand batching, against Ray on 4 machines: Chimaera 96x faster</title></path>
+<text x="640.7" y="112" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">96x</text>
+<path d="M331.3,116 H649.1 Q653.1,116 653.1,120 V124 Q653.1,128 649.1,128 H331.3 Z" fill="#1baf7a"><title>Map over tiny items, no hand batching, against Ray on 16 machines: Chimaera 126x faster</title></path>
+<text x="659.1" y="126" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">126x</text>
+<path d="M331.3,130 H672.8 Q676.8,130 676.8,134 V138 Q676.8,142 672.8,142 H331.3 Z" fill="#eda100"><title>Map over tiny items, no hand batching, against Ray on 64 machines: Chimaera 180x faster</title></path>
+<text x="682.8" y="140" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">180x</text>
+<text x="286" y="190.0" text-anchor="end" font-size="14" fill="#1f2328">32 MiB array passed to every call</text>
+<path d="M331.3,158 H436.8 Q440.8,158 440.8,162 V166 Q440.8,170 436.8,170 H331.3 Z" fill="#2a78d6"><title>32 MiB array passed to every call, against Ray on 1 machine: Chimaera 5.2x faster</title></path>
+<text x="446.8" y="168" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">5.2x</text>
+<path d="M331.3,172 H418.3 Q422.3,172 422.3,176 V180 Q422.3,184 418.3,184 H331.3 Z" fill="#eb6834"><title>32 MiB array passed to every call, against Ray on 4 machines: Chimaera 3.9x faster</title></path>
+<text x="428.3" y="182" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">3.9x</text>
+<path d="M331.3,186 H419.5 Q423.5,186 423.5,190 V194 Q423.5,198 419.5,198 H331.3 Z" fill="#1baf7a"><title>32 MiB array passed to every call, against Ray on 16 machines: Chimaera 4x faster</title></path>
+<text x="429.5" y="196" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">4x</text>
+<path d="M331.3,200 H430.1 Q434.1,200 434.1,204 V208 Q434.1,212 430.1,212 H331.3 Z" fill="#eda100"><title>32 MiB array passed to every call, against Ray on 64 machines: Chimaera 4.7x faster</title></path>
+<text x="440.1" y="210" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">4.7x</text>
+<text x="286" y="260.0" text-anchor="end" font-size="14" fill="#1f2328">Independent tasks</text>
+<path d="M331.3,228 H367.4 Q371.4,228 371.4,232 V236 Q371.4,240 367.4,240 H331.3 Z" fill="#2a78d6"><title>Independent tasks, against Ray on 1 machine: Chimaera 1.8x faster</title></path>
+<text x="377.4" y="238" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">1.8x</text>
+<path d="M331.3,242 H374.4 Q378.4,242 378.4,246 V250 Q378.4,254 374.4,254 H331.3 Z" fill="#eb6834"><title>Independent tasks, against Ray on 4 machines: Chimaera 2x faster</title></path>
+<text x="384.4" y="252" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">2x</text>
+<path d="M331.3,256 H387.7 Q391.7,256 391.7,260 V264 Q391.7,268 387.7,268 H331.3 Z" fill="#1baf7a"><title>Independent tasks, against Ray on 16 machines: Chimaera 2.5x faster</title></path>
+<text x="397.7" y="266" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">2.5x</text>
+<path d="M331.3,270 H388.2 Q392.2,270 392.2,274 V278 Q392.2,282 388.2,282 H331.3 Z" fill="#eda100"><title>Independent tasks, against Ray on 64 machines: Chimaera 2.5x faster</title></path>
+<text x="398.2" y="280" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">2.5x</text>
+<text x="286" y="323.0" text-anchor="end" font-size="14" fill="#1f2328">Recovery from a machine killed mid-run</text>
+<path d="M331.3,298 H368.8 Q372.8,298 372.8,302 V306 Q372.8,310 368.8,310 H331.3 Z" fill="#eb6834"><title>Recovery from a machine killed mid-run, against Ray on 4 machines: Chimaera 1.9x faster</title></path>
+<text x="378.8" y="308" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">1.9x</text>
+<path d="M331.3,312 H375.0 Q379.0,312 379.0,316 V320 Q379.0,324 375.0,324 H331.3 Z" fill="#1baf7a"><title>Recovery from a machine killed mid-run, against Ray on 16 machines: Chimaera 2x faster</title></path>
+<text x="385.0" y="322" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">2x</text>
+<path d="M331.3,326 H371.0 Q375.0,326 375.0,330 V334 Q375.0,338 371.0,338 H331.3 Z" fill="#eda100"><title>Recovery from a machine killed mid-run, against Ray on 64 machines: Chimaera 1.9x faster</title></path>
+<text x="381.0" y="336" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">1.9x</text>
+<text x="286" y="386.0" text-anchor="end" font-size="14" fill="#1f2328">Calls on a 256 MiB value just made</text>
+<path d="M331.3,354 H358.1 Q362.1,354 362.1,358 V362 Q362.1,366 358.1,366 H331.3 Z" fill="#2a78d6"><title>Calls on a 256 MiB value just made, against Ray on 1 machine: Chimaera 1.6x faster</title></path>
+<text x="368.1" y="364" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">1.6x</text>
+<path d="M331.3,368 H343.3 Q347.3,368 347.3,372 V376 Q347.3,380 343.3,380 H331.3 Z" fill="#eb6834"><title>Calls on a 256 MiB value just made, against Ray on 4 machines: Chimaera 1.3x faster</title></path>
+<text x="353.3" y="378" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">1.3x</text>
+<path d="M331.3,382 H343.9 Q347.9,382 347.9,386 V390 Q347.9,394 343.9,394 H331.3 Z" fill="#1baf7a"><title>Calls on a 256 MiB value just made, against Ray on 16 machines: Chimaera 1.3x faster</title></path>
+<text x="353.9" y="392" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">1.3x</text>
+<path d="M331.3,396 H335.3 Q339.3,396 339.3,399.9844967618885 V404.0155032381115 Q339.3,408 335.3,408 H331.3 Z" fill="#eda100"><title>Calls on a 256 MiB value just made, against Ray on 64 machines: Chimaera 1.1x faster</title></path>
+<text x="345.3" y="406" text-anchor="start" font-size="11" font-weight="600" fill="#1f2328">1.1x</text>
 </svg>

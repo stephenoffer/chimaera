@@ -1,0 +1,67 @@
+{
+ "peers": 64,
+ "scale": 1.0,
+ "sleep_s": 20.0,
+ "results": [
+  {
+   "runtime": "chimaera",
+   "workload": "broadcast_1g",
+   "result": {
+    "seconds": 44.245,
+    "nodes": 64,
+    "bytes": 1073741824
+   },
+   "wall_s": 45.0
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "many_actors",
+   "result": {
+    "actors_per_s": 184.1,
+    "actors": 2048,
+    "seconds": 11.13
+   },
+   "wall_s": 11.5
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "many_tasks",
+   "result": {
+    "tasks_per_s": 203.2,
+    "tasks": 4096,
+    "seconds": 40.16
+   },
+   "wall_s": 40.3
+  },
+  {
+   "runtime": "ray",
+   "workload": "broadcast_1g",
+   "result": {
+    "seconds": 31.013,
+    "nodes": 64,
+    "bytes": 1073741824
+   },
+   "wall_s": 33.9
+  },
+  {
+   "runtime": "ray",
+   "workload": "many_actors",
+   "result": {
+    "actors_per_s": 144.7,
+    "actors": 2048,
+    "seconds": 14.16
+   },
+   "wall_s": 16.1
+  },
+  {
+   "runtime": "ray",
+   "workload": "many_tasks",
+   "result": {
+    "tasks_per_s": 207.2,
+    "tasks": 4096,
+    "seconds": 39.77
+   },
+   "wall_s": 41.0
+  }
+ ]
+}

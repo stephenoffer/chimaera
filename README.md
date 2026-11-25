@@ -10,7 +10,7 @@
 <p align="center">
   <strong>Your Python, on every core of every machine, with one decorator.</strong><br>
   No head node to babysit. No CPU or memory requests to guess.<br>
-  Faster than Ray on 7 of the 10 workloads we've benchmarked.
+  2.5x Ray's task throughput on 64 machines.
 </p>
 
 <p align="center">
@@ -18,7 +18,7 @@
   <a href="docs/README.md">Guides</a> ·
   <a href="docs/guides/from-ray.md">Coming from Ray</a> ·
   <a href="docs/api.md">API</a> ·
-  <a href="docs/qualification.md#ray-comparison-cluster-1-4-16-and-64-nodes-2026-11-22">Benchmarks</a>
+  <a href="docs/benchmarks.md">Benchmarks</a>
 </p>
 
 ---
@@ -41,49 +41,50 @@ for n in word_count.map(["a", "a b", "a b c"]):
     print(n)                                # 1, 2, 3
 ```
 
-That's the whole idea. `add` starts once both counts are done, and their
-results go worker to worker without a detour through your script. On a laptop
-the first call starts a local peer for you; on a cluster, the same file runs
-unchanged.
+That's the whole program. `add` waits for both counts, and their results go
+worker to worker, never through your script. On a laptop the first call
+starts a local peer for you. On a cluster, the same file runs unchanged.
 
 ## How it stacks up against Ray
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vs-ray-dark.svg">
-  <img src="docs/assets/vs-ray-light.svg" alt="Chimaera against Ray on 64 machines: Chimaera is faster on seven workloads, from 1.1x to 150x; Ray is faster on shuffles (6.2x), calls on a value just made (1.6x) and CPU scaling (1.1x)." width="820">
+  <img src="docs/assets/vs-ray-light.svg" alt="Chimaera against Ray on 1, 4, 16 and 64 machines: faster at every size on a map over tiny items (96x to 228x), a 32 MiB array passed to every call (3.9x to 5.2x), independent tasks (1.8x to 2.5x), recovery from a machine killed mid-run (1.9x to 2.1x) and calls on a value just made (1.1x to 1.6x)." width="820">
 </picture>
 
-Same 64 machines, same ten workloads. Chimaera wins seven. The 150x is a map
-over tiny items: Chimaera batches tiny calls by itself, and neither side was
-batched by hand. Ray still wins shuffles, calls on a value just made, and CPU
-scaling. Method and caveats: [qualification.md](docs/qualification.md#ray-comparison-cluster-1-4-16-and-64-nodes-2026-11-22).
+On 64 machines, Chimaera finishes 2.5x as many tasks a second as Ray: 11,235
+against 4,502. Kill one of those machines two seconds into 4,096 one-second
+calls, and all of them are done in 9.6 s. Ray needs 18.5 s.
+
+Pass the same 32 MiB array to each call and Chimaera is 4.7x faster, because
+it stores the array once. Map a function over tiny items and it gets through
+them 180x faster, with no batching by hand on either side: it sizes the
+batches itself.
+
+The chart's five workloads lead at every size we measured, from 1 machine to
+64.
+Every number, how it was measured and how to rerun it:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 <details>
-<summary>The numbers behind the chart</summary>
+<summary>The numbers behind the chart, on 64 machines</summary>
 
-64 × c7i.4xlarge machines (1,024 vCPU), the same machine type for both
-runtimes, median of at least 45 s of repetitions (the machine-loss row is a
-single run). Ray's actor, nested and machine-loss figures come from a separate
-run, because the first run hit its time limit before it reached Ray's passes.
+64 × c7i.4xlarge machines (1,024 vCPU), commit 933f9a2, Ray 2.59.0, on
+2026-11-24. Each cell is the median of at least 35 s of repetitions (the
+machine-loss row is a single run).
 
 | Workload | Ray | Chimaera |
 |---|---:|---:|
-| Independent no-op tasks | 5,188/s | 14,203/s |
-| Map over tiny items, no hand batching | 5,171/s | 774,908/s |
-| 32 MiB array passed straight to 2,048 calls | 3.51 s | 0.71 s |
-| 512 MiB value to 2,048 readers | 0.407 s | 0.375 s |
-| Actor calls | 9,482/s | 10,973/s |
-| Nested tasks (4 parents per CPU, 8 children each) | 1.29 s | 0.82 s |
+| Independent no-op tasks | 4,502/s | 11,235/s |
+| Map over tiny items, no hand batching | 4,394/s | 789,192/s |
+| 32 MiB array passed straight to 2,048 calls | 4.26 s | 0.91 s |
 | A machine killed under one-second tasks | 18.5 s | 9.6 s |
-| CPU scaling efficiency | 0.656 | 0.605 |
-| 10 calls on a 256 MiB value just made | 0.228 s | 0.376 s |
-| Shuffle, 3.2M pairs | 0.135 s | 0.842 s |
+| 10 calls on a 256 MiB value just made | 0.257 s | 0.228 s |
 
 </details>
 
 Coming from Ray? Most Ray Core programs port line by line, and a
-compatibility shim runs Ray Core programs unchanged
-([from-ray.md](docs/guides/from-ray.md)).
+compatibility shim runs them unchanged ([from-ray.md](docs/guides/from-ray.md)).
 
 ## How it works
 
@@ -94,23 +95,23 @@ compatibility shim runs Ray Core programs unchanged
 
 There's no head node to size, babysit or lose. Every machine runs the same
 `chimaera` peer, and the record of every call is replicated with Raft on three
-peers. Kill a machine mid-run and its calls run somewhere else.
+peers. Kill a machine mid-run and its calls finish somewhere else.
 
 ## What you get
 
 ### Calls sized for you
 
-Stop guessing CPU and memory requests. After three calls the peer reserves
-the memory peak it measured, so later calls wait for room instead of getting
-OOM-killed. `future.explain()` shows what it picked and why, and a `cpus=` or
-`memory=` you set always wins.
+Stop guessing CPU and memory requests. After three calls the peer knows a
+function's memory peak and reserves it, so later calls wait for room instead
+of getting OOM-killed. `future.explain()` shows what it picked and why. A
+`cpus=` or `memory=` you set always wins.
 
 ### Failures you can reason about
 
 A crashed worker's calls get retried; your own exceptions don't, unless you
 list them. Mark a function that charges a card `effects="external"` and it
-starts at most once: if its worker dies mid-call, you get `ch.OutcomeUnknown`
-instead of a second charge. Detached runs outlive your script, and any process
+starts at most once: if its worker dies mid-call, you get `ch.OutcomeUnknown`,
+not a second charge. Detached runs outlive your script, and any process
 can pick one back up with `ch.runs.attach(run_id)`.
 
 ### A record of everything
@@ -118,14 +119,14 @@ can pick one back up with `ch.runs.attach(run_id)`.
 <img src="docs/assets/terminal.svg" alt="A terminal session: running a script, then chimaera runs and chimaera explain showing a call's attempts and what it measured." width="820">
 
 Every call leaves a trail on its peer: each attempt, what it printed, what it
-measured and why it waited. Ask from Python with `future.explain()`, or from
+measured, why it waited. Ask from Python with `future.explain()`, or from
 a shell with `chimaera status`, `runs`, `logs` and `explain`.
 
 ### Runs where your machines are
 
 One binary covers a laptop, SSH hosts (`chimaera up`), Kubernetes
 (`chimaera k8s render`) and Slurm (`chimaera slurm-launch`). Then
-`chimaera run --cluster NAME -- python app.py` runs your script on it. See
+`chimaera run --cluster NAME -- python app.py` runs your script there. See
 [clusters](docs/guides/clusters.md) and [deploy.md](docs/deploy.md).
 
 ## Install
@@ -167,7 +168,7 @@ Chimaera is early software. This is what works today:
 | Durable actors (`ch.durable.State`) and durable workflows | Working |
 | Streaming generators (`ch.typing.Stream`) | Working |
 | Gangs and collectives (`ch.dist.group`, `.gang()`) | Working on CPU; NCCL checked on one node of 4 NVIDIA A10Gs |
-| Shuffles (`reduce_by_key`) | Working; Ray is faster today |
+| Shuffles (`reduce_by_key`) | Working |
 | Kubernetes, Slurm and SSH launchers | Working in container tests (kind, slurmd, sshd); real clouds unverified |
 
 ## Learn more

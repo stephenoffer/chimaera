@@ -58,7 +58,7 @@ def test_every_claim_of_the_readme_and_the_record_is_listed_with_what_backs_it(t
     status = readme.split("\n## Status\n", 1)[1].split("\n## ", 1)[0]
     rows = [ln for ln in status.splitlines() if ln.startswith("| ") and not ln.startswith("| Area |")]
     assert len(rows) >= 10 and set(rows) <= quoted
-    assert "Faster than Ray on 7 of the 10 workloads we've benchmarked." in quoted
+    assert "No CPU or memory requests to guess. 2.5x Ray's task throughput on 64 machines." in quoted
     assert "| A machine killed under one-second tasks | 18.5 s | 9.6 s |" in by_id["machine-loss-64-nodes"]["quotes"]
     # What you get: retries, at most once and OOM kills avoided are fault-tolerance claims too.
     assert "A crashed worker's calls get retried; your own exceptions don't, unless you list them." in quoted
@@ -92,12 +92,12 @@ def test_every_claim_of_the_readme_and_the_record_is_listed_with_what_backs_it(t
 def test_an_unlisted_claim_a_changed_figure_or_a_changed_artifact_is_refused(tmp_path):
     readme, qualification = docs()
     lane_dir = str(tmp_path / "no-lanes")
-    kill = "Kill a machine mid-run and its calls run somewhere else."
+    kill = "Kill a machine mid-run and its calls finish somewhere else."
     new = readme.replace(kill, kill + " It survives 5 machines lost at once.")
     with pytest.raises(SystemExit, match="a README claim no entry of claims.toml covers: 'It survives 5 machines"):
         qm.build(claims(), new, qualification, lane_dir=lane_dir)
-    changed = readme.replace("| 5,188/s | 14,203/s |", "| 5,188/s | 24,203/s |")
-    with pytest.raises(SystemExit, match=r"ray-64-nodes: quote no longer in README.md: '\| Independent no-op tasks"):
+    changed = readme.replace("| 4,502/s | 11,235/s |", "| 4,502/s | 21,235/s |")
+    with pytest.raises(SystemExit, match=r"ray-cluster-2026-11-24: quote no longer in README.md: '\| Independent no-op tasks"):
         qm.build(claims(), changed, qualification, lane_dir=lane_dir)
     extra = qualification + "\n## Ray comparison (cluster, 128 nodes)\n\n| Workload | Ray |\n|---|---|\n| tasks | 1 |\n"
     with pytest.raises(SystemExit, match=r"no entry covers: 'Ray comparison \(cluster, 128 nodes\)'"):

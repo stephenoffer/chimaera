@@ -1,0 +1,1230 @@
+{
+ "date": "2026-11-24",
+ "machine": {
+  "cpu": "Intel(R) Xeon(R) Platinum 8175M CPU @ 2.50GHz",
+  "hw.ncpu": "64",
+  "memory_gib": 246.5,
+  "os": "Linux-6.8.0-1069-aws-x86_64-with-glibc2.35 (x86_64)",
+  "python_ray": "3.11.16",
+  "python_chimaera": "3.11.16",
+  "ray": "2.59.0",
+  "chimaera_git_head": "",
+  "chimaera_tree_dirty_files": 0,
+  "chimaera_bin_sha256": "b2749793e8dc268c"
+ },
+ "args": {
+  "rounds": 2,
+  "sleep": 3.0,
+  "timeout": 3600.0,
+  "chimaera_bin": "<repo>/target/release/chimaera",
+  "chimaera_path": null,
+  "workdir": "<workdir>",
+  "only": null,
+  "min_free_gb": 3.0,
+  "append": false
+ },
+ "runs": [
+  {
+   "runtime": "ray",
+   "round": 0,
+   "load_before": "2.14 2.07 1.12",
+   "log": "<workdir>/ray-round0.log",
+   "returncode": 0,
+   "seconds": 730.5,
+   "load_after": "6.78 8.92 6.53",
+   "rows": [
+    {
+     "name": "single client get calls (Plasma Store)",
+     "value": 13336.709510369848,
+     "sd": 56.718869950824555,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client put calls (Plasma Store)",
+     "value": 4566.709869195084,
+     "sd": 46.49774965909386,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client put calls (Plasma Store)",
+     "value": 13794.571139100015,
+     "sd": 109.30749356096584,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client put gigabytes",
+     "value": 11.21054413623246,
+     "sd": 5.691755705640777,
+     "unit": "GB/s"
+    },
+    {
+     "name": "single client tasks and get batch",
+     "value": 4.960844388916397,
+     "sd": 2.12963370871815,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client put gigabytes",
+     "value": 31.622745533390656,
+     "sd": 4.291720499837141,
+     "unit": "GB/s"
+    },
+    {
+     "name": "single client get object containing 10k refs",
+     "value": 11.220057505261336,
+     "sd": 0.4590233381271881,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client wait 1k refs",
+     "value": 5.046327709462526,
+     "sd": 0.2884584510267895,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client tasks sync",
+     "value": 781.1473931045027,
+     "sd": 21.865827706933956,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client tasks async",
+     "value": 6344.220478197409,
+     "sd": 708.6834087692623,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client tasks async",
+     "value": 18613.74604697799,
+     "sd": 1845.203851541229,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls sync",
+     "value": 1842.9296831616396,
+     "sd": 102.15485649934107,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 8189.856647910546,
+     "sd": 247.7634034718002,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 5397.467545818501,
+     "sd": 130.5209601169534,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 6819.016325744757,
+     "sd": 518.2160504412384,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 23338.920294844836,
+     "sd": 635.6940791130197,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 13124.974764197465,
+     "sd": 128.23070365897564,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 1372.744809018066,
+     "sd": 71.72953014625867,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 4379.154271953378,
+     "sd": 210.58324201341023,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 3169.229906022634,
+     "sd": 33.148978392209855,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 6644.615344585127,
+     "sd": 90.80793442152705,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 20156.265672265516,
+     "sd": 653.3967873395025,
+     "unit": "ops/s"
+    },
+    {
+     "name": "placement group create/removal",
+     "value": 673.0017634892715,
+     "sd": 6.550823163447714,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: get calls",
+     "value": 1415.3557174624816,
+     "sd": 27.73931385583694,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: put calls",
+     "value": 970.5091288818248,
+     "sd": 23.144706129322014,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: put gigabytes",
+     "value": 0.0956383407122728,
+     "sd": 0.0002713840647625704,
+     "unit": "GB/s"
+    },
+    {
+     "name": "client: tasks and put batch",
+     "value": 13283.212153755163,
+     "sd": 157.33200049154368,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls sync",
+     "value": 594.289249528767,
+     "sd": 23.45773686167986,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls async",
+     "value": 1176.9177133873834,
+     "sd": 10.779427850546112,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls concurrent",
+     "value": 1162.5001253708283,
+     "sd": 16.250921146174846,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: tasks and get batch",
+     "value": 1.068449299789973,
+     "sd": 0.014513442962295687,
+     "unit": "ops/s"
+    }
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "round": 0,
+   "load_before": "6.78 8.92 6.53",
+   "log": "<workdir>/chimaera-round0.log",
+   "snapshot_bytes_pruned": 0,
+   "returncode": 0,
+   "seconds": 860.2,
+   "load_after": "5.30 5.96 6.14",
+   "rows": [
+    {
+     "name": "single client get calls (Plasma Store)",
+     "value": 3032504.18250782,
+     "sd": 27239.343936200767,
+     "unit": "ops/s",
+     "note": "ch.put(0) is inline in the handle; .result() returns the value cached on the future after the first read (no IPC per call)"
+    },
+    {
+     "name": "single client put calls (Plasma Store)",
+     "value": 99622.78636095984,
+     "sd": 579.4812546671773,
+     "unit": "ops/s",
+     "note": "ch.put(0) pickles and hashes in the driver; small values stay inline, no IPC"
+    },
+    {
+     "name": "multi client put calls (Plasma Store)",
+     "value": 260616.4839048084,
+     "sd": 7683.62918510698,
+     "unit": "ops/s",
+     "note": "same as single put: inline, no IPC, inside 10 tasks"
+    },
+    {
+     "name": "single client put gigabytes",
+     "value": 10510.904385273494,
+     "sd": 135.22122277021217,
+     "unit": "GB/s",
+     "note": "content-addressed: the same array is blake3-hashed every put but written once per run"
+    },
+    {
+     "name": "single client tasks and get batch",
+     "value": 7.768144967783331,
+     "sd": 0.21331679811222493,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client put gigabytes",
+     "value": 17.068878431389972,
+     "sd": 0.4144495819121196,
+     "unit": "GB/s",
+     "note": "identical zero arrays: hashed every put, written once per run"
+    },
+    {
+     "name": "single client get object containing 10k refs",
+     "value": 2749142.3583417265,
+     "sd": 2764.5056028687495,
+     "unit": "ops/s",
+     "note": ".result() decodes once and caches on the future; see the uncached row"
+    },
+    {
+     "name": "single client get object containing 10k refs (uncached handle)",
+     "value": 32.2589783251085,
+     "sd": 0.10015414242366276,
+     "unit": "ops/s",
+     "note": "supplemental: a fresh handle per get (private ch._future._future_from_key) so each get asks the peer and decodes 10k handles"
+    },
+    {
+     "name": "single client wait 1k refs",
+     "value": 7.570424778375833,
+     "sd": 0.2891144130066133,
+     "unit": "ops/s",
+     "note": "no ch.wait: 1000 next() calls on one ch.as_completed over the shrinking set"
+    },
+    {
+     "name": "single client tasks sync",
+     "value": 1480.0619571470866,
+     "sd": 9.603578486476131,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client tasks async",
+     "value": 7279.142584093517,
+     "sd": 117.6867218865941,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client tasks async",
+     "value": 3105.4577539420084,
+     "sd": 382.037697474738,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls sync",
+     "value": 3193.5892674399147,
+     "sd": 144.72770772483068,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 5666.468056081132,
+     "sd": 153.54811567528265,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 5290.176854468171,
+     "sd": 190.68548999157753,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 6032.676958748118,
+     "sd": 31.125314659214254,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 7506.515609276651,
+     "sd": 450.1362409787709,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 91341.41823851984,
+     "sd": 2436.428711462549,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 2230.707271462678,
+     "sd": 11.132304926835289,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 2370.9470052866895,
+     "sd": 18.305873157624895,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 2373.9760844588513,
+     "sd": 137.86431773324784,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 2705.3725267233303,
+     "sd": 22.77136591189063,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 6426.055289572641,
+     "sd": 406.7839847654129,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "placement group create/removal",
+     "unsupported": "Chimaera has no placement groups or reservations (placement= is P3, reservations P5)"
+    }
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "round": 1,
+   "load_before": "5.19 5.92 6.13",
+   "log": "<workdir>/chimaera-round1.log",
+   "snapshot_bytes_pruned": 0,
+   "returncode": 0,
+   "seconds": 854.5,
+   "load_after": "21.00 9.29 7.25",
+   "rows": [
+    {
+     "name": "single client get calls (Plasma Store)",
+     "value": 3068903.3338911245,
+     "sd": 12672.710265469424,
+     "unit": "ops/s",
+     "note": "ch.put(0) is inline in the handle; .result() returns the value cached on the future after the first read (no IPC per call)"
+    },
+    {
+     "name": "single client put calls (Plasma Store)",
+     "value": 96964.1721219203,
+     "sd": 488.53517169948094,
+     "unit": "ops/s",
+     "note": "ch.put(0) pickles and hashes in the driver; small values stay inline, no IPC"
+    },
+    {
+     "name": "multi client put calls (Plasma Store)",
+     "value": 261833.37884891016,
+     "sd": 12611.23510716922,
+     "unit": "ops/s",
+     "note": "same as single put: inline, no IPC, inside 10 tasks"
+    },
+    {
+     "name": "single client put gigabytes",
+     "value": 9888.768891446163,
+     "sd": 34.73393844583696,
+     "unit": "GB/s",
+     "note": "content-addressed: the same array is blake3-hashed every put but written once per run"
+    },
+    {
+     "name": "single client tasks and get batch",
+     "value": 7.966833319108415,
+     "sd": 0.21410859684581357,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client put gigabytes",
+     "value": 17.756408133245678,
+     "sd": 0.3389616605466459,
+     "unit": "GB/s",
+     "note": "identical zero arrays: hashed every put, written once per run"
+    },
+    {
+     "name": "single client get object containing 10k refs",
+     "value": 2761750.741336449,
+     "sd": 4392.9279543841485,
+     "unit": "ops/s",
+     "note": ".result() decodes once and caches on the future; see the uncached row"
+    },
+    {
+     "name": "single client get object containing 10k refs (uncached handle)",
+     "value": 31.718474662173367,
+     "sd": 0.11961821566130046,
+     "unit": "ops/s",
+     "note": "supplemental: a fresh handle per get (private ch._future._future_from_key) so each get asks the peer and decodes 10k handles"
+    },
+    {
+     "name": "single client wait 1k refs",
+     "value": 7.574650818311569,
+     "sd": 0.27563930888571936,
+     "unit": "ops/s",
+     "note": "no ch.wait: 1000 next() calls on one ch.as_completed over the shrinking set"
+    },
+    {
+     "name": "single client tasks sync",
+     "value": 1425.0772255783854,
+     "sd": 32.77163312021834,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client tasks async",
+     "value": 7372.025930970986,
+     "sd": 210.79821103197753,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client tasks async",
+     "value": 3224.504452041939,
+     "sd": 307.3134577033208,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls sync",
+     "value": 2903.8202076525113,
+     "sd": 73.19738805712595,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 5477.247574583988,
+     "sd": 89.54231740602249,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 4841.5057134765375,
+     "sd": 60.554853941476786,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 6254.046647219506,
+     "sd": 82.82445518412258,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 8011.296327693808,
+     "sd": 506.88551628773365,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 90958.88399472168,
+     "sd": 1258.3125533636507,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 2137.0036298057344,
+     "sd": 56.57002133605215,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 2539.159818232729,
+     "sd": 62.141250501945066,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 2457.902809839383,
+     "sd": 62.28099997696601,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 2723.3240865301027,
+     "sd": 31.029384043590913,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 6277.521833298622,
+     "sd": 196.86523006820852,
+     "unit": "ops/s",
+     "note": "concurrency=1000, Ray's async-actor default"
+    },
+    {
+     "name": "placement group create/removal",
+     "unsupported": "Chimaera has no placement groups or reservations (placement= is P3, reservations P5)"
+    }
+   ]
+  },
+  {
+   "runtime": "ray",
+   "round": 1,
+   "load_before": "19.56 9.19 7.23",
+   "log": "<workdir>/ray-round1.log",
+   "returncode": 0,
+   "seconds": 741.1,
+   "load_after": "5.06 9.00 9.09",
+   "rows": [
+    {
+     "name": "single client get calls (Plasma Store)",
+     "value": 13359.379213163418,
+     "sd": 50.310697059194105,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client put calls (Plasma Store)",
+     "value": 4612.023469214037,
+     "sd": 12.921892418140063,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client put calls (Plasma Store)",
+     "value": 13912.516026585017,
+     "sd": 184.38074340351957,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client put gigabytes",
+     "value": 14.654648588955025,
+     "sd": 6.563775098633317,
+     "unit": "GB/s"
+    },
+    {
+     "name": "single client tasks and get batch",
+     "value": 4.973178777809976,
+     "sd": 2.21105827478022,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client put gigabytes",
+     "value": 28.973583269889907,
+     "sd": 2.8492658456543567,
+     "unit": "GB/s"
+    },
+    {
+     "name": "single client get object containing 10k refs",
+     "value": 10.893937812861946,
+     "sd": 0.386822958577436,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client wait 1k refs",
+     "value": 5.132176329327159,
+     "sd": 0.32510517044414877,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client tasks sync",
+     "value": 762.9817550235487,
+     "sd": 25.590227499727504,
+     "unit": "ops/s"
+    },
+    {
+     "name": "single client tasks async",
+     "value": 6893.356517428521,
+     "sd": 408.43089418767437,
+     "unit": "ops/s"
+    },
+    {
+     "name": "multi client tasks async",
+     "value": 19974.85893934433,
+     "sd": 1083.7594243039441,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls sync",
+     "value": 1873.1993496093678,
+     "sd": 44.21209604573708,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls async",
+     "value": 8018.97502342323,
+     "sd": 216.1379946977652,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 actor calls concurrent",
+     "value": 5294.812943326704,
+     "sd": 121.03457557255109,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n actor calls async",
+     "value": 7132.045836352086,
+     "sd": 168.63651722962072,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls async",
+     "value": 22823.249607280835,
+     "sd": 733.4782852112293,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n actor calls with arg async",
+     "value": 12477.330257354217,
+     "sd": 171.69343307443305,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls sync",
+     "value": 1321.7171596105507,
+     "sd": 29.399294354288948,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls async",
+     "value": 4351.904283168198,
+     "sd": 225.69270355481126,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:1 async-actor calls with args async",
+     "value": 3070.0548059842486,
+     "sd": 49.72489242501371,
+     "unit": "ops/s"
+    },
+    {
+     "name": "1:n async-actor calls async",
+     "value": 5960.916484961135,
+     "sd": 420.6852832936525,
+     "unit": "ops/s"
+    },
+    {
+     "name": "n:n async-actor calls async",
+     "value": 20189.21950669533,
+     "sd": 594.9080782191085,
+     "unit": "ops/s"
+    },
+    {
+     "name": "placement group create/removal",
+     "value": 728.6205782524162,
+     "sd": 4.282846212854051,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: get calls",
+     "value": 1424.3738200826294,
+     "sd": 12.388157481291048,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: put calls",
+     "value": 1051.1249812086894,
+     "sd": 44.35494165711976,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: put gigabytes",
+     "value": 0.09687767345248768,
+     "sd": 0.000782993667985125,
+     "unit": "GB/s"
+    },
+    {
+     "name": "client: tasks and put batch",
+     "value": 13516.528569362894,
+     "sd": 102.5076751887575,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls sync",
+     "value": 614.7551121408167,
+     "sd": 2.9262036768363595,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls async",
+     "value": 1160.8504018989174,
+     "sd": 22.002402109321785,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: 1:1 actor calls concurrent",
+     "value": 1129.7864736223255,
+     "sd": 31.27753410485404,
+     "unit": "ops/s"
+    },
+    {
+     "name": "client: tasks and get batch",
+     "value": 1.0893201258890304,
+     "sd": 0.01552804373806894,
+     "unit": "ops/s"
+    }
+   ]
+  }
+ ],
+ "table": [
+  {
+   "name": "single client get calls (Plasma Store)",
+   "unit": "ops/s",
+   "ray": [
+    13336.709510369848,
+    13359.379213163418
+   ],
+   "chimaera": [
+    3032504.18250782,
+    3068903.3338911245
+   ],
+   "ray_median": 13348.044361766633,
+   "chimaera_median": 3050703.758199472,
+   "ratio": 228.55061576943297,
+   "note": "ch.put(0) is inline in the handle; .result() returns the value cached on the future after the first read (no IPC per call)"
+  },
+  {
+   "name": "single client put calls (Plasma Store)",
+   "unit": "ops/s",
+   "ray": [
+    4566.709869195084,
+    4612.023469214037
+   ],
+   "chimaera": [
+    99622.78636095984,
+    96964.1721219203
+   ],
+   "ray_median": 4589.366669204561,
+   "chimaera_median": 98293.47924144007,
+   "ratio": 21.41765658015652,
+   "note": "ch.put(0) pickles and hashes in the driver; small values stay inline, no IPC"
+  },
+  {
+   "name": "multi client put calls (Plasma Store)",
+   "unit": "ops/s",
+   "ray": [
+    13794.571139100015,
+    13912.516026585017
+   ],
+   "chimaera": [
+    260616.4839048084,
+    261833.37884891016
+   ],
+   "ray_median": 13853.543582842516,
+   "chimaera_median": 261224.93137685928,
+   "ratio": 18.856181439410484,
+   "note": "same as single put: inline, no IPC, inside 10 tasks"
+  },
+  {
+   "name": "single client put gigabytes",
+   "unit": "GB/s",
+   "ray": [
+    11.21054413623246,
+    14.654648588955025
+   ],
+   "chimaera": [
+    10510.904385273494,
+    9888.768891446163
+   ],
+   "ray_median": 12.932596362593742,
+   "chimaera_median": 10199.83663835983,
+   "ratio": 788.6921042291128,
+   "note": "content-addressed: the same array is blake3-hashed every put but written once per run"
+  },
+  {
+   "name": "single client tasks and get batch",
+   "unit": "ops/s",
+   "ray": [
+    4.960844388916397,
+    4.973178777809976
+   ],
+   "chimaera": [
+    7.768144967783331,
+    7.966833319108415
+   ],
+   "ray_median": 4.9670115833631865,
+   "chimaera_median": 7.867489143445873,
+   "ratio": 1.5839482174347497,
+   "note": ""
+  },
+  {
+   "name": "multi client put gigabytes",
+   "unit": "GB/s",
+   "ray": [
+    31.622745533390656,
+    28.973583269889907
+   ],
+   "chimaera": [
+    17.068878431389972,
+    17.756408133245678
+   ],
+   "ray_median": 30.298164401640282,
+   "chimaera_median": 17.412643282317823,
+   "ratio": 0.5747095121503512,
+   "note": "identical zero arrays: hashed every put, written once per run"
+  },
+  {
+   "name": "single client get object containing 10k refs",
+   "unit": "ops/s",
+   "ray": [
+    11.220057505261336,
+    10.893937812861946
+   ],
+   "chimaera": [
+    2749142.3583417265,
+    2761750.741336449
+   ],
+   "ray_median": 11.05699765906164,
+   "chimaera_median": 2755446.5498390878,
+   "ratio": 249203.86481052494,
+   "note": ".result() decodes once and caches on the future; see the uncached row"
+  },
+  {
+   "name": "single client get object containing 10k refs (uncached handle)",
+   "unit": "ops/s",
+   "ray": null,
+   "chimaera": [
+    32.2589783251085,
+    31.718474662173367
+   ],
+   "ray_median": null,
+   "chimaera_median": 31.988726493640932,
+   "note": "supplemental: a fresh handle per get (private ch._future._future_from_key) so each get asks the peer and decodes 10k handles"
+  },
+  {
+   "name": "single client wait 1k refs",
+   "unit": "ops/s",
+   "ray": [
+    5.046327709462526,
+    5.132176329327159
+   ],
+   "chimaera": [
+    7.570424778375833,
+    7.574650818311569
+   ],
+   "ray_median": 5.089252019394842,
+   "chimaera_median": 7.572537798343701,
+   "ratio": 1.4879471029308828,
+   "note": "no ch.wait: 1000 next() calls on one ch.as_completed over the shrinking set"
+  },
+  {
+   "name": "single client tasks sync",
+   "unit": "ops/s",
+   "ray": [
+    781.1473931045027,
+    762.9817550235487
+   ],
+   "chimaera": [
+    1480.0619571470866,
+    1425.0772255783854
+   ],
+   "ray_median": 772.0645740640257,
+   "chimaera_median": 1452.569591362736,
+   "ratio": 1.881409457393751,
+   "note": ""
+  },
+  {
+   "name": "single client tasks async",
+   "unit": "ops/s",
+   "ray": [
+    6344.220478197409,
+    6893.356517428521
+   ],
+   "chimaera": [
+    7279.142584093517,
+    7372.025930970986
+   ],
+   "ray_median": 6618.788497812965,
+   "chimaera_median": 7325.584257532251,
+   "ratio": 1.1067862736440108,
+   "note": ""
+  },
+  {
+   "name": "multi client tasks async",
+   "unit": "ops/s",
+   "ray": [
+    18613.74604697799,
+    19974.85893934433
+   ],
+   "chimaera": [
+    3105.4577539420084,
+    3224.504452041939
+   ],
+   "ray_median": 19294.302493161158,
+   "chimaera_median": 3164.981102991974,
+   "ratio": 0.16403708318109958,
+   "note": ""
+  },
+  {
+   "name": "1:1 actor calls sync",
+   "unit": "ops/s",
+   "ray": [
+    1842.9296831616396,
+    1873.1993496093678
+   ],
+   "chimaera": [
+    3193.5892674399147,
+    2903.8202076525113
+   ],
+   "ray_median": 1858.0645163855038,
+   "chimaera_median": 3048.704737546213,
+   "ratio": 1.6407959522723483,
+   "note": ""
+  },
+  {
+   "name": "1:1 actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    8189.856647910546,
+    8018.97502342323
+   ],
+   "chimaera": [
+    5666.468056081132,
+    5477.247574583988
+   ],
+   "ray_median": 8104.415835666888,
+   "chimaera_median": 5571.85781533256,
+   "ratio": 0.6875088752000185,
+   "note": ""
+  },
+  {
+   "name": "1:1 actor calls concurrent",
+   "unit": "ops/s",
+   "ray": [
+    5397.467545818501,
+    5294.812943326704
+   ],
+   "chimaera": [
+    5290.176854468171,
+    4841.5057134765375
+   ],
+   "ray_median": 5346.140244572603,
+   "chimaera_median": 5065.841283972354,
+   "ratio": 0.9475698452009732,
+   "note": ""
+  },
+  {
+   "name": "1:n actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    6819.016325744757,
+    7132.045836352086
+   ],
+   "chimaera": [
+    6032.676958748118,
+    6254.046647219506
+   ],
+   "ray_median": 6975.531081048421,
+   "chimaera_median": 6143.361802983812,
+   "ratio": 0.8807016600749582,
+   "note": ""
+  },
+  {
+   "name": "n:n actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    23338.920294844836,
+    22823.249607280835
+   ],
+   "chimaera": [
+    7506.515609276651,
+    8011.296327693808
+   ],
+   "ray_median": 23081.084951062836,
+   "chimaera_median": 7758.905968485229,
+   "ratio": 0.33615863313773503,
+   "note": ""
+  },
+  {
+   "name": "n:n actor calls with arg async",
+   "unit": "ops/s",
+   "ray": [
+    13124.974764197465,
+    12477.330257354217
+   ],
+   "chimaera": [
+    91341.41823851984,
+    90958.88399472168
+   ],
+   "ray_median": 12801.15251077584,
+   "chimaera_median": 91150.15111662075,
+   "ratio": 7.120464430049697,
+   "note": ""
+  },
+  {
+   "name": "1:1 async-actor calls sync",
+   "unit": "ops/s",
+   "ray": [
+    1372.744809018066,
+    1321.7171596105507
+   ],
+   "chimaera": [
+    2230.707271462678,
+    2137.0036298057344
+   ],
+   "ray_median": 1347.2309843143084,
+   "chimaera_median": 2183.855450634206,
+   "ratio": 1.6209955650223626,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "1:1 async-actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    4379.154271953378,
+    4351.904283168198
+   ],
+   "chimaera": [
+    2370.9470052866895,
+    2539.159818232729
+   ],
+   "ray_median": 4365.529277560789,
+   "chimaera_median": 2455.053411759709,
+   "ratio": 0.5623724537546692,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "1:1 async-actor calls with args async",
+   "unit": "ops/s",
+   "ray": [
+    3169.229906022634,
+    3070.0548059842486
+   ],
+   "chimaera": [
+    2373.9760844588513,
+    2457.902809839383
+   ],
+   "ray_median": 3119.6423560034414,
+   "chimaera_median": 2415.939447149117,
+   "ratio": 0.7744283387164178,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "1:n async-actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    6644.615344585127,
+    5960.916484961135
+   ],
+   "chimaera": [
+    2705.3725267233303,
+    2723.3240865301027
+   ],
+   "ray_median": 6302.765914773131,
+   "chimaera_median": 2714.3483066267163,
+   "ratio": 0.43065986319823835,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "n:n async-actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    20156.265672265516,
+    20189.21950669533
+   ],
+   "chimaera": [
+    6426.055289572641,
+    6277.521833298622
+   ],
+   "ray_median": 20172.742589480426,
+   "chimaera_median": 6351.788561435632,
+   "ratio": 0.31486985635497716,
+   "note": "concurrency=1000, Ray's async-actor default"
+  },
+  {
+   "name": "placement group create/removal",
+   "unit": "ops/s",
+   "ray": [
+    673.0017634892715,
+    728.6205782524162
+   ],
+   "chimaera": null,
+   "ray_median": 700.8111708708439,
+   "chimaera_median": null,
+   "note": "unsupported: Chimaera has no placement groups or reservations (placement= is P3, reservations P5)"
+  },
+  {
+   "name": "client: get calls",
+   "unit": "ops/s",
+   "ray": [
+    1415.3557174624816,
+    1424.3738200826294
+   ],
+   "chimaera": null,
+   "ray_median": 1419.8647687725556,
+   "chimaera_median": null,
+   "note": ""
+  },
+  {
+   "name": "client: put calls",
+   "unit": "ops/s",
+   "ray": [
+    970.5091288818248,
+    1051.1249812086894
+   ],
+   "chimaera": null,
+   "ray_median": 1010.8170550452571,
+   "chimaera_median": null,
+   "note": ""
+  },
+  {
+   "name": "client: put gigabytes",
+   "unit": "GB/s",
+   "ray": [
+    0.0956383407122728,
+    0.09687767345248768
+   ],
+   "chimaera": null,
+   "ray_median": 0.09625800708238025,
+   "chimaera_median": null,
+   "note": ""
+  },
+  {
+   "name": "client: tasks and put batch",
+   "unit": "ops/s",
+   "ray": [
+    13283.212153755163,
+    13516.528569362894
+   ],
+   "chimaera": null,
+   "ray_median": 13399.870361559028,
+   "chimaera_median": null,
+   "note": ""
+  },
+  {
+   "name": "client: 1:1 actor calls sync",
+   "unit": "ops/s",
+   "ray": [
+    594.289249528767,
+    614.7551121408167
+   ],
+   "chimaera": null,
+   "ray_median": 604.5221808347918,
+   "chimaera_median": null,
+   "note": ""
+  },
+  {
+   "name": "client: 1:1 actor calls async",
+   "unit": "ops/s",
+   "ray": [
+    1176.9177133873834,
+    1160.8504018989174
+   ],
+   "chimaera": null,
+   "ray_median": 1168.8840576431503,
+   "chimaera_median": null,
+   "note": ""
+  },
+  {
+   "name": "client: 1:1 actor calls concurrent",
+   "unit": "ops/s",
+   "ray": [
+    1162.5001253708283,
+    1129.7864736223255
+   ],
+   "chimaera": null,
+   "ray_median": 1146.143299496577,
+   "chimaera_median": null,
+   "note": ""
+  },
+  {
+   "name": "client: tasks and get batch",
+   "unit": "ops/s",
+   "ray": [
+    1.068449299789973,
+    1.0893201258890304
+   ],
+   "chimaera": null,
+   "ray_median": 1.0788847128395016,
+   "chimaera_median": null,
+   "note": ""
+  }
+ ]
+}

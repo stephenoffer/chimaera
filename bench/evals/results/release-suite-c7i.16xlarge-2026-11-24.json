@@ -1,0 +1,1017 @@
+{
+ "date": "2026-11-24",
+ "machine": {
+  "platform": "Linux-6.8.0-1069-aws-x86_64-with-glibc2.35",
+  "cpu": "Intel(R) Xeon(R) Platinum 8488C",
+  "cpus": 64,
+  "memory_gib": 123.8,
+  "python": "3.11.16"
+ },
+ "versions": {
+  "ray": "ray 2.59.0",
+  "chimaera": "chimaera ?"
+ },
+ "commit": "933f9a2",
+ "peer_sha256": "689f230c526375c9",
+ "profile": "release",
+ "runtimes": [
+  "chimaera",
+  "ray"
+ ],
+ "workloads": [
+  "startup",
+  "latency",
+  "many_args",
+  "many_returns",
+  "get_many",
+  "get_many_np",
+  "queued",
+  "large_object",
+  "many_actors"
+ ],
+ "trials": 2,
+ "seed": 1847512986,
+ "scale": 1.0,
+ "min_seconds": 10.0,
+ "load": {
+  "min": 1.6,
+  "max": 136.4,
+  "median": 2.2
+ },
+ "records": [
+  {
+   "samples": [
+    2.548
+   ],
+   "version": "ray 2.59.0",
+   "objects": 10000,
+   "runtime": "ray",
+   "workload": "get_many_np",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 NumPy arrays of 10,000 int64 put, then all read in one get (zero-copy where offered)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.4,
+   "load_before": 2.3,
+   "load_after": 2.2,
+   "trial": 0
+  },
+  {
+   "samples": [
+    1.181
+   ],
+   "version": "chimaera ?",
+   "objects": 10000,
+   "runtime": "chimaera",
+   "workload": "get_many_np",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 NumPy arrays of 10,000 int64 put, then all read in one get (zero-copy where offered)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 1.7,
+   "load_before": 2.2,
+   "load_after": 2.2,
+   "trial": 0
+  },
+  {
+   "samples": [
+    5.918
+   ],
+   "version": "chimaera ?",
+   "objects": 10000,
+   "runtime": "chimaera",
+   "workload": "get_many",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 lists of 10,000 ints put, then all read in one get",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 6.8,
+   "load_before": 2.2,
+   "load_after": 2.1,
+   "trial": 0
+  },
+  {
+   "samples": [
+    8.86
+   ],
+   "version": "ray 2.59.0",
+   "objects": 10000,
+   "runtime": "ray",
+   "workload": "get_many",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 lists of 10,000 ints put, then all read in one get",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 11.2,
+   "load_before": 2.1,
+   "load_after": 5.1,
+   "trial": 0
+  },
+  {
+   "samples": [
+    225.1
+   ],
+   "version": "chimaera ?",
+   "actors": 1000,
+   "runtime": "chimaera",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.8,
+   "load_before": 5.1,
+   "load_after": 6.4,
+   "trial": 0
+  },
+  {
+   "samples": [
+    36.2
+   ],
+   "version": "ray 2.59.0",
+   "actors": 1000,
+   "runtime": "ray",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 32.3,
+   "load_before": 6.4,
+   "load_after": 136.4,
+   "trial": 0
+  },
+  {
+   "samples": [
+    0.314
+   ],
+   "version": "chimaera ?",
+   "bytes": 17179869184,
+   "runtime": "chimaera",
+   "workload": "large_object",
+   "unit": "s",
+   "better": "lower",
+   "what": "a 16 GiB NumPy array put, then read by a call (Ray: a 100 GiB object)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.1,
+   "load_before": 136.4,
+   "load_after": 125.5,
+   "trial": 0
+  },
+  {
+   "samples": [
+    3.028
+   ],
+   "version": "ray 2.59.0",
+   "bytes": 17179869184,
+   "runtime": "ray",
+   "workload": "large_object",
+   "unit": "s",
+   "better": "lower",
+   "what": "a 16 GiB NumPy array put, then read by a call (Ray: a 100 GiB object)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 5.0,
+   "load_before": 125.5,
+   "load_after": 115.6,
+   "trial": 0
+  },
+  {
+   "samples": [
+    3.269
+   ],
+   "version": "ray 2.59.0",
+   "returns": 3000,
+   "runtime": "ray",
+   "workload": "many_returns",
+   "unit": "s",
+   "better": "lower",
+   "what": "one call returning 3,000 values, each a list of 10,000 ints, every one read",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 5.2,
+   "load_before": 115.6,
+   "load_after": 106.5,
+   "trial": 0
+  },
+  {
+   "samples": [
+    2.338
+   ],
+   "version": "chimaera ?",
+   "returns": 3000,
+   "runtime": "chimaera",
+   "workload": "many_returns",
+   "unit": "s",
+   "better": "lower",
+   "what": "one call returning 3,000 values, each a list of 10,000 ints, every one read",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 2.7,
+   "load_before": 106.5,
+   "load_after": 106.5,
+   "trial": 0
+  },
+  {
+   "samples": [
+    112.697
+   ],
+   "version": "ray 2.59.0",
+   "calls": 1000000,
+   "runtime": "ray",
+   "workload": "queued",
+   "unit": "s",
+   "better": "lower",
+   "what": "1,000,000 no-op calls made in one burst, every result read (Ray: 1M queued tasks)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 116.0,
+   "load_before": 106.5,
+   "load_after": 28.3,
+   "trial": 0
+  },
+  {
+   "error": "timed out after 900 s",
+   "runtime": "chimaera",
+   "workload": "queued",
+   "wall_s": 900.1,
+   "load_before": 28.3,
+   "load_after": 1.9,
+   "trial": 0
+  },
+  {
+   "samples": [
+    3736.7,
+    3715.3,
+    3683.9
+   ],
+   "version": "ray 2.59.0",
+   "p99_us": 4403.2,
+   "runtime": "ray",
+   "workload": "latency",
+   "unit": "us",
+   "better": "lower",
+   "what": "p50 round trip of one no-op call, made alone and read before the next",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 16.4,
+   "load_before": 1.9,
+   "load_after": 2.2,
+   "trial": 0
+  },
+  {
+   "error": "timed out after 900 s",
+   "runtime": "chimaera",
+   "workload": "latency",
+   "wall_s": 900.1,
+   "load_before": 2.2,
+   "load_after": 1.9,
+   "trial": 0
+  },
+  {
+   "samples": [
+    0.2427
+   ],
+   "version": "chimaera ?",
+   "runtime": "chimaera",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 0.3,
+   "load_before": 1.9,
+   "load_after": 1.9,
+   "trial": 0
+  },
+  {
+   "samples": [
+    0.2014
+   ],
+   "version": "chimaera ?",
+   "runtime": "chimaera",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 0.3,
+   "load_before": 1.9,
+   "load_after": 1.9,
+   "trial": 0
+  },
+  {
+   "samples": [
+    0.1991
+   ],
+   "version": "chimaera ?",
+   "runtime": "chimaera",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 0.3,
+   "load_before": 1.9,
+   "load_after": 1.9,
+   "trial": 0
+  },
+  {
+   "samples": [
+    4.3694
+   ],
+   "version": "ray 2.59.0",
+   "runtime": "ray",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 5.0,
+   "load_before": 1.9,
+   "load_after": 1.9,
+   "trial": 0
+  },
+  {
+   "samples": [
+    4.2361
+   ],
+   "version": "ray 2.59.0",
+   "runtime": "ray",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.9,
+   "load_before": 1.9,
+   "load_after": 2.0,
+   "trial": 0
+  },
+  {
+   "samples": [
+    4.2611
+   ],
+   "version": "ray 2.59.0",
+   "runtime": "ray",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.9,
+   "load_before": 2.0,
+   "load_after": 2.0,
+   "trial": 0
+  },
+  {
+   "error": "timed out after 900 s",
+   "runtime": "chimaera",
+   "workload": "many_args",
+   "wall_s": 900.1,
+   "load_before": 2.0,
+   "load_after": 1.6,
+   "trial": 0
+  },
+  {
+   "samples": [
+    6.087
+   ],
+   "version": "ray 2.59.0",
+   "args": 10000,
+   "runtime": "ray",
+   "workload": "many_args",
+   "unit": "s",
+   "better": "lower",
+   "what": "one call given 10,000 arguments, each a list of 10,000 ints (Ray: 10,000 object args)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 9.4,
+   "load_before": 1.6,
+   "load_after": 2.3,
+   "trial": 0
+  },
+  {
+   "samples": [
+    2.903
+   ],
+   "version": "ray 2.59.0",
+   "returns": 3000,
+   "runtime": "ray",
+   "workload": "many_returns",
+   "unit": "s",
+   "better": "lower",
+   "what": "one call returning 3,000 values, each a list of 10,000 ints, every one read",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 5.5,
+   "load_before": 2.3,
+   "load_after": 2.4,
+   "trial": 1
+  },
+  {
+   "samples": [
+    75.07
+   ],
+   "version": "chimaera ?",
+   "returns": 3000,
+   "runtime": "chimaera",
+   "workload": "many_returns",
+   "unit": "s",
+   "better": "lower",
+   "what": "one call returning 3,000 values, each a list of 10,000 ints, every one read",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 382.0,
+   "load_before": 2.4,
+   "load_after": 2.2,
+   "trial": 1
+  },
+  {
+   "samples": [
+    4.3369
+   ],
+   "version": "ray 2.59.0",
+   "runtime": "ray",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.8,
+   "load_before": 2.2,
+   "load_after": 2.2,
+   "trial": 1
+  },
+  {
+   "samples": [
+    4.3941
+   ],
+   "version": "ray 2.59.0",
+   "runtime": "ray",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 5.0,
+   "load_before": 2.2,
+   "load_after": 2.1,
+   "trial": 1
+  },
+  {
+   "samples": [
+    4.194
+   ],
+   "version": "ray 2.59.0",
+   "runtime": "ray",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.9,
+   "load_before": 2.1,
+   "load_after": 2.1,
+   "trial": 1
+  },
+  {
+   "samples": [
+    0.1969
+   ],
+   "version": "chimaera ?",
+   "runtime": "chimaera",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 0.3,
+   "load_before": 2.1,
+   "load_after": 2.1,
+   "trial": 1
+  },
+  {
+   "samples": [
+    0.1971
+   ],
+   "version": "chimaera ?",
+   "runtime": "chimaera",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 0.3,
+   "load_before": 2.1,
+   "load_after": 2.1,
+   "trial": 1
+  },
+  {
+   "samples": [
+    0.2091
+   ],
+   "version": "chimaera ?",
+   "runtime": "chimaera",
+   "workload": "startup",
+   "unit": "s",
+   "better": "lower",
+   "what": "a fresh process: start the runtime (a new cluster, not one already up) and read one call's result",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 0.3,
+   "load_before": 2.1,
+   "load_after": 2.1,
+   "trial": 1
+  },
+  {
+   "samples": [
+    1.189
+   ],
+   "version": "chimaera ?",
+   "objects": 10000,
+   "runtime": "chimaera",
+   "workload": "get_many_np",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 NumPy arrays of 10,000 int64 put, then all read in one get (zero-copy where offered)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 2.4,
+   "load_before": 2.1,
+   "load_after": 2.2,
+   "trial": 1
+  },
+  {
+   "samples": [
+    2.41
+   ],
+   "version": "ray 2.59.0",
+   "objects": 10000,
+   "runtime": "ray",
+   "workload": "get_many_np",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 NumPy arrays of 10,000 int64 put, then all read in one get (zero-copy where offered)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 5.0,
+   "load_before": 2.2,
+   "load_after": 2.4,
+   "trial": 1
+  },
+  {
+   "samples": [
+    5.914
+   ],
+   "version": "chimaera ?",
+   "objects": 10000,
+   "runtime": "chimaera",
+   "workload": "get_many",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 lists of 10,000 ints put, then all read in one get",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 6.9,
+   "load_before": 2.4,
+   "load_after": 2.2,
+   "trial": 1
+  },
+  {
+   "samples": [
+    8.29
+   ],
+   "version": "ray 2.59.0",
+   "objects": 10000,
+   "runtime": "ray",
+   "workload": "get_many",
+   "unit": "s",
+   "better": "lower",
+   "what": "10,000 lists of 10,000 ints put, then all read in one get",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 11.4,
+   "load_before": 2.2,
+   "load_after": 4.6,
+   "trial": 1
+  },
+  {
+   "samples": [
+    7.6
+   ],
+   "version": "chimaera ?",
+   "actors": 1000,
+   "runtime": "chimaera",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 132.2,
+   "load_before": 4.6,
+   "load_after": 3.1,
+   "trial": 1
+  },
+  {
+   "samples": [
+    37.2
+   ],
+   "version": "ray 2.59.0",
+   "actors": 1000,
+   "runtime": "ray",
+   "workload": "many_actors",
+   "unit": "actors/s",
+   "better": "higher",
+   "what": "1,000 actors created, each answering one call",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 31.9,
+   "load_before": 3.1,
+   "load_after": 102.8,
+   "trial": 1
+  },
+  {
+   "samples": [
+    1.437
+   ],
+   "version": "ray 2.59.0",
+   "bytes": 17179869184,
+   "runtime": "ray",
+   "workload": "large_object",
+   "unit": "s",
+   "better": "lower",
+   "what": "a 16 GiB NumPy array put, then read by a call (Ray: a 100 GiB object)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 4.1,
+   "load_before": 102.8,
+   "load_after": 100.2,
+   "trial": 1
+  },
+  {
+   "samples": [
+    0.313
+   ],
+   "version": "chimaera ?",
+   "bytes": 17179869184,
+   "runtime": "chimaera",
+   "workload": "large_object",
+   "unit": "s",
+   "better": "lower",
+   "what": "a 16 GiB NumPy array put, then read by a call (Ray: a 100 GiB object)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 9.8,
+   "load_before": 100.2,
+   "load_after": 86.4,
+   "trial": 1
+  },
+  {
+   "samples": [
+    111.749
+   ],
+   "version": "ray 2.59.0",
+   "calls": 1000000,
+   "runtime": "ray",
+   "workload": "queued",
+   "unit": "s",
+   "better": "lower",
+   "what": "1,000,000 no-op calls made in one burst, every result read (Ray: 1M queued tasks)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 116.6,
+   "load_before": 86.4,
+   "load_after": 26.2,
+   "trial": 1
+  },
+  {
+   "error": "timed out after 900 s",
+   "runtime": "chimaera",
+   "workload": "queued",
+   "wall_s": 900.1,
+   "load_before": 26.2,
+   "load_after": 2.0,
+   "trial": 1
+  },
+  {
+   "samples": [
+    3614.9,
+    3630.1,
+    3615.7
+   ],
+   "version": "ray 2.59.0",
+   "p99_us": 4390.9,
+   "runtime": "ray",
+   "workload": "latency",
+   "unit": "us",
+   "better": "lower",
+   "what": "p50 round trip of one no-op call, made alone and read before the next",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 16.0,
+   "load_before": 2.0,
+   "load_after": 2.2,
+   "trial": 1
+  },
+  {
+   "error": "timed out after 900 s",
+   "runtime": "chimaera",
+   "workload": "latency",
+   "wall_s": 900.1,
+   "load_before": 2.2,
+   "load_after": 2.3,
+   "trial": 1
+  },
+  {
+   "error": "timed out after 900 s",
+   "runtime": "chimaera",
+   "workload": "many_args",
+   "wall_s": 900.0,
+   "load_before": 2.3,
+   "load_after": 2.0,
+   "trial": 1
+  },
+  {
+   "samples": [
+    6.135
+   ],
+   "version": "ray 2.59.0",
+   "args": 10000,
+   "runtime": "ray",
+   "workload": "many_args",
+   "unit": "s",
+   "better": "lower",
+   "what": "one call given 10,000 arguments, each a list of 10,000 ints (Ray: 10,000 object args)",
+   "cpus": 64,
+   "scale": 1.0,
+   "wall_s": 9.5,
+   "load_before": 2.0,
+   "load_after": 3.3,
+   "trial": 1
+  }
+ ],
+ "summary": {
+  "get_many_np": {
+   "ray": {
+    "samples": [
+     2.548,
+     2.41
+    ],
+    "trials": [
+     2.548,
+     2.41
+    ],
+    "errors": [],
+    "median": 2.479
+   },
+   "chimaera": {
+    "samples": [
+     1.181,
+     1.189
+    ],
+    "trials": [
+     1.181,
+     1.189
+    ],
+    "errors": [],
+    "median": 1.185
+   }
+  },
+  "get_many": {
+   "chimaera": {
+    "samples": [
+     5.918,
+     5.914
+    ],
+    "trials": [
+     5.918,
+     5.914
+    ],
+    "errors": [],
+    "median": 5.916
+   },
+   "ray": {
+    "samples": [
+     8.86,
+     8.29
+    ],
+    "trials": [
+     8.86,
+     8.29
+    ],
+    "errors": [],
+    "median": 8.575
+   }
+  },
+  "many_actors": {
+   "chimaera": {
+    "samples": [
+     225.1,
+     7.6
+    ],
+    "trials": [
+     225.1,
+     7.6
+    ],
+    "errors": [],
+    "median": 116.35
+   },
+   "ray": {
+    "samples": [
+     36.2,
+     37.2
+    ],
+    "trials": [
+     36.2,
+     37.2
+    ],
+    "errors": [],
+    "median": 36.7
+   }
+  },
+  "large_object": {
+   "chimaera": {
+    "samples": [
+     0.314,
+     0.313
+    ],
+    "trials": [
+     0.314,
+     0.313
+    ],
+    "errors": [],
+    "median": 0.3135
+   },
+   "ray": {
+    "samples": [
+     3.028,
+     1.437
+    ],
+    "trials": [
+     3.028,
+     1.437
+    ],
+    "errors": [],
+    "median": 2.2325
+   }
+  },
+  "many_returns": {
+   "ray": {
+    "samples": [
+     3.269,
+     2.903
+    ],
+    "trials": [
+     3.269,
+     2.903
+    ],
+    "errors": [],
+    "median": 3.0860000000000003
+   },
+   "chimaera": {
+    "samples": [
+     2.338,
+     75.07
+    ],
+    "trials": [
+     2.338,
+     75.07
+    ],
+    "errors": [],
+    "median": 38.70399999999999
+   }
+  },
+  "queued": {
+   "ray": {
+    "samples": [
+     112.697,
+     111.749
+    ],
+    "trials": [
+     112.697,
+     111.749
+    ],
+    "errors": [],
+    "median": 112.223
+   },
+   "chimaera": {
+    "samples": [],
+    "trials": [],
+    "errors": [
+     "timed out after 900 s",
+     "timed out after 900 s"
+    ]
+   }
+  },
+  "latency": {
+   "ray": {
+    "samples": [
+     3736.7,
+     3715.3,
+     3683.9,
+     3614.9,
+     3630.1,
+     3615.7
+    ],
+    "trials": [
+     3715.3,
+     3615.7
+    ],
+    "errors": [],
+    "median": 3657.0
+   },
+   "chimaera": {
+    "samples": [],
+    "trials": [],
+    "errors": [
+     "timed out after 900 s",
+     "timed out after 900 s"
+    ]
+   }
+  },
+  "startup": {
+   "chimaera": {
+    "samples": [
+     0.2427,
+     0.2014,
+     0.1991,
+     0.1969,
+     0.1971,
+     0.2091
+    ],
+    "trials": [
+     0.2427,
+     0.2014,
+     0.1991,
+     0.1969,
+     0.1971,
+     0.2091
+    ],
+    "errors": [],
+    "median": 0.20024999999999998
+   },
+   "ray": {
+    "samples": [
+     4.3694,
+     4.2361,
+     4.2611,
+     4.3369,
+     4.3941,
+     4.194
+    ],
+    "trials": [
+     4.3694,
+     4.2361,
+     4.2611,
+     4.3369,
+     4.3941,
+     4.194
+    ],
+    "errors": [],
+    "median": 4.2989999999999995
+   }
+  },
+  "many_args": {
+   "chimaera": {
+    "samples": [],
+    "trials": [],
+    "errors": [
+     "timed out after 900 s",
+     "timed out after 900 s"
+    ]
+   },
+   "ray": {
+    "samples": [
+     6.087,
+     6.135
+    ],
+    "trials": [
+     6.087,
+     6.135
+    ],
+    "errors": [],
+    "median": 6.111
+   }
+  }
+ }
+}

@@ -19,29 +19,40 @@
 id = "ray-64-nodes"
 kind = "speed"
 tier = "cluster"
-quotes = [
-  "Faster than Ray on 7 of the 10 workloads we've benchmarked.",
-  "Chimaera against Ray on 64 machines: Chimaera is faster on seven workloads, from 1.1x to 150x; Ray is faster on shuffles (6.2x), calls on a value just made (1.6x) and CPU scaling (1.1x).",
-  "Same 64 machines, same ten workloads.",
-  "Chimaera wins seven.",
-  "The 150x is a map over tiny items: Chimaera batches tiny calls by itself, and neither side was batched by hand.",
-  "Ray still wins shuffles, calls on a value just made, and CPU scaling.",
-  "64 × c7i.4xlarge machines (1,024 vCPU), the same machine type for both runtimes, median of at least 45 s of repetitions (the machine-loss row is a single run).",
-  "Ray's actor, nested and machine-loss figures come from a separate run, because the first run hit its time limit before it reached Ray's passes.",
-  "| Independent no-op tasks | 5,188/s | 14,203/s |",
-  "| Map over tiny items, no hand batching | 5,171/s | 774,908/s |",
-  "| 32 MiB array passed straight to 2,048 calls | 3.51 s | 0.71 s |",
-  "| 512 MiB value to 2,048 readers | 0.407 s | 0.375 s |",
-  "| Actor calls | 9,482/s | 10,973/s |",
-  "| Nested tasks (4 parents per CPU, 8 children each) | 1.29 s | 0.82 s |",
-  "| CPU scaling efficiency | 0.656 | 0.605 |",
-  "| 10 calls on a 256 MiB value just made | 0.228 s | 0.376 s |",
-  "| Shuffle, 3.2M pairs | 0.135 s | 0.842 s |",
-]
+quotes = []  # the README now quotes the 2026-11-24 round (ray-cluster-2026-11-24)
 sections = ["Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22)"]
 replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait (eval-1node, eval-4node and eval-16node for the other sizes)"
 pending = "the round's raw results (multi_results.json) stayed in the cloud jobs' storage and were not kept"
 limit = { what = "machines in one cluster (c7i.4xlarge, 1,024 vCPU)", value = 64 }
+
+[[claim]]
+id = "ray-cluster-2026-11-24"
+kind = "speed"
+tier = "cluster"
+quotes = [
+  "No CPU or memory requests to guess. 2.5x Ray's task throughput on 64 machines.",
+  "Chimaera against Ray on 1, 4, 16 and 64 machines: faster at every size on a map over tiny items (96x to 228x), a 32 MiB array passed to every call (3.9x to 5.2x), independent tasks (1.8x to 2.5x), recovery from a machine killed mid-run (1.9x to 2.1x) and calls on a value just made (1.1x to 1.6x).",
+  "On 64 machines, Chimaera finishes 2.5x as many tasks a second as Ray: 11,235 against 4,502.",
+  "Kill one of those machines two seconds into 4,096 one-second calls, and all of them are done in 9.6 s.",
+  "Ray needs 18.5 s.",
+  "Pass the same 32 MiB array to each call and Chimaera is 4.7x faster, because it stores the array once.",
+  "Map a function over tiny items and it gets through them 180x faster, with no batching by hand on either side: it sizes the batches itself.",
+  "The chart's five workloads lead at every size we measured, from 1 machine to 64.",
+  "The numbers behind the chart, on 64 machines",
+  "64 × c7i.4xlarge machines (1,024 vCPU), commit 933f9a2, Ray 2.59.0, on 2026-11-24.",
+  "Each cell is the median of at least 35 s of repetitions (the machine-loss row is a single run).",
+  "| Independent no-op tasks | 4,502/s | 11,235/s |",
+  "| Map over tiny items, no hand batching | 4,394/s | 789,192/s |",
+  "| 32 MiB array passed straight to 2,048 calls | 4.26 s | 0.91 s |",
+  "| 10 calls on a 256 MiB value just made | 0.257 s | 0.228 s |",
+]
+artifacts = [
+  { path = "bench/evals/results/ray-cluster-1-2026-11-24.json", sha256 = "e06f637685148fd39e8becad0754f639f9f8ce1f1ccd75d6fcf112ce6e79bddf" },
+  { path = "bench/evals/results/ray-cluster-4-2026-11-24.json", sha256 = "ecfc7fef3a860de91c266f6cec193858eeb4b3313f0b83c04604364857972836" },
+  { path = "bench/evals/results/ray-cluster-16-2026-11-24.json", sha256 = "8c2f1fcaea3f0cfb82e5d850b373a665e11bd793ff8a1f3728c1a1507eccff92" },
+  { path = "bench/evals/results/ray-cluster-64-2026-11-24.json", sha256 = "0fe5d9f806b90928dfdc9da21c10ca761f6e02dbfb3056a9a4cfcca53d645ed9" },
+]
+replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait (eval-1node, eval-4node and eval-16node for the other sizes)"
 
 [[claim]]
 id = "machine-loss-64-nodes"
@@ -49,8 +60,10 @@ kind = "fault"
 tier = "cluster"
 quotes = ["| A machine killed under one-second tasks | 18.5 s | 9.6 s |"]
 sections = ["Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22)"]
+artifacts = [
+  { path = "bench/evals/results/ray-cluster-64-2026-11-24.json", sha256 = "0fe5d9f806b90928dfdc9da21c10ca761f6e02dbfb3056a9a4cfcca53d645ed9" },
+]
 replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait"
-pending = "the round's raw results (multi_results.json) stayed in the cloud jobs' storage and were not kept"
 
 [[claim]]
 id = "cluster-scale"
@@ -71,14 +84,14 @@ kind = "fault"
 tier = "local"
 quotes = [
   "No head node to babysit.",
-  "On a laptop the first call starts a local peer for you; on a cluster, the same file runs unchanged.",
+  "On a laptop the first call starts a local peer for you.",
   "Your script talks to any peer.",
   "Four machines each run the same chimaera peer with Python workers.",
   "Raft groups g1, g2 and g3 each live on three peers.",
   "There is no head node.",
   "There's no head node to size, babysit or lose.",
   "Every machine runs the same `chimaera` peer, and the record of every call is replicated with Raft on three peers.",
-  "Kill a machine mid-run and its calls run somewhere else.",
+  "Kill a machine mid-run and its calls finish somewhere else.",
 ]
 sections = ["M2 Multi-peer (in progress)"]
 lanes = ["quick"]
@@ -108,7 +121,7 @@ replay = ".venv/bin/python -m pytest python/tests/test_api.py python/tests/test_
 id = "ray-compat"
 kind = "function"
 tier = "local"
-quotes = ["Most Ray Core programs port line by line, and a compatibility shim runs Ray Core programs unchanged (from-ray.md)."]
+quotes = ["Most Ray Core programs port line by line, and a compatibility shim runs them unchanged (from-ray.md)."]
 lanes = ["quick"]
 replay = ".venv/bin/python -m pytest python/tests/test_compat_ray.py -q"
 
@@ -119,7 +132,7 @@ tier = "local"
 quotes = [
   "| Retries, `ch.OutcomeUnknown` for external effects, memory limits, canceling calls, deadlines | Working |",
   "A crashed worker's calls get retried; your own exceptions don't, unless you list them.",
-  "Mark a function that charges a card `effects=\"external\"` and it starts at most once: if its worker dies mid-call, you get `ch.OutcomeUnknown` instead of a second charge.",
+  "Mark a function that charges a card `effects=\"external\"` and it starts at most once: if its worker dies mid-call, you get `ch.OutcomeUnknown`, not a second charge.",
 ]
 lanes = ["quick"]
 replay = ".venv/bin/python -m pytest python/tests/test_recovery.py python/tests/test_retry_policy.py python/tests/test_failed_calls.py python/tests/test_cancel.py python/tests/test_cancel_timeouts.py python/tests/test_memory.py -q"
@@ -130,7 +143,7 @@ kind = "function"
 tier = "local"
 quotes = [
   "| Learned CPU and memory reservations, memory-aware admission, large values stored once | Working; across peers, placement weighs input locality and memory |",
-  "`future.explain()` shows what it picked and why, and a `cpus=` or `memory=` you set always wins.",
+  "A `cpus=` or `memory=` you set always wins.",
 ]
 sections = ["Smart defaults: learned reservations, memory, large values"]
 lanes = ["quick"]
@@ -140,7 +153,7 @@ replay = ".venv/bin/python -m pytest python/tests/test_learning.py python/tests/
 id = "memory-admission"
 kind = "fault"
 tier = "local"
-quotes = ["After three calls the peer reserves the memory peak it measured, so later calls wait for room instead of getting OOM-killed."]
+quotes = ["After three calls the peer knows a function's memory peak and reserves it, so later calls wait for room instead of getting OOM-killed."]
 lanes = ["quick"]
 replay = ".venv/bin/python -m pytest python/tests/test_learning.py python/tests/test_memory.py -q"
 
@@ -150,7 +163,7 @@ kind = "function"
 tier = "linux"
 quotes = [
   "| Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |",
-  "Every call leaves a trail on its peer: each attempt, what it printed, what it measured and why it waited.",
+  "Every call leaves a trail on its peer: each attempt, what it printed, what it measured, why it waited.",
 ]
 lanes = ["quick", "native"]
 replay = "make linux-pytest (python/tests/test_accounting.py reads the cgroup per attempt)"
@@ -203,7 +216,7 @@ limit = { what = "GPUs in one gang (NVIDIA A10G, one node)", value = 4 }
 id = "shuffle-speed"
 kind = "speed"
 tier = "cluster"
-quotes = ["| Shuffles (`reduce_by_key`) | Working; Ray is faster today |"]
+quotes = ["| Shuffles (`reduce_by_key`) | Working |"]
 sections = ["Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22, evening)"]
 replay = "anyscale job submit -f deploy/anyscale/eval-4node.job.yaml --wait (eval-1node, eval-16node and eval-64node for the other sizes)"
 pending = "the evening round's raw results stayed in the cloud jobs' storage and were not kept"

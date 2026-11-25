@@ -34,6 +34,7 @@ Each guide is about one job, with examples you can paste and run.
 - [Architecture](architecture.md): how Chimaera grows to many machines, and why
 - [Objects](objects.md): how values move, spill and survive a lost machine
 - [Federation](federation.md): cells that lend each other capacity
+- [Benchmarks](benchmarks.md): Chimaera against Ray on clusters of up to 64 machines, and on Ray's own tests
 - [Qualification](qualification.md): the measurements, how they compare with Ray, and what isn't tested yet
 - [Parity](parity.md) and [the other runtimes](landscape.md): Ray Core and the rest, item by item
 - [Lessons from Ray](ray-lessons.md), [Ray gotchas](ray-gotchas.md) and [requirements](requirements.md): what Chimaera does about the problems Ray users hit

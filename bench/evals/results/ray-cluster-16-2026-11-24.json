@@ -1,0 +1,430 @@
+{
+ "peers": 16,
+ "results": [
+  {
+   "runtime": "chimaera",
+   "workload": "tasks",
+   "result": {
+    "tasks_per_s": 14534,
+    "cpus": 256,
+    "metric": "tasks_per_s",
+    "reps": 5,
+    "p10": 14343,
+    "p90": 14800
+   },
+   "wall_s": 82.4,
+   "peer_cores": [
+    0.87,
+    0.71,
+    0.7,
+    0.68,
+    0.66,
+    0.65,
+    0.64,
+    0.62,
+    0.61,
+    0.56,
+    0.52,
+    0.45,
+    0.43,
+    0.41,
+    0.37,
+    0.37
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "cpu_scaling",
+   "result": {
+    "seconds": 2.856,
+    "efficiency": 0.692,
+    "cpus": 256,
+    "metric": "efficiency",
+    "reps": 20,
+    "p10": 0.617,
+    "p90": 0.712
+   },
+   "wall_s": 64.3,
+   "peer_cores": [
+    0.22,
+    0.19,
+    0.15,
+    0.13,
+    0.12,
+    0.12,
+    0.11,
+    0.11,
+    0.1,
+    0.1,
+    0.09,
+    0.09,
+    0.09,
+    0.08,
+    0.08,
+    0.06
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "map_small",
+   "result": {
+    "naive_items_per_s": 785502,
+    "metric": "naive_items_per_s",
+    "reps": 12,
+    "p10": 749260,
+    "p90": 795273
+   },
+   "wall_s": 66.8,
+   "peer_cores": [
+    1.77,
+    0.82,
+    0.75,
+    0.16,
+    0.16,
+    0.15,
+    0.14,
+    0.14,
+    0.14,
+    0.13,
+    0.13,
+    0.13,
+    0.12,
+    0.12,
+    0.12,
+    0.11
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "broadcast",
+   "result": {
+    "seconds": 0.111,
+    "nodes_reached": 1,
+    "readers": 512,
+    "metric": "seconds",
+    "reps": 213,
+    "p10": 0.097,
+    "p90": 0.205
+   },
+   "wall_s": 62.0,
+   "peer_cores": [
+    2.53,
+    1.5,
+    0.31,
+    0.11,
+    0.1,
+    0.1,
+    0.09,
+    0.08,
+    0.08,
+    0.08,
+    0.07,
+    0.07,
+    0.06,
+    0.06,
+    0.06,
+    0.05
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "naive_big_arg",
+   "result": {
+    "seconds": 0.224,
+    "nodes_reached": 2,
+    "calls": 512,
+    "metric": "seconds",
+    "reps": 269,
+    "p10": 0.123,
+    "p90": 0.27
+   },
+   "wall_s": 60.9,
+   "peer_cores": [
+    1.59,
+    0.8,
+    0.48,
+    0.28,
+    0.22,
+    0.22,
+    0.21,
+    0.21,
+    0.2,
+    0.19,
+    0.18,
+    0.17,
+    0.17,
+    0.16,
+    0.15,
+    0.11
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "follow_input",
+   "result": {
+    "seconds": 0.18,
+    "calls_on_one_host": 10,
+    "calls": 10,
+    "metric": "seconds",
+    "reps": 210,
+    "p10": 0.152,
+    "p90": 0.201
+   },
+   "wall_s": 60.5,
+   "peer_cores": [
+    2.08,
+    1.51,
+    0.08,
+    0.03,
+    0.03,
+    0.02,
+    0.02,
+    0.02,
+    0.02,
+    0.02,
+    0.02,
+    0.02,
+    0.02,
+    0.02,
+    0.02,
+    0.01
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "actors",
+   "result": {
+    "calls_per_s": 10917,
+    "actors": 128,
+    "hosts": 16,
+    "metric": "calls_per_s",
+    "reps": 3,
+    "p10": 10774,
+    "p90": 11314
+   },
+   "wall_s": 110.1,
+   "peer_cores": [
+    1.8,
+    0.99,
+    0.98,
+    0.06,
+    0.06,
+    0.06,
+    0.06,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.04,
+    0.04
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "nested",
+   "result": {
+    "seconds": 0.645,
+    "parents": 1024,
+    "metric": "seconds",
+    "reps": 79,
+    "p10": 0.576,
+    "p90": 0.889
+   },
+   "wall_s": 65.0,
+   "peer_cores": [
+    2.77,
+    1.59,
+    1.49,
+    0.82,
+    0.77,
+    0.73,
+    0.72,
+    0.72,
+    0.71,
+    0.71,
+    0.69,
+    0.63,
+    0.62,
+    0.61,
+    0.6,
+    0.53
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "shuffle",
+   "result": {
+    "seconds": 0.181,
+    "pairs": 3200000,
+    "metric": "seconds",
+    "reps": 279,
+    "p10": 0.169,
+    "p90": 0.22
+   },
+   "wall_s": 60.6,
+   "peer_cores": [
+    1.99,
+    0.97,
+    0.96,
+    0.54,
+    0.53,
+    0.51,
+    0.51,
+    0.5,
+    0.49,
+    0.49,
+    0.49,
+    0.48,
+    0.48,
+    0.47,
+    0.45,
+    0.45
+   ]
+  },
+  {
+   "runtime": "chimaera",
+   "workload": "node_loss",
+   "result": {
+    "seconds": 9.241,
+    "tasks": 1024,
+    "killed": "peer-0"
+   },
+   "wall_s": 10.4
+  },
+  {
+   "runtime": "ray",
+   "workload": "tasks",
+   "result": {
+    "tasks_per_s": 5865,
+    "cpus": 256,
+    "metric": "tasks_per_s",
+    "reps": 3,
+    "p10": 5783,
+    "p90": 5907
+   },
+   "wall_s": 138.3
+  },
+  {
+   "runtime": "ray",
+   "workload": "cpu_scaling",
+   "result": {
+    "seconds": 2.828,
+    "efficiency": 0.71,
+    "cpus": 256,
+    "metric": "efficiency",
+    "reps": 18,
+    "p10": 0.69,
+    "p90": 0.738
+   },
+   "wall_s": 66.4
+  },
+  {
+   "runtime": "ray",
+   "workload": "map_small",
+   "result": {
+    "naive_items_per_s": 6245,
+    "hand_batched_items_per_s": 6190464,
+    "metric": "naive_items_per_s",
+    "reps": 3,
+    "p10": 6241,
+    "p90": 6315
+   },
+   "wall_s": 131.0
+  },
+  {
+   "runtime": "ray",
+   "workload": "broadcast",
+   "result": {
+    "seconds": 0.082,
+    "nodes_reached": 1,
+    "readers": 512,
+    "metric": "seconds",
+    "reps": 75,
+    "p10": 0.074,
+    "p90": 0.125
+   },
+   "wall_s": 65.3
+  },
+  {
+   "runtime": "ray",
+   "workload": "naive_big_arg",
+   "result": {
+    "seconds": 0.895,
+    "nodes_reached": 1,
+    "calls": 512,
+    "metric": "seconds",
+    "reps": 67,
+    "p10": 0.876,
+    "p90": 0.919
+   },
+   "wall_s": 83.6
+  },
+  {
+   "runtime": "ray",
+   "workload": "follow_input",
+   "result": {
+    "seconds": 0.231,
+    "calls_on_one_host": 10,
+    "calls": 10,
+    "metric": "seconds",
+    "reps": 166,
+    "p10": 0.226,
+    "p90": 0.235
+   },
+   "wall_s": 64.2
+  },
+  {
+   "runtime": "ray",
+   "workload": "actors",
+   "result": {
+    "calls_per_s": 8553,
+    "actors": 128,
+    "hosts": 16,
+    "metric": "calls_per_s",
+    "reps": 3,
+    "p10": 8348,
+    "p90": 8655
+   },
+   "wall_s": 134.1
+  },
+  {
+   "runtime": "ray",
+   "workload": "nested",
+   "result": {
+    "seconds": 0.438,
+    "parents": 1024,
+    "metric": "seconds",
+    "reps": 128,
+    "p10": 0.34,
+    "p90": 0.608
+   },
+   "wall_s": 66.0
+  },
+  {
+   "runtime": "ray",
+   "workload": "shuffle",
+   "result": {
+    "seconds": 0.132,
+    "pairs": 3200000,
+    "metric": "seconds",
+    "reps": 327,
+    "p10": 0.122,
+    "p90": 0.235
+   },
+   "wall_s": 63.4
+  },
+  {
+   "runtime": "ray",
+   "workload": "node_loss",
+   "result": {
+    "seconds": 18.923,
+    "tasks": 1024,
+    "killed": "peer-0"
+   },
+   "wall_s": 20.2
+  }
+ ]
+}
