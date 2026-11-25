@@ -203,7 +203,11 @@ import chimaera as ch
 from chimaera._runtime import Runtime
 
 def peer_name():
-    return os.path.basename(os.path.dirname(Runtime.get().object_dir))
+    # The peer's home (p0, p1, ...): inside a call, the directory of the socket
+    # the peer gave its worker; in a driver, its CHIMAERA_HOME. Not the object
+    # store's directory: on Linux every peer may keep that in /dev/shm.
+    sock = os.environ.get("CHIMAERA_PEER_SOCKET")
+    return os.path.basename(os.path.dirname(sock) if sock else os.environ["CHIMAERA_HOME"].rstrip("/"))
 """
 
 
