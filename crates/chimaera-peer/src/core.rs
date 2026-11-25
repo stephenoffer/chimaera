@@ -2085,7 +2085,7 @@ impl Core {
             // Two random choices plus the peers holding the most input bytes
             // (core/shortlist.rs); below LOCALITY_MIN_BYTES, the largest
             // input's holders.
-            let seed = (tk.task.0[0] as usize) ^ (now_ns() as usize);
+            let seed = shortlist::seed(&tk.task.0, now_ns());
             let ranked = if cost.held.is_empty() {
                 cost.holders.clone()
             } else {

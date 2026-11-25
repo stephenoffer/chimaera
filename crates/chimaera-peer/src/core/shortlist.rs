@@ -36,6 +36,14 @@ pub(super) fn by_bytes(inputs: &[pb::ObjectRef], held: &[Vec<u64>], seed: u64) -
     bytes.into_iter().map(|(n, _)| n).collect()
 }
 
+/// The seed of a call's random choices: its id's hash bytes, different for
+/// each call (its first bytes, cell and vshard, are the same for a run's
+/// calls), mixed with the clock so a call placed again draws again. The
+/// clock is no seed alone: on macOS it moves in whole microseconds.
+pub(super) fn seed(task: &[u8; 16], now_ns: u64) -> usize {
+    (u64::from_le_bytes(task[8..16].try_into().expect("8 bytes")) ^ now_ns) as usize
+}
+
 /// Indexes into `others` to weigh: two random choices from `seed`, then up to
 /// HOLDER_PICKS of `ranked` (peers by input bytes held, see `by_bytes`).
 pub(super) fn shortlist(others: &[u64], seed: usize, ranked: &[u64]) -> Vec<usize> {
@@ -57,6 +65,20 @@ mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn the_random_choices_reach_every_peer_on_a_clock_of_whole_microseconds() {
+        // One vshard's calls, placed a microsecond apart: seeded from the
+        // id's first byte and the clock, the two choices among 15 peers fell
+        // on 6 of them only, and a 16-peer cluster ran on 7.
+        let others: Vec<u64> = (0..15).collect();
+        let mut weighed = HashSet::new();
+        for i in 0..300u64 {
+            let task = chimaera_core::ids::Id::derive(0, 7, &[&i.to_le_bytes()]);
+            weighed.extend(shortlist(&others, seed(&task.0, 1_764_000_000_000_000_000 + i * 1000), &[]));
+        }
+        assert_eq!(weighed.len(), others.len());
+    }
 
     fn obj(id: u8, size: u64) -> pb::ObjectRef {
         pb::ObjectRef { run: vec![1], object_id: vec![id; 16], size, ..Default::default() }
