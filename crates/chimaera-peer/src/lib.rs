@@ -19,6 +19,7 @@ pub mod keyed_queue;
 pub mod labels;
 pub mod launch;
 pub mod leases;
+pub mod loads;
 pub mod logdedup;
 pub mod logship;
 pub mod mailbox;

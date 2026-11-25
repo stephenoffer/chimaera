@@ -2082,6 +2082,7 @@ impl Core {
         // cost a 64-peer leader 63 copies per call.
         let others = mesh.live_other_ids(|m| m.cpus + 1e-9 >= cpus && allowed(m));
         if !others.is_empty() {
+            crate::loads::placing(&mesh); // weigh them from fresh loads (loads.rs)
             // Two random choices plus the peers holding the most input bytes
             // (core/shortlist.rs); below LOCALITY_MIN_BYTES, the largest
             // input's holders.
