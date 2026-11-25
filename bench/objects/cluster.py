@@ -94,7 +94,8 @@ def _host_class(ray):
         def exec(self, cmd: str) -> str:
             import subprocess
 
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600, check=False)
+            # A shell command the operator typed (`cluster.py exec -- CMD`), on purpose.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3600, check=False)  # noqa: S602
             return p.stdout + p.stderr
 
     return PeerHost
@@ -135,15 +136,24 @@ def up(dist: str, env: dict[str, str]) -> None:
 
 def down() -> None:
     ray = _ray()
+    hosts = []
     for n in nodes(ray):
         try:
-            h = ray.get_actor(f"peer-{n['NodeID']}")
+            hosts.append(ray.get_actor(f"peer-{n['NodeID']}"))
         except ValueError:
             continue
+    # Every peer stops at once: one at a time, a cluster of many nodes waited
+    # for each in turn (up to 90 s apiece).
+    stops = {h.stop.remote(): h for h in hosts}
+    done, pending = ray.wait(list(stops), num_returns=len(stops), timeout=90)
+    for ref in done:
         try:
-            ray.get(h.stop.remote(), timeout=90)
+            ray.get(ref)
         except Exception as e:  # noqa: BLE001
             print("stop:", e)
+    if pending:
+        print(f"stop: {len(pending)} peers did not stop within 90 s")
+    for h in hosts:
         ray.kill(h)
 
 
@@ -153,7 +163,10 @@ def main() -> None:
     ap.add_argument("--dist", default="/tmp/chimaera-devdist")
     ap.add_argument("--env", action="append", default=[])
     ap.add_argument("--ip")
-    ap.add_argument("rest", nargs=argparse.REMAINDER)
+    # Only what follows the command's own options (exec's after "--"): a
+    # REMAINDER here took --dist and --env given after `up` as well, so `up`
+    # silently started the default dist with no extra environment.
+    ap.add_argument("rest", nargs="*")
     a = ap.parse_args()
     if a.cmd == "up":
         up(a.dist, dict(kv.split("=", 1) for kv in a.env))
@@ -166,16 +179,19 @@ def main() -> None:
             cmd = " ".join(a.rest[1:] if a.rest[:1] == ["--"] else a.rest)
             print(ray.get(h.kill.remote() if a.cmd == "kill" else h.exec.remote(cmd)))
             return
+        asked = []
         for n in nodes(ray):
             try:
                 h = ray.get_actor(f"peer-{n['NodeID']}")
             except ValueError:
                 print(n["NodeManagerAddress"], "no peer")
                 continue
+            asked.append((n["NodeManagerAddress"], h.alive.remote() if a.cmd == "status" else h.log_tail.remote()))
+        for (ip, _), got in zip(asked, ray.get([ref for _, ref in asked])):  # every node asked at once
             if a.cmd == "status":
-                print(n["NodeManagerAddress"], "alive" if ray.get(h.alive.remote()) else "dead")
+                print(ip, "alive" if got else "dead")
             else:
-                print("=====", n["NodeManagerAddress"], "\n", ray.get(h.log_tail.remote()))
+                print("=====", ip, "\n", got)
 
 
 if __name__ == "__main__":
