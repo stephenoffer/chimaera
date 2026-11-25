@@ -1721,6 +1721,19 @@ impl Client {
             ad.set_item("detail", &a.detail)?;
             ad.set_item("placement", &a.placement_reason)?;
             ad.set_item("reservation", &a.reservation)?;
+            // Each stage's wall-clock time (ns since the epoch), None where the
+            // peer did not record it. Stamps from different hosts carry their skew.
+            for (k, v) in [
+                ("submitted_unix_ns", a.submitted_unix_ns),
+                ("ready_unix_ns", a.ready_unix_ns),
+                ("queued_unix_ns", a.queued_unix_ns),
+                ("dispatched_unix_ns", a.dispatched_unix_ns),
+                ("py_entry_unix_ns", a.py_entry_unix_ns),
+                ("py_exit_unix_ns", a.py_exit_unix_ns),
+                ("published_unix_ns", a.published_unix_ns),
+            ] {
+                ad.set_item(k, (v != 0).then_some(v))?;
+            }
             let settings = PyDict::new(py);
             for s in &a.settings {
                 let one = PyDict::new(py);

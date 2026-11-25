@@ -340,6 +340,11 @@ message AttemptRecord {
   string placement_reason = 16;
   // CPU and memory this attempt reserved, and where each came from.
   string reservation = 17;
+  // Its inputs were all on the peer and it joined the run queue. Between
+  // ready and this it fetched inputs; between this and dispatched it waited
+  // in the peer's queue (admission, an executor); between dispatched and
+  // py_entry it waited in the executor behind calls batched ahead of it.
+  uint64 queued_unix_ns = 19;
   // The same, setting by setting (settings.rs): cpus, memory and batch.
   repeated Setting settings = 18;
 }

@@ -239,9 +239,12 @@ pub enum CoreMsg {
         work: Box<Work>,
         accepted: bool,
     },
-    /// A publish proposal for this vshard was answered (or failed).
+    /// A publish proposal for this vshard was answered (or failed): the
+    /// attempts whose outcome the shard took, and when.
     Published {
         v: u16,
+        published: Vec<(Tk, u32)>,
+        at: u64,
     },
     /// Result of giving back an unstarted attempt (spillback). Refused or
     /// unknown: the work runs here after all.
@@ -442,6 +445,12 @@ pub struct Work {
     stays: bool,
     /// Lost inputs rebuilt for this attempt so far (see `MAX_REBUILDS`).
     rebuilds: u32,
+    /// When it reached this peer (unix ns), read once like every other
+    /// stamp: rebuilding it from `ready_at` mixes the monotonic clock with
+    /// the wall clock, and the two drift apart by microseconds.
+    ready_ns: u64,
+    /// When its inputs were all here and it joined the queue (unix ns; 0: not yet).
+    queued_ns: u64,
 }
 
 /// The call that made `object`, a lost input of `w`, as running it again
@@ -599,6 +608,8 @@ impl Work {
             read_bytes: 0,
             stays: false,
             rebuilds: 0,
+            ready_ns: now_ns(),
+            queued_ns: 0,
         }
     }
 
@@ -1280,12 +1291,26 @@ impl Core {
         use std::sync::atomic::Ordering::Relaxed;
         let (router, tx, in_flight) = (self.router.clone(), self.me_tx.clone(), self.in_flight.clone());
         in_flight.fetch_add(1, Relaxed);
+        let keys: Vec<(Option<Tk>, u32)> =
+            entries.iter().map(|e| (e.task.as_ref().and_then(Tk::parse), e.attempt)).collect();
         tokio::spawn(async move {
-            if let Err(e) = router.propose(v, pb::shard_cmd::Body::Publish(pb::PublishResults { entries })).await {
-                tracing::warn!("publish proposal failed: {e}");
-            }
+            let reply = router.propose(v, pb::shard_cmd::Body::Publish(pb::PublishResults { entries })).await;
+            let at = now_ns();
+            let published = match reply {
+                Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(t)) }) => keys
+                    .into_iter()
+                    .zip(t.acks)
+                    .filter(|(_, a)| a.status() == pb::task_ack::Status::Published)
+                    .filter_map(|((tk, attempt), _)| Some((tk?, attempt)))
+                    .collect(),
+                Ok(_) => Vec::new(),
+                Err(e) => {
+                    tracing::warn!("publish proposal failed: {e}");
+                    Vec::new()
+                }
+            };
             in_flight.fetch_sub(1, Relaxed);
-            let _ = tx.send(CoreMsg::Published { v }).await;
+            let _ = tx.send(CoreMsg::Published { v, published, at }).await;
         });
     }
 
@@ -1621,7 +1646,13 @@ impl Core {
                 // Denied or stale: another attempt owns the start, or the task
                 // finished; its outcome arrives through the shard.
             }
-            CoreMsg::Published { v } => {
+            CoreMsg::Published { v, published, at } => {
+                for (tk, attempt) in published {
+                    let records = self.attempts.get_mut(&tk).into_iter().flatten();
+                    if let Some(r) = records.filter(|r| r.attempt == attempt).last() {
+                        r.published_unix_ns = at;
+                    }
+                }
                 if let Some(n) = self.publishing.get_mut(&v) {
                     *n = n.saturating_sub(1);
                     if *n == 0 {
@@ -2361,7 +2392,10 @@ impl Core {
         });
     }
 
-    fn enqueue(&mut self, w: Work) {
+    fn enqueue(&mut self, mut w: Work) {
+        if w.queued_ns == 0 {
+            w.queued_ns = now_ns();
+        }
         if w.spec.parent.is_some() && matches!(w.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem) {
             // Possibly a local-first grant arriving (see ingress).
             self.router.local_arrived();
@@ -4633,7 +4667,8 @@ impl Core {
             executor: exec,
             fn_name: w.spec.method.clone(),
             submitted_unix_ns: 0,
-            ready_unix_ns: dispatched_ns.saturating_sub(w.ready_at.elapsed().as_nanos() as u64),
+            ready_unix_ns: w.ready_ns,
+            queued_unix_ns: w.queued_ns,
             dispatched_unix_ns: dispatched_ns,
             py_entry_unix_ns: done.entry_unix_ns,
             py_exit_unix_ns: done.exit_unix_ns,
