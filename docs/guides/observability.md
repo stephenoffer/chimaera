@@ -448,6 +448,7 @@ assert any(str(w.message).startswith("CH101") for w in caught)
 | CH119 | note on the error | A call that asked for no GPU hit a CUDA error on a machine that has GPUs | `@ch.remote(gpus=1)` or `fn.options(gpus=1)` |
 | CH120 | warning | The same code was wrapped as a new remote function 100 times (for example `ch.remote(lambda ...)` in a loop) | Define the remote function once, outside the loop |
 | CH124 | warning | A CUDA tensor of 64 MiB or more was passed straight to calls from one line; each call copies it to host memory | `ch.put(t)` once and pass the future: copied once, and readers on its machine read it from GPU memory |
+| CH126 | warning | Git ignores a whole directory of the project, so none of it ships to remote peers, and the script imported modules from it | Name what the workers need in `CHIMAERA_PROJECT_INCLUDE`, or stop ignoring it in `.gitignore` |
 
 Seen enough of one code? Silence it by filtering on the start of its
 message:

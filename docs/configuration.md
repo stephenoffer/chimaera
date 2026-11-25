@@ -50,6 +50,8 @@ or when you pass `--cluster` ([cli.md](cli.md#which-peer-a-command-asks)).
 |---|---|---|---|
 | `CHIMAERA_ENV_PASSTHROUGH` | driver | unset | More variables for the run to ship to its workers, on top of `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ` and `PYTHONHASHSEED`: comma-separated names or `fnmatch` patterns (`APP_*`). Names starting with `CHIMAERA_` never match. Don't list secrets: the run's variables are stored with the run |
 | `CHIMAERA_PROJECT_MAX_BYTES` | driver | `104857600` (100 MiB) | Largest project archive a remote run ships. Past it, `ch.init` fails and names the largest files |
+| `CHIMAERA_PROJECT_INCLUDE` | driver | unset | Files or directories a remote run ships even though git ignores them, separated by `:` (`;` on Windows), relative to the working directory. A directory git ignores as a whole otherwise ships nothing (warning CH126) |
+| `CHIMAERA_PROJECT_GITIGNORE` | driver | `1` | `0` ships every file of the project's directories, ignored by git or not |
 | `CHIMAERA_MAX_PENDING_BYTES` | driver | unset: half the peer's memory, at least 256 MiB | Bytes of unfinished calls' arguments the driver may hold before `.remote()` waits for room (warning CH110). It also waits at 1,000,000 unfinished calls |
 | `CHIMAERA_SPREAD_RATE` | driver | `2000` | Calls per second a driver must submit before its calls spread over several Raft groups. Below it they stay in the run's own group |
 | `CHIMAERA_STALL_NOTICE_S` | driver, worker | `60` | Seconds a wait on a call that has not started may last before the reason is printed to stderr, once |

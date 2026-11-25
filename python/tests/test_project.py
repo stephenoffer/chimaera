@@ -89,8 +89,14 @@ def test_a_git_projects_ignored_files_stay_home():
     _, data = _project.pack([root])
     names = sorted(tarfile.open(fileobj=io.BytesIO(data)).getnames())
     assert names == ["r0/.gitignore", "r0/pkg/__init__.py", "r0/pkg/new.py", "r0/pkg/tracked.py"]
-    # A folder git ignores as a whole is still the code being run when it is the project.
+    # A folder git ignores as a whole ships nothing, unless its files are named.
     _, data = _project.pack([os.path.join(root, "scratch")])
+    assert tarfile.open(fileobj=io.BytesIO(data)).getnames() == []
+    os.environ["CHIMAERA_PROJECT_INCLUDE"] = os.path.join(root, "scratch", "run.py")
+    try:
+        _, data = _project.pack([os.path.join(root, "scratch")])
+    finally:
+        del os.environ["CHIMAERA_PROJECT_INCLUDE"]
     assert tarfile.open(fileobj=io.BytesIO(data)).getnames() == ["r0/run.py"]
     # Asked for, ignored files ship too (an extension module built in place).
     os.environ["CHIMAERA_PROJECT_GITIGNORE"] = "0"

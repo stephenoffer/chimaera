@@ -305,7 +305,10 @@ uploads once until it changes. Each peer unpacks it once onto the workers'
 `sys.path`. The archive skips `.git`, `__pycache__`, virtualenvs,
 `node_modules`, `build`, `dist`, `target` and other caches. It can hold at
 most 100 MiB (`CHIMAERA_PROJECT_MAX_BYTES`). Past that, `ch.init` fails and
-names the largest files.
+names the largest files. In a git work tree only what git would track ships,
+and a directory git ignores as a whole ships nothing: name what the workers
+need from it in `CHIMAERA_PROJECT_INCLUDE`. Workers find a module in two of
+the directories in the same one your script does, the first on `sys.path`.
 
 Without a `uv.lock`, every peer needs your third-party packages
 already. With one, they go in once per peer, with `uv sync --frozen` and

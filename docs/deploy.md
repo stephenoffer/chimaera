@@ -648,11 +648,16 @@ profile) ships its project's own modules. These are the `sys.path`
 directories that aren't the interpreter's, a virtualenv's or Chimaera's, as
 one archive named by its content, at most `CHIMAERA_PROJECT_MAX_BYTES`
 (100 MiB). Inside a git work tree it holds only what git would track, so
-files your `.gitignore` excludes (data, checkpoints, `.env`) stay home; a
-directory git ignores as a whole still ships when it is the project itself,
-and `CHIMAERA_PROJECT_GITIGNORE=0` ships ignored files too (an extension
-module built in place, say). A directory holding a copy of Chimaera (a source
-checkout on the path) is never shipped: the peers use their own.
+files your `.gitignore` excludes (data, checkpoints, `.env`) stay home. A
+directory git ignores as a whole ships nothing, even when it holds the
+script; warning CH126 says so when the script imported modules from it.
+`CHIMAERA_PROJECT_INCLUDE` names files or directories to ship anyway (an
+extension module built in place, say), and `CHIMAERA_PROJECT_GITIGNORE=0`
+ships every ignored file. If git can't list a work tree's files (it isn't
+installed, or it refuses the directory), `ch.init` fails and says why rather
+than ship every file. `chimaera submit -- python app.py` always ships
+`app.py`. A directory holding a copy of Chimaera (a source checkout on the
+path) is never shipped: the peers use their own.
 Each peer unpacks it once and puts it on the workers' `sys.path`.
 When the project has a `uv.lock`, each peer also installs the locked packages
 once, with its own Python (`uv sync --frozen`), and the workers put them

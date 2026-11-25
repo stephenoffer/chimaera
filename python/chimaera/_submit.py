@@ -44,6 +44,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         print("usage: chimaera submit [--cluster NAME] -- python app.py [args...]", file=sys.stderr)
         return 2
+    # The script (app.py) is the program: it ships even where git ignores it
+    # (a scratch folder). Its other files ship as usual.
+    named = args[1:] if os.path.basename(args[0]).startswith("python") else args[:1]
+    script = next((a for a in named if not a.startswith("-") and os.path.isfile(a)), None)
+    if script is not None:
+        os.environ["CHIMAERA_PROJECT_INCLUDE"] = os.pathsep.join(
+            [script, os.environ.get("CHIMAERA_PROJECT_INCLUDE", "")]
+        ).strip(os.pathsep)
     run = ch.init(detach=True)
     _program.remote(args)
     # Return only once the cluster holds the call: a submission it never took dies with this process.

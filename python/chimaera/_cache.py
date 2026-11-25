@@ -276,7 +276,7 @@ def _env() -> bytes:
     main = os.path.realpath(main) if main else None
     sources = (".py", *importlib.machinery.EXTENSION_SUFFIXES)
     for i, root in enumerate(_project.roots(sys.path)):
-        for path, name, _size in _project._files(root):
+        for path, name, _size in _project._files(root, shipping=False):
             if not name.endswith(sources) or os.path.realpath(path) == main:
                 continue
             try:
