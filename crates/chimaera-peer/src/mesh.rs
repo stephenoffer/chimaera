@@ -1025,7 +1025,7 @@ impl MeshClient {
         // where that result came from (see parts).
         let hinted = if holders.is_empty() { self.parts.holder(run, object) } else { Vec::new() };
         let holders = if holders.is_empty() { &hinted[..] } else { holders };
-        let gate = self.inflight.lock().expect("lock").entry(dest.clone()).or_default().clone();
+        let gate = self.gate(&dest);
         let held = gate.lock().await;
         let result = if dest.exists() {
             Ok(())
@@ -1037,11 +1037,21 @@ impl MeshClient {
             })
         };
         drop(held);
-        let mut inflight = self.inflight.lock().expect("lock");
-        if Arc::strong_count(&gate) <= 2 {
-            inflight.remove(&dest); // nobody else is waiting on it
-        }
+        self.ungate(&dest, &gate);
         result
+    }
+
+    /// The lock one fetch of `dest` at a time holds: a reader's localize and
+    /// a replica sent here share one transfer instead of making two.
+    fn gate(&self, dest: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        self.inflight.lock().expect("lock").entry(dest.to_path_buf()).or_default().clone()
+    }
+
+    fn ungate(&self, dest: &Path, gate: &Arc<tokio::sync::Mutex<()>>) {
+        let mut inflight = self.inflight.lock().expect("lock");
+        if Arc::strong_count(gate) <= 2 {
+            inflight.remove(dest); // nobody else is waiting on it
+        }
     }
 
     async fn fetch_from(
@@ -1601,27 +1611,13 @@ impl pb::mesh_server::Mesh for MeshService {
         let (mesh, objects, wait) = (self.0.mesh.clone(), self.0.objects.clone(), r.wait);
         let copy = async move {
             let dest = objects.path(&r.run, &r.object_id);
-            if tokio::fs::symlink_metadata(&dest).await.is_ok() {
-                return Ok(());
-            }
-            let disk = objects.spill_path(&r.run, &r.object_id);
-            mesh.fetch(r.from_node, &r.run, &r.object_id, r.size, disk.as_deref().unwrap_or(&dest))
-                .await
-                .map_err(|e| format!("replica of {} from node {}: {e}", hex(&r.object_id), r.from_node))?;
-            if let Some(disk) = disk {
-                let link = dest.with_extension("part-replica");
-                let _ = tokio::fs::remove_file(&link).await;
-                let made = async {
-                    tokio::fs::create_dir_all(dest.parent().expect("object paths have a run directory")).await?;
-                    tokio::fs::symlink(&disk, &link).await?;
-                    tokio::fs::rename(&link, &dest).await
-                };
-                if let Err(e) = made.await {
-                    let _ = tokio::fs::remove_file(&disk).await;
-                    return Err(format!("replica of {}: cannot link it: {e}", hex(&r.object_id)));
-                }
-            }
-            Ok(())
+            // One transfer with a reader here fetching it at the same time.
+            let gate = mesh.gate(&dest);
+            let held = gate.lock().await;
+            let copied = replica_into(&mesh, &objects, &r, &dest).await;
+            drop(held);
+            mesh.ungate(&dest, &gate);
+            copied
         };
         if wait {
             copy.await.map_err(Status::unavailable)?;
@@ -1634,6 +1630,37 @@ impl pb::mesh_server::Mesh for MeshService {
         }
         Ok(Response::new(pb::ReplicateReply {}))
     }
+}
+
+/// Copy the object a Replicate request names into this peer's store at
+/// `dest` (or its spill directory, linked from `dest`), unless it is here.
+async fn replica_into(
+    mesh: &MeshClient,
+    objects: &crate::stores::ObjectStore,
+    r: &pb::ReplicateRequest,
+    dest: &Path,
+) -> Result<(), String> {
+    if tokio::fs::symlink_metadata(dest).await.is_ok() {
+        return Ok(());
+    }
+    let disk = objects.spill_path(&r.run, &r.object_id);
+    mesh.fetch(r.from_node, &r.run, &r.object_id, r.size, disk.as_deref().unwrap_or(dest))
+        .await
+        .map_err(|e| format!("replica of {} from node {}: {e}", hex(&r.object_id), r.from_node))?;
+    if let Some(disk) = disk {
+        let link = dest.with_extension("part-replica");
+        let _ = tokio::fs::remove_file(&link).await;
+        let made = async {
+            tokio::fs::create_dir_all(dest.parent().expect("object paths have a run directory")).await?;
+            tokio::fs::symlink(&disk, &link).await?;
+            tokio::fs::rename(&link, dest).await
+        };
+        if let Err(e) = made.await {
+            let _ = tokio::fs::remove_file(&disk).await;
+            return Err(format!("replica of {}: cannot link it: {e}", hex(&r.object_id)));
+        }
+    }
+    Ok(())
 }
 
 /// The first `n` of `ids` after `me` going round the ring of node ids.
@@ -1689,6 +1716,28 @@ mod tests {
         assert_eq!(check.call(with(&bearer)).unwrap_err().code(), tonic::Code::Unauthenticated);
         let admin = clients.call(with("Bearer secret")).unwrap();
         assert_eq!(admin.extensions().get::<crate::auth::Caller>(), Some(&crate::auth::Caller::Admin));
+    }
+
+    #[tokio::test]
+    async fn a_replica_and_a_reader_of_one_object_wait_on_one_gate() {
+        use std::path::Path;
+        use std::sync::Arc;
+        let me = chimaera_core::pb::Member { node_id: 1, ..Default::default() };
+        let m = super::MeshClient::new("c".into(), me, None, None).unwrap();
+        let (a, b) = (Path::new("/objects/r/a"), Path::new("/objects/r/b"));
+        let (replica, reader, other) = (m.gate(a), m.gate(a), m.gate(b));
+        assert!(Arc::ptr_eq(&replica, &reader), "a second fetch of one path waits on the first");
+        assert!(!Arc::ptr_eq(&replica, &other), "fetches of other objects do not wait");
+        let held = replica.lock().await;
+        assert!(reader.try_lock().is_err(), "the reader waits while the replica is copied");
+        assert!(other.try_lock().is_ok());
+        drop(held);
+        m.ungate(a, &replica);
+        drop(replica);
+        assert!(m.inflight.lock().unwrap().contains_key(a), "kept while the reader still holds it");
+        m.ungate(a, &reader);
+        m.ungate(b, &other);
+        assert!(m.inflight.lock().unwrap().is_empty(), "the last one out removes it");
     }
 
     #[tokio::test]
