@@ -4,10 +4,13 @@ submitted per invocation."""
 
 import asyncio
 import os
+import shutil
 import signal
 import socket
+import tempfile
 import threading
 import time
+import types
 
 import pytest
 
@@ -174,6 +177,31 @@ def test_a_connection_that_never_answers_the_key_holds_up_no_other(monkeypatch):
     assert len(silent) == 2
     for s in silent:
         s.close()
+
+
+def test_connections_past_the_handshake_cap_are_closed_at_once(monkeypatch):
+    # Each connection proving the key holds a thread for up to HANDSHAKE_S:
+    # past the cap, one is closed before it is challenged.
+    monkeypatch.setattr(_graph, "HANDSHAKES", 2)
+    home = tempfile.mkdtemp(prefix="chg", dir="/tmp")
+    welcome = {"peer_socket": os.path.join(home, "peer.sock")}
+    executor = types.SimpleNamespace(conn=types.SimpleNamespace(welcome=welcome))
+    server = _graph._Server(executor, os.urandom(16), os.urandom(32), tcp=False)
+    socks = []
+    try:
+        for _ in range(3):
+            s = socket.socket(socket.AF_UNIX)
+            s.connect(server.info["unix"])
+            s.settimeout(5)
+            socks.append(s)
+            time.sleep(0.2)  # accepted in turn
+        assert socks[0].recv(1) != b"", "a connection within the cap is challenged"
+        assert socks[2].recv(1) == b"", "one past the cap is closed, not challenged"
+    finally:
+        server.close()
+        for s in socks:
+            s.close()
+        shutil.rmtree(home, ignore_errors=True)
 
 
 def test_graph_values_inside_containers_or_given_to_functions_are_refused():

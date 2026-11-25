@@ -42,6 +42,7 @@ HELLO, RUN, VALUE, STOP = range(4)
 DRIVER = -1
 SETUP_S = 60.0  # how long an actor waits for the graph's other ends, and keeps a setup that never starts
 HANDSHAKE_S = 5.0  # how long a connection has to prove it holds the graph's key and say who it is
+HANDSHAKES = 64  # connections proving it at once; one past them is closed (each holds a thread up to HANDSHAKE_S)
 MAX_SOCKET_PATH = 100  # sun_path is 104 bytes on macOS
 # The host links are judged by. Tests set it per peer to stand for separate machines.
 HOST = os.environ.get("CHIMAERA_GRAPH_HOST") or socket.gethostname()
@@ -437,6 +438,7 @@ class _Server:
         self.cond = threading.Condition()
         self.done = self.started = False
         self.listeners: list[Listener] = []
+        self.handshakes = threading.BoundedSemaphore(HANDSHAKES)
         ctx = _context.current_task()
         name = f"g{gid.hex()[:12]}-{(ctx.actor if ctx else b'').hex()[:12]}.sock"
         path = os.path.join(os.path.dirname(executor.conn.welcome["peer_socket"]), "direct", name)
@@ -467,6 +469,9 @@ class _Server:
                 conn = listener.accept()
             except OSError:
                 continue
+            if not self.handshakes.acquire(blocking=False):
+                conn.close()  # a flood of connections: the graph's own ends retry no handshake, so they come first
+                continue
             threading.Thread(target=self.admit, args=(conn,), name="graph-admit", daemon=True).start()
 
     def admit(self, conn: Connection) -> None:
@@ -484,6 +489,7 @@ class _Server:
             return
         finally:
             late.cancel()
+            self.handshakes.release()
         if kind != HELLO:
             conn.close()
             return
