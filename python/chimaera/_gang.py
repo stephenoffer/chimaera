@@ -498,7 +498,7 @@ def _fits(opts: dict[str, Any]) -> int:
     """How many ranks of this shape the live peers can hold (CPUs, and GPUs if the ranks need them)."""
     from ._cluster import cluster
 
-    cpus, gpus = opts.get("cpus") or 1.0, _ledger.devices(float(opts.get("gpus") or 0.0))
+    cpus, gpus = opts.get("cpus") or 1.0, _ledger.whole_devices(float(opts.get("gpus") or 0.0))
     cpus = (cpus.initial or 1.0) if isinstance(cpus, Auto) else float(cpus)
     total = 0
     for n in cluster().nodes():

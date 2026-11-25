@@ -47,9 +47,10 @@ so a typo raises `ch.OptionsError` on that line.
 Fractions work: `cpus=0.25` lets four calls that mostly wait on the network
 share one core. Thread pools follow the grant too: `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`,
-`NUMEXPR_NUM_THREADS`, `RAYON_NUM_THREADS`, `POLARS_MAX_THREADS` and
-`NUMBA_NUM_THREADS` are set to the CPUs rounded up (1 for `cpus=0.25`) unless
-your run's environment sets them. On a Linux host with several NUMA nodes, a
+`NUMEXPR_NUM_THREADS`, `RAYON_NUM_THREADS`, `POLARS_MAX_THREADS`,
+`NUMBA_NUM_THREADS` and `LOKY_MAX_CPU_COUNT` (joblib's process pool) are set
+to the CPUs rounded up (1 for `cpus=0.25`) unless your run's environment sets
+them. On a Linux host with several NUMA nodes, a
 worker whose threads fit in one node runs on that node's CPUs and its memory
 goes there first (`CHIMAERA_NUMA_BIND` in
 [configuration.md](../configuration.md#resources-and-memory)).

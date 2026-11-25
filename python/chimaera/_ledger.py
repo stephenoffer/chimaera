@@ -34,7 +34,7 @@ def shape(opts: dict[str, Any], cpus: float = 1.0) -> Shape:
     return float(c), float(opts.get("gpus") or 0), opts.get("device") or ""
 
 
-def devices(gpus: float) -> int:
+def whole_devices(gpus: float) -> int:
     """The whole devices a slot asking for `gpus` takes, as its peer grants
     them (devices.rs ``Devices::want``): a fraction takes a whole device,
     since devices are not shared."""
@@ -66,7 +66,7 @@ def plan(
         if n.alive and not n.draining and all(n.labels.get(k) == v for k, v in require.items())
     }
     order = sorted(room, key=lambda p: (refused.get(p, 0), -room[p][0], p))
-    need = [sum(s[0] for s in shapes) + 1e-9, sum(devices(s[1]) for s in shapes) + 1e-9]
+    need = [sum(s[0] for s in shapes) + 1e-9, sum(whole_devices(s[1]) for s in shapes) + 1e-9]
     whole = [p for p in order if all((p, s) not in never for s in shapes)]
     one = next((p for p in whole if room[p][0] >= need[0] and room[p][1] >= need[1]), None)
     if strategy.endswith("pack") and one is not None:
@@ -75,7 +75,7 @@ def plan(
         return None, 0
     peers: list[str] = []
     for shape in shapes:
-        cpus, gpus = shape[0], devices(shape[1])
+        cpus, gpus = shape[0], whole_devices(shape[1])
         fits = [p for p in order if room[p][0] + 1e-9 >= cpus and room[p][1] + 1e-9 >= gpus and (p, shape) not in never]
         if strategy.endswith("spread"):
             fresh = [p for p in fits if p not in peers]
