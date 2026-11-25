@@ -218,7 +218,7 @@ print("PEERS", len(set(ran)))
 
 
 def test_a_released_put_value_is_deleted_on_the_peers_that_fetched_it(zoned):
-    p1_objects = os.path.join(zoned.dir(1), "objects")
+    p1_objects = zoned.objects(1)
     out = zoned.run(
         0,
         WHERE
@@ -279,7 +279,7 @@ def test_a_peer_on_the_same_machine_takes_an_object_from_the_holders_store():
 
 
 def _same_machine_read(zoned: Cluster) -> None:
-    p1_objects = os.path.join(zoned.dir(1), "objects")
+    p1_objects = zoned.objects(1)
     out = zoned.run(
         0,
         WHERE

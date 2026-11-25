@@ -90,7 +90,7 @@ wait_for(DONE)
 def stored(c: Cluster, i: int) -> dict[str, bytes]:
     """Object files on peer `i`: name -> first bytes."""
     out = {}
-    for path in glob.glob(os.path.join(c.dir(i), "objects", "*", "*")):
+    for path in glob.glob(os.path.join(c.objects(i), "*", "*")):
         name = os.path.basename(path)
         if len(name) == 32 and os.path.isfile(path):
             with open(path, "rb") as f:

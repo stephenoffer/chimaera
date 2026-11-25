@@ -101,6 +101,25 @@ class Cluster:
     def dir(self, i: int) -> str:
         return os.path.join(self.root, f"p{i}")
 
+    def objects(self, i: int) -> str:
+        """Peer `i`'s object store: `chimaera-<peer>` in memory (a tmpfs such
+        as /dev/shm on Linux, or under CHIMAERA_OBJECT_DIR) when it is there,
+        else `objects` in its home. Found by name, so a stopped peer's too."""
+        home = self.dir(i)
+        try:
+            with open(os.path.join(home, "peer-id")) as f:
+                name = "chimaera-" + f.read().strip()[:16]
+        except OSError:
+            return os.path.join(home, "objects")
+        roots = [os.environ.get("CHIMAERA_OBJECT_DIR", "")]
+        try:
+            with open("/proc/self/mounts") as f:
+                roots += [line.split()[1] for line in f if line.split()[2:3] == ["tmpfs"]]
+        except OSError:
+            pass  # not Linux: the store is in the home
+        found = [os.path.join(r, name) for r in roots if r and os.path.isdir(os.path.join(r, name))]
+        return found[0] if found else os.path.join(home, "objects")
+
     def sock(self, i: int) -> str:
         os.makedirs(self.dir(i), exist_ok=True)
         return socket_path(self.dir(i), "peer.sock")
@@ -1817,7 +1836,7 @@ def _lose_the_writer(c: Cluster, driver: int, killed: list[int], **kw) -> tuple[
     proc = c.driver(driver, LOSE_THE_WRITER.format(marks=marks, go=go, **kw))
     ready = proc.stdout.readline().split()
     assert ready[:1] == ["READY"], proc.stderr.read()[-3000:]
-    held = [i for i in range(len(c.addrs)) if glob.glob(os.path.join(c.dir(i), "objects", "*", ready[1]))]
+    held = [i for i in range(len(c.addrs)) if glob.glob(os.path.join(c.objects(i), "*", ready[1]))]
     for i in killed:
         c.signal(i, signal.SIGKILL)
     open(go, "w").close()
@@ -1926,7 +1945,7 @@ def test_an_actors_results_are_kept_as_their_durability_says():
         assert (direct, after) == ("1", "0"), "a default call went direct, the retained one did not"
 
         def held(oid: str) -> list[int]:
-            return [i for i in range(3) if glob.glob(os.path.join(c.dir(i), "objects", "*", oid))]
+            return [i for i in range(3) if glob.glob(os.path.join(c.objects(i), "*", oid))]
 
         assert len(held(retained)) == 2 and 0 in held(retained), f"a copy before success: {held(retained)}"
         out, err = proc.communicate(timeout=60)
@@ -1960,7 +1979,7 @@ def test_holding_another_runs_value_does_not_fetch_it():
             f'print("READ", len(h.result(timeout=60)), flush=True)\n',
         )
         assert b.stdout.readline().split() == ["HELD", "1"], b.stderr.read()[-3000:]
-        held = [i for i in range(2) if glob.glob(os.path.join(c.dir(i), "objects", "*", line[1]))]
+        held = [i for i in range(2) if glob.glob(os.path.join(c.objects(i), "*", line[1]))]
         assert held == [0], f"unpickling fetched nothing: {held}"
         open(go, "w").close()
         out, err = b.communicate(timeout=120)
