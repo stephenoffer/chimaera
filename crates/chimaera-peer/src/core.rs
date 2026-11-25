@@ -983,6 +983,10 @@ pub struct Core {
     /// Items still running per task, so a finished call heard of (most ran
     /// elsewhere, or already finished here) costs a lookup, not a scan.
     unfinished: HashMap<Tk, u32>,
+    /// Items per task in `running`, finished or not (a batch keeps its items
+    /// until its last one finishes): the checks made for every finished call
+    /// look into the batches only for a task with another item there.
+    batched: HashMap<Tk, u32>,
     execs: HashMap<u32, Exec>,
     running: Vec<Running>,
     /// Calls told to stop while running: (executor, call, when).
@@ -1181,6 +1185,7 @@ impl Core {
             cpu_used: 0.0,
             queue: crate::keyed_queue::KeyedQueue::new(|w: &Work| w.tk),
             unfinished: HashMap::new(),
+            batched: HashMap::new(),
             execs: HashMap::new(),
             running: Vec::new(),
             cancelling: Vec::new(),
@@ -2263,8 +2268,9 @@ impl Core {
         let Some(tk) = rw.task.as_ref().and_then(Tk::parse) else { return };
         let attempt = rw.attempt;
         let known = self.localizing.contains(&(tk, attempt))
-            || self.queue.iter().any(|w| w.tk == tk && w.attempt == attempt)
-            || self.running.iter().any(|r| r.items.iter().any(|w| w.tk == tk && w.attempt == attempt))
+            || self.queue.any_for(&tk, |w| w.tk == tk && w.attempt == attempt)
+            || (self.batched.contains_key(&tk)
+                && self.running.iter().any(|r| r.items.iter().any(|w| w.tk == tk && w.attempt == attempt)))
             || self
                 .actors
                 .values()
@@ -2488,7 +2494,7 @@ impl Core {
     /// if it is not queued here (it started, finished, or was never here).
     pub(crate) fn requeue(&mut self, tk: Tk, attempt: u32) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        let Some(i) = self.queue.iter().position(|w| w.tk == tk && w.attempt == attempt) else { return false };
+        let Some(i) = self.queue.position_for(&tk, |w| w.tk == tk && w.attempt == attempt) else { return false };
         if !self.queue[i].publish || self.queue[i].start_consumed {
             // A replayed constructor, or an external effect whose start is
             // committed, must stay where it is.
@@ -2640,10 +2646,26 @@ impl Core {
     /// too), when no other attempt of the task could publish a different one.
     fn notify_early(&self, tk: Tk, attempt: u32) -> bool {
         let other = |w: &Work| w.tk == tk && w.attempt != attempt;
+        // This attempt's own item is still in its batch: look through the
+        // batches only when the task has another item there.
+        let other_running =
+            || self.batched.get(&tk).is_some_and(|&n| n > 1) && self.running.iter().any(|r| r.items.iter().any(other));
         !self.router.is_cluster()
             && self.runs.get(&tk.run).is_some_and(|r| !r.detached)
-            && !self.queue.iter().any(other)
-            && !self.running.iter().any(|r| r.items.iter().any(other))
+            && !self.queue.any_for(&tk, other)
+            && !other_running()
+    }
+
+    /// Count `items` out of `batched`: their batch left `running`.
+    fn unbatch(&mut self, items: &[Work]) {
+        for w in items {
+            if let Some(n) = self.batched.get_mut(&w.tk) {
+                *n -= 1;
+                if *n == 0 {
+                    self.batched.remove(&w.tk);
+                }
+            }
+        }
     }
 
     /// A replica here installed a snapshot: outcomes it skipped over raised no
@@ -3761,9 +3783,10 @@ impl Core {
     /// 100 ms to seconds to start, so one at a time serializes a cold burst).
     fn ensure_executor(&mut self, env: &ExecEnv, threads: u32, key: &str, cpus: f64) {
         let starting = self.execs.values().filter(|e| e.state == ExecState::Starting && e.env_key == key).count();
-        let queued = self.queue.iter().filter(|w| w.cpus.ceil().max(1.0) as u32 == threads).count();
         // Held slots count as free: the ranks and bundles queued for them need executors too.
         let free = ((self.capacity - self.cpu_used + self.ledger.cpus()) / cpus.max(0.01)).floor().max(1.0) as usize;
+        // Only up to `free` matter below: not a count of the whole queue each time.
+        let queued = self.queue.iter().filter(|w| w.cpus.ceil().max(1.0) as u32 == threads).take(free).count();
         if starting >= queued.min(free).max(1) {
             return;
         }
@@ -3958,6 +3981,7 @@ impl Core {
         let mem = items.iter().map(|w| self.need(w)).max().unwrap_or(0);
         for w in &items {
             *self.unfinished.entry(w.tk).or_default() += 1;
+            *self.batched.entry(w.tk).or_default() += 1;
         }
         self.running.push(Running {
             exec,
@@ -4265,15 +4289,18 @@ impl Core {
     fn on_exec_done(&mut self, exec: u32, done: pb::ExecDone) {
         let Some(tk) = done.task.as_ref().and_then(Tk::parse) else { return };
         let pid = self.execs.get(&exec).map_or(0, |e| e.pid);
-        let Some(idx) = self
-            .running
-            .iter()
-            .position(|r| r.exec == exec && r.items.iter().any(|w| w.tk == tk && w.attempt == done.attempt))
+        let attempt = done.attempt;
+        let this = move |w: &Work| w.tk == tk && w.attempt == attempt;
+        let at = |r: &Running| {
+            let next = r.items.len().saturating_sub(r.remaining);
+            r.items.get(next).filter(|w| this(w)).map(|_| next).or_else(|| r.items.iter().position(this))
+        };
+        let Some((idx, i)) =
+            self.running.iter().enumerate().filter(|(_, r)| r.exec == exec).find_map(|(idx, r)| Some((idx, at(r)?)))
         else {
             return;
         };
         let run = &mut self.running[idx];
-        let i = run.items.iter().position(|w| w.tk == tk && w.attempt == done.attempt).expect("found above");
         let work = run.items[i].clone();
         let first_report = !std::mem::replace(&mut run.finished[i], true);
         run.remaining = run.remaining.saturating_sub(1);
@@ -4349,6 +4376,7 @@ impl Core {
         let mut unlearned = Vec::new();
         if finished {
             let mut r = self.running.remove(idx);
+            self.unbatch(&r.items);
             unlearned = std::mem::take(&mut r.unlearned);
             if !r.blocked {
                 self.cpu_used -= r.cpus;
@@ -4391,9 +4419,11 @@ impl Core {
         }
         let peak_bytes = peak.map_or(0, |p| p.0);
         if cores.is_none() && !finished && batch_len > 1 {
-            let mine =
-                |r: &&mut Running| r.exec == exec && r.items.iter().any(|w| w.tk == tk && w.attempt == done.attempt);
-            if let Some(r) = self.running.iter_mut().find(mine) {
+            // The batch found above, unless it moved; then a search.
+            let here = self.running.get(idx).is_some_and(|r| r.exec == exec && r.items.get(i).is_some_and(this));
+            let mine = |r: &&mut Running| r.exec == exec && r.items.iter().any(this);
+            let r = if here { self.running.get_mut(idx) } else { self.running.iter_mut().find(mine) };
+            if let Some(r) = r {
                 r.unlearned.push((work.clone(), done.clone(), peak_bytes));
             }
         } else {
@@ -4879,6 +4909,9 @@ impl Core {
             self.running = keep;
             lost
         };
+        for r in &lost {
+            self.unbatch(&r.items);
+        }
         if !lost.is_empty() || info.as_ref().is_some_and(|e| e.actor.is_some()) {
             crate::counters::WORKER_DEATHS.add(1);
         }

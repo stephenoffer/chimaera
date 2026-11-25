@@ -25,6 +25,19 @@ impl<T, K: Copy + Eq + Hash> KeyedQueue<T, K> {
         self.counts.contains_key(k)
     }
 
+    /// Whether an item for `k` satisfies `f`. A hash lookup, and a scan only
+    /// while something for `k` is queued: a check made for every finished
+    /// call must not cost the queue's depth.
+    pub fn any_for(&self, k: &K, f: impl FnMut(&T) -> bool) -> bool {
+        self.contains_key(k) && self.items.iter().any(f)
+    }
+
+    /// Where the first item for `k` that satisfies `f` is, scanning only
+    /// while something for `k` is queued.
+    pub fn position_for(&self, k: &K, f: impl FnMut(&T) -> bool) -> Option<usize> {
+        if self.contains_key(k) { self.items.iter().position(f) } else { None }
+    }
+
     fn added(&mut self, item: &T) {
         *self.counts.entry((self.key)(item)).or_default() += 1;
     }
@@ -106,5 +119,33 @@ mod tests {
         assert!(!q.contains_key(&removed.0));
         assert_eq!(q.len(), 1);
         assert!(q.contains_key(&2) && !q.contains_key(&4));
+    }
+
+    /// A key with nothing queued is answered without looking at the items: a
+    /// local peer asked this for each of a million queued calls as it finished,
+    /// and a scan per call made the burst quadratic (it did not finish in 900 s).
+    #[test]
+    fn a_lookup_for_a_key_with_nothing_queued_reads_no_items() {
+        let mut q: KeyedQueue<(u32, u32), u32> = KeyedQueue::new(|x| x.0);
+        for i in 0..100_000 {
+            q.push_back((i, 0));
+        }
+        let mut read = 0;
+        assert!(!q.any_for(&100_000, |_| {
+            read += 1;
+            true
+        }));
+        assert_eq!(
+            q.position_for(&100_001, |_| {
+                read += 1;
+                true
+            }),
+            None
+        );
+        assert_eq!(read, 0, "the items were scanned for a key with none queued");
+        // A key that is queued is still found, by its predicate.
+        assert!(q.any_for(&99_999, |x| x.0 == 99_999));
+        assert_eq!(q.position_for(&99_999, |x| x.0 == 99_999), Some(99_999));
+        assert!(!q.any_for(&99_999, |x| x.0 == 99_999 && x.1 == 1), "the predicate still decides");
     }
 }
