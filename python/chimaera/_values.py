@@ -27,7 +27,7 @@ import warnings
 import weakref
 from typing import Any, Callable
 
-from . import _objects, _serde
+from . import _objects, _recheck, _serde
 from ._native import blake3_buffer
 
 # Out-of-band buffers and top-level arguments at least this large become blobs.
@@ -419,8 +419,9 @@ def encode_frame(
                 holds.append(hold)
                 blobs[hold.blob] = view.nbytes
                 return hold.blob, claimed[1]
-        bid = blob_id_of(view)
+        bid = _recheck.stored_as(view, local_dir) or blob_id_of(view)
         hold = _hold_blob(run, bid, view, sink, release)
+        _recheck.remember(view, bid, local_dir)
         if hold is not None:
             hold.held_by(view.obj)
             holds.append(hold)
