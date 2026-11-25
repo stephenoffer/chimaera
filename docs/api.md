@@ -507,6 +507,21 @@ assert nodes and all(n.cpus > 0 for n in nodes)
 assert ch.runs.cluster().resources()["cpus"] >= 1
 ```
 
+`ch.runs.object_locations(futures)` names the peers each finished value is
+stored at, with its size: `{"peers": [...], "size": bytes, "inline": bool}`
+per future, the peer ids being those of `nodes()`. A call's result names the
+peer it was stored at (with a retained value's copies), and a `ch.put` value
+made here this peer. A small value held inline in its handle has no peers
+(`inline` is true). A `ch.put` made inside a call on another peer is not
+located: its size, no peers. Background copies are not listed either.
+**Runs today:**
+
+```python run
+value = ch.put(bytes(1 << 20))
+where = ch.runs.object_locations([value])[value]
+assert where["peers"] and where["size"] >= 1 << 20
+```
+
 `ch.runs.cluster().events(kinds, start=)` streams what the cluster does: members
 joining and leaving (`member`), actors starting, restarting and dying
 (`actor`), calls failing for good (`task_failed`), controller `decision`s and

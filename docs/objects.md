@@ -287,12 +287,11 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | `OwnerDiedError` when a `put`'s owner dies | the value is read from its replica |
 | ref counting, `free` | a `put` handle dropped without escaping is freed at once; a released value is deleted on every peer that fetched it; the rest go when their run ends |
 
-Not matched yet:
-
-- `ray.experimental.get_object_locations`. No peer keeps a record of where
-  every copy of an object is (a reader whose holder is gone asks the peers
-  its copies go to), so the Ray shim does not offer it. It is mostly asked
-  for to place work near its inputs, which placement does by itself.
+Not matched yet: nothing in Ray's object store.
+`ray.experimental.get_object_locations` is `ch.runs.object_locations`: the
+peer each value is stored at, with its size. Copies made in the background
+are not listed, as no peer keeps a record of where every copy is, and Ray
+lists no spilled copies either.
 
 Ray Direct Transport's NIXL option is `CHIMAERA_CUDA_NET=nixl` (see CUDA
 tensors above); its gloo option, for CPU tensors, is not needed here, since

@@ -248,6 +248,7 @@ def kill(actor: Any, *, no_restart: bool = True) -> None:
 
 _SUBMODULES = (
     "exceptions",
+    "experimental",
     "actor",
     "runtime_context",
     "util",

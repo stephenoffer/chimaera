@@ -877,6 +877,34 @@ impl Client {
         }
     }
 
+    /// Where `key`'s value is stored: (peer ids in hex, its size in bytes,
+    /// whether it is held inline). A call's record names the peers its result
+    /// was published at (its holder, and a retained value's copies); a result
+    /// held inline has none. A `ch.put` has no record: it is this peer's
+    /// while its file is in this peer's store. None for a call not finished
+    /// or failed, and for a put whose file is not here.
+    fn object_locations(&self, py: Python<'_>, key: Vec<u8>) -> PyResult<Option<(Vec<String>, u64, bool)>> {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let mut peer = self.peer.clone();
+        let k = task_key(&key)?;
+        let rec = py.detach(|| runtime().block_on(async move { peer.get_task(k).await }));
+        match rec {
+            Ok(r) => match r.into_inner().outcome.and_then(|o| o.value) {
+                Some(pb::outcome::Value::Ok(obj)) if !obj.inline_data.is_empty() => Ok(Some((vec![], obj.size, true))),
+                Some(pb::outcome::Value::Ok(obj)) => {
+                    Ok(Some((obj.locations.iter().map(|l| hex(&l.peer)).collect(), obj.size, false)))
+                }
+                _ => Ok(None),
+            },
+            Err(e) if e.code() == tonic::Code::NotFound => {
+                let (run, object) = key.split_at(16); // a put's key: its run and object id
+                let path = std::path::Path::new(&self.info.object_dir).join(hex(run)).join(hex(object));
+                Ok(std::fs::metadata(path).ok().map(|m| (vec![hex(&self.info.peer)], m.len(), false)))
+            }
+            Err(e) => Err(rpc_err(e)),
+        }
+    }
+
     /// The cluster as the connected peer sees it: a list of node dicts.
     fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let mut peer = self.peer.clone();

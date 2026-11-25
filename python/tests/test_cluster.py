@@ -1629,3 +1629,39 @@ print("ACTOR", len(r.result(timeout=120)), flush=True)
         assert f"PUT {1 << 20}" in out and f"ACTOR {1 << 20}" in out, out + err[-3000:]
     finally:
         c.close()
+
+
+def test_object_locations_name_the_peer_a_result_was_stored_at():
+    c = Cluster(2, labels={0: "slot=s0", 1: "slot=s1"})
+    try:
+        out = c.run(
+            0,
+            """
+import chimaera as ch
+
+on_s1 = ch.dist.Placement(require={"slot": "s1"})
+
+@ch.remote
+def make(n):
+    return bytes(n)
+
+@ch.remote
+def stash(n):
+    return ch.put(bytes(n))
+
+f = make.options(placement=on_s1).remote(1 << 20)
+ch.wait([f], timeout=60)  # finished, not read here
+there = next(n.peer for n in ch.runs.cluster().nodes() if n.labels.get("slot") == "s1")
+loc = ch.runs.object_locations([f])[f]
+print("LOC", loc["peers"] == [there], loc["size"] >= 1 << 20, flush=True)
+# A put made by a call on s1 has no record to name its writer: it says so
+# with its size and no peers, and is not taken for an inline value.
+handle = stash.options(placement=on_s1).remote(1 << 20).result(timeout=60)
+put = ch.runs.object_locations([handle])[handle]
+print("PUT", put["peers"], put["size"] >= 1 << 20, put["inline"], flush=True)
+""",
+        )
+        assert "LOC True True" in out.stdout, out.stdout + out.stderr[-3000:]
+        assert "PUT [] True False" in out.stdout, out.stdout + out.stderr[-3000:]
+    finally:
+        c.close()

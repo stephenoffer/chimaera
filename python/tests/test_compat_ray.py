@@ -771,3 +771,20 @@ def test_register_serializer_takes_any_callables_lambdas_included():
         ray.util.deregister_serializer(_Point)
     back = ray.get(ray.put(_Point(1, 2)))
     assert (back.x, back.y) == (1, 2), "serialized the usual way again"
+
+
+def test_get_object_locations_names_the_node_storing_each_value():
+    import numpy as np
+
+    from chimaera.compat.ray import experimental  # ray.experimental under ray.install()
+
+    @ray.remote
+    def big():
+        return np.ones(1 << 20)
+
+    refs = [big.remote(), ray.put(np.ones(1 << 18))]
+    ray.get(refs)
+    locs = experimental.get_object_locations(refs)
+    me = ray.get_runtime_context().get_node_id()
+    assert [locs[r]["node_ids"] for r in refs] == [[me], [me]]
+    assert locs[refs[0]]["object_size"] >= 8 << 20 and locs[refs[1]]["object_size"] >= 2 << 20

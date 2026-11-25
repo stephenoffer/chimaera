@@ -634,3 +634,21 @@ def test_a_large_plain_dict_round_trips_through_put_an_argument_and_a_result():
     assert length.remote(d).result(timeout=60) == len(d)
     back = echo.remote(d).result(timeout=60)
     assert back == d and type(back["k1"][4]) is bool and type(back["k1"][5]) is tuple
+
+
+def test_object_locations_name_the_peer_storing_each_value():
+    import numpy as np
+
+    @ch.remote
+    def big():
+        return np.ones(1 << 20)  # 8 MiB
+
+    f = big.remote()
+    f.result(timeout=60)
+    p = ch.put(np.ones(1 << 18))  # 2 MiB
+    small = ch.put(1)  # held inline in its handle
+    me = next(n.peer for n in ch.runs.cluster().nodes() if n.this_peer)
+    loc = ch.runs.object_locations([f, p, small])
+    assert loc[f] == {"peers": [me], "size": loc[f]["size"], "inline": False} and loc[f]["size"] >= 8 << 20
+    assert loc[p] == {"peers": [me], "size": loc[p]["size"], "inline": False} and loc[p]["size"] >= 2 << 20
+    assert loc[small]["peers"] == [] and loc[small]["inline"], loc[small]
