@@ -3,8 +3,10 @@
     python bench/compare/chart.py SPEC.json OUT_PREFIX    # writes OUT_PREFIX-light.svg and -dark.svg
 
 The spec: {"aria": "...", "series": ["Ray", ...], "rows": [{"label": "...",
-"values": {"Ray": 2.5, ...}}]}. A value is how many times faster Chimaera
-is than that runtime: above 1 the bar goes right, below 1 it goes left (the
+"values": {"Ray": 2.5, ...}}]}, and optionally "versus": a prefix for every
+series name ("Ray on ", when the series are cluster sizes), shown as the
+legend's lead-in. A value is how many times faster Chimaera is than that
+runtime: above 1 the bar goes right, below 1 it goes left (the
 other runtime is faster). A runtime missing from a row has no bar there.
 The scale is logarithmic and every bar carries its value.
 """
@@ -39,6 +41,7 @@ def times(v: float) -> str:
 def draw(spec: dict, theme: str) -> str:
     primary, secondary, grid, axis = INK[theme]
     series = spec["series"]
+    versus = spec.get("versus", "")
     color = dict(zip(series, SLOTS[theme]))
     vals = [v for r in spec["rows"] for v in r["values"].values()]
     lo = min(1.0, min(vals)) / 1.6
@@ -61,8 +64,9 @@ def draw(spec: dict, theme: str) -> str:
                f'{escape(spec.get("right", "Chimaera faster"))} ▶</text>')
     if legend:
         lx = PLOT_L
+        lead = f"Chimaera against {versus}".rstrip()
         out.append(f'<text x="{LABEL_X}" y="44" text-anchor="end" font-size="12" fill="{secondary}">'
-                   'Chimaera against</text>')
+                   f'{escape(lead)}</text>')
         for s in series:
             out.append(f'<rect x="{lx}" y="34" width="12" height="12" rx="3" fill="{color[s]}"/>')
             out.append(f'<text x="{lx + 17}" y="44" font-size="12" fill="{primary}">{escape(s)}</text>')
@@ -98,8 +102,8 @@ def draw(spec: dict, theme: str) -> str:
                 d = (f"M{one:.1f},{by} H{end + rad:.1f} Q{end:.1f},{by} {end:.1f},{by + rad} V{by + BAR - rad} "
                      f"Q{end:.1f},{by + BAR} {end + rad:.1f},{by + BAR} H{one:.1f} Z")
                 tx, anchor = end - 6, "end"
-            who = f"Chimaera {times(v)} faster" if v >= 1 else f"{s} {times(v)} faster"
-            out.append(f'<path d="{d}" fill="{color[s]}"><title>{escape(r["label"])}, against {escape(s)}: '
+            who = f"Chimaera {times(v)} faster" if v >= 1 else f"{versus}{s} {times(v)} faster"
+            out.append(f'<path d="{d}" fill="{color[s]}"><title>{escape(r["label"])}, against {escape(versus + s)}: '
                        f'{who}</title></path>')
             out.append(f'<text x="{tx:.1f}" y="{by + BAR - 2}" text-anchor="{anchor}" font-size="11" '
                        f'font-weight="600" fill="{primary}">{times(v)}</text>')

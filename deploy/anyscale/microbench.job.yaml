@@ -1,0 +1,22 @@
+# Ray's microbenchmark suite (`ray microbenchmark`) and its Chimaera port, on the
+# machine type Ray publishes its numbers for (m5.16xlarge, 64 vCPU).
+#   anyscale job submit -f deploy/anyscale/microbench.job.yaml
+name: chimaera-microbench
+cloud: anyscale_v2_default_cloud
+compute_config:
+  cloud: anyscale_v2_default_cloud
+  head_node:
+    instance_type: m5.16xlarge
+    # Schedulable head: this run has no workers.
+    resources:
+      CPU: 64
+  worker_nodes: []
+working_dir: .
+excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
+entrypoint: bash deploy/anyscale/run_microbench.sh
+env_vars:
+  # Alternating rounds of both suites; the pause before each benchmark (Ray's default is 10 s).
+  MICROBENCH_ROUNDS: "2"
+  MICROBENCH_SLEEP: "3"
+max_retries: 0
+timeout_s: 10800

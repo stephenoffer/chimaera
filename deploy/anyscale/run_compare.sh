@@ -33,7 +33,9 @@ export CHIMAERA_BIN=${CARGO_TARGET_DIR:-$ROOT/target}/release/chimaera
 "$CHIMAERA_BIN" --version
 "$PY" -c 'import ray; ray.init(address="auto"); print("cpus", ray.cluster_resources().get("CPU"))'
 COMMIT=${COMPARE_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}
-"$PY" bench/compare/run.py --ray-address auto --trials "${COMPARE_TRIALS:-3}" --commit "$COMMIT" --out "$OUT"
+# COMPARE_ONLY / COMPARE_RUNTIMES: a subset of workloads or runtimes (comma lists).
+"$PY" bench/compare/run.py --ray-address auto --trials "${COMPARE_TRIALS:-3}" --commit "$COMMIT" --out "$OUT" \
+  ${COMPARE_ONLY:+--only "$COMPARE_ONLY"} ${COMPARE_RUNTIMES:+--runtimes "$COMPARE_RUNTIMES"}
 echo "===== report ====="
 cat "$OUT/report.md"
 echo "===== results.json ====="

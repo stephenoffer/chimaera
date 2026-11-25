@@ -1,0 +1,21 @@
+# Ray's distributed release benchmarks (bench/evals/release_scale.py) against
+# Chimaera on the same 16 machines (c7i.4xlarge, 16 vCPU each), one after the other.
+#   anyscale job submit -f deploy/anyscale/release-16node.job.yaml
+name: chimaera-release-16node
+cloud: anyscale_v2_default_cloud
+compute_config:
+  cloud: anyscale_v2_default_cloud
+  head_node:
+    instance_type: c7i.4xlarge
+    # Schedulable head: both runtimes use all 16 machines.
+    resources:
+      CPU: 16
+  worker_nodes:
+    - instance_type: c7i.4xlarge
+      min_nodes: 15
+      max_nodes: 15
+working_dir: .
+excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
+entrypoint: bash deploy/anyscale/run_release.sh
+max_retries: 0
+timeout_s: 3600

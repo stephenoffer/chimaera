@@ -34,7 +34,20 @@ SCRIPT = {"ray": "ray_perf_ray.py", "chimaera": "ray_perf_chimaera.py"}
 
 
 def sh(*cmd: str) -> str:
-    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    except FileNotFoundError:  # a tool this OS doesn't have
+        return ""
+
+
+def cpu_model() -> str:
+    if sys.platform == "darwin":
+        return sh("sysctl", "-n", "machdep.cpu.brand_string")
+    try:
+        with open("/proc/cpuinfo") as f:
+            return next((ln.split(":", 1)[1].strip() for ln in f if ln.startswith("model name")), "?")
+    except OSError:
+        return platform.processor() or "?"
 
 
 def load_average() -> str:
@@ -174,10 +187,11 @@ def machine_info(args: argparse.Namespace) -> dict:
         return sh(PYTHON[runtime], "-c", code)
 
     info = {
-        "cpu": sh("sysctl", "-n", "machdep.cpu.brand_string"),
-        "hw.ncpu": sh("sysctl", "-n", "hw.ncpu"),
-        "memory_gib": round(int(sh("sysctl", "-n", "hw.memsize") or 0) / 2**30, 1),
-        "os": f"macOS {sh('sw_vers', '-productVersion')} ({platform.machine()})",
+        "cpu": cpu_model(),
+        "hw.ncpu": str(os.cpu_count()),
+        "memory_gib": round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30, 1),
+        "os": (f"macOS {sh('sw_vers', '-productVersion')}" if sys.platform == "darwin" else platform.platform())
+        + f" ({platform.machine()})",
         "python_ray": version("ray", "import sys; print(sys.version.split()[0])"),
         "python_chimaera": version("chimaera", "import sys; print(sys.version.split()[0])"),
         "ray": version("ray", "import ray; print(ray.__version__)"),

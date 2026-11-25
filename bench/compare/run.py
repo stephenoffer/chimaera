@@ -79,8 +79,26 @@ def machine() -> dict:
             "python": platform.python_version()}
 
 
+def settle(limit: float = 120.0) -> float:
+    """Wait (up to `limit` s) until the processes the last run left behind are gone: Linux's count of
+    runnable tasks at most an eighth of the CPUs. A run that started 1,000 actors leaves hundreds
+    runnable as they exit, which the next runtime would otherwise pay for. Returns the seconds waited."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < limit:
+        try:
+            with open("/proc/loadavg") as f:
+                running = int(f.read().split()[3].split("/")[0]) - 1  # less this process
+        except (OSError, IndexError, ValueError):
+            return 0.0  # not Linux: nothing to read
+        if running <= max(4, CPUS // 8):
+            break
+        time.sleep(1)
+    return round(time.monotonic() - t0, 1)
+
+
 def run_child(runtime: str, workload: str, env: dict) -> dict:
-    t0 = time.time()
+    settled = settle()
+    t0 = time.monotonic()
     load0 = os.getloadavg()[0]
     try:
         p = subprocess.run([sys.executable, os.path.join(HERE, "workloads.py"), runtime, workload],
@@ -89,7 +107,7 @@ def run_child(runtime: str, workload: str, env: dict) -> dict:
         rec = json.loads(lines[-1]) if p.returncode == 0 and lines else {"error": (p.stderr or p.stdout)[-2000:]}
     except subprocess.TimeoutExpired:
         rec = {"error": "timed out after 900 s"}
-    rec.update({"runtime": runtime, "workload": workload, "wall_s": round(time.time() - t0, 1),
+    rec.update({"runtime": runtime, "workload": workload, "wall_s": round(time.monotonic() - t0, 1), "settled_s": settled,
                 "load_before": round(load0, 1), "load_after": round(os.getloadavg()[0], 1)})
     return rec
 
@@ -205,12 +223,53 @@ def main() -> None:
         holders.append(p)
         return p.stdout.readline().strip()
 
+    def release(p: subprocess.Popen) -> None:
+        p.stdin.close()
+        try:
+            p.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
     binary = ""
     if "chimaera" in rts:
         from chimaera import _runtime
 
         binary = _runtime._peer_binary()
     home = os.path.join(tmp, "peer")
+    peer: list[subprocess.Popen] = []
+
+    def start_chimaera() -> bool:
+        """Start the run's own peer and warm it; False if it did not come up (the next Chimaera run
+        fails fast and restarts it again). The one a first ch.init() starts stops after ten idle
+        minutes, and one Ray or Dask run can take longer."""
+        from chimaera._runtime import peer_socket
+
+        os.makedirs(home, exist_ok=True)
+        settle()  # a peer started at load 90 can miss any short deadline
+        with open(os.path.join(home, "peer.log"), "ab") as log:
+            peer.append(subprocess.Popen(
+                [binary, "--dir", home, "peer", "start", "--provider", "local", "--idle-timeout", "86400"],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True))
+        deadline = time.monotonic() + 300
+        while not os.path.exists(peer_socket(home)):
+            if peer[-1].poll() is not None or time.monotonic() > deadline:
+                return False
+            time.sleep(0.2)
+        try:
+            subprocess.run([sys.executable, "-c", CHIMAERA_WARM], env=env, check=True, timeout=300)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return False
+        return True
+
+    def stop_chimaera() -> None:
+        subprocess.run([binary, "--dir", home, "stop"], capture_output=True, timeout=120, check=False)
+        while peer:
+            p = peer.pop()
+            try:
+                p.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
     try:
         if "ray" in rts and a.ray_address:
             env["RAY_ADDRESS"] = a.ray_address
@@ -219,11 +278,14 @@ def main() -> None:
             # driver; it guards connections only, so the run turns it off.
             env["RAY_AUTH_MODE"] = "disabled"
             env["RAY_ADDRESS"] = hold(RAY_HOLDER)
+        dask_at = -1
         if "dask" in rts:
             env["DASK_SCHEDULER"] = hold(DASK_HOLDER)
+            dask_at = len(holders) - 1
         if "chimaera" in rts:
             env["CHIMAERA_HOME"] = home
-            subprocess.run([sys.executable, "-c", CHIMAERA_WARM], env=env, check=True, timeout=120)
+            if not start_chimaera():
+                raise SystemExit(f"the Chimaera peer did not start; see {os.path.join(home, 'peer.log')}")
         records = []
         for trial in range(a.trials):
             for w in rng.sample(names, len(names)):
@@ -233,18 +295,26 @@ def main() -> None:
                     for _ in range(STARTUP_REPS if w == "startup" else 1):
                         rec = run_child(rt, w, env)
                         rec["trial"] = trial
+                        if rt == "dask" and "error" in rec and w != "startup":
+                            # A failed run can leave Dask's cluster broken (256 nested
+                            # worker_client calls did): the next workload gets a new one.
+                            release(holders.pop(dask_at))
+                            env["DASK_SCHEDULER"] = hold(DASK_HOLDER)
+                            dask_at = len(holders) - 1
+                            rec["dask_restarted"] = True
+                        if rt == "chimaera" and "error" in rec and w != "startup":
+                            # A driver stopped at its time limit leaves its calls queued in the
+                            # peer, which would run them during the next workload: start a new one.
+                            stop_chimaera()
+                            rec["chimaera_restarted"] = start_chimaera()
                         records.append(rec)
                         shown = rec.get("samples") or rec.get("error", "")[-200:]
                         print(f"[{trial}] {w:13s} {rt:16s} load {rec['load_before']:5} {shown}", flush=True)
     finally:
         for p in holders:
-            p.stdin.close()
-            try:
-                p.wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                p.kill()
+            release(p)
         if "chimaera" in rts:
-            subprocess.run([binary, "--dir", home, "stop"], capture_output=True, timeout=60, check=False)
+            stop_chimaera()
 
     versions = {}
     for r in records:
