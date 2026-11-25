@@ -29,6 +29,63 @@ def test_a_subtree_over_its_budget_stops_with_an_error_naming_the_budget():
     assert time.monotonic() - start < 20, "stopped while the children ran, not after all 24 CPU-seconds"
 
 
+def test_each_budgeted_call_charges_its_own_budget():
+    # A worker reuses a function's options across calls, and the budget a call
+    # inherits was cached with them: in a worker that had run one budgeted
+    # call, later budgeted calls' children charged the first one's budget,
+    # which had ended, so they were never stopped. With hosting off the
+    # children run in workers of their own, so only their charges count.
+    import os
+    import subprocess
+    import tempfile
+
+    from chimaera._native import socket_path
+    from conftest import BIN, run_script
+
+    home = tempfile.mkdtemp(prefix="cha", dir="/tmp")
+    subprocess.Popen(
+        [BIN, "--dir", home, "peer", "start", "--idle-timeout", "60"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        env=dict(os.environ, CHIMAERA_HOST_WHILE_WAITING="0"),
+    )
+    deadline = time.monotonic() + 30
+    while not os.path.exists(socket_path(home, "peer.sock")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    try:
+        r = run_script(
+            """
+            import time
+            import chimaera as ch
+
+            @ch.remote(cpus=1)
+            def burn(seconds):
+                end = time.process_time() + seconds
+                while time.process_time() < end:
+                    pass
+                return seconds
+
+            @ch.remote(cpus=0.1)
+            def sweep(n, each):
+                out = sum(ch.get([burn.remote(each) for _ in range(n)]))
+                time.sleep(2.5)  # every charge lands while it still runs
+                return out
+
+            for _ in range(3):
+                try:
+                    sweep.options(budget={"cpu_seconds": 0.05}).remote(8, 0.3).result(timeout=120)
+                    print("NOT-RAISED")
+                except ch.errors.BudgetExceeded:
+                    print("RAISED")
+            """,
+            home=home,
+            timeout=240,
+        )
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.split() == ["RAISED"] * 3, r.stdout
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+
+
 def test_work_within_its_budget_finishes():
     assert sweep.options(budget={"cpu_seconds": 100}).remote(2, 0.2).result(timeout=120) == pytest.approx(0.4)
 

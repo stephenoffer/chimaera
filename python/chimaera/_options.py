@@ -233,33 +233,40 @@ def _budget(name: str, v: Any) -> dict[str, float]:
     return _Frozen(out)
 
 
-def _budget_fields(eff: Effective) -> dict[str, Any]:
-    """The policy's budget: this call's own (it is the root), or the enclosing
-    call's, inherited with its root. Budgets do not nest."""
+def _own_budget(eff: Effective) -> dict[str, Any]:
+    """This call's own budget (it is the root): part of the cached policy."""
+    own = eff.get("budget")
+    if not own:
+        return {}
+    return {
+        "budget_cpu_seconds": own.get("cpu_seconds", 0.0),
+        "budget_gpu_seconds": own.get("gpu_seconds", 0.0),
+        "budget_root": b"",
+    }
+
+
+def inherited_budget(eff: Effective) -> dict[str, Any]:
+    """The budget of the call this one is made from, with its root; budgets do
+    not nest. Resolved for each call, never cached with the options: a worker
+    reuses a function's options across calls, and its later budgeted calls'
+    children charged the first one's budget, which had ended, so they were
+    never stopped."""
     from ._context import context
 
     ctx = context()
     outer = ctx.policy if ctx is not None and isinstance(ctx.policy, Mapping) else {}
-    inherited = (outer.get("budget_cpu_seconds") or 0) > 0 or (outer.get("budget_gpu_seconds") or 0) > 0
-    own = eff.get("budget")
-    if own and inherited:
+    if not ((outer.get("budget_cpu_seconds") or 0) > 0 or (outer.get("budget_gpu_seconds") or 0) > 0):
+        return {}
+    if eff.get("budget"):
         raise OptionsError(
             "budget: this call runs inside a call that has a budget, which already covers it; budgets do not nest"
         )
-    if own:
-        return {
-            "budget_cpu_seconds": own.get("cpu_seconds", 0.0),
-            "budget_gpu_seconds": own.get("gpu_seconds", 0.0),
-            "budget_root": b"",
-        }
-    if inherited:
-        assert ctx is not None
-        return {
-            "budget_cpu_seconds": outer.get("budget_cpu_seconds") or 0.0,
-            "budget_gpu_seconds": outer.get("budget_gpu_seconds") or 0.0,
-            "budget_root": outer.get("budget_root") or (ctx.run + ctx.task),
-        }
-    return {}
+    assert ctx is not None
+    return {
+        "budget_cpu_seconds": outer.get("budget_cpu_seconds") or 0.0,
+        "budget_gpu_seconds": outer.get("budget_gpu_seconds") or 0.0,
+        "budget_root": outer.get("budget_root") or (ctx.run + ctx.task),
+    }
 
 
 def _placement(name: str, v: Any) -> Placement:
@@ -673,7 +680,7 @@ def policy_dict(eff: Effective) -> dict[str, Any]:
         "priority": int(eff.get("priority") or 0),
         "max_in_flight": int(eff.get("max_in_flight") or 0),
         "durability": "" if eff.get("durability") in (None, "default") else eff.get("durability"),
-        **_budget_fields(eff),
+        **_own_budget(eff),
         # Only with explain=True: sent with every call, the words cost a call
         # through a fresh .options() view ~10% more driver work, and each call
         # ~35 bytes per option set.

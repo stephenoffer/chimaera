@@ -21,7 +21,17 @@ from . import _context, _direct, _leases, _serde, _values, _width, _workflow
 from ._errors import ActorDied, ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
 from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part, start_pending
 from ._native import blake3_digest, child_id, derive_id
-from ._options import U32_MAX, Effective, Layer, Options, resolve, resolve_cached, signature_of, validate
+from ._options import (
+    U32_MAX,
+    Effective,
+    Layer,
+    Options,
+    inherited_budget,
+    resolve,
+    resolve_cached,
+    signature_of,
+    validate,
+)
 from ._batch import Batch
 from ._mailbox import Mailbox, limits as _method_limits
 from ._pool import Pool
@@ -222,7 +232,7 @@ def build_call(
         "effects": EFFECTS_CODE[effects],
         "max_attempts": int(eff.get("max_attempts")),
         "deadline_unix_ms": _deadline_ms(eff),
-        "policy": {**eff.native, "fn_name": _fn_name(target, method), **(policy_extra or {})},
+        "policy": {**eff.native, **inherited_budget(eff), "fn_name": _fn_name(target, method), **(policy_extra or {})},
         "actor": actor,
         "handle": handle,
         "seq": seq,
