@@ -162,6 +162,25 @@ from ._ref_future import attach as _attach_future  # noqa: E402 -- needs _get_on
 _attach_future(_get_one, (ch.Future, PutRef, ItemRef))  # ref.future(), as in Ray
 
 
+def _ref_binary(self: Any) -> bytes:
+    """The ref's id (Ray's ``ObjectRef.binary()``): a call's or put's run and
+    object ids, then the index of one of a call's ``num_returns`` values."""
+    if isinstance(self, ItemRef):
+        return self._id
+    whole, _, index = (self._ref if isinstance(self, PutRef) else self).id.partition("#")
+    return bytes.fromhex(whole) + (int(index).to_bytes(4, "little") if index else b"")
+
+
+def _ref_hex(self: Any) -> str:
+    """The ref's id in hex (Ray's ``ObjectRef.hex()``)."""
+    return _ref_binary(self).hex()
+
+
+for _ref_type in (ch.Future, PutRef, ItemRef):
+    setattr(_ref_type, "binary", _ref_binary)  # noqa: B010 -- as _attach_future does
+    setattr(_ref_type, "hex", _ref_hex)  # noqa: B010
+
+
 def get(object_refs: Any, *, timeout: float | None = None) -> Any:
     """Values for one ref or a list of refs. Errors come back Ray-shaped."""
     if not isinstance(object_refs, list):

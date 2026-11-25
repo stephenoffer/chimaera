@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import sys
 import types
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Generator, Mapping
 from typing import Any
 
 import chimaera as ch
@@ -33,6 +34,9 @@ class PutRef:
     def result(self, timeout: float | None = None) -> Any:
         return self._ref.result(timeout)
 
+    def __await__(self) -> Generator[Any, None, Any]:
+        return self._ref.__await__()
+
     def __reduce__(self) -> tuple[Any, ...]:
         return (PutRef, (self._ref,))
 
@@ -44,18 +48,23 @@ class ItemRef:
     """One item of an ``ObjectRefGenerator``: already resolved (or the error
     the generator raised there, raised by ``ray.get``)."""
 
-    __slots__ = ("_value", "_error")
+    __slots__ = ("_value", "_error", "_id")
 
-    def __init__(self, value: Any = None, error: BaseException | None = None) -> None:
+    def __init__(self, value: Any = None, error: BaseException | None = None, id: bytes | None = None) -> None:
         self._value, self._error = value, error
+        self._id = id or os.urandom(16)  # its ObjectRef id: an item is not stored under one of its own
 
     def result(self, timeout: float | None = None) -> Any:
         if self._error is not None:
             raise self._error
         return self._value
 
+    def __await__(self) -> Generator[Any, None, Any]:
+        yield from ()  # resolved already: nothing to wait for
+        return self.result()
+
     def __reduce__(self) -> tuple[Any, ...]:
-        return (ItemRef, (self._value, self._error))
+        return (ItemRef, (self._value, self._error, self._id))
 
     def __repr__(self) -> str:
         return "<ObjectRef generator item>"

@@ -721,6 +721,46 @@ def test_refs_inside_a_list_arrive_as_refs_as_in_ray():
     ray.kill(a)
 
 
+def test_refs_have_ray_ids_await_and_ray_s_object_errors_are_there_to_catch():
+    import asyncio
+
+    from chimaera.compat.ray import exceptions as rex
+
+    @ray.remote
+    def one():
+        return 1
+
+    @ray.remote(num_returns=2)
+    def two():
+        return "a", "b"
+
+    @ray.remote
+    def items():
+        yield 1
+        yield 2
+
+    @ray.remote
+    def ids(nested):  # refs in a list arrive as refs
+        return [r.hex() for r in nested]
+
+    (a, b), item = two.remote(), next(iter(items.options(num_returns="streaming").remote()))
+    refs = [one.remote(), ray.put("p"), a, b, item]
+    for ref in refs:
+        assert isinstance(ref.binary(), bytes) and ref.hex() == ref.binary().hex(), ref
+    assert len({r.hex() for r in refs}) == 5, "every ref has its own id, each of a call's values too"
+    assert ray.get(ids.remote(refs)) == [r.hex() for r in refs], "and keeps it wherever it goes"
+
+    async def awaited():
+        return [await r for r in refs] + [await r.as_future() for r in refs]
+
+    assert asyncio.run(awaited()) == [1, "p", "a", "b", 1] * 2
+    lost = ("OwnerDiedError", "ObjectReconstructionFailedError", "ObjectFreedError", "ObjectFetchTimedOutError")
+    for name in (*lost, "ReferenceCountingAssertionError"):
+        assert issubclass(getattr(rex, name), rex.ObjectLostError), name
+    assert issubclass(rex.ReferenceCountingAssertionError, AssertionError)
+    assert issubclass(rex.ObjectStoreFullError, rex.RayError) and issubclass(rex.OutOfDiskError, rex.RayError)
+
+
 def test_a_ref_gives_a_concurrent_future_of_its_value_as_in_ray():
     import asyncio
     import concurrent.futures

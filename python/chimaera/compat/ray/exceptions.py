@@ -59,6 +59,37 @@ class ObjectLostError(RayError):
     """A value the call needs no longer exists."""
 
 
+# Ray's kinds of lost value, for code that imports or catches them. A lost
+# value comes back as ObjectLostError itself (Chimaera's DataLost): one whose
+# owner died is read from its replica instead of raising OwnerDiedError.
+class OwnerDiedError(ObjectLostError):
+    """The process that owned the value died."""
+
+
+class ObjectReconstructionFailedError(ObjectLostError):
+    """The value could not be made again."""
+
+
+class ObjectFreedError(ObjectLostError):
+    """The value was freed while a reference to it remained."""
+
+
+class ObjectFetchTimedOutError(ObjectLostError):
+    """Fetching the value from another node timed out."""
+
+
+class ReferenceCountingAssertionError(ObjectLostError, AssertionError):
+    """A reference was used after the runtime counted it released."""
+
+
+class ObjectStoreFullError(RayError):
+    """Ray's store-full error. Chimaera's store spills to disk instead of filling."""
+
+
+class OutOfDiskError(RayError):
+    """The disk the values spill to is full."""
+
+
 class RaySystemError(RayError):
     """An internal failure of the runtime."""
 

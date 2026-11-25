@@ -66,6 +66,7 @@ Chimaera API work on them too.
 | `ray.wait(refs, num_returns=, timeout=)` | Same contract: at most `num_returns` ready, both lists in input order, unique refs required |
 | `ray.cancel(ref, force=)` | The result becomes `TaskCancelledError` at once. Without `force`, a running body is asked to stop through `ch.context().cancelled()` and keeps running until it checks; Ray interrupts it. With `force`, the worker is killed. `recursive=False` is `Unsupported` |
 | `isinstance(x, ray.ObjectRef)` | True for futures and `put` references |
+| `ref.hex()`, `ref.binary()`, `ref.future()`, `ref.as_future()`, `await ref` | The same, for every kind of ref. The id is a call's or put's run and object ids, with the index of one of a call's `num_returns` values; a generator item's is its own. `ObjectRef.from_hex`, `task_id()`, `call_site()`, `owner_address()` and `size()` are missing |
 | `f.bind()`, `ray.dag` | `Unsupported` until `ch.graph` (P5) |
 
 ### Task options
@@ -144,7 +145,7 @@ traceback is attached as a note.
 | `ch.Cancelled`, `ch.DeadlineExceeded` | `TaskCancelledError` |
 | `ch.ActorDied` | `ActorDiedError` (a `RayActorError`) |
 | `ch.OutOfMemory` | `OutOfMemoryError` |
-| `ch.errors.DataLost` | `ObjectLostError` |
+| `ch.errors.DataLost` | `ObjectLostError`. Ray's kinds of it (`OwnerDiedError`, `ObjectReconstructionFailedError`, `ObjectFreedError`, `ObjectFetchTimedOutError`, `ReferenceCountingAssertionError`) are there to import and catch, and so are `ObjectStoreFullError` and `OutOfDiskError`, but the shim raises none of them: a lost value is `ObjectLostError`, and a value whose owner died is read from its replica |
 | `ch.InfrastructureFailure`, `ch.errors.WorkerCrashed` | `WorkerCrashedError` |
 | `ch.errors.Overloaded` | `PendingCallsLimitExceeded` |
 | a `ray.get` timeout | `GetTimeoutError`, which is also a `TimeoutError` |

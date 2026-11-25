@@ -1,5 +1,6 @@
 """``ObjectRef.future()``: a ``concurrent.futures.Future`` of a ref's value,
-as Ray gives, for ``concurrent.futures.wait`` and ``asyncio.wrap_future``.
+as Ray gives, for ``concurrent.futures.wait`` and ``asyncio.wrap_future``
+(which ``ObjectRef.as_future()`` is).
 
 The shim hands out Chimaera's own futures as Ray's ObjectRefs (and its
 PutRef and ItemRef for puts and generator items); `attach` gives those types
@@ -10,6 +11,7 @@ futures, where a large value's read would hold up every other future.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import threading
 from typing import Any, Callable
@@ -27,7 +29,7 @@ def _readers() -> concurrent.futures.ThreadPoolExecutor:
 
 
 def attach(get_one: Callable[[Any, float | None], Any], types: tuple[type, ...]) -> None:
-    """Give each of `types` a ``future()`` that settles with ``get_one(ref, None)``."""
+    """Give each of `types` a ``future()`` that settles with ``get_one(ref, None)``, and ``as_future()``."""
 
     def future(self: Any) -> concurrent.futures.Future[Any]:
         """A ``concurrent.futures.Future`` of this ref's value (Ray's ``ObjectRef.future()``)."""
@@ -46,5 +48,10 @@ def attach(get_one: Callable[[Any, float | None], Any], types: tuple[type, ...])
             when_done(lambda _: _readers().submit(settle))
         return out
 
+    def as_future(self: Any) -> asyncio.Future[Any]:
+        """An ``asyncio.Future`` of this ref's value (Ray's ``ObjectRef.as_future()``)."""
+        return asyncio.wrap_future(future(self))
+
     for t in types:
         setattr(t, "future", future)  # noqa: B010 -- a method added to types the shim does not define
+        setattr(t, "as_future", as_future)  # noqa: B010
