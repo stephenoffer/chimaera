@@ -32,6 +32,8 @@ For a walkthrough, see [guides/clusters.md](guides/clusters.md) and
 | [`chimaera cluster cert`](#chimaera-cluster-cert) | Issue a peer certificate |
 | [`chimaera cluster credential`](#chimaera-cluster-credential) | Print a driver credential for one tenant |
 | [`chimaera cluster recover`](#chimaera-cluster-recover) | Rebuild a group whose other voters are gone |
+| [`chimaera cluster backup`](#chimaera-cluster-backup) | Back up a stopped peer's groups as Raft snapshots |
+| [`chimaera cluster restore`](#chimaera-cluster-restore) | Rebuild a lost cell from backups, in a new directory |
 | [`chimaera k8s render`](#chimaera-k8s-render) | Print Kubernetes manifests for a cluster |
 | [`chimaera slurm-launch`](#chimaera-slurm-launch) | Start peers across a Slurm allocation, run a command |
 | [`chimaera up`](#chimaera-up) | Start an SSH profile's peers |
@@ -70,8 +72,8 @@ the first of these that applies wins:
 [guides/clusters.md](guides/clusters.md#point-a-script-at-the-cluster)
 describes profiles.
 
-`objects`, `profiles`, `stop`, `doctor` and `cluster recover` always use this
-machine's data directory. `objects --cluster` is a plain switch with another
+`objects`, `profiles`, `stop`, `doctor`, `cluster recover`, `cluster backup` and
+`cluster restore` always use this machine's data directory. `objects --cluster` is a plain switch with another
 meaning: every live peer's store. `doctor --cluster` names the cluster it
 checks, besides this machine; without it, `doctor` checks the one a driver
 here would use (rule 3).
@@ -512,6 +514,57 @@ chimaera cluster recover [OPTIONS] --group <GROUP>
 | `--force-new-quorum` | Required: confirms that the group's other voters will not return |
 
 Run it against a stopped peer's `--dir`, then start that peer.
+
+</details>
+
+### `chimaera cluster backup`
+
+Back up every group this stopped peer holds into OUT, as Raft snapshots of all it holds committed.
+
+<details>
+<summary><code>chimaera cluster backup --out &lt;OUT&gt;</code></summary>
+
+The peer's files are first settled as its next start would settle them (its write-ahead log replayed, a
+state machine a machine restart may have torn rebuilt), every committed entry is applied, and each group's
+snapshot is written and copied into OUT with `backup.json`, which lists each group's log index, and the
+peer's code store. Back up one peer at a time: while it is stopped, its groups run with one voter fewer,
+so another loss in that window costs their quorum. A peer of a cell of three peers votes in every group;
+in a larger cell, back up peers until every group is covered.
+
+```text
+chimaera cluster backup --out <OUT>
+```
+
+| Flag | Description |
+|---|---|
+| `--out <OUT>` | The directory the snapshots go to (created if missing) |
+
+</details>
+
+### `chimaera cluster restore`
+
+Rebuild a lost cell into a new peer directory from backups.
+
+<details>
+<summary><code>chimaera cluster restore --from &lt;FROM&gt;... --advertise &lt;ADVERTISE&gt; --force-new-cell</code></summary>
+
+The newest snapshot of each group across the backups is checked (whole, of its group, at the log index its
+`backup.json` names, one per group) before anything is written. Then this directory holds every group, with
+this peer as its only voter, and the backups' code. Start it with `peer start --listen <ADVERTISE> --seeds
+<ADVERTISE> --data-groups N` (the command prints it); peers that join become voters, as after `cluster
+recover`. At its first start the peer retires the lost cell's peers, so the calls they were running are
+retried. The state is the backups': commits after them are lost, and so are results only the lost peers
+stored (values inline in an outcome, or in the remote spill store, survive).
+
+```text
+chimaera cluster restore --from <FROM>... --advertise <ADVERTISE> --force-new-cell
+```
+
+| Flag | Description |
+|---|---|
+| `--from <FROM>` | A backup's OUT directory; repeat it for backups of several peers |
+| `--advertise <ADVERTISE>` | The address other peers will reach this one at (`peer start --advertise`) |
+| `--force-new-cell` | Required: confirms that this makes a new cell from the backups |
 
 </details>
 

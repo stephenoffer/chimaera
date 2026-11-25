@@ -34,6 +34,7 @@ pub mod prom;
 pub mod quotas;
 pub mod remote_spill;
 pub mod replicas;
+pub mod restore;
 pub mod router;
 pub mod runlogs;
 pub mod runtime;

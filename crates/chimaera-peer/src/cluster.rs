@@ -493,6 +493,7 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
 
     let planned: BTreeMap<u32, usize> = (0..=plan.data_groups).map(|g| (g, voters_in(&plan, g).len())).collect();
     tokio::spawn(liveness(router.clone(), mesh.clone(), node.core_tx.clone(), planned, cfg.dir.join(MEMBERS_FILE)));
+    tokio::spawn(crate::restore::retire_restored(router.clone(), cfg.dir.clone()));
     tokio::spawn(crate::loads::poll(mesh.clone()));
     let clients = cfg.client_listen.map(|addr| runtime::ClientListen {
         addr,

@@ -317,6 +317,30 @@ enum ClusterCmd {
         #[arg(long)]
         force_new_quorum: bool,
     },
+    /// Back up every group this stopped peer holds, as Raft snapshots of all
+    /// it holds committed, into OUT. Back up one peer at a time: while it is
+    /// stopped its groups run with one voter fewer, and another loss then
+    /// costs their quorum.
+    Backup {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Restore a lost cell into a new peer directory from backups (each
+    /// --from a `backup` OUT; the newest snapshot of each group is used).
+    /// This peer becomes the only voter of every group; started with
+    /// `peer start --seeds <ADVERTISE>`, it serves them, and peers that join
+    /// become voters. Calls the lost peers were running are retried; results
+    /// stored only on them are lost.
+    Restore {
+        #[arg(long = "from", required = true)]
+        from: Vec<PathBuf>,
+        /// The address other peers will reach this one at (`peer start --advertise`).
+        #[arg(long)]
+        advertise: String,
+        /// Required: confirms that this makes a new cell from the backup.
+        #[arg(long)]
+        force_new_cell: bool,
+    },
 }
 
 /// The cluster CA passed in the environment (slurm-launch to its peers and
@@ -534,6 +558,31 @@ fn main() -> ExitCode {
                 println!(
                     "group {group}: this peer is its only voter, resuming after log index {at}; start the peer, and \
                      the cluster adds voters back from live peers"
+                );
+                Ok(0)
+            }
+            Cmd::Cluster { action: ClusterCmd::Backup { out } } => {
+                let backed =
+                    chimaera_peer::restore::backup(&dir, &out).map_err(|e| format!("{}: {e}", dir.display()))?;
+                for b in &backed {
+                    println!("group {}: log index {}, {}", b.group, b.index, b.file.display());
+                }
+                Ok(0)
+            }
+            Cmd::Cluster { action: ClusterCmd::Restore { from, advertise, force_new_cell } } => {
+                if !force_new_cell {
+                    return Err("restore makes a new cell from the backup, its state as of the backup; pass \
+                                --force-new-cell"
+                        .into());
+                }
+                let r = chimaera_peer::restore::restore(&dir, &from, &advertise)
+                    .map_err(|e| format!("{}: {e}", dir.display()))?;
+                let data = r.groups.iter().filter(|(g, _)| *g != 0).count();
+                println!(
+                    "restored {} group(s); start this peer with: chimaera --dir {} peer start --listen {advertise} \
+                     --seeds {advertise} --data-groups {data}",
+                    r.groups.len(),
+                    dir.display()
                 );
                 Ok(0)
             }

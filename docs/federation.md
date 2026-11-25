@@ -213,5 +213,8 @@ Two flooding bugs were found and fixed while making it pass:
 - each of A's peers counted all of B's room as its own.
 
 Not covered here:
-- calls with dependencies, which stay home;
-- a restore from a Raft snapshot, rather than from each peer's directory.
+- calls with dependencies, which stay home.
+
+A cell lost whole can be rebuilt from Raft snapshots rather than from each peer's directory:
+`chimaera cluster backup` and `chimaera cluster restore` (see deploy.md, "Backing up and restoring a
+cell").

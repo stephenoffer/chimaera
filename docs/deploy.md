@@ -299,6 +299,27 @@ seconds' warning for a preemption, so set `CHIMAERA_DRAIN_SECONDS` below that
 there. It is off by default, since only a cloud VM has the metadata address,
 and it has not been run against a real cloud.
 
+### Backing up and restoring a cell
+
+A cell survives losing a minority of its peers. To survive losing all of them, back their groups up:
+stop one peer, run `chimaera --dir <its dir> cluster backup --out <dir>`, and start it again. Back up one
+peer at a time: while it is stopped, its groups run with one voter fewer, and another loss in that window
+costs their quorum. In a cell of three peers, every peer votes in every group, so one backup covers the
+cell; in a larger one, back up peers until `backup.json` lists every group. Copy the backup off the
+machines.
+
+To rebuild a lost cell, restore into a new directory and start that peer:
+
+```
+chimaera --dir /data/new cluster restore --from /backups/p0 --advertise 10.0.0.9:7700 --force-new-cell
+chimaera --dir /data/new peer start --listen 10.0.0.9:7700 --seeds 10.0.0.9:7700 --data-groups 8
+```
+
+It serves every group alone, and the peers that join become voters. Runs, actors' records and the store
+come back as they were at the backup. Calls the lost peers were running are retried; results stored only on
+them are lost (values inline in an outcome, or spilled to `CHIMAERA_SPILL_URL`, are not).
+`python/tests/test_restore.py` loses a whole cell of three and restores it this way.
+
 ### Tenants and quotas
 
 A run belongs to a tenant: `ch.init(tenant="team-a")`, or `CHIMAERA_TENANT`,

@@ -414,7 +414,7 @@ pub(crate) fn apply_batch(
     Ok((replies, events))
 }
 
-fn snapshot_path(dir: &std::path::Path, group: u32, meta: &SnapshotMetaOf<TypeConfig>) -> PathBuf {
+pub(crate) fn snapshot_path(dir: &std::path::Path, group: u32, meta: &SnapshotMetaOf<TypeConfig>) -> PathBuf {
     let idx = meta.last_log_id.as_ref().map_or(0, |l| l.index);
     dir.join(format!("group-{group}-{idx}.snap"))
 }
@@ -476,6 +476,11 @@ pub(crate) fn prune_snapshots(db: &Database, dir: &Path, scratch: &Path) -> io::
 /// process that died within the same boot left it whole in the page cache; a
 /// machine that restarted without a clean shutdown may have left it torn.
 const SM_MARKER: &str = "raft-sm.state";
+
+/// Whether the peer under `dir` keeps its state machine unsynced (see SM_MARKER).
+pub(crate) fn has_marker(dir: &Path) -> bool {
+    dir.join(SM_MARKER).exists()
+}
 
 /// Whether the state machine's file under `dir` can be trusted (see SM_MARKER).
 pub(crate) fn sm_trusted(dir: &Path) -> bool {

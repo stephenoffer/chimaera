@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 mod diverge;
+mod restore;
 
 struct Builder;
 

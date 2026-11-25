@@ -10,6 +10,8 @@ mod local;
 mod log_store;
 mod network;
 mod recover;
+mod restore;
+mod settle;
 mod snapshot_file;
 mod state_machine;
 mod wal;
@@ -17,6 +19,8 @@ mod wal;
 pub use log_store::{DiskReport, DiskStats, DiskWriter, LogStore, MAX_COMMIT_DELAY, SLOW_COMMIT};
 pub use network::{NetworkFactory, NoTransport, RpcFuture, RpcKind, Transport, handle_rpc, handle_snapshot};
 pub use recover::force_single_voter;
+pub use restore::{Backed, Restored, backup, restore};
+pub use settle::settle_files;
 pub use state_machine::{GroupEvents, GroupRead, StateMachine, mark_state_machine_clean};
 
 use chimaera_core::kv::KvRead;
@@ -167,45 +171,8 @@ impl RaftHost {
         transport: Arc<dyn Transport>,
         durability: DiskDurability,
     ) -> io::Result<(RaftHost, tokio::sync::mpsc::Receiver<GroupEvents>)> {
-        std::fs::create_dir_all(dir.join("snapshots"))?;
         let (log_path, sm_path) = (dir.join("raft-log.redb"), dir.join("raft-sm.redb"));
-        // A peer that syncs its log keeps its state machine's file unsynced:
-        // syncing it cost ~600 write IOs a checkpoint (redb's copy-on-write
-        // pages), most of a network volume's IOPS. After a machine restart
-        // without a clean stop it may be torn: it is rebuilt from the synced
-        // snapshot files, and the synced log replays the rest.
-        let unsynced_sm = durability != DiskDurability::Process;
-        let rebuild = unsynced_sm && !state_machine::sm_trusted(dir);
-        if rebuild {
-            tracing::warn!(
-                "{}: the machine restarted without a clean stop: rebuilding the raft state from snapshots and the log",
-                dir.display()
-            );
-            let _ = std::fs::remove_file(&sm_path);
-        }
-        let mut log_db = open_db(&log_path, durability)?;
-        let mut sm_db = open_db(&sm_path, DiskDurability::Process)?;
-        create_tables(&log_db, &sm_db)?;
-        if rebuild {
-            let groups = state_machine::rebuild_from_snapshots(&sm_db, &dir.join("snapshots"))?;
-            tracing::info!("raft state rebuilt: {groups} group(s) from snapshots");
-        }
-        if unsynced_sm {
-            state_machine::mark_sm(dir, false)?;
-        }
-        // A syncing peer writes its log through a wal (crate::wal): first what
-        // the last run left there goes into redb.
-        let wal = match durability {
-            DiskDurability::Process => None,
-            d => {
-                let (wal, replayed) =
-                    wal::Wal::recover(&log_db, &dir.join("raft-log.wal"), matches!(d, DiskDurability::Full))?;
-                if replayed > 0 {
-                    tracing::info!("raft log: {replayed} operations replayed from its write-ahead log");
-                }
-                Some(wal)
-            }
-        };
+        let (mut log_db, mut sm_db, wal) = settle::recover_files(dir, durability)?;
         // Purged logs and expired state leave free pages that redb reuses but
         // never gives back to the disk; return them at each start.
         compact(&mut log_db, &log_path);

@@ -8,6 +8,13 @@ use chimaera_core::ids::Id;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// A new random peer id (a peer's first start, or a restored peer's).
+pub fn new_peer_id() -> io::Result<Id> {
+    let mut seed = [0u8; 32];
+    getrandom(&mut seed)?;
+    Ok(Id::derive(0, 0, &[b"peer", &seed]))
+}
+
 /// A peer's stable id plus the incarnation of this process lifetime.
 #[derive(Clone, Copy, Debug)]
 pub struct Identity {
@@ -31,9 +38,7 @@ impl Identity {
         let peer = match std::fs::read_to_string(&id_path).ok().and_then(|s| Id::parse_hex(s.trim())) {
             Some(id) => id,
             None => {
-                let mut seed = [0u8; 32];
-                getrandom(&mut seed)?;
-                let id = Id::derive(0, 0, &[b"peer", &seed]);
+                let id = new_peer_id()?;
                 write_atomic(&id_path, id.hex().as_bytes())?;
                 id
             }
