@@ -634,6 +634,12 @@ usage: python -m chimaera.provisioner [-h] (--k8s-statefulset NAME | --slurm |
                                       [--down-after SECONDS]
                                       [--start-grace SECONDS]
                                       [--interval SECONDS]
+                                      [--planner {queue,forecast}]
+                                      [--target-start SECONDS]
+                                      [--target-finish SECONDS]
+                                      [--startup-estimate SECONDS]
+                                      [--peer-cpus CPUS] [--peer-memory BYTES]
+                                      [--dry-run] [--explain]
 ```
 
 | Flag | Description |
@@ -651,6 +657,14 @@ usage: python -m chimaera.provisioner [-h] (--k8s-statefulset NAME | --slurm |
 | `--down-after SECONDS` | Shrink after the cluster has been mostly idle this long (no help text; default 300) |
 | `--start-grace SECONDS` | No help text; default 300 |
 | `--interval SECONDS` | No help text; default 5 |
+| `--planner {queue,forecast}` | how growth is decided: queue (the backlog lasted --up-after) or forecast (queued work and its run time); default queue |
+| `--target-start SECONDS` | forecast: start every queued call within (default 60) |
+| `--target-finish SECONDS` | forecast: and finish it within |
+| `--startup-estimate SECONDS` | forecast: a new peer's startup until three are seen (a slow one, not a typical one; default 60) |
+| `--peer-cpus CPUS` | forecast: a new peer's CPUs (default: as the first it adds; until one has joined, as the smallest peer there is) |
+| `--peer-memory BYTES` | forecast: and its memory, e.g. "32 GiB" (with --peer-cpus) |
+| `--dry-run` | change nothing: print what would be asked for |
+| `--explain` | print every look's plan, not only changes (needs --planner forecast) |
 
 [deploy.md](deploy.md#autoscaling-kubernetes) explains when it grows and
 shrinks the pool.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import time
 import subprocess
 
 import pytest
@@ -430,3 +431,170 @@ def test_a_step_names_its_victim_once_and_says_once_why_it_holds(monkeypatch):
     assert held["holding"] == 3 and held["why"].endswith("holds 1 actors") and held["peers"] == {"asked": 3, "up": 3, "usable": 3}
     assert step(Pool(), RULES, m, now=66) is None, "the same reason is printed once"
     assert asked == [3, 3]
+
+
+# --planner forecast (chimaera._planner): growth from what peers report queued.
+
+
+def backlog(i, calls, wall, cpus=8.0):
+    """A peer of `cpus` with `calls` one-core calls of `wall` seconds queued and nothing running."""
+    shape = {"cpus": 1.0, "memory": 0, "queued": calls, "wall_s": calls * wall, "cold": 0, "actors": 0}
+    demand = {"shapes": [shape], "releases": [], "started_total": 0, "started_core_s_total": 0.0}
+    return Node(f"p{i}", f"chimaera-{i}.peers:7700", cpus, 32 << 30, [], True, 0.0, calls, False, {}, demand=demand)
+
+
+class Grows:
+    def __init__(self, replicas):
+        self.n, self.asked = replicas, []
+
+    def replicas(self):
+        return self.n
+
+    def scale(self, n):
+        self.asked.append(n)
+
+    def shrink(self, victim):
+        raise AssertionError("nothing should shrink here")
+
+
+def forecast_memory(start_s=60.0):
+    from chimaera._planner import Forecast, Target
+
+    return Memory(busy_since=0, forecast=Forecast(Target(start_s=start_s), 60.0))
+
+
+def test_with_the_forecast_planner_a_backlog_that_clears_soon_buys_nothing(monkeypatch):
+    from chimaera.provisioner import step
+
+    nodes = [backlog(0, 24, 1.0), backlog(1, 24, 1.0)]
+    monkeypatch.setattr(ch.runs, "cluster", lambda: type("View", (), {"nodes": lambda self: nodes})())
+    rules = Rules(min=1, max=8, up_after=10, down_after=60)
+    today, planned = Grows(2), Grows(2)
+    assert step(today, rules, Memory(busy_since=0), now=30)["to"] == 8, "48 queued / 8 CPUs per peer: 6 more"
+    m = forecast_memory()
+    assert step(planned, rules, m, now=30) is None and planned.asked == []
+    assert m.plan.action == "hold" and "the last call starts at 2 s" in m.plan.reason
+
+
+def test_the_forecast_planner_counts_the_peers_it_asked_for_while_they_start(monkeypatch):
+    from chimaera.provisioner import step
+
+    nodes = [backlog(0, 24, 60.0), backlog(1, 24, 60.0)]
+    monkeypatch.setattr(ch.runs, "cluster", lambda: type("View", (), {"nodes": lambda self: nodes})())
+    rules = Rules(min=1, max=8, up_after=10, down_after=60)
+    pool, m = Grows(2), forecast_memory(start_s=65)
+    grew = step(pool, rules, m, now=0)
+    assert grew["to"] == 4 and pool.asked == [4], grew  # 32 calls left at 60 s need 16 more cores then
+    pool.n = 4  # asked for, not up yet
+    assert step(pool, rules, m, now=10) is None and pool.asked == [4], "they count as arriving: nothing more"
+    assert m.forecast.asked == [0.0, 0.0]
+
+
+def test_a_dry_run_reads_the_pool_and_never_changes_it(monkeypatch):
+    from chimaera.provisioner import Preview, step
+
+    nodes = [backlog(0, 24, 60.0), backlog(1, 24, 60.0)]
+    monkeypatch.setattr(ch.runs, "cluster", lambda: type("View", (), {"nodes": lambda self: nodes})())
+
+    class Untouchable(Grows):
+        def scale(self, n):
+            raise AssertionError("--dry-run changed the pool")
+
+    rules = Rules(min=1, max=8, up_after=10, down_after=60)
+    record = step(Preview(Untouchable(2)), rules, forecast_memory(start_s=65), now=0)
+    assert record["to"] == 4
+
+
+def test_one_forecast_provisioner_acts_per_pool_and_explain_shows_its_plan():
+    from chimaera._planner import Plan
+    from chimaera.provisioner import Owner
+
+    pool = f"k8s/test-{os.getpid()}"
+    first = Owner(pool)
+    first.hold()
+    m = forecast_memory()
+    m.plan = Plan(3, "grow", "grow from 2 to 3 peers", 10.0, 0.0, None, None, None, 30.0, {})
+    m.forecast.startup = type(m.forecast.startup)((42.0,), 60.0)
+    first.publish(m, 2)
+    second = Owner(pool)
+    second.lease = second.store.lock(f"owner:{pool}", ttl="30s", timeout=0.5)
+    with pytest.raises(TimeoutError):
+        second.hold()
+    assert second.samples() == [42.0], "a successor starts from what the first learned"
+    plans = [p for p in ch.runs.cluster().capacity() if p["pool"] == pool]
+    assert len(plans) == 1 and (plans[0]["want"], plans[0]["replicas"], plans[0]["action"]) == (3, 2, "grow")
+
+    @ch.remote
+    def nap(s):
+        time.sleep(s)
+        return s
+
+    waiting = nap.remote(3)
+    shown = [p for p in waiting.explain().get("capacity", ()) if p["pool"] == pool]
+    assert shown and shown[0]["reason"] == "grow from 2 to 3 peers", "a call still waiting shows the pool's plan"
+    assert waiting.result(timeout=60) == 3 and "capacity" not in waiting.explain(), "a finished one does not"
+    first.lease.release()
+    second.hold()  # the lease is free: the successor takes over
+    assert second.lease.valid
+    second.lease.release()
+    for key in (f"plan:{pool}", f"startup:{pool}"):  # later tests' explain() should not see this pool
+        second.store.delete(key)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--peer-cpus", "8", "--planner", "forecast"],  # its memory too
+        ["--peer-cpus", "8", "--peer-memory", "32 GiB"],  # only with the forecast planner
+        ["--explain"],
+    ],
+)
+def test_forecast_flags_are_checked_before_anything_runs(args, capsys):
+    from chimaera.provisioner import main
+
+    with pytest.raises(SystemExit):
+        main(["--k8s-statefulset", "chimaera", *args])
+    assert "error:" in capsys.readouterr().err
+
+
+def test_a_store_not_answering_yet_is_retried_at_the_next_look_and_read_once():
+    from chimaera.provisioner import Owner
+
+    owner = Owner("k8s/flaky", act=False)
+    reads = []
+
+    class Flaky:
+        def get(self, key):
+            reads.append(key)
+            if len(reads) == 1:
+                raise ch.ChimaeraError("no peer answers yet")
+            return [12.0, 15.0, 20.0]
+
+    owner.store = Flaky()
+    m = forecast_memory()
+    with pytest.raises(ch.ChimaeraError):
+        owner.hold(m)  # inside run()'s try: printed, and tried again next look
+    owner.hold(m)
+    owner.hold(m)
+    assert m.forecast.samples == (12.0, 15.0, 20.0) and len(reads) == 2
+
+
+def test_the_forecast_provisioner_touches_the_store_only_from_its_loop(monkeypatch):
+    import chimaera.provisioner as prov
+
+    class NoStore:
+        def __init__(self, namespace):
+            pass
+
+        def lock(self, key, ttl):
+            return None
+
+        def get(self, key):
+            raise AssertionError("read the store before the run loop")
+
+    started = []
+    monkeypatch.setattr(ch, "init", lambda **kw: None)
+    monkeypatch.setattr(ch.coord, "Store", NoStore)
+    monkeypatch.setattr(prov, "run", lambda pool, rules, interval, **kw: started.append(kw))
+    prov.main(["--k8s-statefulset", "chimaera", "--planner", "forecast"])
+    assert started and started[0]["owner"].kept is None

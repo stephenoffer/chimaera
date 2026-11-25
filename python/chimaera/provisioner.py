@@ -23,6 +23,16 @@ JSON line saying what it saw.
   ``--start-grace`` seconds; peers still not up then (no room for their pods)
   count as unavailable: it stops growing and may shrink them away.
 
+With ``--planner forecast``, growth is decided instead from what each peer
+reports queued and how long those calls take (``chimaera._planner``): it asks
+for the fewest new peers that start every queued call within
+``--target-start`` seconds (and end them within ``--target-finish``), counting
+the peers it asked for that are still starting, and none when the backlog
+clears before a new peer could start. Shrinking is today's rule, never while
+peers it asked for are starting. One provisioner per pool acts (a lease in
+the cluster's store); another waits to take over. ``--dry-run`` changes
+nothing and ``--explain`` prints every plan.
+
 Kubernetes is driven through the API server with the pod's service account
 when it runs in the cluster (``chimaera k8s render --provisioner MAX``), else
 with ``kubectl`` (your current context, or ``--namespace``). Inside a
@@ -74,6 +84,8 @@ class Memory:
     idle_since: float | None = None
     starting_since: float | None = None
     held: str | None = None  # why the last shrink it wanted did not happen
+    forecast: Any = None  # --planner forecast: the planner's state (chimaera._planner.Forecast)
+    plan: Any = None  # its last plan
 
 
 class Victim(NamedTuple):
@@ -531,6 +543,8 @@ def step(pool: Any, rules: Rules, memory: Memory, now: float) -> dict[str, Any] 
     victim = cache(lambda: pool.victim(nodes, replicas))  # asked only when a shrink is due, then reused
     was = memory.held
     want, why = decide(nodes, replicas, rules, memory, now, victim)
+    if memory.forecast is not None:
+        want, why = forecast(memory, nodes, replicas, rules, now, want, why)
     removes = None
     if want < replicas:
         memory.held = pool.shrink(victim())
@@ -540,6 +554,8 @@ def step(pool: Any, rules: Rules, memory: Memory, now: float) -> dict[str, Any] 
             removes = {"unit": victim().target, "as": victim().state}
     elif want > replicas:
         pool.scale(want)
+        if memory.forecast is not None:
+            memory.forecast.grew(want - replicas, now)
     live = [n for n in nodes if n.alive]
     peers = {"asked": replicas, "up": len(live), "usable": sum(not n.draining for n in live)}
     if want != replicas:
@@ -551,13 +567,119 @@ def step(pool: Any, rules: Rules, memory: Memory, now: float) -> dict[str, Any] 
     return None
 
 
-def run(pool: Any, rules: Rules, interval: float, out: Any = sys.stdout) -> None:
-    memory = Memory()
+def forecast(
+    memory: Memory, nodes: list[Any], replicas: int, rules: Rules, now: float, want: int, why: str
+) -> tuple[int, str]:
+    """--planner forecast: the planner decides growth; today's rule may still
+    shrink (`want`, `why` from decide()), but not while peers it asked for
+    are starting."""
+    plan = memory.plan = memory.forecast.look(nodes, replicas, rules.min, rules.max, now)
+    if plan.want > replicas:
+        return plan.want, plan.reason
+    if want < replicas and not memory.forecast.asked:
+        return want, why
+    return replicas, plan.reason
+
+
+def plan_record(plan: Any) -> dict[str, Any]:
+    """What a printed line (and the store, for explain()) says of a plan."""
+    out: dict[str, Any] = {"want": plan.want, "action": plan.action, "reason": plan.reason}
+    out.update({k: v for k in ("missed", "binding") if (v := getattr(plan, k))})
+    if plan.runner_up:
+        out["runner_up"] = {"peers": plan.runner_up[0], "why": plan.runner_up[1]}
+    if plan.inputs.get("unconfirmed"):
+        out["left_out"] = plan.inputs["unconfirmed"]
+    return out
+
+
+class Preview:
+    """--dry-run: the pool as it is, read but never changed."""
+
+    def __init__(self, pool: Any) -> None:
+        self.pool = pool
+
+    def replicas(self) -> int:
+        return self.pool.replicas()
+
+    def victim(self, nodes: list[Any], replicas: int) -> Any:
+        return self.pool.victim(nodes, replicas)
+
+    def scale(self, n: int) -> None:
+        pass
+
+    def shrink(self, victim: Any) -> str | None:
+        return "--dry-run: nothing is removed"
+
+
+class Owner:
+    """With --planner forecast, one provisioner per pool acts: it holds a lease
+    in the cluster's store (another waits to take over) and keeps there what
+    it learned of startup times, and its latest plan, which explain() shows
+    for calls still waiting. Writes are fenced: one that lost the lease writes
+    nothing."""
+
+    NAMESPACE = "chimaera/capacity"
+
+    def __init__(self, pool_id: str, act: bool = True) -> None:
+        """`act`: hold the lease and write (else, for --dry-run, only read)."""
+        self.pool_id = pool_id
+        self.store = ch.coord.Store(self.NAMESPACE)
+        self.lease = self.store.lock(f"owner:{pool_id}", ttl="30s") if act else None
+        self.kept: list[float] | None = None  # startup times as the store has them, once read
+        self.shown: tuple[Any, ...] | None = None
+
+    def hold(self, memory: Memory | None = None) -> None:
+        """Hold the lease, waiting for it if another provisioner has it; on the
+        first look, start from the startup times kept in the store. Called
+        inside the run loop, so a store not answering yet (peers still
+        starting) is retried at the next look, not fatal."""
+        if self.lease is not None and not self.lease.valid:
+            self.lease.acquire()
+        if self.kept is None:
+            self.kept = self.samples()
+            if memory is not None and memory.forecast is not None:
+                memory.forecast.remember(self.kept)
+
+    def samples(self) -> list[float]:
+        return list(self.store.get(f"startup:{self.pool_id}") or [])
+
+    def publish(self, memory: Memory, replicas: int) -> None:
+        f, plan = memory.forecast, memory.plan
+        if plan is None or self.lease is None or not self.lease.valid:
+            return
+        if list(f.samples) != self.kept:
+            self.store.put(f"startup:{self.pool_id}", list(f.samples), fence=self.lease)
+            self.kept = list(f.samples)
+        said = (replicas, plan.want, plan.action, plan.reason)
+        if said != self.shown:
+            record = {"pool": self.pool_id, "at": time.time(), "replicas": replicas, **plan_record(plan)}
+            self.store.put(f"plan:{self.pool_id}", record, fence=self.lease)
+            self.shown = said
+
+
+def run(
+    pool: Any,
+    rules: Rules,
+    interval: float,
+    out: Any = sys.stdout,
+    memory: Memory | None = None,
+    owner: Owner | None = None,
+    explain: bool = False,
+) -> None:
+    memory = memory or Memory()
     while True:
         try:
+            if owner is not None:
+                owner.hold(memory)
             record = step(pool, rules, memory, time.monotonic())
+            if owner is not None:
+                owner.publish(memory, pool.replicas())
         except Exception as e:  # noqa: BLE001 - a failed look or change is retried; nothing acts on stale data
             record = {"at": time.time(), "error": str(e)}
+        if memory.plan is not None and (record or explain):
+            record = (record or {"at": time.time()}) | {"plan": plan_record(memory.plan)}
+        if record and isinstance(pool, Preview):
+            record["dry_run"] = True
         if record:
             print(json.dumps(record), file=out, flush=True)
         time.sleep(interval)
@@ -583,9 +705,36 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--down-after", type=float, default=300.0, metavar="SECONDS")
     p.add_argument("--start-grace", type=float, default=300.0, metavar="SECONDS")
     p.add_argument("--interval", type=float, default=5.0, metavar="SECONDS")
+    p.add_argument(
+        "--planner",
+        choices=("queue", "forecast"),
+        default="queue",
+        help="how growth is decided: queue (the backlog lasted --up-after) or forecast (queued work and its run time)",
+    )
+    p.add_argument(
+        "--target-start", type=float, default=60.0, metavar="SECONDS", help="forecast: start every queued call within"
+    )
+    p.add_argument("--target-finish", type=float, metavar="SECONDS", help="forecast: and finish it within")
+    p.add_argument(
+        "--startup-estimate",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="forecast: a new peer's startup until three are seen (a slow one, not a typical one)",
+    )
+    p.add_argument(
+        "--peer-cpus", type=float, metavar="CPUS", help="forecast: a new peer's CPUs (default: as the first it adds)"
+    )
+    p.add_argument("--peer-memory", metavar="BYTES", help='forecast: and its memory, e.g. "32 GiB" (with --peer-cpus)')
+    p.add_argument("--dry-run", action="store_true", help="change nothing: print what would be asked for")
+    p.add_argument("--explain", action="store_true", help="print every look's plan, not only changes")
     a = p.parse_args(argv)
     if not 1 <= a.min <= a.max:
         p.error("need 1 <= --min <= --max")
+    if a.planner == "queue" and (a.explain or a.target_finish is not None or a.peer_cpus is not None):
+        p.error("--explain, --target-finish and --peer-cpus need --planner forecast")
+    if (a.peer_cpus is None) != (a.peer_memory is None):
+        p.error("--peer-cpus and --peer-memory go together")
     ch.init(cluster=a.cluster)
     if a.slurm:
         pool: Any = SlurmSpares(int(os.environ.get("SLURM_JOB_NUM_NODES", "1")), a.partition)
@@ -593,7 +742,21 @@ def main(argv: list[str] | None = None) -> None:
         pool = SkySpares(a.base, shlex.split(a.sky))
     else:
         pool = StatefulSet(a.k8s_statefulset, a.namespace)
-    run(pool, Rules(a.min, a.max, a.up_after, a.down_after, a.start_grace), a.interval)
+    memory, owner = Memory(), None
+    if a.planner == "forecast":
+        from ._planner import Forecast, Target
+
+        pool_id = f"k8s/{a.k8s_statefulset}" if a.k8s_statefulset else "slurm" if a.slurm else "sky"
+        owner = Owner(pool_id, act=not a.dry_run)  # reads what it kept at its first look, in run()
+        target = Target(start_s=a.target_start, finish_s=a.target_finish)
+        from ._units import parse_bytes
+
+        shape = (a.peer_cpus, parse_bytes(a.peer_memory, "--peer-memory")) if a.peer_cpus is not None else None
+        memory.forecast = Forecast(target, a.startup_estimate, shape=shape)
+    if a.dry_run:
+        pool = Preview(pool)
+    rules = Rules(a.min, a.max, a.up_after, a.down_after, a.start_grace)
+    run(pool, rules, a.interval, memory=memory, owner=owner, explain=a.explain)
 
 
 if __name__ == "__main__":

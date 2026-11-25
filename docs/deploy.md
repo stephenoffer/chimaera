@@ -380,6 +380,33 @@ credentials that scale the cluster.
 - **Shrink:** by one after the cluster has been mostly idle for `--down-after` seconds (default 300), and only once it knows what the unit that would go (the highest pod; under `--slurm` or `--sky`, the newest spare) holds. Its peer is the member that names it (a pod's `host` label is the pod's name; a spare's peer carries `slurm.job=<id>` or `chimaera.spare=<name>`), whatever address it advertises. It goes when that peer holds no calls, actors or stored values, or when the provider shows it never started (a Pending pod none of whose containers ran, a pending job, no such SkyPilot cluster). When neither can be shown (it started but no peer from it joined, or its peer stopped answering) the pool keeps its size and prints why, once. It checks again just before the change, and a Kubernetes change is made on top of the StatefulSet version it read, so it fails rather than undo another writer. Kubernetes removes the highest pod, and its SIGTERM drains it: it hands the groups it leads, and its voter seats, to other peers before it stops.
 - **Hold:** while peers it asked for are still starting.
 
+**Sizing by forecast.** With `--planner forecast`, growth is decided from what
+each peer reports queued instead: its calls by CPUs, memory and expected run
+time (a function's median call time; at least a second, or as long as its
+calls have run so far, for one never measured), and when its running calls
+free their cores. It simulates the queue on the peers there are, on those it
+asked for that are still starting, and on each number of new ones, and asks
+for the fewest that start every queued call within `--target-start` seconds
+(default 60; with `--target-finish`, also end them in time). A backlog that
+clears before a new peer could start buys nothing, and when no size meets the
+target it says which target and what binds it (the calls' own length, the
+provider's startup, `--max`). New peers count as usable after the 90th
+percentile of the startups it has seen, or `--startup-estimate` until it has
+seen three: set that to a slow startup, not a typical one. A new peer is
+assumed as large as the first one it adds, and until one has joined as the
+smallest peer there is; when the pool's peers differ from the ones already
+there (a larger first node), say so with `--peer-cpus` and `--peer-memory`.
+Shrinking is the
+rule above, never while peers it asked for are starting. Only one forecast
+provisioner per pool acts: it holds a lease in the cluster's store, and a
+second waits to take over, starting from the startup times the first kept
+there. `--dry-run` changes nothing and `--explain` prints every plan. While a
+call waits, its `future.explain()["capacity"]` holds each pool's latest plan.
+On `bench/autoscale/replay.py`'s burst traces it uses 90% fewer peer-seconds
+than the queue rule for the same completions, and it never grows for a
+backlog that clears on its own. On one of its ten persistent-load replays it
+finishes later than the queue rule (completion p99 76 s against 60 s).
+
 Each change, each failed look and each new reason a shrink is held prints one JSON line, with the peers asked for, up and usable. In the cluster,
 `chimaera k8s render --namespace NS --provisioner MAX` adds it as a
 one-replica Deployment that scales between `--replicas` and `MAX`, with a

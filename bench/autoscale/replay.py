@@ -40,7 +40,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python"))
 
-from chimaera._planner import Pool, Startup, Target, arrival_rate, plan  # noqa: E402
+from chimaera._planner import Forecast, Target  # noqa: E402
 from chimaera.provisioner import Memory, Rules, Victim, decide  # noqa: E402
 
 GiB = 1 << 30
@@ -122,7 +122,7 @@ class Sim:
         self.max_replicas = trace.base
         self.rules = Rules(min=trace.base, max=trace.max, up_after=30.0, down_after=300.0, start_grace=300.0)
         self.memory = Memory()
-        self.history: list[tuple[float, list[Any]]] = []
+        self.forecast: Forecast | None = None
         self.reports: dict[int, list[tuple[float, Any]]] = {}
         for i, j in enumerate(trace.jobs):
             if j.after is not None:
@@ -319,22 +319,20 @@ class Sim:
         victim = Victim("joined", last, node=node) if node is not None else Victim("never_joined", last, "not up yet")
         want, _ = decide(nodes, replicas, self.rules, self.memory, self.now, victim)
         if self.policy == "forecast":
-            self.history = [h for h in self.history if h[0] >= self.now - 300.0] + [(self.now, nodes)]
-            samples = tuple(p.visible - p.requested for p in self.peers if not p.base and p.visible <= self.now)
-            startup = Startup(samples, 60.0).seconds()
-            shown = {n.peer for n in nodes}
-            pending = tuple(
-                Startup(samples, 60.0).remaining(self.now - p.requested)
-                for p in active
-                if f"p{p.ordinal}" not in shown or p.ready > self.now
-            )
-            pool = Pool(self.t.peer_cpus, self.t.peer_memory, replicas, self.t.base, self.t.max, pending)
-            p = plan(nodes, pool, Target(start_s=self.t.target_start), startup, arrival_rate(self.history))
+            # The provisioner's own bookkeeping (Forecast): what it asked for,
+            # when, and how long peers took to show up.
+            if self.forecast is None:
+                target = Target(start_s=self.t.target_start)
+                self.forecast = Forecast(target, 60.0, shape=(self.t.peer_cpus, self.t.peer_memory))
+            p = self.forecast.look(nodes, replicas, self.t.base, self.t.max, self.now)
             if p.want > replicas:
                 want = p.want
-            elif want > replicas or pending:
+            elif want > replicas or self.forecast.asked:
                 want = replicas  # today's rule shrinks; the planner alone grows
+        before = len(self.active())
         self._scale(want)
+        if self.forecast is not None and len(self.active()) > before:
+            self.forecast.grew(len(self.active()) - before, self.now)
 
     def _scale(self, want: int) -> None:
         active = self.active()

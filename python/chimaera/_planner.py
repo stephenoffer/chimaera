@@ -509,6 +509,11 @@ class Forecast:
     def samples(self) -> tuple[float, ...]:
         return self.startup.samples
 
+    def remember(self, samples: Sequence[float]) -> None:
+        """Startup times seen before (what a provisioner kept in its store),
+        ahead of any seen since."""
+        self.startup = Startup((tuple(samples) + self.startup.samples)[-KEEP_SAMPLES:], self.startup.default_s)
+
     def grew(self, peers: int, now: float) -> None:
         """The provisioner asked for `peers` more at `now`."""
         self.asked += [now] * peers
