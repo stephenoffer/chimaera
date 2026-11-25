@@ -25,6 +25,30 @@ enum Effects {
   EFFECTS_EXTERNAL = 2;    // at-most-once start; OutcomeUnknown after a fenced start
 }
 
+// What a stored value survives (`durability=` on a call or `ch.put`). The
+// class a result was published with is recorded in its ObjectRef.
+enum Durability {
+  // Copied to CHIMAERA_OBJECT_REPLICAS other peers in the background; a
+  // call's result is also made again by running its call (lineage).
+  DURABILITY_DEFAULT = 0;
+  // No copy, never made again: lost with the peer that wrote it.
+  DURABILITY_EPHEMERAL = 1;
+  // No copy: made again by running its call when lost.
+  DURABILITY_REPLAYABLE = 2;
+  // Acknowledged only once copies on other peers, in other failure domains
+  // first, are made: the loss of its writer (or its writer's rack) keeps it.
+  DURABILITY_RETAINED = 3;
+}
+
+// Why object bytes cross from one peer to another. A peer paces what it
+// sends (CHIMAERA_MESH_RATE) and shares that rate among these by weight.
+enum TrafficClass {
+  TRAFFIC_FOREGROUND = 0;  // a running call or a driver reads it now
+  TRAFFIC_SHUFFLE = 1;     // a shuffle's gather reads its parts
+  TRAFFIC_RECOVERY = 2;    // restoring copies: a drain's hand-off, a Raft snapshot
+  TRAFFIC_CHECKPOINT = 3;  // copies made ahead of a loss: replicas, retained puts
+}
+
 // A handle to an immutable value. Small values travel inline.
 message ObjectRef {
   bytes object_id = 1;
@@ -40,6 +64,9 @@ message ObjectRef {
   // Files of this run that the frame refers to (a result's large buffers,
   // stored apart from it): fetched, placed by and freed with the object.
   repeated ObjectRef blobs = 8;
+  // The class it was published with (a retained value's `locations` name
+  // its copies too).
+  Durability durability = 9;
 }
 
 message ErrorRecord {
@@ -57,6 +84,7 @@ message ErrorRecord {
     ACTOR_DIED = 10;
     COMMAND_CONFLICT = 11;
     BUDGET = 12;          // its budget, or an enclosing call's, ran out
+    OVERLOADED = 13;      // its actor method's mailbox was full (ch.Mailbox)
   }
   Kind kind = 1;
   string type_name = 2;
@@ -127,10 +155,67 @@ message Policy {
   double budget_cpu_seconds = 26;
   double budget_gpu_seconds = 27;
   TaskKey budget_root = 28;     // the budgeted call; unset on the root itself
+  Durability durability = 29;   // what the call's result survives
+  // "name=value (where it was set)" for each option not left at its default,
+  // sorted by name: ch.context().describe_policy() words the call's options
+  // as fn.policy().describe() did where it was made. Sent only for calls made
+  // with explain=True; empty otherwise.
+  repeated string explained = 30;
+  // A gang rank or a reservation bundle: it runs on the resources its peer
+  // holds for it (Peer.Hold), not on free capacity.
+  LaunchToken launch = 31;
+  // Generator calls: the stored bytes the generator may yield ahead of its
+  // consumer, which credits by bytes as well as items. 0: a consumer that
+  // credits by items only, so the generator waits on items only.
+  uint64 max_in_flight_bytes = 32;
+  // `cpus` / `memory` is ch.auto(initial=...): the first reservation, which
+  // learning may move within cpus_min..cpus_max (memory_min..memory_max).
+  // False: a positive value is the caller's, never changed. A peer that
+  // predates these fields reads an initial value as the caller's.
+  bool cpus_initial = 33;
+  bool memory_initial = 34;
+}
+
+// One slot of a hold on a peer's resource ledger. The peer starts a call or
+// actor carrying it on exactly that slot, and refuses it once the slot was
+// taken, the hold expired or was released, or a newer generation of the same
+// owner replaced it.
+message LaunchToken {
+  string owner = 1;       // the gang or reservation that holds it
+  uint64 generation = 2;
+  uint32 slot = 3;        // index into the hold's slots on that peer
 }
 
 // What a function's recent calls used (chimaera_core::profile::Summary).
 // Persisted by each peer and gossiped between peers; soft state.
+// What more capacity would start sooner on one peer (core/demand.rs): its
+// queued calls by shape and expected run time, and when its running calls
+// free their cores. Each queued attempt is in one peer's queue at a time, so
+// the peers' summaries add up without counting a call twice.
+message Demand {
+  repeated DemandShape shapes = 1;      // at most 16, most wall time first
+  repeated DemandRelease releases = 2;  // cores in use, by when they free up
+  uint64 started_total = 3;             // attempts started here since the peer started
+  double started_core_s_total = 4;      // their cores × estimated seconds
+  double oldest_ready_s = 5;            // the longest any queued call has waited
+  uint32 excluded_labels = 6;           // queued calls with hard `require` labels (not in shapes)
+  uint32 excluded_devices = 7;          // queued calls needing accelerators (not in shapes)
+}
+
+message DemandShape {
+  double cpus = 1;
+  uint64 memory = 2;     // reserved per call, rounded up to a power of two; 0 = not known yet
+  uint32 queued = 3;
+  double wall_s = 4;     // estimated wall seconds of those calls, summed
+  uint32 cold = 5;       // of them, calls of a function never measured (the estimate is a floor)
+  uint32 actors = 6;     // actors waiting for these CPUs: they hold them for their life
+}
+
+message DemandRelease {
+  double upper_s = 1;    // freed within this many seconds; 0 = not known (an actor, a waiting call)
+  double cores = 2;
+}
+
 message ProfileSummary {
   bytes fn_digest = 1;
   string method = 2;

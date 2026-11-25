@@ -23,9 +23,9 @@ me = [n.peer for n in ch.runs.cluster().nodes() if n.this_peer][0]
 others = [n.peer for n in ch.runs.cluster().nodes() if not n.this_peer]
 for peer in others:
     pinned = shout.options(placement=ch.dist.Placement(require={"node": peer}))
-    assert pinned.remote(peer[:8]).result(timeout=60) == peer
+    assert pinned.remote(peer[-8:]).result(timeout=60) == peer  # distinct: ids share their leading digits
 deadline = time.time() + 10
-want = {f"hello from {p[:8]}" for p in others}
+want = {f"hello from {p[-8:]}" for p in others}
 while time.time() < deadline:
     kept = {line.split("| ", 1)[1] for line in ch.runs.current_run().logs() if "hello from" in line}
     if kept >= want:

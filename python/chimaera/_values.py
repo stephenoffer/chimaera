@@ -162,6 +162,8 @@ def store(
     inline_limit: int,
     prefix: bytes = b"",
     device_holds: list[Any] | None = None,
+    keep_local: bool = False,
+    files: list[bytes] | None = None,
 ) -> tuple[bytes, bytes | None, int, list[str]]:
     """Store one value (``ch.put``): (object id, inline bytes or None, size,
     files that only this value uses). Local ids start with `prefix`: a put
@@ -169,6 +171,9 @@ def store(
     results and outlive the run's values (the call may return the handle).
     With `device_holds`, large CUDA tensors are also shared with readers on
     this machine (see _cuda_share) and added to it, for the caller to keep.
+    With `keep_local` the peer makes no background copy of its files (a
+    durability class other than the default); `files` gets the ids of the
+    files the value is stored in.
 
     Locally nothing is hashed: arena arrays are linked in place (no copy, see
     _objects), everything else is written once by the native writer, and the
@@ -179,7 +184,7 @@ def store(
         owned: list[str] = []
 
         def claim(view: memoryview) -> tuple[bytes, int] | None:
-            got = _objects.claim(view, rdir, prefix) if view.nbytes >= PROMOTE_BYTES else None
+            got = _objects.claim(view, rdir, prefix, keep_local=keep_local) if view.nbytes >= PROMOTE_BYTES else None
             if got is not None:
                 owned.append(os.path.join(rdir, got[0].hex()))
             return got
@@ -189,6 +194,8 @@ def store(
             # that takes it GPU to GPU never fetches it (see tensor_from_gpu).
             blob = prefix + os.urandom(16 - len(prefix))
             path = os.path.join(rdir, blob.hex())
+            if keep_local:
+                _objects.mark_local(path)
             _serde.write_file(path, [view])
             owned.append(path)
             return run, blob
@@ -202,17 +209,25 @@ def store(
             if device_holds is not None:
                 del _put_holds.list, _put_holds.write_blob
         object_id = prefix + os.urandom(16 - len(prefix))
+        if size > inline_limit:
+            path = _serde.object_path(sink.object_dir, run, object_id)
+            if keep_local:
+                _objects.mark_local(path)
+            _serde.write_file(path, parts)
+            owned.append(path)
+        if files is not None:
+            files.extend(bytes.fromhex(os.path.basename(p)) for p in owned)
         if size <= inline_limit:
             return object_id, b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts), size, owned
-        path = _serde.object_path(sink.object_dir, run, object_id)
-        _serde.write_file(path, parts)
-        return object_id, None, size, [*owned, path]
+        return object_id, None, size, owned
 
     def external(view: memoryview) -> bytes | None:
         if view.nbytes < PROMOTE_BYTES:
             return None
         bid = blob_id_of(view)
-        sink.put(run, bid, view)
+        sink.put(run, bid, view, keep_local=keep_local)
+        if files is not None:
+            files.append(bid)
         return bid
 
     parts, size, _ = _serde.dumps_parts(value, external=external)
@@ -220,7 +235,9 @@ def store(
     object_id = blake3_buffer(data)[:16]
     if size <= inline_limit:
         return object_id, data, size, []
-    sink.put(run, object_id, data)
+    sink.put(run, object_id, data, keep_local=keep_local)
+    if files is not None:
+        files.append(object_id)
     return object_id, None, size, []
 
 

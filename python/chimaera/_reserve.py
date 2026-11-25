@@ -4,39 +4,37 @@
     workers = [Trainer.options(within=res[i]).remote(i) for i in range(4)]
     step.options(within=res[0]).remote(batch)
 
-Each bundle's resources are held by a host process on one peer from
-``ready()`` until ``release()``, whether or not anything runs in it. Calls
-and actors created ``within=res[i]`` run inside that host, on its peer and
-with its resources, so nothing else can take them. ``strategy``:
-``"pack"`` (one peer when it fits), ``"spread"`` (different peers when
-there are enough), and ``"strict_pack"``/``"strict_spread"`` (required, or
-the reservation is infeasible).
+Each bundle's CPUs and devices are held on one peer's resource ledger from
+``ready()`` until ``release()``, whether or not anything runs in it: every
+bundle, or none (see ``_ledger``). The first call or actor created
+``within=res[i]`` starts the bundle's host process on that peer, on the
+resources held for it; it and everything later within the bundle run inside
+that host, so nothing else can take them. ``strategy``: ``"pack"`` (one peer
+when it fits), ``"spread"`` (different peers when there are enough), and
+``"strict_pack"``/``"strict_spread"`` (required, or the reservation is
+infeasible).
 
 Calls in one bundle share its host process (threads, up to the bundle's
 CPUs at once); give each parallel worker its own bundle.
 
-Every bundle is held, or none: a try that cannot hold them all within
-``Reservation.HOLD_S`` (or whose holder dies) lets go and tries again after a
-random pause, so
-reservations competing for the same capacity take turns (a try starts only
-when the peers report the CPUs free, and gives everything back if a peer ends
-up over capacity). shortcut: the holds are taken by the client from the peers'
-load reports, not in one shard commit, so a burst of reservations against
-stale reports can briefly over-commit before backing off; atomic holds come
-with the shard's gang commit (plan P5).
+Reservations competing for the same capacity take turns: one holds every
+bundle and the others hold nothing, trying again after random pauses. The
+driver renews its holds while the reservation lives; if the driver
+disappears, bundles no host has started on yet are free again within
+``Reservation.HOLD_S``.
 """
 
 from __future__ import annotations
 
 import itertools
 import os
-import random
 import threading
 import time
 from typing import Any
 
-from ._errors import ChimaeraError, Infeasible
-from ._future import Future, get
+from . import _ledger
+from ._errors import Infeasible
+from ._future import Future
 from ._options import Placement
 from ._remote import remote
 
@@ -86,14 +84,14 @@ class Bundle:
         return f"<Bundle {self.index} of {self.reservation!r}>"
 
     def _host(self) -> Any:
-        return self.reservation._ready_hosts()[self.index]
+        return self.reservation._host(self.index)
 
 
 class Reservation:
     """Resources held on peers for later calls (``ch.dist.reserve``)."""
 
-    # One try holds some bundles for at most this long while waiting for the rest.
-    HOLD_S = 15.0
+    # A hold its driver stops renewing (the driver is gone) ends after this long.
+    HOLD_S = _ledger.TTL
 
     def __init__(self, bundles: list[dict[str, Any]], strategy: str, timeout: float | None) -> None:
         if strategy not in STRATEGIES:
@@ -104,52 +102,50 @@ class Reservation:
         self.strategy = strategy
         self._timeout = timeout
         self.id = os.urandom(8).hex()
-        self._hosts: list[Any] = []
+        self._shapes = [(float(b.get("cpus", 1)), float(b.get("gpus", 0)), b.get("device", "")) for b in self.bundles]
+        self._hosts: list[Any] = [None] * len(self.bundles)
         self._nodes: list[str] = []
+        self._holds: _ledger.Holds | None = None
         self._released = False
         self._error: BaseException | None = None
         self._done = threading.Event()
-        first = self._targets()  # strict placement that can never fit fails here, at once
-        threading.Thread(target=self._acquire, args=(first,), name=f"reserve-{self.id}", daemon=True).start()
+        self._lock = threading.Lock()
+        self._check()  # strict placement that can never fit fails here, at once
+        threading.Thread(target=self._acquire, name=f"reserve-{self.id}", daemon=True).start()
 
-    def _acquire(self, targets: list[str | None]) -> None:
-        """Hold every bundle, or none: a try that cannot hold them all within
-        HOLD_S lets go of what it held and tries again after a random, growing
-        pause, so reservations competing for the same capacity take turns
-        instead of each holding part of it forever."""
+    def _check(self) -> None:
+        from ._cluster import cluster
+
+        live = sum(1 for n in cluster().nodes() if n.alive)
+        if self.strategy == "strict_spread" and live < len(self.bundles):
+            raise Infeasible(f"strict_spread: {len(self.bundles)} bundles need as many peers; {live} are live")
+        if self.strategy == "strict_pack" and _ledger.plan(self._shapes, {}, self.strategy, free=False)[0] is None:
+            need = sum(s[0] for s in self._shapes)
+            raise Infeasible(f"strict_pack: no live peer has room for all {len(self.bundles)} bundles ({need:g} CPUs)")
+
+    def _acquire(self) -> None:
+        """Hold every bundle, or none, waiting while others hold the capacity."""
+        from ._runtime import Runtime
         from ._store import Store
 
         store = Store(f"reserve/{self.id}")
-        attempt = 0
-        def back_off() -> list[str | None]:
-            nonlocal attempt
-            attempt += 1
-            time.sleep(random.uniform(0.0, min(8.0, 0.25 * 2**attempt)))
-            return self._targets()
-
         try:
-            while not self._released:
-                if not self._fits(targets):  # someone else holds it: wait for a turn
-                    targets = back_off()
-                    continue
-                hosts = [self._place(i, t) for i, t in enumerate(targets)]
-                probes = [h.node.remote() for h in hosts]
-                try:
-                    nodes = get(probes, timeout=self.HOLD_S)
-                except (TimeoutError, ChimaeraError):  # slow, or a holder died: this try failed, not the reservation
-                    nodes = None
-                # Another reservation may have taken the same CPUs in the meantime:
-                # then neither keeps them, and the random pause picks a winner.
-                if nodes is None or self._overcommitted(nodes):
-                    _let_go(hosts, probes)
-                    targets = back_off()
-                    continue
-                if self._released:  # released while this try was waiting
-                    _let_go(hosts, probes)
-                    return
-                self._hosts, self._nodes = hosts, nodes
-                store.put("nodes", nodes, ttl="24h")
-                return
+            holds = _ledger.admit(
+                f"{Runtime.get().tenant}/reserve/{self.id}",
+                1,
+                self._shapes,
+                name=lambda i: f"bundle {i}",
+                strategy=self.strategy,
+                ttl=self.HOLD_S,
+                stopped=lambda: self._released,
+            )
+            with self._lock:
+                if holds is not None and self._released:
+                    holds.release()  # released while this try held them
+                elif holds is not None:
+                    self._holds, self._nodes = holds, holds.peers
+            if self._nodes:
+                store.put("nodes", self._nodes, ttl="24h")
         except BaseException as e:  # noqa: BLE001 - e.g. infeasible bundles: ready() raises it
             self._error = e
             store.put("error", f"{type(e).__name__}: {e}", ttl="24h")
@@ -160,59 +156,24 @@ class Reservation:
         state = "released" if self._released else ("ready" if self._nodes else "pending")
         return f"<Reservation {len(self.bundles)} bundles, {self.strategy}, {state}>"
 
-    def _targets(self) -> list[str | None]:
-        """A peer for each bundle (None: wherever it fits), from the live peers' free CPUs."""
-        from ._cluster import cluster
+    def _host(self, i: int) -> Any:
+        """Bundle `i`'s host process: started on the slot held for it by the
+        first call or actor placed within the bundle."""
+        from ._remote import Runtime, _create_actor
 
-        live = [n for n in cluster().nodes() if n.alive]
-        free = {n.peer: n.cpus - n.cpu_used for n in live}
-        need = [float(b.get("cpus", 1)) for b in self.bundles]
-        if self.strategy in ("pack", "strict_pack"):
-            fits = [p for p, f in sorted(free.items(), key=lambda kv: -kv[1]) if f + 1e-9 >= sum(need)]
-            if fits:
-                return [fits[0]] * len(self.bundles)
-            if self.strategy == "strict_pack":
-                raise Infeasible(f"strict_pack: no live peer has {sum(need):g} CPUs free for all {len(need)} bundles")
-            return [None] * len(self.bundles)
-        order = [p for p, _ in sorted(free.items(), key=lambda kv: -kv[1])]
-        if len(order) >= len(self.bundles):
-            return order[: len(self.bundles)]
-        if self.strategy == "strict_spread":
-            raise Infeasible(f"strict_spread: {len(self.bundles)} bundles need as many peers; {len(order)} are live")
-        return [order[i % len(order)] if order else None for i in range(len(self.bundles))]
-
-    def _free(self) -> dict[str, float]:
-        from ._cluster import cluster
-
-        return {n.peer: n.cpus - n.cpu_used for n in cluster().nodes() if n.alive}
-
-    def _fits(self, targets: list[str | None]) -> bool:
-        """Whether the free CPUs (as the peers last reported) take every bundle now."""
-        free, want = self._free(), {}
-        for b, t in zip(self.bundles, targets, strict=True):
-            want[t] = want.get(t, 0.0) + float(b.get("cpus", 1))
-        anywhere = want.pop(None, 0.0)
-        if any(free.get(t, 0.0) + 1e-9 < need for t, need in want.items()):
-            return False
-        return sum(free.values()) - sum(want.values()) + 1e-9 >= anywhere
-
-    def _overcommitted(self, nodes: list[str]) -> bool:
-        time.sleep(0.3)  # let the peers count every holder placed alongside these
-        free = self._free()
-        return any(free.get(n, 0.0) < -1e-9 for n in set(nodes))
-
-    def _place(self, i: int, target: str | None) -> Any:
-        b = self.bundles[i]
-        opts: dict[str, Any] = {"cpus": float(b.get("cpus", 1)), "concurrency": max(1, int(b.get("cpus", 1)))}
-        for k in ("gpus", "memory", "device", "resources"):
-            if k in b:
-                opts[k] = b[k]
-        if target is not None:
-            strict = self.strategy.startswith("strict")
-            opts["placement"] = (
-                Placement(require={"node": target}) if strict else Placement(prefer=(f"node={target}",))
-            )
-        return _BundleHost.options(**opts).remote()
+        self.ready()
+        with self._lock:
+            if self._released:
+                raise RuntimeError("this reservation was released")
+            if self._hosts[i] is None:
+                b, holds = self.bundles[i], self._holds
+                assert holds is not None  # ready() returned
+                opts: dict[str, Any] = {"cpus": self._shapes[i][0], "concurrency": max(1, int(self._shapes[i][0]))}
+                opts.update((k, b[k]) for k in ("gpus", "memory", "device", "resources") if k in b)
+                view = _BundleHost.options(**opts, placement=Placement(require={"node": self._nodes[i]}))
+                launch = {"launch": holds.tokens[i]}
+                self._hosts[i] = _create_actor(Runtime.get(), view._cls, view.policy(), (), {}, launch)
+            return self._hosts[i]
 
     def ready(self, timeout: float | None = None) -> Reservation:
         """Wait until every bundle is held. On a timeout this raises and the
@@ -232,10 +193,6 @@ class Reservation:
         """A future of the bundles' peers, done once every bundle is held."""
         return _ready_when.remote(f"reserve/{self.id}")
 
-    def _ready_hosts(self) -> list[Any]:
-        self.ready()
-        return self._hosts
-
     def __await__(self) -> Any:
         async def wait() -> Reservation:
             import asyncio
@@ -254,27 +211,23 @@ class Reservation:
 
     def release(self) -> None:
         """Give the resources back; what runs within it ends."""
-        if not self._released:
+        with self._lock:
+            if self._released:
+                return
             self._released = True
-            for h in self._hosts:
+            hosts, holds = self._hosts, self._holds
+        for h in hosts:
+            if h is not None:
                 h.close()
-            self._done.set()
+        if holds is not None:
+            holds.release()
+        self._done.set()
 
     def __enter__(self) -> Reservation:
         return self.ready()
 
     def __exit__(self, *exc: object) -> None:
         self.release()
-
-
-def _let_go(hosts: list[Any], probes: list[Future[Any]]) -> None:
-    """Give up a try: cancel its probes (a holder that never started would
-    leave its probe unfinished, and the driver waits for those at exit) and
-    close its holders."""
-    for p in probes:
-        p.cancel()
-    for h in hosts:
-        h.close()
 
 
 @remote(cpus=0.01)

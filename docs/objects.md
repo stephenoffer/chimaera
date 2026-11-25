@@ -206,9 +206,20 @@ and any blobs it names) to this host before returning, as Ray's
   directory. `CHIMAERA_SPILL_DIR` names others instead, colon-separated
   (bigger or faster disks, or a network mount, like Ray's
   `object_spilling_config` directories), each used as
-  `<dir>/chimaera-<peer>`. Spilled objects go to each directory in turn.
-  Spilling only happens when objects are in memory, and only to spill
-  directories on another filesystem. `CHIMAERA_SPILL_THRESHOLD` (default
+  `<dir>/chimaera-<peer>`. Spilled objects go to each directory in turn,
+  skipping one without room for the object or whose copy failed in the
+  last minute (it is tried after the others). An object's bytes are
+  reserved on the disk (`posix_fallocate`) before it is copied, so a full
+  disk fails before anything is written; a failed copy leaves nothing in
+  that directory, the object stays in memory, and the next directory is
+  tried. Writers spilling at birth do the same. Spilling only happens when
+  objects are in memory, and only to spill directories on another
+  filesystem. `CHIMAERA_TEST_SMALL_SPILL_DIR` runs the full-disk test
+  (`cargo test -p chimaera-peer a_spill_to_a_full_disk`) against a real
+  small filesystem: on Linux `docker run --tmpfs /small:size=4m` with the
+  variable set to `/small`; on macOS a disk image, `hdiutil create -size 6m
+  -fs HFS+ small.dmg && hdiutil attach -nobrowse -mountpoint <dir>
+  small.dmg`. `CHIMAERA_SPILL_THRESHOLD` (default
   0.8) and `CHIMAERA_SPILL_THREADS` (default 4) are Ray's
   `object_spilling_threshold` and `max_io_workers`.
 - **Seeing what is stored.** `chimaera objects` (or `--json`) lists what this
@@ -218,35 +229,66 @@ and any blobs it names) to this host before returning, as Ray's
   lists each one's store.
 - **Lifetime.** A `ch.put` whose handle is dropped without having escaped
   (pickled, or passed by reference to a call) is deleted at once. Everything
-  else lives until its run ends, as before.
+  else lives until its run ends, as before, unless another run holds it.
+- **Handles held by other runs.** A `ch.put` handle unpickled where another
+  run is current (a second program, a detached run, an actor of another
+  run) holds the value: the peer records a lease on its files in the run's
+  replicated shard state, so they stay when their run ends. The value goes
+  once its last holder lets go: the handle is collected, the holder's
+  session ends, or its peer restarts or is lost. A held handle passed to a
+  function as an argument (the call reads the value) keeps its lease until
+  the call's outcome; passed to an actor, or pickled again (inside
+  `ch.handles`, deeper in an argument, or returned), until the session
+  ends. A run whose files are held does not expire. A handle
+  unpickled after its run ended and its value was deleted raises `DataLost`
+  when read.
 
 ## Fault tolerance
 
-- **Replicas.** Every object a peer writes is copied to its ring successor,
-  the next live peer by node id. The successor pulls the bytes into its
-  spill directory on disk behind the same symlink layout, so a replica
-  costs no memory. Copies fetched from other peers and spilled objects are
-  not replicated again.
-- **When the copy is made.** The copy starts 1 s after the write and is
-  skipped if another peer has fetched the object by then: that peer already
-  holds a copy, and a replica would only compete with it for bandwidth. So
-  an object is safe about one second plus one transfer after it is written.
-  At most eight copies are in flight from one peer; the rest wait their
-  turn. The writer waits for the successor to confirm each copy
+- **Replicas.** Every object a peer writes is copied to another peer in
+  the background. The copy goes to another failure domain first: a peer in
+  another `zone`, then another `rack` (both from `CHIMAERA_LABELS`), then
+  on another machine, then the next live peer by node id. The receiver
+  pulls the bytes into its spill directory on disk behind the same symlink
+  layout, so a replica costs no memory. Copies fetched from other peers and
+  spilled objects are not replicated again.
+- **When the copy is made.** The copy starts as soon as the replicator sees
+  the object (`CHIMAERA_REPLICA_DELAY_MS`, default 0, delays it), so an
+  object is safe one transfer after it is written. A delayed copy is
+  skipped if another peer fetched the object meanwhile: that peer already
+  holds a copy. At most eight copies are in flight from one peer; the rest
+  wait their turn. The writer waits for the receiver to confirm each copy
   (`ReplicateRequest.wait`), so a failed copy is logged as a warning and
   counted (`replication_failures_total` in `/metrics`), not lost silently.
-  `CHIMAERA_OBJECT_REPLICAS=N` keeps N copies, on the next N peers round
-  the ring (default 1; a peer that fetched the object counts as one); 0
-  turns replicas off.
-- **Finding a copy.** A reader whose holder is gone tries the holders'
-  successors, then a few other live peers (at most eight peers in all),
-  before reporting `DataLost`.
+  `CHIMAERA_OBJECT_REPLICAS=N` keeps N copies, each in a domain of its own
+  where there are enough (default 1; a peer that fetched the object counts
+  as one); 0 turns background copies off. Linux sees new objects through
+  inotify; other systems list the store every 250 ms.
+- **Durability classes.** `durability=` on a call (or `.options()`) or on
+  `ch.put` says what the value survives, and a result's record keeps the
+  class it was published with:
+
+  | class | copies | when every copy is lost |
+  |---|---|---|
+  | default | a background copy, as above | a call's result is made again by running its call |
+  | `"ephemeral"` | none | `DataLost`, saying it was ephemeral |
+  | `"replayable"` | none | made again by running its call (functions and map items without external effects) |
+  | `"retained"` | made before the call succeeds (or `ch.put` returns), `CHIMAERA_OBJECT_REPLICAS` of them, at least one; the result's record names them | made again by running its call, where it can |
+
+  A writer that wants no background copy leaves an empty
+  `<object>.tmp-local` file beside the object before writing it, which the
+  replicator takes away. A retained result whose copies fail is an
+  infrastructure failure of that attempt (it is retried); on a peer that
+  runs alone it fails as `ch.Infeasible`, as does a retained `ch.put`.
+- **Finding a copy.** A reader whose holder is gone tries the peers the
+  holder's copies go to, in the order above, then a few other live peers
+  (at most eight peers in all), before reporting `DataLost`.
 - **Draining.** A peer that drains (stopped with SIGTERM, or scaled down)
-  first copies every object it holds to its ring successor, the next live
-  peer that is not draining, where readers look once it is gone. It waits
-  for each copy, eight at a time, within the drain's grace, and logs how
-  many it copied and how many it left (`objplane::hand_off`, called from
-  the drain once running calls finish).
+  first copies every object it holds to the first peer its copies go to
+  (another failure domain first; never a draining peer), where readers look
+  once it is gone. It waits for each copy, eight at a time, within the
+  drain's grace, and logs how many it copied and how many it left
+  (`objplane::hand_off`, called from the drain once running calls finish).
 - **Results returned as handles.** A `ch.put` made inside a call is named
   like the call's results, so when the run ends and its other values are
   deleted, a result that is a handle to that put still reads.
@@ -297,9 +339,9 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | `ray memory` | `chimaera objects`, `chimaera objects --cluster` (every live peer) |
 | store metrics in the dashboard | Prometheus `object_bytes`, `memory_used_bytes`, `replication_failures_total` |
 | chunked pull between nodes | parallel ranges over four connections, every chunk checked with blake3 (Ray checks nothing) |
-| lineage reconstruction of task outputs | both: replicas on the next peer, for task outputs *and* `put` values. When every copy of a call's result is lost, the call runs again on the reader's peer, under the same attempt, so it writes the same object and blob ids. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again; the chain is rebuilt depth first, three levels at most. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
+| lineage reconstruction of task outputs | both: replicas on another peer (another failure domain first), for task outputs *and* `put` values, with a durability class per value (above). When every copy of a call's result is lost, the call runs again on the reader's peer, under the same attempt, so it writes the same object and blob ids. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again; the chain is rebuilt depth first, three levels at most. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
 | `OwnerDiedError` when a `put`'s owner dies | the value is read from its replica |
-| ref counting, `free` | a `put` handle dropped without escaping is freed at once; a released value is deleted on every peer that fetched it; the rest go when their run ends |
+| ref counting, `free` | a `put` handle dropped without escaping is freed at once; a released value is deleted on every peer that fetched it; the rest go when their run ends, except values another run's handle holds, which go when the last such handle does |
 
 Not matched yet: nothing in Ray's object store.
 `ray.experimental.get_object_locations` is `ch.runs.object_locations`: the

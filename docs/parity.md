@@ -30,7 +30,7 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | Ray Client (`ray://`), deprecated in 2.60 | Remote drivers connect over TCP to a peer started with `--client-listen` (today); connecting through any peer with a versioned protocol and no version lock-step is P3 | Today (any peer of a profile) / P3 (version-skew tests) |
 | `namespace=` | Key prefix `"ns/name"` | Today |
 | `num_cpus`, `num_gpus`, `resources`, `labels` on `init` (caps for tests and CI) | `ch.init(cpus=, memory=, gpus=)` caps the local peer; cluster peers advertise what they were granted | New (P3) |
-| `logging_config=LoggingConfig(encoding="JSON", log_level=...)` | `ch.init(log_format="json", log_level=...)`, applied to every executor | New (P4) |
+| `logging_config=LoggingConfig(encoding="JSON", log_level=...)` | `ch.init(log_format="json", log_level=...)`, applied to every executor | Partly today (`CHIMAERA_LOG_FORMAT=json` for workers' output in the driver) / P4 |
 | `log_to_driver`, worker stdout forwarded with a prefix and de-duplicated | Task output reaches the driver at its log level (Today); de-duplication of repeated lines | Today / New (P4) |
 | `JobConfig(metadata=...)` | `ch.init(metadata={...})` on the run record | New (P3) |
 | `enable_resource_isolation`, `system_reserved_*` | The agent always runs in its own reserved cgroup when delegation exists (requirement P6); attempts get their own when `accounting="isolated"` | Today (attempts; the agent moves into its own cgroup) / M2 (a reservation for it) |
@@ -91,7 +91,7 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | `ray.put` | `ch.put` returns a finished `Future`; content-addressed, stored once | Today |
 | Owner death → `OwnerDiedError`; `put` objects cannot be rebuilt | Owners are agents with successors (D3); `put` values get one replica under budget (D5) | Partly today (stored objects copied to the ring successor, Linux) / M2–M3 (lineage, budgeted replicas) |
 | Lineage reconstruction (`max_lineage_bytes`) | Rebuild lost values by replaying replayable producers, cut points chosen by cost (D5, §10) | Today: a call's result lost with every copy is remade by running its call again (functions and map items without external effects, three levels deep), for calls and programs reading it / New: cost-chosen cut points (D5) |
-| Reference counting and borrowing | A value lives while a future, a pickled future or a pending dependent refers to it, and at most until its run ends (design.md amendment 14) | Today (needs api.md text) |
+| Reference counting and borrowing | A value lives while a future, a pickled future or a pending dependent refers to it, and until its run ends; a `put` handle unpickled under another run (another program, a detached run, an actor) holds the value past that, until it is collected or its session ends (replicated leases, objects.md) | Today (needs api.md text) |
 | Nested refs stay refs | Same | Today |
 | Zero-copy numpy (read-only arrays) | Copy-on-write mappings: arrays arrive writable, writes stay in the call | Today |
 | Spilling to disk / S3 | Disk: Today (`stores.rs`); object-store URI target: M3 | Today / M3 |
@@ -100,7 +100,7 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 | `ray memory`, `get_object_locations` | `chimaera memory RUN` and `ch.runs.cluster().objects(run=)`: owner, holders, size, who pins it | New (P4) |
 | `ObjectStoreFullError`, `OutOfDiskError` | `ch.DiskFull` with the budget and the largest holders; objects spill before that | Partly today (an `OSError` naming the disk and its free space) / M3 (`ch.DiskFull`) |
 | `put(_tensor_transport="nixl")` | `ch.put(tensor)` of a CUDA tensor: through CUDA IPC on the same machine, else from its host copy; across machines GPU to GPU over NCCL with `CHIMAERA_CUDA_NET=1`, or NIXL with `CHIMAERA_CUDA_NET=nixl` | Today, opt-in: unauthenticated and unencrypted, for trusted cluster networks; on plain TCP the host copy measured faster |
-| Ray Direct Transport (alpha), `tensor_transport=` on methods | `transport="device"` on any call or method; transport negotiated per pair (D5) | P5 |
+| Ray Direct Transport (alpha), `tensor_transport=` on methods | put CUDA tensors, as above; a two-rank NCCL group per pair of processes, kept for their later transfers | Today for put values (calls' own arguments and results take the host copy) |
 
 ### Scheduling and placement
 
@@ -149,7 +149,7 @@ API budget in architecture.md §13 is what keeps this list from growing the firs
 |---|---|---|
 | `ray.get_gpu_ids()`, `get_accelerator_ids()` | `ch.dist.devices()`, `ch.dist.device()` | Today (`ch.dist.devices()`, `ch.dist.device()`) |
 | `ray.util.collective` (NCCL, GLOO; allreduce, allgather, broadcast, reduce, reducescatter, send/recv, barrier, multi-GPU variants, custom backends) | `ch.context().gang` and `ch.dist.group(*actors)` with the same operations; `reduce`, multi-GPU variants and `ext.CollectiveBackend` | Today (barrier, all_gather, all_reduce, broadcast; the shim adds reduce) / P5 (reducescatter, send/recv, multi-GPU, `ext.CollectiveBackend`) |
-| Placement-group SPMD by hand | `.gang()` with rank variables for PyTorch, JAX and DeepSpeed; elastic `ranks=ch.auto(...)` | Today (`.gang()` with elastic ranks; ranks placed one at a time) |
+| Placement-group SPMD by hand | `.gang()` with rank variables for PyTorch, JAX and DeepSpeed; elastic `ranks=ch.auto(...)` | Today (`.gang()` with elastic ranks; each generation admitted all or none) |
 | `ray.dag`, Compiled Graphs (`experimental_compile`, NCCL channels) | `@ch.graph`, `.compile(max_in_flight=)` | P5 |
 | `visualize()` | `graph.explain()` renders the compiled plan | New (P5) |
 | `register_tensor_transport`, NIXL memory registration | `ext.Transport`; NIXL and UCX registration are admission resources | New (P5) |
@@ -285,7 +285,7 @@ are out of scope.
 
 | Feature | From | Chimaera | Status |
 |---|---|---|---|
-| Gang-scheduled multi-node clusters with RDMA | Modal `@clustered` | `.gang()` | Partly today (`.gang()`) / P5 (RDMA setup, all-or-nothing placement) |
+| Gang-scheduled multi-node clusters with RDMA | Modal `@clustered` | `.gang()` | Partly today (`.gang()`, all-or-nothing placement) / P5 (RDMA setup) |
 | Replica groups with per-step commit and recovery from a peer | torchft | Gangs of replica groups; partial restart (L13) | P5 |
 | Elastic resharding after losing a slice | Cloud Pathways | `ranks=ch.auto(min, max)`, new generation per membership change | Today (`ranks=ch.auto(min, max)`) |
 | KV-aware routing hooks | Dynamo | `pool.route(key)` and an `ext.Router` for custom policies | Today (route) / New (P5) |
@@ -474,9 +474,17 @@ The Ray numbers were taken at load 6–20.
   call takes 192.5 µs against Ray's 378 µs. A local actor call takes 190.5 µs against Ray's 145 µs, so Ray is
   still about 1.3× faster on actor calls. That is down from 3.5× this morning. Ray's actor round trip ranged
   141–185 µs across runs on this machine.
-- **What is left:** two group proposals (~44 µs), the executor (~46 µs CPU), the peer's core loop (~34 µs) and
-  about six thread wake-ups. Ray's actor call skips the agent entirely, so closing this needs D2's direct actor
+- **What was left:** two group proposals (~44 µs), the executor (~46 µs CPU), the peer's core loop (~34 µs) and
+  about six thread wake-ups. Ray's actor call skips the agent entirely, so closing this needed D2's direct actor
   path.
+- **Direct actor path, 2026-11-23** (on by default; `CHIMAERA_DIRECT=0` turns it off): a local
+  actor call goes from the caller straight to the actor's executor and the peer records it afterwards
+  ([results](../bench/proto/local-group/DIRECT-RESULTS.md)). On this laptop, one interpreter for both, paired with
+  Ray: 118–196 µs p50 against Ray's 224–452 µs (198–265 µs with the path off). On a 32-core Linux workspace
+  (measured by another session): 212 µs against Ray's 426 µs, plain tasks 1.8× Ray's speed. Ray's actor
+  microbenchmark rows moved from 0.23–0.83× to 1.04–1.77× for one-to-one calls; one-to-many (0.71×) and
+  many-to-many (0.21–0.46×) were measured before calls made inside tasks went direct too (2026-11-23) and have
+  not been measured since.
 
 ### What closes each gap
 
@@ -601,15 +609,15 @@ more.
 | Capability | Reference | Chimaera | Status |
 |---|---|---|---|
 | Memory monitor ahead of the kernel OOM killer, with a kill order and a typed error | Ray (0.95 threshold, idle workers first) | Admission pauses under 10% free or high PSI, kills under 5%. The victim is the attempt furthest over its reservation; actors and started external calls go last. `OutOfMemory` carries the peak | Today (the host-pressure kill path has no pytest) |
-| Object store sizing, spill threshold, refusing writes when the disk is nearly full | Ray (30% of RAM, spill at 80%, `OutOfDiskError` at 95%) | Pool = usable memory minus a reserve; spill at 0.8; low disk makes new calls wait; a full disk gives a plain `OSError` | Partly today (no typed disk error) |
-| Killing a worker kills its children; SIGTERM then SIGKILL | Ray (process groups, 5 s) | Process groups and `killpg(SIGKILL)` at once. Only cancel escalates | Partly today (no SIGTERM grace on kill) |
+| Object store sizing, spill threshold, refusing writes when the disk is nearly full | Ray (30% of RAM, spill at 80%, `OutOfDiskError` at 95%) | Pool = usable memory minus a reserve; spill at 0.8; low disk makes new calls wait; a full disk raises `ch.errors.OutOfDisk`, still an `OSError` with `ENOSPC` (`test_out_of_disk.py`) | Today |
+| Killing a worker kills its children; SIGTERM then SIGKILL | Ray (process groups, 5 s) | Process groups. Closing an actor sends SIGTERM, then SIGKILL after 5 s, so its `__del__` and `atexit` run (`test_defaults.py`); an idle worker is asked to exit; a cancel interrupts, then kills. A kill for memory and a forced cancel are immediate, as `ray.kill` is | Today |
 | Bounded logs, kept after the driver exits | Ray (512 MB × 5 rotation; lost with the node) | Run logs capped at 64 MiB and kept until the run expires. Executor logs deleted after 2 days. `peer.log` rotates only for an auto-started local peer | Partly today |
-| Worker output to the driver: prefix, de-duplication, JSON | Ray (all three) | Prefix `(fn pid=N)` | Partly today (no dedup, no JSON) |
-| Prometheus: task and actor state series, bounded labels, discovery | Ray | Opt-in `/metrics` with queue and running gauges, counters and group gauges. Labels are limited; the k8s template sets a fixed port | Partly today (no per-state task or actor series) |
+| Worker output to the driver: prefix, de-duplication, JSON | Ray (all three) | Prefix `(fn pid=N)`; a line several of a run's workers print within 5 s reaches the driver once, then as `[repeated Nx across workers]`, and `chimaera logs` keeps every copy (`CHIMAERA_DEDUP_LOGS=0` off; `test_log_dedup.py`). `CHIMAERA_LOG_FORMAT=json` prints each line as one JSON object with its call, function, pid and stream (`test_log_format.py`) | Today (a `logging` record's own fields, such as its level, stay inside the line) |
+| Prometheus: task and actor state series, bounded labels, discovery | Ray | Opt-in `/metrics` with queue and running gauges, counters, group gauges, and `chimaera_tasks{state}` / `chimaera_actors{state}` with fixed state sets. The k8s template sets a fixed port (`test_prom_states.py`) | Today |
 | Bounded history, with the oldest dropped | Ray (100k attempts) | Attempt log 200k / 8 MiB, events 10k, failures 8 per call | Today |
 | No telemetry sent by default | Ray sends usage stats from clusters | Nothing is sent | Today (better) |
 | mTLS and tokens | Ray (one static token; TLS optional) | Peer mTLS from a cluster CA, driver TLS plus token, per-tenant credentials, token removed from workers | Today (better) |
-| Stop and start timeouts for runs | Ray Jobs (3 s stop, 15 min start) | `chimaera cancel` resends for 30 s; fixed 2 s / 5 s escalation | Partly today (not configurable) |
+| Stop and start timeouts for runs | Ray Jobs (3 s stop, 15 min start) | `chimaera cancel` resends for 30 s; cancel escalation set by `CHIMAERA_CANCEL_INTERRUPT_SECONDS` / `CHIMAERA_CANCEL_KILL_SECONDS` (2 s / 5 s; a bad value stops the peer) (`test_cancel_timeouts.py`) | Partly today (no run start timeout) |
 | Dead-peer detection | Ray (health check, about 15 s) | SWIM with a 6 s floor; a refused port counts as dead after 1 s | Today. The comment at `mesh.rs:118` says "1.2 s up to 10 peers", which contradicts the floor |
 | Version skew | Exact match required | Peers must share `PEER_LEVEL`; drivers are checked by wire version; warnings for a stale local binary | Today |
 | Open-files limit raised | Recommended by hand | Raised automatically to the hard limit, at most 65,536 | Today |
@@ -622,12 +630,12 @@ more.
 | Separate queue-wait, attempt and total timeouts; progress heartbeats with a stall timeout | Temporal | One `deadline` across queueing and attempts; progress through `ch.context().report()` | Partly today |
 | Mark an exception non-retryable where it is raised | Temporal | Raise `ch.errors.NonRetryable`, or a class that also derives from it: never retried, whatever `retry_exceptions` lists (`test_retry_policy.py`) | Today |
 | Soft time limit (catchable) before a hard kill | Celery | Flag, then `Cancelled` after 2 s, then a kill after 5 s; fixed gap, and the same type for deadlines | Partly today |
-| Dead-letter store of calls that exhausted retries, with requeue | Dramatiq | Final failures are readable (`Run.outcomes()`, `task_failed` events), not requeueable. A finished call nothing holds is shrunk to a tombstone without its spec, so requeueing needs the shard to keep a failed call's spec and inputs | Missing (designed; needs the runtime owner's shard change) |
+| Dead-letter store of calls that exhausted retries, with requeue | Dramatiq | A function call that fails for good keeps its spec and its inputs (the newest 1,000 per run). `run.failed()` lists them, `run.retry_failed()` runs them again as new calls, `run.discard_failed()` lets them go; `chimaera retry RUN [--call ID] --yes` from the shell. Calls whose input failed and cancelled calls are not kept (`test_failed_calls.py`, shard tests) | Today |
 | A failure hook after the final retry, run on the cluster | Inngest, Prefect | Driver-side `add_done_callback`; `task_failed` events | Partly today |
 | Result cache keyed by inputs and code version | Flyte, Prefect | `@ch.remote(cache=True)` (7 days) or `cache="30d"`. The key covers the function's code, plain-data arguments by value, futures of other cached calls by their key, `device=`/`gpus=`, installed distributions and the project's Python sources. A hit is a finished future and `explain()` says `"hit"`. Only `effects="none"`, deterministic functions; results up to 1 MiB, in the replicated store (`test_cache.py`) | Today. A cached `map()` looks items up one by one; a batched lookup is a follow-up |
 | Recycle a worker after N calls or N MB | Celery, Dask | Automatic leak detection replaces a worker; idle workers expire after 60 s; no user-set N | Partly today |
 | Allocator trimming | Dask | `malloc_trim` after 256 MiB of growth; `MALLOC_ARENA_MAX=4` | Today |
-| Backlog age as a metric and scaling signal | Temporal | The provisioner uses time since the queue was last empty | Partly today |
+| Backlog age as a metric and scaling signal | Temporal | `chimaera_queue_oldest_seconds` on `/metrics`; the provisioner uses time since the queue was last empty (`test_prom_states.py`) | Today |
 | Run a function once on every peer | Dask `Client.run` | `ch.runs.on_every_peer(fn, *args)` returns `{peer id: result}`, skipping draining peers (`test_runs_ops.py`) | Today |
 | Batch operations on runs matched by a filter | Temporal | `chimaera cancel --match TEXT` lists the active runs whose description matches, and `--yes` cancels them; `chimaera cancel` also takes several run ids (`test_runs_ops.py`) | Today (cancel only) |
 | Per-tenant spend caps | Modal | Per-tenant CPU caps; per-call-subtree CPU/GPU-second budgets | Partly today |
@@ -640,15 +648,15 @@ Of the 42 items checked:
 
 | Status | Items |
 |---|---:|
-| Today | 25 |
-| Partly today | 16 |
-| Missing | 1 |
+| Today | 31 |
+| Partly today | 11 |
+| Missing | 0 |
 
 The first count (18 / 17 / 7) was taken before the graceful shutdown, drain-then-close, executor priority, the
-non-retryable marker, run-on-every-peer, batch cancel and the result cache were built on 2026-11-22.
-
-The missing item is the dead-letter store. It is designed, and it needs a shard change that belongs to the runtime
-owner.
+non-retryable marker, run-on-every-peer, batch cancel, the result cache and the dead-letter store were built on
+2026-11-22; the typed disk-full error, per-state metrics and the backlog's age on 2026-11-23 (log de-duplication and
+configurable cancel timeouts narrowed two partial rows); JSON worker output on 2026-11-24, when the kill row was
+also found already met (actor close had SIGTERM and a grace period).
 
 Two findings were passed to their owners:
 - the SWIM comment that contradicts its 6 s floor;

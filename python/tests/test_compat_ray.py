@@ -663,10 +663,10 @@ class Collective:
 
         from chimaera.compat.ray.util import collective as col
 
-        col.init_collective_group(world, rank, backend="gloo", group_name=name)
+        col.init_collective_group(world, rank, backend="gloo", group_name=name, gloo_timeout=45000)
         x = np.array([float(value)])
         col.reduce(x, dst_rank=0, group_name=name)
-        return col.get_rank(name), col.is_group_initialized(name), x.tolist()
+        return col.get_rank(name), col.is_group_initialized(name), x.tolist(), col._groups[name]._deadline()
 
 
 def test_collective_groups_reduce_in_place_like_rays():
@@ -677,13 +677,16 @@ def test_collective_groups_reduce_in_place_like_rays():
     col.create_collective_group(actors, 3, [2, 0, 1], backend="gloo", group_name=name)
     with pytest.raises(RuntimeError, match="twice"):
         col.create_collective_group(actors, 3, [0, 1, 2], group_name=name)
+    assert col._declared().get(name).collective_timeout == 30.0, "a gloo group waits gloo_timeout (30 s) per collective"
     out = ray.get([a.declared.remote(name, v) for a, v in zip(actors, (1, 2, 4))])
     # Ranks follow `ranks`: actor 0 is rank 2. Sums and maxima are on every rank, in place.
     assert [o[0] for o in out] == [2, 0, 1]
     assert all(o[1] == [7.0] * 3 and o[2] == [4.0] * 3 and o[3] == [10.0] for o in out)
     assert all(o[4] == [[2.0], [4.0], [1.0]] for o in out), "gathered in rank order"
     joined = ray.get([a.joins.remote(3, r, name + "-init", r + 1) for r, a in enumerate(actors)])
-    assert joined == [(0, True, [6.0]), (1, True, [2.0]), (2, True, [3.0])], "only the destination gets the sum"
+    sums = [(0, True, [6.0]), (1, True, [2.0]), (2, True, [3.0])]
+    assert [j[:3] for j in joined] == sums, "only the destination gets the sum"
+    assert [j[3] for j in joined] == [45.0] * 3, "gloo_timeout=45000 (ms): each collective waits at most 45 s"
     with pytest.raises(NotImplementedError, match="send is not supported"):
         col.send  # noqa: B018
     for a in actors:

@@ -76,6 +76,11 @@ impl Inflight {
         self.calls.get(tk)
     }
 
+    /// How many direct calls to `actor` are in flight.
+    pub fn at(&self, actor: Id) -> usize {
+        self.order.get(&actor).map_or(0, VecDeque::len)
+    }
+
     /// How many of its actor's direct calls were sent before it and are not done.
     pub fn ahead(&self, tk: Tk) -> Option<usize> {
         let call = self.calls.get(&tk)?;

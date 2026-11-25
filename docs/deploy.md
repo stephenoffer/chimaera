@@ -45,25 +45,59 @@ when the match is unique; IP addresses only match exactly.
 Ports: 7700, or `CHIMAERA_PORT`. Under Slurm the default is
 `7700 + SLURM_JOB_ID % 1000`, so two jobs sharing a node don't collide.
 
-Raft durability: each cluster peer measures its disk's fsync when it starts.
-Where an fsync takes under a millisecond (local SSDs) every commit is synced
-on each voter. Where it takes longer (network volumes such as EBS, about
-3.5 ms) commits are only replicated: a call is acknowledged once a majority of
-its group's machines hold it in memory, because syncing would cap per-call
-throughput (on 4 cloud machines: 2,681 no-op calls/s synced, 17,547/s
-replicated). A peer whose logs were not synced and whose machine rebooted
-without a clean shutdown first asks the other voters of its groups whether
-they still lead them (for up to 10 seconds). If they do, it discards its raft
-identity and joins as a new member, so it can never vote with a log it may
-have lost. If some group has no leader (most of its machines went down
-together), it keeps its state instead, so the group comes back when enough
-of its voters return, possibly without its last moments of commits. A peer
-whose groups have no majority yet still starts and serves the groups that
-do; the others are retried in the background. `chimaera status` lists the
-choice and why. `CHIMAERA_RAFT_SYNC` overrides it: `fsync`, `full` (also
-flushes the drive cache; very slow on macOS) or `none`. Local peers never
-sync, except that the record of an `effects="external"` call starting is
-synced before the call runs, so a power loss cannot make it run twice.
+Raft durability: every cluster peer syncs each Raft commit to its disk, so a
+call is acknowledged once a majority of its group's voters have it on disk.
+`CHIMAERA_RAFT_SYNC=none` keeps commits in the page cache only, and only when
+set: a commit then survives the peers' processes dying, not a majority of
+their machines restarting together. It buys throughput on slow volumes (on 4
+cloud machines with EBS, about 3.5 ms per fsync: 2,681 no-op calls/s synced,
+17,547/s with `none`, measured before commits were batched as below). A slow
+disk never lowers the setting. While its commits keep taking a millisecond or
+more, a peer holds each one open for a quarter of a recent commit (at most
+`CHIMAERA_RAFT_MAX_COMMIT_DELAY_US`, 2 ms) so more entries share its fsync,
+and `chimaera status` lists the slow disk as degraded service. `full` also
+flushes the drive cache (very slow on macOS).
+
+What is synced, and how often:
+- **The log.** A syncing peer appends each batch of Raft operations to a
+  write-ahead file (`raft/raft-log.wal`) and syncs that: one sequential write.
+  Its database takes the batch unsynced and is synced by a checkpoint every
+  second, after which the file starts over; at start, what the file holds is
+  applied again.
+- **The state.** The state machine's database (`raft/raft-sm.redb`) is not
+  synced as the peer runs: it is the log applied, and the log and snapshot
+  files are synced. After the machine restarts without a clean stop, the peer
+  rebuilds it from each group's newest snapshot file and replays the log
+  after it (a process that died within the same boot left it whole). A clean
+  stop syncs it.
+
+Network volumes are why. On EBS gp3 a sync is cheap but an IO is not: each
+synced redb commit rewrote about twenty pages, and the volume's 3,000 IOPS
+then held one c7i.4xlarge peer to about 1,050 no-op calls/s. With the log
+and state written this way the same peer, still syncing every commit, ran
+13,066/s (13,486/s with `none`).
+
+`chimaera status` shows the guarantee asked for next to the one the groups
+give: `machine` (every voter syncs and no machine holds a majority of a
+group's voters, so a commit survives the loss of any one machine and every
+machine restarting at once), `reboot` (every voter syncs, but one machine
+holds a majority: restarts are survived, that machine's loss is not) or
+`process` (some voter does not sync). A group is only as strong as its
+weakest voter, since a majority that includes it can acknowledge a commit,
+and status names the voter that holds a group back. Dead voters are
+replaced, and seats moved, only with peers that sync as the leader asks.
+
+A peer whose logs were not synced and whose machine rebooted without a clean
+shutdown first asks the other voters of its groups whether they still lead
+them (for up to 10 seconds). If they do, it discards its raft identity and
+joins as a new member, so it can never vote with a log it may have lost. If
+some group has no leader (most of its machines went down together), it keeps
+its state instead, so the group comes back when enough of its voters return,
+possibly without its last moments of commits. A peer whose groups have no
+majority yet still starts and serves the groups that do; the others are
+retried in the background. Local peers never sync, except that the record of
+an `effects="external"` call starting is synced before the call runs, so a
+power loss cannot make it run twice.
 
 Recovering a group whose other voters are gone for good (their disks lost):
 stop the surviving peer, then run
@@ -74,12 +108,19 @@ live peers back as voters. Use it only when the other voters will not return,
 and on the surviving replica that holds the most of the group's log.
 
 Upgrading: `chimaera --version` prints the release and its peer level, for
-example `chimaera 0.1.0 (peer level 1)`. Every replica of a group must apply
-its log with the same code, so peers at different levels refuse each other's
-calls (the refused peer logs "every peer of a cluster must run the same
-release"). A release that keeps the level can replace peers one at a time:
-restart a peer, wait for `chimaera status` to list it, then the next. Under
-Kubernetes, `kubectl apply` the new image, then `kubectl delete pod NAME-N`
+example `chimaera 0.1.0 (peer level 1, wire 1, build dev-487df68cf4ccb0f2)`.
+Every replica of a group must apply its log with the same code, so peers at
+different levels refuse each other's calls (the refused peer logs "every
+peer of a cluster must run the same release"). A release that keeps the
+level can replace peers one at a time: restart a peer, wait for
+`chimaera status` to list it, then the next. A peer still on a release that
+does not say whether it syncs its raft log counts as not syncing, so until
+the last one is replaced, upgraded peers that sync give it no voter seat and
+may move its seats to each other, and each group it votes in reports `process`
+durability with a degraded line. Likewise, while a peer on a release too old
+to say which stored layouts it reads is live, shuffles store their buckets in
+the layout every release reads, so any peer can run any gather. Under Kubernetes,
+`kubectl apply` the new image, then `kubectl delete pod NAME-N`
 one pod at a time, since the StatefulSet only replaces pods you delete. A
 release that raises the level needs every peer stopped before any starts
 again on the new release (`kubectl scale --replicas=0`, then back). Raft
@@ -298,7 +339,7 @@ Start peers with `CHIMAERA_TENANT_QUOTAS="team-a=8,team-b=2"`
 to cap each tenant's CPUs on that peer:
 - **At the cap:** while a tenant's running calls hold its quota, its other calls wait, and other tenants' work goes ahead.
 - **Over the cap:** a call that asks for more than the whole quota fails as infeasible, naming the quota.
-- **Waiting calls:** a call waiting on its own calls lends its share, as it lends its CPU, so nested work never deadlocks a quota.
+- **Waiting calls:** a call waiting on its own calls lends its share, as it lends its CPU, so nested work never deadlocks a quota. Threads it started that keep running through the wait, such as a BLAS pool, keep the share they use. When only what those threads keep stands in the way, calls still start, one at a time on each peer, under a quota or a cluster share.
 - **No quota:** tenants without a quota are not limited.
 - **Bad setting:** a malformed setting stops the peer.
 
@@ -374,10 +415,10 @@ stays opt-in for spares until one has.
 ### Several clusters (federation)
 
 Clusters (cells) can lend each other capacity. Start a cell's peers with the
-other cells' client endpoints and a token those cells accept:
+cell's name, the other cells' client endpoints and a token those cells accept:
 
 ```
-CHIMAERA_FLEET="b=10.0.1.5:7710" CHIMAERA_FLEET_TOKEN_FILE=/etc/chimaera/fleet chimaera peer start ...
+CHIMAERA_CELL=a CHIMAERA_FLEET="b=10.0.1.5:7710" CHIMAERA_FLEET_TOKEN_FILE=/etc/chimaera/fleet chimaera peer start ...
 ```
 
 When every peer of a cell is full, a queued call that carries everything it

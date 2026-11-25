@@ -133,9 +133,12 @@ fn spill_threads() -> usize {
 pub struct ObjectStore {
     dir: PathBuf,
     /// On disk, for objects moved out of a memory-backed store under
-    /// pressure; each spilled object goes to the next one in turn.
+    /// pressure; each spilled object goes to the next one in turn (see
+    /// spill_order).
     spill: Vec<PathBuf>,
     next_spill: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// When a copy to each spill directory last failed (none: never).
+    spill_failed: std::sync::Arc<std::sync::Mutex<Vec<Option<std::time::Instant>>>>,
     /// Object storage that spilled objects go to instead (CHIMAERA_SPILL_URL).
     remote: Option<std::sync::Arc<crate::remote_spill::RemoteSpill>>,
     /// Objects still stored in each pack uploaded by this process, by (run,
@@ -151,6 +154,7 @@ impl ObjectStore {
             dir,
             spill: Vec::new(),
             next_spill: Default::default(),
+            spill_failed: Default::default(),
             remote: None,
             packs: Default::default(),
         })
@@ -158,7 +162,8 @@ impl ObjectStore {
 
     /// Spill to `dirs` (on disk) when the store itself is in memory (tmpfs).
     pub fn with_spill(self, dirs: Vec<PathBuf>) -> ObjectStore {
-        ObjectStore { spill: dirs, ..self }
+        let failed = std::sync::Arc::new(std::sync::Mutex::new(vec![None; dirs.len()]));
+        ObjectStore { spill: dirs, spill_failed: failed, ..self }
     }
 
     /// Spill to object storage instead of the spill directories.
@@ -195,16 +200,28 @@ impl ObjectStore {
         Ok(true)
     }
 
-    /// The next spill directory, in turn (None: this store does not spill).
-    fn next_spill(&self) -> Option<&Path> {
+    /// The spill directories to try for `len` bytes, starting from the next
+    /// one in turn: first those with that much free and no failed copy in the
+    /// last SPILL_RETRY_AFTER, then the others (a reading may be stale, and
+    /// a directory recovers). Empty when this store does not spill.
+    fn spill_order(&self, len: u64) -> Vec<usize> {
         let n = self.spill.len();
-        (n > 0).then(|| self.spill[self.next_spill.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n].as_path())
+        let start = self.next_spill.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let failed = self.spill_failed.lock().expect("lock").clone();
+        let (mut good, mut rest): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        for i in (0..n).map(|k| (start + k) % n) {
+            let healthy = failed[i].is_none_or(|at| at.elapsed() >= SPILL_RETRY_AFTER);
+            let room = crate::objplane::free_bytes(&self.spill[i]).is_none_or(|free| free >= len);
+            if healthy && room { good.push(i) } else { rest.push(i) }
+        }
+        good.extend(rest);
+        good
     }
 
     /// Where a copy of `object` on disk goes (a spill or a replica), when
-    /// this store spills.
-    pub fn spill_path(&self, run: &[u8], object: &[u8]) -> Option<PathBuf> {
-        self.next_spill().map(|d| d.join(hex(run)).join(hex(object)))
+    /// this store spills: the first spill directory of spill_order.
+    pub fn spill_path(&self, run: &[u8], object: &[u8], len: u64) -> Option<PathBuf> {
+        self.spill_order(len).first().map(|&i| self.spill[i].join(hex(run)).join(hex(object)))
     }
 
     /// Move the least recently written objects to disk until `want` bytes are
@@ -215,6 +232,7 @@ impl ObjectStore {
         if self.spill.is_empty() && self.remote.is_none() {
             return Ok(0);
         }
+        let started = std::time::Instant::now();
         let mut files = Vec::new();
         for run in std::fs::read_dir(&self.dir)?.flatten().filter(|e| !is_plane_dir(e)) {
             let Ok(entries) = std::fs::read_dir(run.path()) else { continue };
@@ -270,7 +288,7 @@ impl ObjectStore {
                     while let Some((len, path)) = picked.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         let spilled = match &self.remote {
                             Some(remote) => self.spill_remote(remote, path),
-                            None => self.spill_one(self.next_spill().expect("checked above"), path),
+                            None => self.spill_one(path, *len),
                         };
                         match spilled {
                             Ok(()) => {
@@ -285,6 +303,8 @@ impl ObjectStore {
                 });
             }
         });
+        crate::counters::SPILLED_BYTES.add(moved.load(std::sync::atomic::Ordering::Relaxed));
+        crate::counters::SPILL_MICROSECONDS.add(started.elapsed().as_micros() as u64);
         match failed.into_inner().expect("lock") {
             Some(e) if moved.load(std::sync::atomic::Ordering::Relaxed) == 0 => Err(e),
             _ => Ok(moved.into_inner()),
@@ -354,17 +374,37 @@ impl ObjectStore {
         std::fs::rename(&link, path) // readers see the file or the link
     }
 
-    /// Copy one in-memory object to the spill directory and make its path a
-    /// symlink to the copy.
-    fn spill_one(&self, spill: &Path, path: &Path) -> io::Result<()> {
+    /// Copy one in-memory object of `len` bytes to a spill directory and
+    /// make its path a symlink to the copy. The copy's bytes are reserved on
+    /// that disk before any is written; a copy that fails (a full or broken
+    /// disk) leaves nothing there, marks the directory and goes to the next
+    /// one (spill_order). The object stays in memory until a copy is whole.
+    fn spill_one(&self, path: &Path, len: u64) -> io::Result<()> {
         let rel = path.strip_prefix(&self.dir).expect("listed under the store");
-        let target = spill.join(rel);
-        std::fs::create_dir_all(target.parent().expect("run directory"))?;
-        std::fs::copy(path, &target)?;
-        let link = path.with_extension("spilling");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&target, &link)?;
-        std::fs::rename(&link, path) // atomic: readers see the file or the link
+        let mut last = io::Error::new(io::ErrorKind::StorageFull, "this store has no spill directory");
+        for i in self.spill_order(len) {
+            let target = self.spill[i].join(rel);
+            match copy_reserved(path, &target, len) {
+                Ok(()) => {
+                    let link = path.with_extension("spilling");
+                    let _ = std::fs::remove_file(&link);
+                    // The rename is atomic: readers see the file or the link.
+                    let linked = std::os::unix::fs::symlink(&target, &link).and_then(|()| std::fs::rename(&link, path));
+                    if linked.is_err() {
+                        let _ = std::fs::remove_file(&link);
+                        let _ = std::fs::remove_file(&target);
+                    }
+                    return linked;
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&target);
+                    self.spill_failed.lock().expect("lock")[i] = Some(std::time::Instant::now());
+                    tracing::warn!("cannot spill to {}: {e}; trying another spill directory", self.spill[i].display());
+                    last = e;
+                }
+            }
+        }
+        Err(last)
     }
 
     pub fn dir(&self) -> &Path {
@@ -434,17 +474,19 @@ impl ObjectStore {
     /// vshard bytes, which a content digest does only by chance (it then stays
     /// until expiry too). A `ch.put` made inside a call is named like a
     /// result (chimaera-py's `_future.put`), so a call that returns its handle
-    /// keeps it readable; one made by the driver goes. Returns the bytes freed.
-    pub fn delete_values(&self, run: &Id) -> u64 {
+    /// keeps it readable; one made by the driver goes. So do the files in
+    /// `kept`, which sessions hold (leases). Returns the bytes freed.
+    pub fn delete_values(&self, run: &Id, kept: &[Vec<u8>]) -> u64 {
         let (dir, run_hex) = (self.dir.join(run.hex()), run.hex());
         let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
+        let kept: std::collections::HashSet<String> = kept.iter().map(|k| hex(k)).collect();
         let mut freed = 0;
         let mut gone = Vec::new();
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
             let digest = name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit()) && name[..8] != run_hex[..8];
-            if !digest {
+            if !digest || kept.contains(name) {
                 continue;
             }
             freed += std::fs::metadata(e.path()).map_or(0, |m| m.len());
@@ -535,6 +577,61 @@ impl ObjectStore {
         }
         std::fs::create_dir_all(path.parent().expect("object paths have a run directory"))?;
         write_atomic(&path, data)
+    }
+}
+
+/// A spill directory whose copy failed is tried after the others for this long.
+const SPILL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Copy `src` (`len` bytes) to a new file `dst`, reserving its bytes on
+/// dst's filesystem first: a disk without room fails before anything is
+/// written, and no other writer can take the room while it is copied.
+fn copy_reserved(src: &Path, dst: &Path, len: u64) -> io::Result<()> {
+    std::fs::create_dir_all(dst.parent().expect("object paths have a run directory"))?;
+    let mut out = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(dst)?;
+    preallocate(&out, len)?;
+    let copied = std::io::copy(&mut std::fs::File::open(src)?, &mut out)?;
+    if copied != len {
+        return Err(io::Error::other(format!("copied {copied} of {len} bytes (the object changed)")));
+    }
+    Ok(())
+}
+
+/// Reserve `len` bytes of disk for `f` (posix_fallocate; F_PREALLOCATE on
+/// macOS): ENOSPC now rather than partway through writing it.
+pub fn preallocate(f: &std::fs::File, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: posix_fallocate on a descriptor we own; it returns the error.
+        match unsafe { libc::posix_fallocate(f.as_raw_fd(), 0, len as libc::off_t) } {
+            0 => Ok(()),
+            libc::EOPNOTSUPP => Ok(()), // a filesystem that cannot: the copy reports a full disk itself
+            e => Err(io::Error::from_raw_os_error(e)),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: len as libc::off_t,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: F_PREALLOCATE reads and fills `store` for a descriptor we own.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_PREALLOCATE, &mut store) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (f.as_raw_fd(), len);
+        Ok(())
     }
 }
 
@@ -720,7 +817,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
         }
         let before = store.bytes_used();
+        let counted = crate::counters::SPILLED_BYTES.get();
         assert_eq!(store.spill_oldest(4000).unwrap(), 5000, "the two oldest move");
+        // Process wide: other tests may spill meanwhile.
+        assert!(crate::counters::SPILLED_BYTES.get() >= counted + 5000, "/metrics counts what moved");
         // What remains is the newest object and two links (a path each).
         assert!(store.bytes_used() < before - 4000, "spilled bytes no longer count as stored");
         assert_eq!(std::fs::read(store.path(&run.0, &[1])).unwrap(), vec![1u8; 3000], "read through the link");
@@ -741,6 +841,56 @@ mod tests {
     }
 
     #[test]
+    fn a_spill_a_directory_cannot_take_goes_to_the_next_and_leaves_nothing_there() {
+        let mem = tempfile::tempdir().unwrap();
+        let (broken, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let dirs = vec![broken.path().to_path_buf(), disk.path().to_path_buf()];
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(dirs);
+        let run = Id::derive(0, 0, &[b"run"]);
+        // The first directory in turn cannot hold the run's files: a file has
+        // its run directory's name (root cannot write there either).
+        std::fs::write(broken.path().join(run.hex()), b"").unwrap();
+        let path = store.path(&run.0, &[1]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![7u8; 5000]).unwrap();
+        assert_eq!(store.spill_oldest(1).unwrap(), 5000);
+        assert_eq!(std::fs::read_link(&path).unwrap(), disk.path().join(run.hex()).join(hex(&[1])));
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 5000], "read through the link");
+        assert!(store.spill_failed.lock().unwrap()[0].is_some(), "the failure is remembered");
+        assert_eq!(store.spill_order(1), [1, 0], "the failed directory is tried last for a while");
+    }
+
+    /// A spill directory that fills up: `CHIMAERA_TEST_SMALL_SPILL_DIR` names
+    /// a directory on a filesystem with less than 8 MiB free (Linux: `docker
+    /// run --tmpfs /small:size=4m`; macOS: a small disk image, see
+    /// docs/objects.md). Skipped without it.
+    #[test]
+    fn a_spill_to_a_full_disk_fails_before_writing_and_goes_to_the_next() {
+        let Some(small) = std::env::var_os("CHIMAERA_TEST_SMALL_SPILL_DIR").map(PathBuf::from) else {
+            eprintln!("skipped: set CHIMAERA_TEST_SMALL_SPILL_DIR to a directory on a small filesystem");
+            return;
+        };
+        let (mem, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let small = tempfile::tempdir_in(small).unwrap();
+        let size = 8 << 20;
+        assert!(crate::objplane::free_bytes(small.path()).unwrap() < size as u64, "the small filesystem has room");
+        let run = Id::derive(0, 0, &[b"run"]);
+        let only_small = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(vec![small.path().into()]);
+        let path = only_small.path(&run.0, &[1]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![9u8; size]).unwrap();
+        let e = only_small.spill_oldest(1).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::StorageFull, "{e}");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file(), "the object stays where it was");
+        assert!(!small.path().join(run.hex()).join(hex(&[1])).exists(), "no partial copy is left");
+        let dirs = vec![small.path().to_path_buf(), disk.path().to_path_buf()];
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(dirs);
+        assert_eq!(store.spill_oldest(1).unwrap(), size as u64);
+        assert_eq!(std::fs::read_link(&path).unwrap(), disk.path().join(run.hex()).join(hex(&[1])));
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; size]);
+    }
+
+    #[test]
     fn an_ended_runs_stored_values_go_and_its_results_stay() {
         let d = tempfile::tempdir().unwrap();
         let store = ObjectStore::open(d.path().to_path_buf()).unwrap();
@@ -753,10 +903,45 @@ mod tests {
             std::fs::write(&path, vec![1u8; len]).unwrap();
         }
         std::fs::write(store.path(&run.0, b"x").with_extension("tmp1"), b"partial").unwrap();
-        assert_eq!(store.delete_values(&run), 5000);
+        let held = blake3::hash(b"a value another session holds").as_bytes()[..16].to_vec();
+        std::fs::write(store.path(&run.0, &held), vec![1u8; 300]).unwrap();
+        assert_eq!(store.delete_values(&run, std::slice::from_ref(&held)), 5000);
         assert!(!store.path(&run.0, &value).exists(), "the stored argument is gone");
         assert!(store.path(&run.0, &result.0).exists(), "the result stays for reattaching clients");
-        assert_eq!(store.delete_values(&run), 0);
+        assert!(store.path(&run.0, &held).exists(), "a held value stays");
+        assert_eq!(store.delete_values(&run, &[]), 300);
+    }
+
+    #[cfg(feature = "object-store-spill")]
+    #[test]
+    fn objects_spilled_to_object_storage_come_back_on_first_read_and_go_with_their_run() {
+        let (mem, bucket, cache) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let url = format!("file://{}", bucket.path().display());
+        let peer = "ab".repeat(16);
+        let remote = crate::remote_spill::RemoteSpill::open(&url, &peer, cache.path().to_path_buf()).unwrap();
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_remote(std::sync::Arc::new(remote));
+        let run = Id::derive(0, 0, &[b"run"]);
+        for (i, size) in [(1u8, 3000usize), (2, 1000)] {
+            let path = store.path(&run.0, &[i]);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![i; size]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
+        }
+        assert_eq!(store.spill_oldest(2000).unwrap(), 3000, "the oldest goes to object storage");
+        let remote_dir = bucket.path().join(format!("chimaera-{}", &peer[..16])).join(run.hex());
+        assert_eq!(std::fs::read(remote_dir.join("01")).unwrap(), vec![1u8; 3000], "uploaded");
+        let path = store.path(&run.0, &[1]);
+        assert!(!path.exists(), "its path waits for the first reader to restore it");
+        assert!(store.ensure_local(&run.0, &[1]).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 3000], "restored through the same path");
+        assert!(store.ensure_local(&run.0, &[2]).unwrap(), "an object never spilled is simply here");
+        store.delete_run(&run);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while remote_dir.join("01").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50)); // deleted in the background
+        }
+        assert!(!remote_dir.join("01").exists(), "the remote copy goes with its run");
     }
 
     #[cfg(feature = "object-store-spill")]
@@ -836,38 +1021,6 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(listed(&run_b).is_empty(), "the pack goes with its run");
-    }
-
-    #[cfg(feature = "object-store-spill")]
-    #[test]
-    fn objects_spilled_to_object_storage_come_back_on_first_read_and_go_with_their_run() {
-        let (mem, bucket, cache) =
-            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let url = format!("file://{}", bucket.path().display());
-        let peer = "ab".repeat(16);
-        let remote = crate::remote_spill::RemoteSpill::open(&url, &peer, cache.path().to_path_buf()).unwrap();
-        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_remote(std::sync::Arc::new(remote));
-        let run = Id::derive(0, 0, &[b"run"]);
-        for (i, size) in [(1u8, 3000usize), (2, 1000)] {
-            let path = store.path(&run.0, &[i]);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, vec![i; size]).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
-        }
-        assert_eq!(store.spill_oldest(2000).unwrap(), 3000, "the oldest goes to object storage");
-        let remote_dir = bucket.path().join(format!("chimaera-{}", &peer[..16])).join(run.hex());
-        assert_eq!(std::fs::read(remote_dir.join("01")).unwrap(), vec![1u8; 3000], "uploaded");
-        let path = store.path(&run.0, &[1]);
-        assert!(!path.exists(), "its path waits for the first reader to restore it");
-        assert!(store.ensure_local(&run.0, &[1]).unwrap());
-        assert_eq!(std::fs::read(&path).unwrap(), vec![1u8; 3000], "restored through the same path");
-        assert!(store.ensure_local(&run.0, &[2]).unwrap(), "an object never spilled is simply here");
-        store.delete_run(&run);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while remote_dir.join("01").exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50)); // deleted in the background
-        }
-        assert!(!remote_dir.join("01").exists(), "the remote copy goes with its run");
     }
 
     #[test]

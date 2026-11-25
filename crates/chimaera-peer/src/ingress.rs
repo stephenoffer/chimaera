@@ -269,8 +269,8 @@ impl Ingress {
                 });
                 continue;
             };
-            let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-            if let Some(why) = self.infeasible(&policy) {
+            let checked = crate::policy_check::decode(&spec.policy);
+            if let Some(why) = checked.as_ref().map_or_else(|e| Some(e.clone()), |p| self.infeasible(p)) {
                 acks.push(pb::TaskAck {
                     task: Some(tk.pb()),
                     status: pb::task_ack::Status::Rejected as i32,
@@ -380,7 +380,8 @@ fn runs_anywhere(spec: &pb::TaskSpec) -> bool {
     if !matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem) {
         return false;
     }
-    let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
+    // One that does not decode was refused at submit; never place it here.
+    let Ok(policy) = pb::Policy::decode(spec.policy.as_slice()) else { return false };
     policy.gpus == 0.0 && policy.device.is_empty() && policy.require.is_empty() && policy.cpus <= 1.0
 }
 
@@ -390,7 +391,7 @@ const SUBMIT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::SessionEvent, Status>> + Send>>;
 
 fn ev(seq: u64, event: pb::session_event::Event) -> pb::SessionEvent {
-    pb::SessionEvent { seq, event: Some(event) }
+    pb::SessionEvent { seq, event: Some(event), ..Default::default() }
 }
 
 /// The gRPC service: a handle to the shared ingress state.
@@ -521,18 +522,35 @@ impl pb::peer_server::Peer for Service {
         let caller = Caller::of(&req);
         let mut inbound = req.into_inner();
         let id = self.0.next_session.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel::<pb::SessionEvent>();
+        // Bounded (mailbox.rs): replies below wait for room, so a client that
+        // stops reading stops being read.
+        let tx = crate::mailbox::Mailbox::new();
+        let _ = tx.offer(ev(0, pb::session_event::Event::Opened(id)), crate::mailbox::Kind::Notice);
+        let tenant = caller.tenant().map(str::to_string);
         self.0
             .core
-            .send(CoreMsg::OpenSession { id, tx: tx.clone() })
+            .send(CoreMsg::OpenSession { id, mailbox: tx.clone(), tenant })
             .await
             .map_err(|_| Status::unavailable("peer is stopping"))?;
         let this = self.0.clone();
+        let out = crate::mailbox::stream(tx.clone(), {
+            let core = self.0.core.clone();
+            move || {
+                let core = core.clone();
+                async move {
+                    let _ = core.send(CoreMsg::SessionRoom { id }).await;
+                }
+            }
+        });
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = inbound.next().await {
+            // A resume of this session on another stream ends this one, though it is still open here.
+            let superseded = tx.superseded();
+            tokio::pin!(superseded);
+            while let Some(Ok(msg)) = tokio::select! { m = inbound.next() => m, () = &mut superseded => None } {
                 let seq = msg.seq;
                 if let Err(e) = this.may_send(&caller, msg.msg.as_ref()).await {
-                    let _ = tx.send(ev(seq, pb::session_event::Event::Error(e.message().to_string())));
+                    tx.send(ev(seq, pb::session_event::Event::Error(e.message().to_string()))).await;
+                    tx.took(seq);
                     continue;
                 }
                 match msg.msg {
@@ -564,7 +582,7 @@ impl pb::peer_server::Peer for Service {
                             ran.retain(|r| fresh.contains(&r.tk));
                             let _ = this.core.send(CoreMsg::DirectAttempts(ran)).await;
                         }
-                        let _ = tx.send(ev(seq, pb::session_event::Event::Acks(acks)));
+                        tx.send(ev(seq, pb::session_event::Event::Acks(acks))).await;
                         let _ = this.core.send(CoreMsg::Watch { session: id, tasks: accepted }).await;
                     }
                     Some(pb::client_msg::Msg::Watch(w)) => {
@@ -574,6 +592,20 @@ impl pb::peer_server::Peer for Service {
                     Some(pb::client_msg::Msg::ReleaseObjects(r)) => {
                         let msg = CoreMsg::ReleaseObjects { session: id, run: r.run, objects: r.object_ids };
                         let _ = this.core.send(msg).await;
+                    }
+                    Some(pb::client_msg::Msg::DiscardFailed(r)) => {
+                        let mut by_v: BTreeMap<u16, Vec<pb::TaskKey>> = BTreeMap::new();
+                        for t in r.tasks {
+                            if let Some(tk) = Tk::parse(&t) {
+                                by_v.entry(tk.v()).or_default().push(t);
+                            }
+                        }
+                        for (v, tasks) in by_v {
+                            let p = this.router.clone();
+                            tokio::spawn(async move {
+                                p.propose(v, pb::shard_cmd::Body::DiscardDead(pb::Release { tasks })).await
+                            });
+                        }
                     }
                     Some(pb::client_msg::Msg::Release(r)) => {
                         let mut by_v: BTreeMap<u16, Vec<pb::TaskKey>> = BTreeMap::new();
@@ -601,7 +633,7 @@ impl pb::peer_server::Peer for Service {
                     }
                     Some(pb::client_msg::Msg::ActorCreate(a)) => {
                         let reply = this.create_actor(a).await;
-                        let _ = tx.send(ev(seq, reply));
+                        tx.send(ev(seq, reply)).await;
                     }
                     Some(pb::client_msg::Msg::AttachRun(run)) => {
                         if let Ok(run) = Id::from_slice(&run) {
@@ -622,12 +654,20 @@ impl pb::peer_server::Peer for Service {
                             let _ = this.core.send(CoreMsg::EndRun { run, cancel: e.cancel }).await;
                         }
                     }
+                    Some(pb::client_msg::Msg::AckCursor(cursor)) => tx.ack(cursor),
+                    Some(pb::client_msg::Msg::Resume(r)) => {
+                        let msg = CoreMsg::ResumeSession { id, seq, old: r.session, cursor: r.cursor };
+                        let _ = this.core.send(msg).await;
+                        // Not counted as taken: the requests the client sends
+                        // again after it have lower seqs (mailbox.rs).
+                        continue;
+                    }
                     _ => {}
                 }
+                tx.took(seq);
             }
             let _ = this.core.send(CoreMsg::CloseSession { id }).await;
         });
-        let out = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok);
         Ok(Response::new(Box::pin(out)))
     }
 
@@ -662,6 +702,16 @@ impl pb::peer_server::Peer for Service {
         } else {
             Some(Id::from_slice(&r.after_task).map_err(|e| Status::invalid_argument(e.to_string()))?)
         };
+        if r.failed {
+            let mut reply = pb::ListTasksReply::default();
+            for v in self.0.spread_of(run).await? {
+                for (tk, d) in self.0.dead_letters(run, v).await? {
+                    reply.failed_keys.push(tk.pb());
+                    reply.failed.push(d);
+                }
+            }
+            return Ok(Response::new(reply));
+        }
         let limit = (r.limit as usize).clamp(1, 10_000);
         // Task ids lead with their vshard, so the run's vshards in order, each
         // in id order, list its tasks in id order.
@@ -820,7 +870,7 @@ impl pb::peer_server::Peer for Service {
 
     async fn status(&self, req: Request<pb::StatusRequest>) -> Result<Response<pb::StatusReply>, Status> {
         let caller = Caller::of(&req);
-        let want_objects = req.into_inner().objects;
+        let pb::StatusRequest { objects: want_objects, fleet, .. } = req.into_inner();
         if want_objects && caller != Caller::Admin {
             return Err(Status::permission_denied(
                 "every peer's object store lists every tenant's runs: it takes the cluster token",
@@ -830,6 +880,10 @@ impl pb::peer_server::Peer for Service {
         self.0.core.send(CoreMsg::Status { reply }).await.map_err(|_| Status::unavailable("peer is stopping"))?;
         let mut s = rx.await.map_err(|_| Status::unavailable("peer is stopping"))?;
         s.peer = Some(self.0.info.clone());
+        if fleet {
+            crate::counters::FLEET_SUMMARIES_SERVED.add(1);
+            return Ok(Response::new(crate::fleet::answer(s)));
+        }
         if want_objects {
             s.objects = self.0.inventories().await;
         }
@@ -846,7 +900,7 @@ impl pb::peer_server::Peer for Service {
         let Some(mesh) = &self.0.router.mesh else {
             return Err(Status::not_found("object not in this peer's store"));
         };
-        let Err(e) = mesh.localize(&self.0.objects, &r.run, &r.object_id, 0, &[]).await else {
+        let Err(e) = mesh.localize(&self.0.objects, &r.run, &r.object_id, 0, &[], r.traffic()).await else {
             return Ok(Response::new(pb::LocalizeReply {}));
         };
         // Every copy is lost. A call's result can be made again by running
@@ -873,6 +927,61 @@ impl pb::peer_server::Peer for Service {
         }
     }
 
+    /// A retained ch.put: copy its files to other peers (replicas::retain)
+    /// and answer once they are made.
+    async fn retain(&self, req: Request<pb::RetainRequest>) -> Result<Response<pb::RetainReply>, Status> {
+        let caller = Caller::of(&req);
+        let r = req.into_inner();
+        self.0.may_run(&caller, &r.run).await?;
+        let Some(mesh) = &self.0.router.mesh else {
+            return Err(Status::failed_precondition(
+                "durability='retained' keeps a copy on another peer, and this peer runs alone",
+            ));
+        };
+        let copies = crate::objplane::replica_count().max(1);
+        crate::replicas::retain(mesh, &self.0.objects, &r.run, &r.object_ids, copies)
+            .await
+            .map_err(|why| Status::aborted(format!("durability='retained': no copy was made: {why}")))?;
+        Ok(Response::new(pb::RetainReply {}))
+    }
+
+    /// A session holds (or lets go of) stored files of another run (leases).
+    async fn borrow(&self, req: Request<pb::BorrowRequest>) -> Result<Response<pb::BorrowReply>, Status> {
+        let caller = Caller::of(&req);
+        let r = req.into_inner();
+        self.0.may_run(&caller, &r.run).await?;
+        let tenant = caller.tenant().map(str::to_string);
+        crate::leases::borrow(&self.0.core, &self.0.router, tenant, r).await?;
+        Ok(Response::new(pb::BorrowReply {}))
+    }
+
+    /// Hold resources on this peer's ledger (core/holds.rs), or on another's
+    /// through the mesh. Owners are named under their tenant.
+    async fn hold(&self, req: Request<pb::HoldRequest>) -> Result<Response<pb::HoldReply>, Status> {
+        let caller = Caller::of(&req);
+        let mut r = req.into_inner();
+        let tenant_of = |owner: &str| owner.split('/').next().unwrap_or_default().to_string();
+        if !r.owner.is_empty() && !caller.may(&tenant_of(&r.owner)) {
+            return Err(Status::permission_denied(format!("this credential may not hold for {}", r.owner)));
+        }
+        let gone = || Status::unavailable("peer is stopping");
+        let mut reply = match &self.0.router.mesh {
+            Some(mesh) if !r.peer.is_empty() && r.peer != self.0.router.identity.peer.to_vec() => {
+                let node = mesh.member_by_peer(&r.peer).filter(|p| !p.dead).map(|p| p.member.node_id);
+                let node = node.ok_or_else(|| Status::unavailable("that peer is not live"))?;
+                r.peer.clear();
+                mesh.hold(node, r).await.map_err(|e| Status::unavailable(format!("holding on another peer: {e}")))?
+            }
+            _ => {
+                let (reply, rx) = oneshot::channel();
+                self.0.core.send(CoreMsg::Hold { req: r, reply }).await.map_err(|_| gone())?;
+                rx.await.map_err(|_| gone())?
+            }
+        };
+        reply.holds.retain(|line| caller.may(&tenant_of(line)));
+        Ok(Response::new(reply))
+    }
+
     async fn has_blobs(&self, req: Request<pb::HasBlobsRequest>) -> Result<Response<pb::HasBlobsReply>, Status> {
         let caller = Caller::of(&req);
         let r = req.into_inner();
@@ -885,7 +994,7 @@ impl pb::peer_server::Peer for Service {
         let caller = Caller::of(&req);
         let mut chunks = req.into_inner();
         let first = chunks.next().await.ok_or_else(|| Status::invalid_argument("empty upload"))??;
-        let (run, blob_id, size) = (first.run, first.blob_id, first.size);
+        let (run, blob_id, size, keep_local) = (first.run, first.blob_id, first.size, first.keep_local);
         self.0.may_run(&caller, &run).await?;
         if blob_id.len() != 16 || run.is_empty() {
             return Err(Status::invalid_argument("the first chunk names the run and the 16-byte blob id"));
@@ -903,6 +1012,9 @@ impl pb::peer_server::Peer for Service {
         }
         if data.len() as u64 != size {
             return Err(Status::invalid_argument(format!("upload ended at {} of {size} bytes", data.len())));
+        }
+        if keep_local {
+            crate::replicas::keep_local(&blob_id); // no background copy (see replicas)
         }
         let objects = self.0.objects.clone();
         tokio::task::spawn_blocking(move || objects.put_blob(&run, &blob_id, &data))
@@ -1064,12 +1176,19 @@ impl pb::peer_server::Peer for Service {
 
     async fn store(&self, req: Request<pb::StoreRequest>) -> Result<Response<pb::StoreReply>, Status> {
         use chimaera_core::shard::store;
+        crate::counters::STORE_REQUESTS.add(1);
         let caller = Caller::of(&req);
         let r = req.into_inner();
-        let (tenant, namespace) = match (&r.write, &r.read) {
-            (Some(w), _) => (w.tenant.clone(), w.namespace.clone()),
-            (None, Some(rd)) => (rd.tenant.clone(), rd.namespace.clone()),
-            (None, None) => return Err(Status::invalid_argument("a store request needs a write or a read")),
+        let (tenant, namespace) = match (&r.write, &r.txn, &r.read, &r.claim) {
+            (Some(w), _, _, _) => (w.tenant.clone(), w.namespace.clone()),
+            (None, Some(t), _, _) => (t.tenant.clone(), t.namespace.clone()),
+            (None, None, Some(rd), _) => (rd.tenant.clone(), rd.namespace.clone()),
+            (None, None, None, Some(c)) => (c.tenant.clone(), c.namespace.clone()),
+            (None, None, None, None) => {
+                return Err(Status::invalid_argument(
+                    "a store request needs a write, a transaction, a read or a claim",
+                ));
+            }
         };
         if namespace.is_empty() {
             return Err(Status::invalid_argument("a store namespace must not be empty"));
@@ -1091,7 +1210,12 @@ impl pb::peer_server::Peer for Service {
         if let Some(w) = r.write {
             return propose(pb::shard_cmd::Body::StoreWrite(w)).await.map(Response::new);
         }
-        let read = r.read.expect("checked above");
+        if let Some(t) = r.txn {
+            return propose(pb::shard_cmd::Body::StoreTxn(t)).await.map(Response::new);
+        }
+        let Some(read) = r.read else {
+            return propose(pb::shard_cmd::Body::StoreClaim(r.claim.expect("checked above"))).await.map(Response::new);
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(r.wait_ms as u64);
         let watching = read.kind() == pb::store_read::Kind::Changes && r.wait_ms > 0;
         loop {
@@ -1220,7 +1344,7 @@ impl Ingress {
                 return Ok(());
             }
             Some(Msg::Watch(w)) => w.tasks.iter().collect(),
-            Some(Msg::Release(r)) => r.tasks.iter().collect(),
+            Some(Msg::Release(r) | Msg::DiscardFailed(r)) => r.tasks.iter().collect(),
             Some(Msg::Cancel(c)) => c.task.iter().collect(),
             Some(Msg::StreamCredit(c)) => c.task.iter().collect(),
             Some(Msg::ReleaseObjects(r)) => return self.may_run(caller, &r.run).await,
@@ -1241,7 +1365,8 @@ impl Ingress {
                     None => Ok(()),
                 };
             }
-            Some(Msg::Heartbeat(_) | Msg::FinishRun(_)) | None => return Ok(()),
+            // A resume checks the credential against the session's own (core.rs).
+            Some(Msg::Heartbeat(_) | Msg::FinishRun(_) | Msg::AckCursor(_) | Msg::Resume(_)) | None => return Ok(()),
         };
         let runs: BTreeSet<&[u8]> = tasks.iter().map(|t| t.run.as_slice()).collect();
         for run in runs {
@@ -1327,6 +1452,22 @@ impl Ingress {
         Ok(reply.page_keys.iter().filter_map(Tk::parse).zip(reply.tasks).collect())
     }
 
+    /// A run's dead letters in vshard `v`.
+    async fn dead_letters(&self, run: Id, v: u16) -> Result<Vec<(Tk, pb::DeadLetter)>, Status> {
+        if let Some(dead) = self.router.read(v, |kv| read::dead_letters(kv, v, run)) {
+            return Ok(dead);
+        }
+        let req = pb::ReadRequest {
+            run: run.to_vec(),
+            failed: true,
+            failed_vshard: v as u32,
+            linearizable: true,
+            ..Default::default()
+        };
+        let reply = self.remote_read(v, req).await?;
+        Ok(reply.failed_keys.iter().filter_map(Tk::parse).zip(reply.failed).collect())
+    }
+
     /// Why the actor a pending call goes to has not started on its host, when
     /// the host is another peer: its own reason, or that it did not answer in
     /// ACTOR_WAIT_ASK. None when the call is not to an actor, its actor is here
@@ -1367,7 +1508,10 @@ impl Ingress {
         let (Some(spec), Some(ctor)) = (a.spec, a.ctor) else {
             return pb::session_event::Event::Error("actor create needs a spec and a constructor call".into());
         };
-        let policy = pb::Policy::decode(ctor.policy.as_slice()).unwrap_or_default();
+        let policy = match crate::policy_check::decode(&ctor.policy) {
+            Ok(p) => p,
+            Err(why) => return pb::session_event::Event::Error(why),
+        };
         if let Some(why) = self.infeasible(&policy) {
             return pb::session_event::Event::Error(why);
         }
@@ -1399,6 +1543,12 @@ impl Ingress {
             );
         }
         let tenant = spec.tenant.clone();
+        let upgrade = pb::ActorUpgrade {
+            actor: actor.to_vec(),
+            class_digest: spec.class_digest.clone(),
+            state_schema: spec.state_schema,
+            methods: spec.methods.clone(),
+        };
         // Create (or find) the actor first: for keyed actors a second creator
         // gets the existing one and must not submit a second constructor.
         let created = self
@@ -1421,7 +1571,43 @@ impl Ingress {
                 return pb::session_event::Event::Error(format!("constructor rejected: {}", a.reason));
             }
         }
+        // A named durable actor found with an older state version is bound
+        // to this creator's class (the shard ignores an older or equal one).
+        let older = ack.record.as_ref().and_then(|r| r.spec.as_ref()).is_some_and(|s| {
+            s.durable && s.state_schema.max(1) < upgrade.state_schema // 0: from before versions, version 1's
+        });
+        if ack.status() == pb::actor_ack::Status::Existing && older {
+            match self.router.propose(actor.vshard(), pb::shard_cmd::Body::ActorUpgrade(upgrade)).await {
+                Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Actor(a)) }) => {
+                    if a.status() == pb::actor_ack::Status::Ok {
+                        self.tell_host(&a).await;
+                    }
+                    return pb::session_event::Event::Actor(a);
+                }
+                Ok(other) => return pb::session_event::Event::Error(format!("actor upgrade rejected: {other:?}")),
+                Err(e) => return pb::session_event::Event::Error(e.to_string()),
+            }
+        }
         pb::session_event::Event::Actor(ack)
+    }
+
+    /// Give an upgraded record to the actor's host before its creator hears
+    /// of it, so the creator's next call cannot reach the instance of the
+    /// older class first: that call comes to the host later, on this or
+    /// another link. (Its group's leader also sends the record.)
+    async fn tell_host(&self, ack: &pb::ActorAck) {
+        let Some(rec) = ack.record.clone() else { return };
+        let Some(host) = rec.host.clone() else { return }; // not running: it starts with the new class
+        let mesh = self.router.mesh.as_ref().filter(|_| host.peer != self.router.identity.peer.to_vec());
+        let Some(mesh) = mesh else {
+            let _ = self.core.send(CoreMsg::Remote { work: Vec::new(), actors: vec![rec], actor_env: None }).await;
+            return;
+        };
+        let Some(target) = mesh.member_by_peer(&host.peer) else { return };
+        let req = pb::DispatchRequest { cluster: mesh.cluster.clone(), actors: vec![rec], ..Default::default() };
+        if let Err(e) = mesh.dispatch(target.member.node_id, req).await {
+            tracing::warn!("cannot give actor host {} its upgraded record: {e}", target.member.node_id);
+        }
     }
 }
 

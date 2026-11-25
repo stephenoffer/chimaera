@@ -99,18 +99,8 @@ pub fn target_voters(group: u32, members: &[pb::Member], n: usize) -> Vec<u64> {
         })
         .collect();
     ranked.sort_by_key(|(h, m)| (*h, m.node_id));
-    let mut zones = BTreeSet::new();
-    let mut voters: Vec<u64> = Vec::new();
-    for (_, m) in &ranked {
-        if voters.len() < n && m.labels.get("zone").is_some_and(|z| zones.insert(z.clone())) {
-            voters.push(m.node_id);
-        }
-    }
-    for (_, m) in &ranked {
-        if voters.len() < n && !voters.contains(&m.node_id) {
-            voters.push(m.node_id);
-        }
-    }
+    let ranked: Vec<&pb::Member> = ranked.into_iter().map(|(_, m)| m).collect();
+    let mut voters = crate::labels::spread(&ranked, n, &["zone"], None);
     voters.sort();
     voters
 }
@@ -319,7 +309,7 @@ fn others_lead(raft: &std::path::Path, cfg: &ClusterConfig) -> bool {
 
 /// Run a cluster peer until shutdown.
 pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
-    let durability = crate::durability::choose(&cfg.dir.join("raft"))?;
+    let durability = crate::durability::choose()?;
     let (node, _lock) = Node::open_with(&cfg.dir, cfg.cpus, || {
         crate::durability::guard(&cfg.dir, durability, |raft| others_lead(raft, &cfg))
     })?;
@@ -338,6 +328,8 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
             .or_else(crate::durability::boot_id)
             .unwrap_or_default(),
         object_dir: node.objects.dir().to_string_lossy().into_owned(),
+        raft_sync: crate::durability::advertised(durability) as i32,
+        object_layout: crate::parts::OBJECT_LAYOUT,
     };
     let mesh = Arc::new(MeshClient::new(
         cfg.cluster.clone(),
@@ -445,6 +437,7 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
 
     let (host, raft_events) =
         RaftHost::open(&cfg.dir.join("raft"), me.node_id, Arc::new(MeshTransport(mesh.clone())), durability)?;
+    crate::durability::watch(host.disk_stats());
     let router = Arc::new(Router::cluster(node.identity, plan.data_groups, mesh.clone()));
     let _ = server.router.set(router.clone());
     let groups = Arc::new(Groups {
@@ -752,13 +745,15 @@ async fn rebalance(
     let others = mesh.live_others();
     let mut members: Vec<pb::Member> = others.iter().map(|p| p.member.clone()).collect();
     members.push(mesh.me.clone());
+    // Seats go only to peers that sync their log as this peer asks.
+    let seats: Vec<pb::Member> = members.iter().filter(|m| crate::durability::meets_floor(m)).cloned().collect();
     let me = mesh.me.node_id;
     for g in router.hosted_groups() {
         if !router.leads(g.id) || changed_at.get(&g.id).is_some_and(|t| t.elapsed() < rebalance_after()) {
             continue;
         }
         let voters: BTreeSet<u64> = g.view().1.into_iter().collect();
-        let target: BTreeSet<u64> = target_voters(g.id, &members, voters.len()).into_iter().collect();
+        let target: BTreeSet<u64> = target_voters(g.id, &seats, voters.len()).into_iter().collect();
         let (Some(add), Some(remove)) =
             (target.difference(&voters).next().copied(), voters.difference(&target).find(|v| **v != me).copied())
         else {
@@ -853,6 +848,9 @@ async fn replace_voters(
         }
         let mut spares: Vec<_> =
             mesh.live_others().into_iter().filter(|p| !voters.contains(&p.member.node_id)).collect();
+        // Only peers that sync their log as this peer asks: a dead voter stays
+        // unreplaced rather than its seat going to one that does not sync.
+        spares.retain(|p| crate::durability::meets_floor(&p.member));
         spares.sort_by(|a, b| a.pressure().total_cmp(&b.pressure()));
         let mut next: BTreeSet<u64> = voters.clone();
         let wanted = dead.iter().map(Some).chain(std::iter::repeat_n(None, missing));

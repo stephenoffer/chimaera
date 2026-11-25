@@ -99,6 +99,13 @@ between calls that run one after another in a worker, and a lock held across
 `CHIMAERA_HOST_WHILE_WAITING=0` on the peers to give each waiting call a
 process of its own.
 
+Threads the call started that keep running through the wait, such as a BLAS
+pool, keep the CPU they use: the peer measures them and grants only the rest.
+When only those threads stand in the way of the calls it waits for, the calls
+still start, one at a time beside them: the next once the one before ends,
+waits, or sits idle for a quarter of a second. If other calls are running on
+the peer too, a call first waits up to two seconds for one of them to end.
+
 </details>
 
 ## Cancel a call
@@ -207,10 +214,57 @@ iterating, or read `.outcomes()`, whose `(index, value, error)` tuples never
 raise.
 
 The default window is the larger of 256 items and 32 per usable core (widened
-so every core can hold two batches), and 256 MiB of arguments plus the
-measured size of results. If you set `max_in_flight` or `max_in_flight_bytes`,
-it's a hard cap. Leaving a `with` block or calling `.close()` cancels the items
-still running and closes the source iterator.
+so every core can hold two batches), and 256 MiB. If you set `max_in_flight`
+or `max_in_flight_bytes`, it's a hard cap: `max_in_flight` counts every item
+taken from your iterator that you haven't read yet, running or finished.
+Leaving a `with` block or calling `.close()` cancels the items still running
+and closes the source iterator.
+
+The bytes a map holds are the arguments of the items in flight, the stored
+size of every result that has finished but that you haven't read yet (in an
+ordered map they wait behind a slow item), and the batch it's handing out.
+An item still running counts as the mean result size measured so far, and a
+batch takes at most half the window, in items and in bytes, so the next one
+runs while you read it. So when results are about the same size, a map holds
+at most the cap plus one call's results (one batch), and a slow first item
+can't make it pile up more. Until a result's size is known, a map sends only
+as many items as can run at once, so it holds at most one result per call
+running. For `fn.map` that's the live peers' CPUs divided by the call's
+`cpus` (one when unset), and their GPUs divided by its `gpus` if it takes
+some. For an actor method's `.map` it's the calls the method's lane runs at
+once: its concurrency group's size, its own `concurrency` (twice the batch's
+`max_size` for a batched method), or the actor's. For `Pool.map` it's that
+times the replicas. The first call to finish, even behind a slow first item,
+gives the size, and the rest of the window goes out.
+Results over the inline limit stay in the peers' object stores until you
+read them, so this machine holds only small results, the batch being handed
+out, and what you keep. On Linux, an array a worker put in the shared arena
+counts only its small frame until you read it.
+
+The items can come from an async iterable, such as an async generator. Read
+that map with `async for`. It takes items only as the window has room and
+sends them as they arrive. Items that arrive while calls run go out together,
+batched as a list's are, and results that are ready are read while the
+iterable waits. An error the iterable raises reaches
+you after the items before it. Leaving the loop early (a `break`, an error,
+cancellation) cancels the items still running and closes the iterable, so its
+`finally` blocks run. An `async with` block or `await results.aclose()` does
+the same. A plain `with` block or `.close()` can't wait for an async
+iterable, so its `finally` blocks run then only if it was producing an item,
+and otherwise when it's garbage collected.
+
+```python run
+import asyncio
+
+async def texts():
+    for text in ["a", "a b", "a b c"]:
+        yield text
+
+async def counts() -> list[int]:
+    return [n async for n in word_count.map(texts())]
+
+assert asyncio.run(counts()) == [1, 2, 3]
+```
 
 Fast items get batched, one call per batch. Batches start at one item and
 grow, by the measured time per item, to about 0.1 s of worker time (4096
@@ -352,9 +406,10 @@ with countdown.remote(1_000_000) as stream:
 <summary>Stream reruns and closing</summary>
 
 The generator pauses once it's `max_in_flight` items ahead of you (default
-64). If its worker dies mid-stream, it runs again from the start on another
-worker and skips the items you already have. So make it yield the same items
-each time.
+64), or `max_in_flight_bytes` of stored items (default 256 MiB; one item
+larger than that still goes, alone). If its worker dies mid-stream, it runs
+again from the start on another worker and skips the items you already have.
+So make it yield the same items each time.
 
 If the generator raises, you get the items it yielded first, then the
 exception. `stream.close()` stops it and drops what you haven't taken, just
@@ -393,8 +448,23 @@ except ch.DeadlineExceeded:
     pass
 ```
 
-Not sure which setting won? `fn.policy().describe()` lists each effective value
-and where it came from.
+Not sure which setting won? `fn.policy()`, or `actor.method.policy()`, is
+what the call will run with: read-only `values`, `sources` saying where each
+came from, and `describe()`, which words both. Inside a call made with
+`explain=True`, `ch.context().describe_policy()` says the same. It is off by
+default because the call then carries those words, about 35 bytes for each
+option set.
+
+```python run
+@ch.remote
+def how_am_i_set() -> str:
+    return ch.context().describe_policy()
+
+view = how_am_i_set.options(priority=2)
+with ch.defaults(deadline="30s", explain=True):
+    said = view.policy().describe()   # "..., deadline=30.0 (with ch.defaults at ...), priority=2 (.options at ...), ..."
+    assert view.remote().result() == said
+```
 
 <details>
 <summary>Option precedence and defaults</summary>
@@ -408,7 +478,11 @@ The first of these that sets an option wins:
 5. Built-in defaults.
 
 A typo or a bad value raises `ch.OptionsError` on the line where you wrote it,
-with a suggestion.
+with a suggestion. So do options that contradict each other, such as a
+`memory_limit` below `memory`, a `ch.auto(min=..., max=...)` whose min is
+above its max, or `gpus=0` with a `device`: the error names both and where
+each was set. Sizes are at most 16 EiB, and durations at most 100 years,
+except a `budget`, which is compute time rather than a wait and may be longer.
 
 A deadline is `"250ms"`, `"30s"`, `"5m"`, `"2h"`, a number of seconds, or a
 `datetime`. It counts from `.remote()`, so time queued for a worker counts
@@ -425,7 +499,7 @@ waiting for a peer. It never stops a running call.
 | `deadline` | none | Cancel the call this long after `.remote()`. |
 | `priority` | `0` | Order among calls waiting for room on a peer. |
 | `max_in_flight` | map: max(256, 32 per core); stream: 64 | Map items in flight, or stream items produced ahead of you. |
-| `max_in_flight_bytes` | `256 MiB` | Argument bytes in flight for a map. |
+| `max_in_flight_bytes` | `256 MiB` | Bytes a map holds (arguments in flight, results not read yet), or stored stream items produced ahead of you. |
 | `latency` | unset | `"interactive"` turns batching off. |
 | `max_attempts`, `retry_exceptions`, `effects` | `3`, none, `"none"` | Retries; see [failures.md](failures.md). |
 | `cpus`, `memory`, `gpus`, `memory_limit` | see [resources.md](resources.md) | What a call reserves. |

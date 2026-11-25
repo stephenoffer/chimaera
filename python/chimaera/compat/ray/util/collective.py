@@ -4,9 +4,11 @@ A group is declared from the driver (``create_collective_group``) or by each
 actor (``init_collective_group``); the collectives run inside the actors and
 work in place, as Ray's do. Torch tensors go through ``torch.distributed``
 (``gloo`` on CPU, ``nccl`` on CUDA), so an actor process uses one
-torch-backed group at a time. NumPy arrays go through the replicated store, so
-keep them small (a value is at most 1 MiB). Not mapped: ``send``/``recv``,
-``reducescatter`` and the ``*_multigpu`` calls.
+torch-backed group at a time. NumPy arrays go through the group's store
+collectives: the replicated store, or the object plane past 64 KiB. A gloo
+group's ``gloo_timeout`` bounds each collective's wait (the group's
+``collective_timeout``); an NCCL group's is 600 s. Not mapped:
+``send``/``recv``, ``reducescatter`` and the ``*_multigpu`` calls.
 """
 
 from __future__ import annotations
@@ -41,6 +43,11 @@ def _declared() -> ch.coord.Store:
     return ch.coord.Store("ray-collective")
 
 
+def _timeouts(backend: str, gloo_timeout: int) -> dict[str, float]:
+    """Ray's ``gloo_timeout`` (ms) bounds a gloo group's collectives; an NCCL group keeps the default."""
+    return {"collective_timeout": gloo_timeout / 1000} if str(backend).lower() == Backend.GLOO else {}
+
+
 def create_collective_group(
     actors: list[Any],
     world_size: int,
@@ -62,7 +69,8 @@ def create_collective_group(
 
     native = [a._actor if isinstance(a, ActorHandle) else a for a in actors]
     ordered = [a for _, a in sorted(zip(ranks, native, strict=True), key=lambda ra: ra[0])]
-    _declared().put(group_name, ch.dist.group(*ordered, name=f"ray-{group_name}"), ttl=TTL)
+    handle = ch.dist.group(*ordered, name=f"ray-{group_name}", **_timeouts(backend, gloo_timeout))
+    _declared().put(group_name, handle, ttl=TTL)
 
 
 def init_collective_group(
@@ -80,7 +88,7 @@ def init_collective_group(
     store.put(f"member/{rank}", ctx.actor_id, ttl=TTL)
     round_ = store.barrier("init", world_size).wait()  # the same number on every rank
     members = tuple(store.get(f"member/{r}") for r in range(world_size))
-    joined = ch.dist.GroupHandle(f"ray-init-{group_name}", round_, members).join()
+    joined = ch.dist.GroupHandle(f"ray-init-{group_name}", round_, members, **_timeouts(backend, gloo_timeout)).join()
     with _lock:
         _groups[group_name] = joined
 

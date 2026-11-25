@@ -4,44 +4,37 @@
 //! The owning shard never learns the call left the cell. This peer publishes
 //! the other cell's outcome as its attempt's outcome, or reports the attempt
 //! failed, and the shard retries it like any lost attempt. Only calls whose
-//! whole meaning travels with them are eligible (`eligible`). Each cell's free
-//! CPUs come from polling its `Status` every `SUMMARY_EVERY`.
+//! whole meaning travels with them are eligible (`eligible`).
 //!
-//! The other cells are a static list (`CHIMAERA_FLEET`), the cells listed in
-//! a directory cell (`CHIMAERA_FLEET_DIRECTORY`), or both. In the directory,
-//! each cell (`CHIMAERA_CELL=name@endpoint`) keeps an entry with a short TTL,
-//! in a store namespace replicated by the directory cell's Raft groups. If
-//! the directory is lost, peers keep the last list they read: discovery
-//! stops, delegation does not.
+//! Which cells there are and how much room each has comes from this cell's
+//! view of the fleet, which `view` keeps.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chimaera_core::cell;
 use chimaera_core::ids::Id;
 use chimaera_core::pb;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::executor::ExecEnv;
+use crate::router::Router;
+
+mod view;
+pub use view::answer;
 
 pub const ENV: &str = "CHIMAERA_FLEET";
 pub const TOKEN_ENV: &str = "CHIMAERA_FLEET_TOKEN_FILE";
 pub const DIRECTORY_ENV: &str = "CHIMAERA_FLEET_DIRECTORY";
 pub const CELL_ENV: &str = "CHIMAERA_CELL";
-const DIRECTORY_NAMESPACE: &str = "fleet/cells";
-/// Every this many summary rounds, the directory is read and this cell's entry renewed.
-const DIRECTORY_EVERY: u32 = 4;
-/// A cell's directory entry outlives a few missed renewals, not a dead cell.
-const DIRECTORY_TTL_MS: u64 = 10_000;
 /// A queued call waits at least this long before it may leave the cell.
 pub const DELEGATE_AFTER: Duration = Duration::from_millis(300);
-/// What is sent to a cell counts against its room until its next report, so
-/// this bounds how long freed room there goes unused. shortcut: every peer polls
-/// every cell; a large fleet would read summaries through per-cell ambassadors.
-const SUMMARY_EVERY: Duration = Duration::from_millis(500);
 /// A cell that failed a delegation gets none for this long.
 const DOWN_FOR: Duration = Duration::from_secs(30);
+/// The resource class delegated calls need (only CPU calls are eligible).
+const CPU: &str = "cpu";
 
 type Client =
     pb::peer_client::PeerClient<tonic::service::interceptor::InterceptedService<tonic::transport::Channel, Auth>>;
@@ -56,30 +49,24 @@ impl tonic::service::Interceptor for Auth {
     }
 }
 
-/// The other cells, what they last reported free, and what this peer has sent them.
+/// The other cells, as this cell's view has them, and what this peer sent them.
 pub struct Fleet {
-    /// The cells listed in `CHIMAERA_FLEET`, then those the directory lists.
-    cells: Arc<Mutex<Vec<(String, String)>>>,
+    /// The cells listed in `CHIMAERA_FLEET`.
     fixed: Vec<(String, String)>,
     directory: Option<String>,
-    /// This cell's (name, client endpoint), as it registers in the directory.
-    me: Option<(String, String)>,
+    /// This cell's name and client endpoint (`this_cell`).
+    me: (String, String),
+    /// This cell's region (its peers' `region` label): calls go to cells there first.
+    region: String,
     auth: Auth,
-    /// Each cell's last report: (free CPUs, all CPUs, report number).
-    free: Arc<Mutex<HashMap<String, Report>>>,
-    /// CPUs sent to each cell since the report this peer last read from it.
+    /// The cell's view, as this peer last read or wrote it.
+    view: Arc<Mutex<pb::FleetView>>,
+    /// CPUs sent to each cell since the report (by number) this peer last read from it.
     sent: HashMap<String, (f64, u64)>,
     /// CPUs of this peer's calls running in each cell now.
     in_flight: HashMap<String, f64>,
     down_until: HashMap<String, Instant>,
     links: HashMap<String, Arc<Link>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Report {
-    free: f64,
-    cpus: f64,
-    number: u64,
 }
 
 /// Why a delegation produced no outcome.
@@ -103,6 +90,18 @@ pub fn parse(text: &str) -> Result<Vec<(String, String)>, String> {
             Ok((name.trim().to_string(), addr.trim().to_string()))
         })
         .collect()
+}
+
+/// `CHIMAERA_CELL`: this cell's name, as the other cells list it, then
+/// `@host:port` where they reach it, which lists it in the directory (none:
+/// not listed). A fleet needs the name: each cell's neighbors follow from it.
+fn this_cell(value: Option<&str>) -> Result<(String, String), String> {
+    let v = value.unwrap_or_default();
+    let (name, endpoint) = v.split_once('@').unwrap_or((v, ""));
+    if name.trim().is_empty() {
+        return Err(format!("a fleet needs {CELL_ENV}: this cell's name, as the other cells list it"));
+    }
+    Ok((name.trim().to_string(), endpoint.trim().to_string()))
 }
 
 /// Whether a call may run in another cell: a plain function call whose
@@ -142,26 +141,20 @@ impl Fleet {
         if fixed.is_empty() && directory.is_none() {
             return Ok(None);
         }
-        let me = match std::env::var(CELL_ENV) {
-            Ok(v) => Some(
-                v.split_once('@')
-                    .map(|(n, e)| (n.trim().to_string(), e.trim().to_string()))
-                    .ok_or_else(|| io::Error::other(format!("{CELL_ENV}: expected name@host:port, got {v:?}")))?,
-            ),
-            Err(_) => None,
-        };
+        let me = this_cell(std::env::var(CELL_ENV).ok().as_deref()).map_err(io::Error::other)?;
         let path = std::env::var(TOKEN_ENV).map_err(|_| io::Error::other(format!("a fleet needs {TOKEN_ENV}")))?;
         let token = std::fs::read_to_string(&path)?;
         let auth = format!("Bearer {}", token.trim())
             .parse()
             .map_err(|_| io::Error::other(format!("{TOKEN_ENV}: the token must be printable ASCII")))?;
+        let region = crate::labels::parse(&std::env::var("CHIMAERA_LABELS").unwrap_or_default()).remove("region");
         Ok(Some(Fleet {
-            cells: Arc::new(Mutex::new(fixed.clone())),
             fixed,
             directory,
             me,
+            region: region.unwrap_or_default(),
             auth: Auth(auth),
-            free: Arc::default(),
+            view: Arc::default(),
             sent: HashMap::new(),
             in_flight: HashMap::new(),
             down_until: HashMap::new(),
@@ -169,54 +162,45 @@ impl Fleet {
         }))
     }
 
-    /// Poll every cell's `Status` for its free CPUs, for as long as the peer runs.
-    pub fn spawn_summaries(&self) {
-        let (cells, free, auth) = (self.cells.clone(), self.free.clone(), self.auth.clone());
-        let (fixed, directory, me) = (self.fixed.clone(), self.directory.clone(), self.me.clone());
-        tokio::spawn(async move {
-            for round in 0u32.. {
-                if let Some(dir) = directory.as_deref().filter(|_| round % DIRECTORY_EVERY == 0) {
-                    match register_and_list(dir, &auth, me.as_ref()).await {
-                        Ok(listed) => *cells.lock().expect("fleet cells") = merged(&fixed, listed, me.as_ref()),
-                        Err(e) => tracing::debug!("fleet directory {dir}: {e}"),
-                    }
-                }
-                let known = cells.lock().expect("fleet cells").clone();
-                for (name, addr) in known {
-                    let (room, cpus) = summary(&addr, &auth).await;
-                    record(&free, &name, room, cpus);
-                }
-                tokio::time::sleep(SUMMARY_EVERY).await;
-            }
-        });
+    /// Keep this cell's view of the fleet for as long as the peer runs: as the
+    /// cell's publisher, or by reading what the publisher wrote.
+    pub fn spawn_summaries(&self, router: Arc<Router>) {
+        view::spawn(self, router);
     }
 
-    /// A cell with room for `cpus` more, the roomiest first (the first listed on
-    /// a tie). This peer counts on `share` of each cell (1 / the live peers of
-    /// its own cell, which all delegate without talking to each other): of the
-    /// cell's reported free CPUs, less what this peer sent since that report
-    /// (so a burst cannot flood it between reports), and never more than its
-    /// CPUs less this peer's calls still running there (reports lag, and those
-    /// calls may not show in them yet).
-    pub fn pick(&mut self, cpus: f64, share: f64) -> Option<String> {
+    /// The cell's view as this peer last read it (`Status`).
+    pub fn view(&self) -> pb::FleetView {
+        self.view.lock().expect("fleet view").clone()
+    }
+
+    /// A cell this cell lists (reports name others too, but calls go only
+    /// where this cell knows to reach) with room for `cpus` more: one in this
+    /// cell's region if one there has room, drawn in proportion to room
+    /// (`cell::choose`; `key`, the call's id, makes the draw). This peer counts
+    /// on `share` of each cell (1 / the live peers of its own cell, which all
+    /// delegate without talking to each other): of the cell's reported free
+    /// CPUs, less what this peer sent since that report (so a burst cannot
+    /// flood it between reports), and never more than its CPUs less this
+    /// peer's calls still running there (reports lag, and those calls may not
+    /// show in them yet).
+    pub fn pick(&mut self, cpus: f64, share: f64, key: &[u8]) -> Option<String> {
         let now = Instant::now();
-        let free = self.free.lock().expect("fleet summaries").clone();
-        let mut best: Option<(String, f64, u64)> = None;
-        let cells = self.cells.lock().expect("fleet cells").clone();
-        for (name, _) in &cells {
-            let Some(r) = free.get(name) else { continue };
-            if self.down_until.get(name).is_some_and(|t| *t > now) {
+        let mut cells: Vec<(String, String, u64, f64)> = Vec::new();
+        let view = self.view.lock().expect("fleet view");
+        let listed: HashSet<&str> = view.cells.iter().map(|c| c.name.as_str()).collect();
+        for c in view.capacity.iter().filter(|c| c.resource == CPU && listed.contains(c.cell.as_str())) {
+            if self.down_until.get(&c.cell).is_some_and(|t| *t > now) {
                 continue;
             }
-            let report = r.number;
-            let sent = self.sent.get(name).filter(|(_, n)| *n == report).map_or(0.0, |(s, _)| *s);
-            let running = self.in_flight.get(name).copied().unwrap_or(0.0);
-            let left = (r.free * share - sent).min(r.cpus * share - running);
-            if left + 1e-9 >= cpus && best.as_ref().is_none_or(|(_, b, _)| left > *b) {
-                best = Some((name.clone(), left, report));
-            }
+            let sent = self.sent.get(&c.cell).filter(|(_, n)| *n == c.number).map_or(0.0, |(s, _)| *s);
+            let running = self.in_flight.get(&c.cell).copied().unwrap_or(0.0);
+            let left = (c.free * share - sent).min(c.total * share - running);
+            cells.push((c.cell.clone(), c.region.clone(), c.number, left));
         }
-        let (name, _, report) = best?;
+        let room: Vec<(&str, f64)> = cells.iter().map(|(_, region, _, left)| (region.as_str(), *left)).collect();
+        let draw = u64::from_le_bytes(blake3::hash(key).as_bytes()[..8].try_into().expect("8 bytes"));
+        let chosen = cell::choose(&room, &self.region, cpus, draw)?;
+        let (name, _, report, _) = cells.swap_remove(chosen);
         let entry = self.sent.entry(name.clone()).or_insert((0.0, report));
         if entry.1 != report {
             *entry = (0.0, report);
@@ -239,83 +223,13 @@ impl Fleet {
         self.links.remove(cell);
     }
 
-    /// The connection to `cell` that delegations share.
+    /// The connection to `cell` that delegations share, at the endpoint this
+    /// cell lists it at.
     pub fn link(&mut self, cell: &str) -> Option<Arc<Link>> {
-        let addr = self.cells.lock().expect("fleet cells").iter().find(|(n, _)| n == cell)?.1.clone();
+        let addr = self.view.lock().expect("fleet view").cells.iter().find(|c| c.name == cell)?.endpoint.clone();
         let auth = self.auth.clone();
         Some(self.links.entry(cell.to_string()).or_insert_with(|| Arc::new(Link::new(addr, auth))).clone())
     }
-}
-
-/// The static cells, then the directory's, without this cell or duplicates.
-fn merged(
-    fixed: &[(String, String)],
-    listed: Vec<(String, String)>,
-    me: Option<&(String, String)>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = fixed.to_vec();
-    for (name, endpoint) in listed {
-        if me.is_none_or(|(m, _)| *m != name) && !out.iter().any(|(n, _)| *n == name) {
-            out.push((name, endpoint));
-        }
-    }
-    out
-}
-
-/// Renew this cell's directory entry (when it has a name) and read every cell's.
-async fn register_and_list(
-    directory: &str,
-    auth: &Auth,
-    me: Option<&(String, String)>,
-) -> Result<Vec<(String, String)>, String> {
-    let mut c = connect(directory, auth).await?;
-    let store =
-        |write: Option<pb::StoreWrite>, read: Option<pb::StoreRead>| pb::StoreRequest { write, read, wait_ms: 0 };
-    if let Some((name, endpoint)) = me {
-        let put = pb::StoreWrite {
-            tenant: "default".into(),
-            namespace: DIRECTORY_NAMESPACE.into(),
-            key: name.clone(),
-            value: endpoint.clone().into_bytes(),
-            ttl_ms: DIRECTORY_TTL_MS,
-            ..Default::default()
-        };
-        let r = c.store(store(Some(put), None)).await.map_err(|e| e.message().to_string())?.into_inner();
-        if !r.ok {
-            return Err(format!("registering {name}: {}", r.error));
-        }
-    }
-    let scan = pb::StoreRead {
-        tenant: "default".into(),
-        namespace: DIRECTORY_NAMESPACE.into(),
-        kind: pb::store_read::Kind::Scan as i32,
-        limit: 1000,
-        ..Default::default()
-    };
-    let r = c.store(store(None, Some(scan))).await.map_err(|e| e.message().to_string())?.into_inner();
-    if !r.ok {
-        return Err(format!("listing cells: {}", r.error));
-    }
-    Ok(r.entries.into_iter().filter_map(|e| Some((e.key, String::from_utf8(e.value).ok()?))).collect())
-}
-
-/// Keep `cell`'s newest report, numbered after the one before.
-fn record(reports: &Mutex<HashMap<String, Report>>, cell: &str, free: f64, cpus: f64) {
-    let mut reports = reports.lock().expect("fleet summaries");
-    let number = reports.get(cell).map_or(1, |r| r.number + 1);
-    reports.insert(cell.to_string(), Report { free, cpus, number });
-}
-
-/// A cell's (free CPUs, all CPUs) over its live peers, from its `Status`; an
-/// unreachable cell has none. Calls waiting in its queues take room too.
-async fn summary(addr: &str, auth: &Auth) -> (f64, f64) {
-    let nodes = match connect(addr, auth).await {
-        Ok(mut c) => c.status(pb::StatusRequest::default()).await.map(|r| r.into_inner().nodes).unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    let alive = nodes.iter().filter(|n| n.alive);
-    let room = alive.clone().map(|n| (n.cpus - n.cpu_used - n.queued as f64).max(0.0)).sum();
-    (room, alive.map(|n| n.cpus).sum())
 }
 
 async fn connect(addr: &str, auth: &Auth) -> Result<Client, String> {
@@ -538,6 +452,11 @@ mod tests {
         );
         assert!(parse("b").unwrap_err().contains("cell=host:port"));
         assert!(parse("b=host").unwrap_err().contains("needs host:port"));
+        assert_eq!(this_cell(Some(" a ")).unwrap(), ("a".into(), String::new()), "a name alone: not in the directory");
+        assert_eq!(this_cell(Some("a@10.0.0.5:7710")).unwrap(), ("a".into(), "10.0.0.5:7710".into()));
+        for unnamed in [None, Some(""), Some("@h:1")] {
+            assert!(this_cell(unnamed).unwrap_err().contains("a fleet needs CHIMAERA_CELL"), "{unnamed:?}");
+        }
     }
 
     #[test]
@@ -566,55 +485,83 @@ mod tests {
         assert!(!eligible(&plain, &pb::Policy { budget_cpu_seconds: 5.0, ..Default::default() }), "budgets");
     }
 
-    #[test]
-    fn delegations_count_against_a_cells_room_until_its_next_report() {
-        let mut f = Fleet {
-            cells: Arc::new(Mutex::new(vec![("b".into(), "h:1".into()), ("c".into(), "h:2".into())])),
+    fn fleet(region: &str) -> Fleet {
+        Fleet {
             fixed: Vec::new(),
             directory: None,
-            me: None,
+            me: ("a".into(), String::new()),
+            region: region.into(),
             auth: Auth("Bearer t".parse().unwrap()),
-            free: Arc::default(),
+            view: Arc::default(),
             sent: HashMap::new(),
             in_flight: HashMap::new(),
             down_until: HashMap::new(),
             links: HashMap::new(),
-        };
-        let report = |free: f64, cpus: f64, number: u64| Report { free, cpus, number };
-        assert_eq!(f.pick(1.0, 1.0), None, "no report yet: no room known");
-        f.free.lock().unwrap().extend([("b".to_string(), report(2.0, 4.0, 1)), ("c".to_string(), report(3.0, 4.0, 1))]);
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("c"));
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("b"), "a tie goes to the first listed");
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("c"));
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("b"));
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("c"));
-        assert_eq!(f.pick(1.0, 1.0), None, "both full until they report again");
-        // b's next report lags: it still shows 2 free, but 2 of b's 4 CPUs run
-        // this peer's calls, and 2 more were sent: none left until they end.
-        f.free.lock().unwrap().insert("b".to_string(), report(2.0, 4.0, 2));
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("b"));
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("b"));
-        assert_eq!(f.pick(1.0, 1.0), None, "4 of b's 4 CPUs run this peer's calls");
-        f.done("b", 1.0);
-        assert_eq!(f.pick(1.0, 1.0), None, "what was sent counts until b reports again");
-        f.free.lock().unwrap().insert("b".to_string(), report(1.0, 4.0, 3));
-        assert_eq!(f.pick(1.0, 1.0).as_deref(), Some("b"), "one ended and b reported it: room again");
-        assert_eq!(f.pick(1.0, 1.0), None);
-        f.free.lock().unwrap().insert("b".to_string(), report(4.0, 4.0, 4));
-        f.done("b", 4.0);
-        assert_eq!(f.pick(2.0, 0.25), None, "a quarter of b is 1 CPU: not 2");
-        assert_eq!(f.pick(1.0, 0.25).as_deref(), Some("b"));
-        f.free.lock().unwrap().insert("c".to_string(), report(4.0, 4.0, 2));
-        f.failed("c"); // out for a while, whatever its room: b takes what fits, c nothing
-        let picks: Vec<String> = std::iter::from_fn(|| f.pick(1.0, 1.0)).collect();
-        assert_eq!(picks, ["b", "b", "b"]);
+        }
+    }
+
+    fn report(cell: &str, region: &str, free: f64, number: u64) -> pb::CellCapacity {
+        let (cell, region, resource) = (cell.into(), region.into(), CPU.into());
+        pb::CellCapacity { cell, region, resource, free, total: 4.0, number, ..Default::default() }
+    }
+
+    /// Set `f`'s view to `reports`, of cells it lists.
+    fn set(f: &Fleet, reports: Vec<pb::CellCapacity>) {
+        let mut view = f.view.lock().unwrap();
+        view.cells = reports.iter().map(|r| pb::FleetCell { name: r.cell.clone(), endpoint: "h:1".into() }).collect();
+        view.capacity = reports;
+    }
+
+    /// Every cell `f` picks for calls of `cpus` until none has room, sorted.
+    fn picks(f: &mut Fleet, cpus: f64, share: f64) -> Vec<String> {
+        let mut out: Vec<String> = (0u64..).map_while(|i| f.pick(cpus, share, &i.to_le_bytes())).collect();
+        out.sort();
+        out
     }
 
     #[test]
-    fn the_directory_adds_cells_but_never_this_one_or_a_listed_one_twice() {
-        let fixed = vec![("b".to_string(), "h:1".to_string())];
-        let listed = vec![("a".into(), "h:0".into()), ("b".into(), "h:9".into()), ("c".into(), "h:2".into())];
-        let me = ("a".to_string(), "h:0".to_string());
-        assert_eq!(merged(&fixed, listed, Some(&me)), [("b".into(), "h:1".into()), ("c".into(), "h:2".into())]);
+    fn delegations_count_against_a_cells_room_until_its_next_report() {
+        let mut f = fleet("");
+        assert_eq!(f.pick(1.0, 1.0, b"x"), None, "no report yet: no room known");
+        set(&f, vec![report("b", "", 2.0, 1), report("c", "", 3.0, 1)]);
+        assert_eq!(picks(&mut f, 1.0, 1.0), ["b", "b", "c", "c", "c"], "both full until they report again");
+        // b's next report lags: it still shows 2 free, but 2 of b's 4 CPUs run
+        // this peer's calls, and 2 more were sent: none left until they end.
+        set(&f, vec![report("b", "", 2.0, 2), report("c", "", 0.0, 2)]);
+        assert_eq!(picks(&mut f, 1.0, 1.0), ["b", "b"], "4 of b's 4 CPUs run this peer's calls");
+        f.done("b", 1.0);
+        assert_eq!(f.pick(1.0, 1.0, b"y"), None, "what was sent counts until b reports again");
+        set(&f, vec![report("b", "", 1.0, 3), report("c", "", 0.0, 2)]);
+        assert_eq!(picks(&mut f, 1.0, 1.0), ["b"], "one ended and b reported it: room again");
+        f.done("b", 4.0);
+        f.done("c", 3.0);
+        set(&f, vec![report("b", "", 4.0, 4), report("c", "", 4.0, 3)]);
+        assert_eq!(f.pick(2.0, 0.25, b"z"), None, "a quarter of a cell is 1 CPU: not 2");
+        f.failed("c"); // out for a while, whatever its room: b takes what fits, c nothing
+        assert_eq!(picks(&mut f, 1.0, 0.25), ["b"]);
+    }
+
+    #[test]
+    fn calls_go_to_this_regions_cells_first_and_spread_by_room() {
+        let mut f = fleet("eu");
+        let near = |free| report("b", "eu", free, 1);
+        set(&f, vec![near(2.0), report("c", "us", 4.0, 1), report("d", "eu", 1.0, 1)]);
+        assert_eq!(picks(&mut f, 1.0, 1.0), ["b", "b", "c", "c", "c", "c", "d"]);
+        // The first three went to b or d, the cells in this region with room.
+        let mut f = fleet("eu");
+        set(&f, vec![near(2.0), report("c", "us", 4.0, 1), report("d", "eu", 1.0, 1)]);
+        let first: Vec<String> = (0u64..3).filter_map(|i| f.pick(1.0, 1.0, &i.to_le_bytes())).collect();
+        assert!(first.iter().all(|c| c != "c"), "{first:?}");
+    }
+
+    #[test]
+    fn calls_go_only_to_cells_this_one_lists() {
+        let mut f = fleet("");
+        set(&f, vec![report("b", "", 1.0, 1)]);
+        // A report another cell passed on, of a cell this one does not list:
+        // its endpoint, if any, would be the other cell's to choose.
+        f.view.lock().unwrap().capacity.push(report("x", "", 4.0, 1));
+        assert_eq!(picks(&mut f, 1.0, 1.0), ["b"]);
+        assert!(f.link("x").is_none() && f.link("b").is_some());
     }
 }

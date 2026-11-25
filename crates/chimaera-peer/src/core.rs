@@ -30,6 +30,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+mod actor_limits;
+mod actor_state;
+mod demand;
+mod holds;
+mod native;
+
 type Kind = pb::error_record::Kind;
 
 /// Work behind the head of the queue that may start while the head waits for
@@ -117,14 +123,47 @@ const PUBLISH_IN_FLIGHT: u32 = 2;
 const IDLE_EXECUTOR_TTL: Duration = Duration::from_secs(60);
 /// A running call told to stop that has not stopped by itself (the executor
 /// interrupts its main thread after 2 s) loses its executor after this long.
-const CANCEL_KILL_AFTER: Duration = Duration::from_secs(5);
+static CANCEL_KILL_AFTER: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Read the cancel timeouts, once at the peer's start: a running call told to
+/// stop is interrupted by its executor after `CHIMAERA_CANCEL_INTERRUPT_SECONDS`
+/// (2 s; the executor reads it), and loses its executor after
+/// `CHIMAERA_CANCEL_KILL_SECONDS` (5 s). A value that is not a positive number
+/// of seconds, or a kill before the interrupt, stops the peer instead.
+pub fn configure_cancel() -> Result<(), String> {
+    let seconds = |name: &str, unset: f64| match std::env::var(name) {
+        Err(_) => Ok(unset),
+        Ok(v) => v
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .ok_or_else(|| format!("{name}={v:?}: expected a number of seconds above 0, such as 2.5")),
+    };
+    let interrupt = seconds("CHIMAERA_CANCEL_INTERRUPT_SECONDS", 2.0)?;
+    let kill = seconds("CHIMAERA_CANCEL_KILL_SECONDS", 5.0)?;
+    if kill <= interrupt {
+        return Err(format!(
+            "CHIMAERA_CANCEL_KILL_SECONDS ({kill}) must be longer than CHIMAERA_CANCEL_INTERRUPT_SECONDS \
+             ({interrupt}): a cancelled call is interrupted before its worker is killed"
+        ));
+    }
+    let _ = CANCEL_KILL_AFTER.set(Duration::from_secs_f64(kill));
+    Ok(())
+}
+
+fn cancel_kill_after() -> Duration {
+    CANCEL_KILL_AFTER.get().copied().unwrap_or(Duration::from_secs(5))
+}
 
 pub enum CoreMsg {
     Raft(GroupEvents),
     Exec(Box<ExecEvent>),
     OpenSession {
         id: u64,
-        tx: mpsc::UnboundedSender<pb::SessionEvent>,
+        mailbox: Arc<crate::mailbox::Mailbox>,
+        /// The caller's tenant (None: any), which a resume must match.
+        tenant: Option<String>,
     },
     BindRun {
         session: u64,
@@ -132,6 +171,17 @@ pub enum CoreMsg {
     },
     CloseSession {
         id: u64,
+    },
+    /// The session's reader made room for what waited (mailbox.rs).
+    SessionRoom {
+        id: u64,
+    },
+    /// Session `id` continues session `old`, whose stream broke.
+    ResumeSession {
+        id: u64,
+        seq: u64,
+        old: u64,
+        cursor: u64,
     },
     RegisterRun {
         run: Id,
@@ -221,6 +271,15 @@ pub enum CoreMsg {
         run: Vec<u8>,
         objects: Vec<Vec<u8>>,
     },
+    /// A session's Borrow request, counted (leases.rs): the leases to propose.
+    Lease {
+        session: u64,
+        tenant: Option<String>,
+        run: Id,
+        files: Vec<Vec<u8>>,
+        release: bool,
+        reply: oneshot::Sender<Result<crate::leases::Leases, String>>,
+    },
     /// The objects an attempt reads are now local (or could not be fetched).
     Localized {
         work: Box<Work>,
@@ -267,6 +326,12 @@ pub enum CoreMsg {
         work: Box<Work>,
         outcome: Option<pb::Outcome>,
     },
+    /// A retained result's copies are made (`error` None: publish `entry`,
+    /// which names them), or could not be (see replicas).
+    Retained {
+        entry: Box<pb::PublishEntry>,
+        error: Option<String>,
+    },
     /// An outcome reported by another peer's replica (remote watch).
     Outcome {
         task: Tk,
@@ -310,6 +375,11 @@ pub enum CoreMsg {
         since: u64,
         wait: bool,
         reply: oneshot::Sender<Vec<pb::ClusterEvent>>,
+    },
+    /// `Peer.Hold` for this peer's resource ledger (core/holds.rs).
+    Hold {
+        req: pb::HoldRequest,
+        reply: oneshot::Sender<pb::HoldReply>,
     },
     /// Write learned profiles to disk now (clean shutdown).
     Persist {
@@ -358,6 +428,14 @@ pub struct Work {
     mem_source: String,
     /// In a CPU trial: Some(true) for the canary, Some(false) for the control.
     arm: Option<bool>,
+    /// What each source chose and what was granted, the placing peer's
+    /// reservation, and calls in its executor round trip (settings.rs).
+    cpus_chosen: crate::settings::Chosen,
+    mem_chosen: crate::settings::Chosen,
+    placer: (f64, u64),
+    batched: u32,
+    /// The function's median call time when it was reserved; 0 = never measured.
+    est_s: f64,
     /// Bytes the call reads: arguments, blobs and dependency values.
     read_bytes: u64,
     /// Spillback was refused for this attempt: it runs here.
@@ -406,6 +484,9 @@ pub(crate) async fn producer_plan(
     let Some(outcome) = record.outcome.filter(|o| made(o, object)) else {
         return Err("its call's recorded outcome is another value".into());
     };
+    if matches!(&outcome.value, Some(pb::outcome::Value::Ok(o)) if o.durability() == pb::Durability::Ephemeral) {
+        return Err("it was stored with durability='ephemeral', which is lost with its peer, never made again".into());
+    }
     let mut deps = Vec::with_capacity(spec.deps.len());
     for d in &spec.deps {
         let dep = Tk::parse(d).ok_or("malformed task key")?;
@@ -510,6 +591,11 @@ impl Work {
             cpus_source: "default".into(),
             mem_source: "default".into(),
             arm: None,
+            cpus_chosen: Default::default(),
+            mem_chosen: Default::default(),
+            placer: (0.0, 0),
+            batched: 1,
+            est_s: 0.0,
             read_bytes: 0,
             stays: false,
             rebuilds: 0,
@@ -529,6 +615,19 @@ impl Work {
         matches!(self.kind(), pb::CallKind::CallActorCtor | pb::CallKind::CallActorMethod)
     }
 
+    /// The settings it runs with (AttemptRecord.settings).
+    fn settings(&self, capacity: f64) -> Vec<pb::Setting> {
+        crate::settings::of(
+            &self.policy,
+            self.cpus_chosen,
+            self.mem_chosen,
+            self.mem_floor,
+            self.placer,
+            capacity,
+            self.batched,
+        )
+    }
+
     /// CPU and memory reserved, and where each came from.
     fn reservation(&self) -> String {
         let mem = if self.mem > 0 { format!("{} MiB", self.mem.div_ceil(MIB)) } else { "not known yet".into() };
@@ -538,7 +637,12 @@ impl Work {
     /// Memory to learn from the function's profile: no value was set, none
     /// is known yet, and learning is on.
     fn learns_memory(&self) -> bool {
-        self.mem == 0 && self.policy.memory == 0 && self.policy.adaptive() == pb::policy::Adaptive::On
+        // An initial value (ch.auto(initial=...)) holds only until there is an estimate.
+        let unlearned =
+            self.mem == 0 || (self.policy.memory_initial && self.mem == self.policy.memory && self.mem_floor == 0);
+        unlearned
+            && (self.policy.memory == 0 || self.policy.memory_initial)
+            && self.policy.adaptive() == pb::policy::Adaptive::On
     }
 
     /// Fast calls of one function that can share an executor round trip
@@ -576,6 +680,10 @@ impl Work {
             && other.tk.run == self.tk.run
             && other.policy == self.policy
             && other.spec.retry_exception_types == self.spec.retry_exception_types
+            // A batch runs at its head's grant and each call is recorded
+            // under its own trial arm: never mix arms or grants.
+            && other.arm == self.arm
+            && other.cpus == self.cpus
     }
 }
 
@@ -596,7 +704,7 @@ async fn fetch_inputs(
     use futures_util::StreamExt;
     let fetches = objs.into_iter().map(|obj| async move {
         let holders = mesh.holders(&obj);
-        mesh.localize(store, &obj.run, &obj.object_id, obj.size, &holders)
+        mesh.localize(store, &obj.run, &obj.object_id, obj.size, &holders, pb::TrafficClass::TrafficForeground)
             .await
             .map_err(|e| (obj.object_id.clone(), format!("cannot fetch input object {}: {e}", hex(&obj.object_id))))
     });
@@ -781,6 +889,7 @@ struct ActorHost {
     /// Constructor finished on the current executor.
     constructed: bool,
     ctor: Option<Work>,
+    /// Calls waiting to start, by (handle, seq): in through actor_limits::enqueue.
     mailbox: BTreeMap<(u64, u64), Work>,
     next_seq: HashMap<u64, u64>,
     done_seqs: HashMap<u64, BTreeSet<u64>>,
@@ -810,6 +919,17 @@ struct ActorHost {
     /// It moved away: calls that reach this peer are given back to the shard,
     /// which grants them again at its new host.
     moved: bool,
+    /// Per-method limits on its calls (ActorSpec.methods; actor_limits), and
+    /// its mailbox methods' calls queued here in the order they take room.
+    limits: Vec<pb::MethodLimit>,
+    waiting: actor_limits::Waiting,
+    /// Its record names a newer class than its instance was built from: the
+    /// instance is rebuilt from the committed state between calls (actor_state).
+    upgrade: bool,
+    /// The state version its record's class writes (ActorSpec.state_schema).
+    state_schema: u32,
+    /// The digests of its committed state's chunks, when it is that large.
+    state_chunks: Vec<Vec<u8>>,
 }
 
 struct RunInfo {
@@ -818,10 +938,7 @@ struct RunInfo {
     sessions: BTreeSet<u64>,
 }
 
-struct Session {
-    tx: mpsc::UnboundedSender<pb::SessionEvent>,
-    run: Option<Id>,
-}
+use crate::mailbox::Session;
 
 pub struct Core {
     me_tx: mpsc::Sender<CoreMsg>,
@@ -831,6 +948,10 @@ pub struct Core {
     code: CodeStore,
     capacity: f64,
     cpu_used: f64,
+    /// Executors where calls wait, and the CPU their threads still use (native).
+    native: HashMap<u32, native::Native>,
+    /// What was last let in over those threads' CPU, and when a call last started (native).
+    letting: native::Letting,
     queue: crate::keyed_queue::KeyedQueue<Work, Tk>,
     /// Items still running per task, so a finished call heard of (most ran
     /// elsewhere, or already finished here) costs a lookup, not a scan.
@@ -841,6 +962,13 @@ pub struct Core {
     cancelling: Vec<(u32, Tk, Instant)>,
     actors: HashMap<Id, ActorHost>,
     sessions: HashMap<u64, Session>,
+    /// Resumes waiting for the old session's stream to end here: old -> (new, seq, cursor).
+    resuming: HashMap<u64, (u64, u64, u64)>,
+    /// Sessions resumed into another, by the session now holding them, for a
+    /// client that did not hear the resume's answer and names the old one again.
+    resumed_as: HashMap<u64, u64>,
+    /// Files of other runs sessions hold (leases.rs).
+    borrows: crate::leases::Borrows,
     watchers: HashMap<Tk, Vec<u64>>,
     runs: HashMap<Id, RunInfo>,
     pending_grants: BTreeMap<u16, Vec<pb::Grant>>,
@@ -938,10 +1066,14 @@ pub struct Core {
     in_flight: Arc<std::sync::atomic::AtomicU64>,
     /// Accelerators, and which executors hold them (`gpus=`, `device=`).
     devices: crate::devices::Devices,
+    /// Resources held for gang generations and reservations (core/holds.rs).
+    ledger: holds::Ledger,
     /// Each run's output on this peer (`chimaera logs`).
     run_logs: crate::runlogs::RunLogs,
     /// Output bound for runs whose driver is on another peer.
     log_ship: crate::logship::LogShip,
+    /// Lines several workers of a run print at once, collapsed for its drivers.
+    log_dedup: crate::logdedup::LogDedup,
     /// Per-tenant CPU quotas on this peer (CHIMAERA_TENANT_QUOTAS).
     quotas: crate::quotas::Quotas,
     budgets: crate::budgets::Budgets,
@@ -949,6 +1081,10 @@ pub struct Core {
     fleet: Option<crate::fleet::Fleet>,
     /// Actors waiting for a peer with their CPUs free (placed on a later tick).
     actors_waiting: BTreeSet<Id>,
+    /// Those actors' CPUs and when each was last seen waiting (core/demand.rs).
+    actor_demand: BTreeMap<Id, (f64, Instant)>,
+    /// Attempts started here, and their cores × estimated seconds (core/demand.rs).
+    started: (u64, f64),
     /// CPUs of actors just placed (actor, peer, cpus, when), counted as used
     /// until the peers' own numbers include them.
     actor_holds: Vec<(Id, Vec<u8>, f64, Instant)>,
@@ -992,8 +1128,10 @@ impl Core {
         Core {
             me_tx,
             devices: crate::devices::Devices::discover(),
+            ledger: Default::default(),
             run_logs: Default::default(),
             log_ship: Default::default(),
+            log_dedup: Default::default(),
             // Validated before the core starts (runtime::serve).
             quotas: crate::quotas::Quotas::from_env().unwrap_or_default(),
             budgets: Default::default(),
@@ -1002,6 +1140,8 @@ impl Core {
                 None
             }),
             actors_waiting: BTreeSet::new(),
+            actor_demand: BTreeMap::new(),
+            started: (0, 0.0),
             actor_holds: Vec::new(),
             actor_recent: VecDeque::new(),
             router,
@@ -1017,6 +1157,9 @@ impl Core {
             cancelling: Vec::new(),
             actors: HashMap::new(),
             sessions: HashMap::new(),
+            resuming: HashMap::new(),
+            resumed_as: HashMap::new(),
+            borrows: Default::default(),
             watchers: HashMap::new(),
             runs: HashMap::new(),
             pending_grants: BTreeMap::new(),
@@ -1069,6 +1212,8 @@ impl Core {
             outstanding: HashMap::new(),
             finished_at: HashMap::new(),
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            native: HashMap::new(),
+            letting: native::Letting::default(),
         }
     }
 
@@ -1078,7 +1223,7 @@ impl Core {
             self.resume(g);
         }
         if let Some(f) = &self.fleet {
-            f.spawn_summaries();
+            f.spawn_summaries(self.router.clone());
         }
         let mut house = tokio::time::interval(Duration::from_millis(100));
         loop {
@@ -1254,6 +1399,10 @@ impl Core {
                 }
                 self.dispatch();
             }
+            CoreMsg::Lease { session, tenant, run, files, release, reply } => {
+                let owner = self.sessions.get(&session).map(|s| &s.tenant);
+                let _ = reply.send(self.borrows.request(owner, &tenant, session, run, &files, release));
+            }
             CoreMsg::ReleaseObjects { session, run, objects } => {
                 let own = self.sessions.get(&session).and_then(|s| s.run).is_some_and(|r| r.0[..] == run[..]);
                 if own {
@@ -1280,6 +1429,7 @@ impl Core {
             }
             CoreMsg::HandleFloor { actor, handle, floor } => self.on_handle_floor(actor, handle, floor),
             CoreMsg::ActorMoved { actor, ok } => self.on_actor_moved(actor, ok),
+            CoreMsg::Retained { entry, error } => self.on_retained(*entry, error),
             CoreMsg::Rebuilt { work, outcome } => {
                 self.rebuilt(&work, outcome.as_ref());
                 self.dispatch();
@@ -1365,6 +1515,9 @@ impl Core {
                 self.on_committed(actor, *work, ack, *reply, state);
                 self.dispatch();
             }
+            CoreMsg::Hold { req, reply } => {
+                let _ = reply.send(self.on_hold(req));
+            }
             CoreMsg::Persist { reply } => {
                 self.save_profiles();
                 let _ = reply.send(());
@@ -1392,6 +1545,8 @@ impl Core {
                     memory_available: self.available.unwrap_or(0),
                     object_bytes: self.object_bytes,
                     tenant_cpu: self.quotas.usage(),
+                    tenant_kept: self.quotas.kept(),
+                    demand: Some(self.demand()),
                     ..Default::default()
                 });
             }
@@ -1399,8 +1554,8 @@ impl Core {
                 self.on_exec(*e);
                 self.dispatch();
             }
-            CoreMsg::OpenSession { id, tx } => {
-                self.sessions.insert(id, Session { tx, run: None });
+            CoreMsg::OpenSession { id, mailbox, tenant } => {
+                self.sessions.insert(id, Session::new(mailbox, tenant));
             }
             CoreMsg::BindRun { session, run } => {
                 if let Some(s) = self.sessions.get_mut(&session) {
@@ -1411,6 +1566,8 @@ impl Core {
                 }
             }
             CoreMsg::CloseSession { id } => self.close_session(id),
+            CoreMsg::SessionRoom { id } => self.session_room(id),
+            CoreMsg::ResumeSession { id, seq, old, cursor } => self.resume_session(id, seq, old, cursor),
             CoreMsg::RegisterRun { run, env, detached } => {
                 self.prestart(&env);
                 self.runs.entry(run).or_insert(RunInfo { env, detached, sessions: BTreeSet::new() });
@@ -1550,14 +1707,29 @@ impl Core {
                 if leader {
                     self.end_spread(run);
                     self.end_run_actors(run);
-                    self.drop_run_values(run);
+                    // Values that sessions hold stay (leases.rs).
+                    let kept = self
+                        .router
+                        .read(run.vshard(), |kv| chimaera_core::shard::leases::held(kv, run))
+                        .unwrap_or_default();
+                    self.drop_run_values(run, kept.clone());
                     self.broadcast_forget(pb::ForgetRequest {
                         run: run.to_vec(),
                         run_ended: true,
+                        kept,
                         ..Default::default()
                     });
                 }
             }
+            Event::Unleased { run, files } if leader => {
+                let objects: Vec<pb::ObjectRef> = files
+                    .into_iter()
+                    .map(|object_id| pb::ObjectRef { run: run.to_vec(), object_id, ..Default::default() })
+                    .collect();
+                self.forget_objects(&objects);
+                self.broadcast_forget(pb::ForgetRequest { objects, ..Default::default() });
+            }
+            Event::Unleased { .. } => {}
         }
     }
 
@@ -1598,14 +1770,15 @@ impl Core {
 
     /// A run ended: its stored arguments and `ch.put` values go now, not when
     /// the run expires a day later. A detached actor of the run hosted here
-    /// may be constructed again from them, so they stay while it lives.
-    fn drop_run_values(&self, run: Id) {
+    /// may be constructed again from them, so they stay while it lives, as
+    /// do the files in `kept`, which sessions hold (leases.rs).
+    fn drop_run_values(&self, run: Id, kept: Vec<Vec<u8>>) {
         if self.actors.values().any(|h| h.run == Some(run) && h.detached && !h.dead) {
             return;
         }
         let objects = self.objects.clone();
         tokio::task::spawn_blocking(move || {
-            let freed = objects.delete_values(&run);
+            let freed = objects.delete_values(&run, &kept);
             if freed > 0 {
                 tracing::debug!(run = %run.hex(), freed, "deleted an ended run's stored arguments");
             }
@@ -1670,7 +1843,7 @@ impl Core {
         if let Ok(run) = Id::from_slice(&f.run) {
             if f.run_ended {
                 self.end_run_actors(run);
-                self.drop_run_values(run);
+                self.drop_run_values(run, f.kept);
             }
             if f.run_expired {
                 self.objects.delete_run(&run);
@@ -2195,6 +2368,10 @@ impl Core {
         }
         match w.kind() {
             pb::CallKind::CallActorCtor | pb::CallKind::CallActorMethod => self.route_to_actor(w),
+            // A gang rank's slot is held for it (core/holds.rs): it takes
+            // nothing the work ahead waits for, so a call too big to start
+            // yet never holds it up.
+            _ if w.policy.launch.is_some() => self.queue.push_front(w),
             // Higher `priority` first; equal priorities keep arrival order.
             // Ordering only: nothing running is preempted.
             _ if self.queue.back().is_none_or(|b| b.policy.priority >= w.policy.priority) => self.queue.push_back(w),
@@ -2234,7 +2411,10 @@ impl Core {
             .iter()
             .rev()
             .filter(|w| {
-                waited(w) && !w.stays && matches!(w.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem)
+                waited(w)
+                    && !w.stays
+                    && w.policy.launch.is_none() // its slot is held here
+                    && matches!(w.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem)
             })
             .take_while(|_| {
                 let go = budget > 0;
@@ -2374,6 +2554,35 @@ impl Core {
         self.router.read(tk.v(), read_all).unwrap_or_else(|| vec![pb::Outcome::default(); spec.deps.len()])
     }
 
+    /// A retained result's copies are made: publish it. Else, in a cluster,
+    /// the attempt failed for want of them (it is retried within its
+    /// attempts); a peer that runs alone never has a copy, so the call fails.
+    fn on_retained(&mut self, mut entry: pb::PublishEntry, error: Option<String>) {
+        let Some(tk) = entry.task.as_ref().and_then(Tk::parse) else { return };
+        let Some(why) = error else {
+            self.pending_publish.entry(tk.v()).or_default().push(entry);
+            return;
+        };
+        tracing::warn!(task = %tk.task.hex(), "{why}");
+        let err = pb::ErrorRecord { message: why, attempt: entry.attempt, ..Default::default() };
+        if !self.router.is_cluster() {
+            let err = pb::ErrorRecord { kind: pb::error_record::Kind::Infeasible as i32, ..err };
+            entry.outcome = Some(pb::Outcome { value: Some(pb::outcome::Value::Err(err)), ..Default::default() });
+            self.pending_publish.entry(tk.v()).or_default().push(entry);
+            return;
+        }
+        let failure = pb::RecordFailure {
+            task: Some(tk.pb()),
+            attempt: entry.attempt,
+            peer: entry.peer,
+            kind: pb::record_failure::Kind::Infra as i32,
+            error: Some(pb::ErrorRecord { kind: pb::error_record::Kind::Infra as i32, ..err }),
+            fingerprint: Vec::new(),
+            memory_peak: 0,
+        };
+        self.propose(tk.v(), pb::shard_cmd::Body::RecordFailure(failure));
+    }
+
     /// Whether an attempt's outcome may reach its callers before it is
     /// published: on a local peer, for an attached run (a crash ends its driver
     /// too), when no other attempt of the task could publish a different one.
@@ -2401,16 +2610,9 @@ impl Core {
 
     fn notify_watchers(&mut self, tk: Tk, outcome: &pb::Outcome) {
         let Some(ids) = self.watchers.remove(&tk) else { return };
-        let ev = pb::SessionEvent {
-            seq: 0,
-            event: Some(pb::session_event::Event::Outcome(pb::OutcomeEvent {
-                task: Some(tk.pb()),
-                outcome: Some(outcome.clone()),
-            })),
-        };
         for id in ids {
-            if let Some(s) = self.sessions.get(&id) {
-                let _ = s.tx.send(ev.clone());
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.outcome(tk, outcome.clone());
             }
         }
     }
@@ -2450,7 +2652,7 @@ impl Core {
     }
 
     /// Kill the executor of a cancelled call that kept running past
-    /// `CANCEL_KILL_AFTER` (a C extension or a thread that never checks),
+    /// [`cancel_kill_after`] (a C extension or a thread that never checks),
     /// when every call on it was cancelled. An actor's executor is kept: its
     /// state lives there, so cancelling a method stays cooperative.
     fn kill_stuck_cancelled(&mut self) {
@@ -2460,7 +2662,7 @@ impl Core {
         let due: BTreeSet<u32> = self
             .cancelling
             .iter()
-            .filter(|(_, _, at)| at.elapsed() >= CANCEL_KILL_AFTER)
+            .filter(|(_, _, at)| at.elapsed() >= cancel_kill_after())
             .map(|&(exec, _, _)| exec)
             .collect();
         for exec in due {
@@ -2560,14 +2762,8 @@ impl Core {
             let done = self.router.read(tk.v(), |kv| read::task(kv, tk)).flatten().and_then(|r| r.outcome);
             match done {
                 Some(outcome) => {
-                    if let Some(s) = self.sessions.get(&session) {
-                        let _ = s.tx.send(pb::SessionEvent {
-                            seq: 0,
-                            event: Some(pb::session_event::Event::Outcome(pb::OutcomeEvent {
-                                task: Some(tk.pb()),
-                                outcome: Some(outcome),
-                            })),
-                        });
+                    if let Some(s) = self.sessions.get_mut(&session) {
+                        s.outcome(tk, outcome);
                     }
                 }
                 None => self.watchers.entry(tk).or_default().push(session),
@@ -2663,8 +2859,88 @@ impl Core {
         }
     }
 
+    /// A session's stream ended. A resumable one waits for its client to
+    /// resume it (mailbox::RESUME_WINDOW), or is taken over at once by a
+    /// resume that waited for this; any other ends now.
     fn close_session(&mut self, id: u64) {
+        // A resume this session waited to make ends with it.
+        self.resuming.retain(|_, (new, ..)| *new != id);
+        let waiting = self.resuming.remove(&id);
+        let Some(s) = self.sessions.get_mut(&id) else { return };
+        if s.park(Instant::now()) {
+            if let Some((new, seq, cursor)) = waiting {
+                self.resume_session(new, seq, id, cursor);
+            }
+            return;
+        }
+        self.end_session(id);
+        if let Some((new, seq, _)) = waiting {
+            self.session_error(new, seq, format!("cannot resume session {id}: its client acknowledged nothing"));
+        }
+    }
+
+    /// Session `id` continues session `old`, whose client received up to
+    /// `cursor`: its run, its watches, and what it sent that the client missed.
+    fn resume_session(&mut self, id: u64, seq: u64, old: u64, cursor: u64) {
+        let Some(tenant) = self.sessions.get(&id).map(|s| s.tenant.clone()) else { return };
+        let old = self.resumed_as.get(&old).copied().unwrap_or(old);
+        let why = match self.sessions.get(&old) {
+            None => Some("it has ended (or this peer restarted)".to_string()),
+            Some(s) if s.tenant != tenant => Some("it belongs to another credential".to_string()),
+            Some(s) => s.cannot_resume(cursor),
+        };
+        if let Some(why) = why {
+            return self.session_error(id, seq, format!("cannot resume session {old}: {why}"));
+        }
+        if let Some(s) = self.sessions.get(&old)
+            && !s.parked()
+        {
+            // Its stream has not ended here yet: it ends after the request it
+            // is handling, and the resume waits for that (close_session).
+            s.mailbox.supersede();
+            self.resuming.insert(old, (id, seq, cursor));
+            return;
+        }
+        let Some(prev) = self.sessions.remove(&old) else { return };
+        let Some(s) = self.sessions.get_mut(&id) else { return };
+        s.adopt(prev, cursor);
+        self.borrows.adopt(old, id);
+        self.resumed_as.values_mut().filter(|v| **v == old).for_each(|v| *v = id);
+        self.resumed_as.insert(old, id);
+        let run = s.run;
+        for w in self.watchers.values_mut() {
+            w.iter_mut().filter(|x| **x == old).for_each(|x| *x = id);
+        }
+        if let Some(r) = run.and_then(|run| self.runs.get_mut(&run)) {
+            r.sessions.remove(&old);
+            r.sessions.insert(id);
+        }
+        self.session_room(id);
+    }
+
+    fn session_error(&self, id: u64, seq: u64, message: String) {
+        if let Some(s) = self.sessions.get(&id) {
+            let ev =
+                pb::SessionEvent { seq, event: Some(pb::session_event::Event::Error(message)), ..Default::default() };
+            let _ = s.mailbox.offer(ev, crate::mailbox::Kind::Notice);
+        }
+    }
+
+    /// The session's reader made room: what waited for it goes now.
+    fn session_room(&mut self, id: u64) {
+        let Some(s) = self.sessions.get_mut(&id) else { return };
+        let again = s.refill();
+        if !again.is_empty() {
+            self.watch(id, again);
+        }
+    }
+
+    /// A session ends: its watches go, and its run, if no other session holds
+    /// it and it is not detached, is cancelled.
+    fn end_session(&mut self, id: u64) {
         let Some(s) = self.sessions.remove(&id) else { return };
+        self.resumed_as.retain(|_, now| *now != id);
+        crate::leases::release_ended(self.router.clone(), self.in_flight.clone(), self.borrows.end(id));
         for w in self.watchers.values_mut() {
             w.retain(|x| *x != id);
         }
@@ -2701,6 +2977,7 @@ impl Core {
             || w.ready_at.elapsed() < crate::fleet::DELEGATE_AFTER
             || !w.publish
             || !crate::fleet::eligible(&w.spec, &w.policy)
+            || w.policy.durability() != pb::Durability::Default // published here, with its class (see replicas)
             || self.cell_has_room(cpus)
         {
             return false;
@@ -2720,7 +2997,7 @@ impl Core {
         // Every live peer of this cell may delegate: each counts on its share of another cell.
         let peers = self.router.mesh.as_ref().map_or(1, |m| m.members().iter().filter(|v| !v.dead).count().max(1));
         let fleet = self.fleet.as_mut().expect("checked above");
-        let Some(cell) = fleet.pick(cpus, 1.0 / peers as f64) else { return false };
+        let Some(cell) = fleet.pick(cpus, 1.0 / peers as f64, &self.queue[i].tk.task.0) else { return false };
         let Some(link) = fleet.link(&cell) else { return false };
         let w = self.queue.remove(i).expect("index in range");
         let (spec, tx) = (w.spec.clone(), self.me_tx.clone());
@@ -2799,15 +3076,21 @@ impl Core {
     }
 
     /// Per tenant, the CPUs the other live peers last reported holding.
-    fn tenants_elsewhere(&self) -> HashMap<String, f64> {
-        let mut out = HashMap::new();
+    /// Per tenant, the CPUs its calls hold on the other peers, and what the
+    /// threads of its waiting calls keep there (native).
+    fn tenants_elsewhere(&self) -> HashMap<String, (f64, f64)> {
+        let mut out: HashMap<String, (f64, f64)> = HashMap::new();
         let me = self.router.identity.peer.0.to_vec();
         for v in self.router.mesh.as_ref().map(|m| m.members()).unwrap_or_default() {
             if v.dead || v.member.peer == me {
                 continue;
             }
-            for (tenant, cpus) in v.load.map(|l| l.tenant_cpu).unwrap_or_default() {
-                *out.entry(tenant).or_insert(0.0) += cpus;
+            let Some(load) = v.load else { continue };
+            for (tenant, cpus) in load.tenant_cpu {
+                out.entry(tenant).or_default().0 += cpus;
+            }
+            for (tenant, kept) in load.tenant_kept {
+                out.entry(tenant).or_default().1 += kept;
             }
         }
         out
@@ -2848,9 +3131,25 @@ impl Core {
     /// fits, until the head has waited HEAD_WAIT).
     fn dispatch(&mut self) {
         let mut i = 0;
-        let mut elsewhere: Option<HashMap<String, f64>> = None; // tenants' CPUs on other peers, read once
+        let mut elsewhere: Option<HashMap<String, (f64, f64)>> = None; // tenants' CPUs on other peers, read once
         while i < self.queue.len() && i <= BACKFILL {
             self.refresh_cpus(i);
+            // A gang rank or a bundle's host runs on the slot held for it
+            // (core/holds.rs), never on free capacity, and not at all once
+            // that slot is gone: then it is lost, as to a failure.
+            let (run, launch) = (self.queue[i].tk.run, self.queue[i].policy.launch.clone());
+            let slot = match launch.map(|t| self.slot_of(run, &t)) {
+                None => None,
+                Some(Ok((cpus, held))) => {
+                    self.queue.get_mut(i).expect("index in range").cpus = cpus;
+                    Some(held)
+                }
+                Some(Err(why)) => {
+                    let w = self.queue.remove(i).expect("index in range");
+                    self.fail_attempt(&w, pb::record_failure::Kind::Infra, &why);
+                    continue;
+                }
+            };
             let w = &self.queue[i];
             let (cpus, floor, waited) = (w.cpus, w.mem_floor, w.ready_at.elapsed());
             if cpus > self.capacity + 1e-9 {
@@ -2877,7 +3176,9 @@ impl Core {
                 );
                 continue;
             }
-            if self.cpu_used + cpus > self.capacity + 1e-9 {
+            // Let in over what waiting calls' threads keep, if only that is in the way (native).
+            let mut lent = slot.is_none() && self.cpu_used + cpus > self.capacity + 1e-9;
+            if lent && !self.native_in_the_way(cpus, waited) {
                 if self.delegate(i, cpus) {
                     continue; // it runs in another cell; look at the next
                 }
@@ -2886,12 +3187,13 @@ impl Core {
             if self.quotas.enabled() {
                 let tenant = self.tenant_of(self.queue[i].tk.run);
                 let others = if self.quotas.has_share(&tenant) {
-                    elsewhere.get_or_insert_with(|| self.tenants_elsewhere()).get(&tenant).copied().unwrap_or(0.0)
+                    elsewhere.get_or_insert_with(|| self.tenants_elsewhere()).get(&tenant).copied().unwrap_or_default()
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 };
-                match self.quotas.admit(&tenant, cpus, others) {
+                match self.quotas.admit(&tenant, cpus, others, || self.native_free(waited)) {
                     crate::quotas::Admit::Yes => {}
+                    crate::quotas::Admit::Lent => lent = true,
                     crate::quotas::Admit::Wait(_) => {
                         i += 1; // other tenants' work may go ahead
                         continue;
@@ -2920,7 +3222,12 @@ impl Core {
                 continue;
             }
             if w.policy.accounting() == pb::policy::Accounting::Isolated {
+                if self.devices.wait_reason(w.policy.gpus, &w.policy.device).is_some() {
+                    i += 1; // its devices are held: it waits, as any call
+                    continue;
+                }
                 let w = self.queue.remove(i).expect("index in range");
+                self.native_started(w.tk, lent);
                 self.start_isolated(w);
                 continue;
             }
@@ -2931,7 +3238,11 @@ impl Core {
                 continue;
             };
             let threads = cpus.ceil().max(1.0) as u32;
-            let key = match self.devices.key_for(gpus, &device, &env.key(threads)) {
+            let want = match &slot {
+                Some(held) => Want::Key(self.devices.key_of(&env.key(threads), held)),
+                None => self.devices.key_for(gpus, &device, &env.key(threads)),
+            };
+            let key = match want {
                 Want::None => env.key(threads),
                 Want::Key(key) => key,
                 Want::Wait => {
@@ -2952,7 +3263,11 @@ impl Core {
                 continue;
             };
             let batch = self.take_batch(i);
+            if let Some(t) = &batch[0].policy.launch {
+                let _ = self.take_slot(run, t); // found above in this pass: its CPUs and devices are the call's now
+            }
             self.devices.hold(exec, &key);
+            self.native_started(batch[0].tk, lent);
             self.start(exec, batch);
         }
     }
@@ -2976,7 +3291,7 @@ impl Core {
             return; // runs inside the actor's own grant
         }
         let p = &w.policy;
-        let req = Request { cpus: p.cpus, memory: p.memory, adaptive: p.adaptive() };
+        let req = Request::of(p);
         let r = self.profiles.reserve(&w.key(), &p.fn_name, w.read_bytes, req);
         let clip = |x: f64, lo: f64, hi: f64| {
             let x = if lo > 0.0 { x.max(lo) } else { x };
@@ -3001,7 +3316,12 @@ impl Core {
             r.memory_source.describe()
         };
         w.cpus_source = r.cpus_source.describe();
-        (w.cpus, w.mem, w.mem_floor, w.arm) = (cpus, mem, hint, r.arm);
+        w.cpus_chosen = crate::settings::Chosen { asked: r.cpus, granted: cpus, source: r.cpus_source.kind() };
+        let raised = hint > 0 && hint >= mem;
+        let mem_kind = if raised { "raised" } else { r.memory_source.kind() };
+        w.mem_chosen = crate::settings::Chosen { asked: r.memory as f64, granted: mem as f64, source: mem_kind };
+        w.placer = (placer_cpus, placer_mem);
+        (w.cpus, w.mem, w.mem_floor, w.arm, w.est_s) = (cpus, mem, hint, r.arm, r.est_s);
     }
 
     /// Queued work takes the CPU grant learning has now (a trial's next arm,
@@ -3009,17 +3329,18 @@ impl Core {
     /// measured would otherwise all run at the default.
     fn refresh_cpus(&mut self, i: usize) {
         let w = &self.queue[i];
-        if w.policy.cpus > 0.0
+        if !Request::of(&w.policy).learns_cpus()
             || !w.publish
             || matches!(w.kind(), pb::CallKind::CallActorCtor | pb::CallKind::CallActorMethod)
         {
             return;
         }
-        let req = Request { cpus: w.policy.cpus, memory: w.policy.memory, adaptive: w.policy.adaptive() };
+        let req = Request::of(&w.policy);
         let (lo, hi) = (w.policy.cpus_min, w.policy.cpus_max);
-        let Some((cpus, source, arm)) = self.profiles.cpus_now(&w.key(), req, w.arm) else { return };
-        let cpus = if hi > 0.0 { cpus.min(hi) } else { cpus }.max(lo).min(self.capacity.max(0.25));
+        let Some((asked, source, arm)) = self.profiles.cpus_now(&w.key(), req, w.arm) else { return };
+        let cpus = if hi > 0.0 { asked.min(hi) } else { asked }.max(lo).min(self.capacity.max(0.25));
         let w = self.queue.get_mut(i).expect("index in range");
+        w.cpus_chosen = crate::settings::Chosen { asked, granted: cpus, source: source.kind() };
         (w.cpus, w.arm, w.cpus_source) = (cpus, arm, source.describe());
     }
 
@@ -3034,6 +3355,7 @@ impl Core {
         let (lo, hi) = (w.policy.memory_min, w.policy.memory_max);
         let w = self.queue.get_mut(i).expect("index in range");
         w.mem = if hi > 0 { m.bytes.min(hi) } else { m.bytes }.max(lo);
+        w.mem_chosen = crate::settings::Chosen { asked: m.bytes as f64, granted: w.mem as f64, source: "learned" };
         w.mem_source = Source::Learned(m.evidence).describe();
     }
 
@@ -3151,7 +3473,8 @@ impl Core {
 
     /// Why queued work `w` has not started.
     fn wait_reason(&self, w: &Work) -> String {
-        if self.cpu_used + w.cpus > self.capacity + 1e-9 {
+        let leased = w.policy.launch.is_some(); // its CPUs and devices are held for it
+        if !leased && self.cpu_used + w.cpus > self.capacity + 1e-9 {
             // Actors given cpus= keep them while idle: name that, since it is
             // the usual reason work waits forever.
             let holders: Vec<f64> =
@@ -3165,15 +3488,23 @@ impl Core {
                     holders.len()
                 )
             };
+            let held = self.ledger.cpus();
+            let by_holds =
+                if held > 0.0 { format!(", {held:.2} of it held for gangs and reservations") } else { String::new() };
             return format!(
-                "needs {} CPU ({}); {:.2} of {:.2} in use{by_actors}",
+                "needs {} CPU ({}); {:.2} of {:.2} in use{by_actors}{by_holds}{}",
                 w.cpus,
                 w.reservation(),
                 self.cpu_used,
-                self.capacity
+                self.capacity,
+                self.native_note()
             );
         }
-        self.memory_wait(w)
+        if let Some(why) = self.devices.wait_reason(w.policy.gpus, &w.policy.device).filter(|_| !leased) {
+            return why;
+        }
+        self.quota_note(w)
+            .or_else(|| self.memory_wait(w))
             .or_else(|| self.pids_note.clone())
             .unwrap_or_else(|| "waiting for an executor to start".into())
     }
@@ -3217,17 +3548,17 @@ impl Core {
         };
         let threads = w.cpus.ceil() as u32;
         let base = format!("isolated-{}", self.iso_seq);
-        let key = match self.devices.key_for_actor(w.policy.gpus, &w.policy.device, &base) {
+        let key = match self.devices.key_for(w.policy.gpus, &w.policy.device, &base) {
             Want::Infeasible(why) => {
                 self.fail_infeasible(&w, &why);
                 return;
             }
             Want::Key(key) => key,
-            Want::None | Want::Wait => base,
+            Want::None | Want::Wait => base, // Wait: dispatch checked its devices are free
         };
         let mut extra = vec![("CHIMAERA_PEER_SOCKET", Some(self.peer_socket.clone()))];
         extra.extend(self.devices.env_for_key(&key));
-        match self.sup.spawn(&env, threads, &extra, Some(&group)) {
+        match self.sup.spawn(&env, threads, &extra, Some(&group), &self.devices.numa_for_key(&key)) {
             Ok((id, pid)) => {
                 self.devices.hold(id, &key);
                 self.cpu_used += w.cpus;
@@ -3374,7 +3705,8 @@ impl Core {
     fn ensure_executor(&mut self, env: &ExecEnv, threads: u32, key: &str, cpus: f64) {
         let starting = self.execs.values().filter(|e| e.state == ExecState::Starting && e.env_key == key).count();
         let queued = self.queue.iter().filter(|w| w.cpus.ceil().max(1.0) as u32 == threads).count();
-        let free = ((self.capacity - self.cpu_used) / cpus.max(0.01)).floor().max(1.0) as usize;
+        // Held slots count as free: the ranks and bundles queued for them need executors too.
+        let free = ((self.capacity - self.cpu_used + self.ledger.cpus()) / cpus.max(0.01)).floor().max(1.0) as usize;
         if starting >= queued.min(free).max(1) {
             return;
         }
@@ -3408,7 +3740,7 @@ impl Core {
         }
         let mut extra = vec![("CHIMAERA_PEER_SOCKET", Some(self.peer_socket.clone()))];
         extra.extend(self.devices.env_for_key(key));
-        match self.sup.spawn(env, threads, &extra, None) {
+        match self.sup.spawn(env, threads, &extra, None, &self.devices.numa_for_key(key)) {
             Ok((id, pid)) => {
                 self.execs.insert(
                     id,
@@ -3465,7 +3797,8 @@ impl Core {
         let first = self.queue.remove(at).expect("caller checked");
         // The profile's batch counts calls of the function; a map chunk is
         // already `items` of them.
-        let k = if first.batchable() {
+        // Learned batching is learning: an observed or frozen call runs alone.
+        let k = if first.batchable() && first.policy.adaptive() == pb::policy::Adaptive::On {
             let profile =
                 (self.profiles.batch(&first.key()) / first.policy.items.max(1) as usize).clamp(1, profiles::MAX_BATCH);
             // Never more than an even share of the queue for each free slot:
@@ -3486,10 +3819,15 @@ impl Core {
                 _ => break,
             }
         }
+        let n = batch.len() as u32;
+        for w in &mut batch {
+            w.batched = n;
+        }
         batch
     }
 
     fn start(&mut self, exec: u32, items: Vec<Work>) {
+        self.note_started(&items);
         let head = items[0].clone();
         if let Some(e) = self.execs.get_mut(&exec) {
             e.last_fn.clone_from(&head.spec.fn_digest);
@@ -3644,12 +3982,14 @@ impl Core {
                     r.blocked = msg.blocked;
                     let head = r.items.first().map(|w| (w.tk.run, w.tk.task));
                     // A task waiting on other futures lends out its CPU so the
-                    // work it waits for can run (it keeps its memory charge).
+                    // work it waits for can run (it keeps its memory charge),
+                    // less what its threads go on using (native).
                     if msg.blocked {
                         self.cpu_used -= r.cpus;
                     } else {
                         self.cpu_used += r.cpus;
                     }
+                    self.native_restart(exec);
                     if let Some(call) = head {
                         if msg.blocked {
                             self.quotas.pause(call);
@@ -3676,17 +4016,17 @@ impl Core {
         let Some(tk) = item.task.as_ref().and_then(Tk::parse) else { return };
         let Some(ids) = self.watchers.get(&tk) else { return };
         let ev = pb::SessionEvent {
-            seq: 0,
             event: Some(pb::session_event::Event::StreamItem(pb::StreamItem {
                 task: item.task.clone(),
                 attempt: item.attempt,
                 index: item.index,
                 value: item.value,
             })),
+            ..Default::default()
         };
         for id in ids {
-            if let Some(s) = self.sessions.get(id) {
-                let _ = s.tx.send(ev.clone());
+            if let Some(s) = self.sessions.get_mut(id) {
+                s.item(ev.clone());
             }
         }
     }
@@ -3836,11 +4176,19 @@ impl Core {
         if let Err(e) = self.run_logs.append(&self.code, &tk.run.0, &tk.task.0, &ev.stream, &ev.text) {
             tracing::warn!("cannot keep run output: {e}");
         }
-        let msg = pb::SessionEvent { seq: 0, event: Some(pb::session_event::Event::Log(ev.clone())) };
-        if let Some(r) = self.runs.get(&tk.run) {
+        if self.runs.get(&tk.run).is_none_or(|r| r.sessions.is_empty()) {
+            return; // no driver here to print it
+        }
+        if let Some(ev) = self.log_dedup.filter(tk.run, ev, Instant::now()) {
+            self.send_log(tk.run, &ev);
+        }
+    }
+
+    fn send_log(&mut self, run: Id, ev: &pb::LogEvent) {
+        if let Some(r) = self.runs.get(&run) {
             for s in &r.sessions {
-                if let Some(sess) = self.sessions.get(s) {
-                    let _ = sess.tx.send(msg.clone());
+                if let Some(sess) = self.sessions.get_mut(s) {
+                    sess.log(ev);
                 }
             }
         }
@@ -3905,6 +4253,7 @@ impl Core {
             && work.publish
             && !done.retryable
             && done.forward_to.is_none()
+            && work.policy.durability() != pb::Durability::Retained // not before its copies exist
             && self.notify_early(tk, done.attempt)
             && let Some(outcome) = done.outcome.as_ref()
         {
@@ -3945,6 +4294,9 @@ impl Core {
             if !r.blocked {
                 self.cpu_used -= r.cpus;
             }
+            if self.native.contains_key(&exec) {
+                self.native_restart(exec);
+            }
             if let Some(w) = r.items.first() {
                 self.quotas.give((w.tk.run, w.tk.task));
             }
@@ -3971,7 +4323,12 @@ impl Core {
         } else if let Some(p) = end_private {
             // Leaks are judged on what the worker holds, arena arrays included
             // (they are shared tmpfs pages, not private memory).
-            self.check_leak(exec, p, end_memory.and_then(|(_, held)| held).unwrap_or(p));
+            let held = end_memory.and_then(|(_, held)| held).unwrap_or(p);
+            if let Some(before) = self.execs.get(&exec).and_then(|e| e.leak.last()) {
+                // What each call left behind: keeps batches of such calls small.
+                self.profiles.note_kept(&work.key(), held.saturating_sub(before) / batch_len.max(1) as u64);
+            }
+            self.check_leak(exec, p, held);
         }
         let peak_bytes = peak.map_or(0, |p| p.0);
         if cores.is_none() && !finished && batch_len > 1 {
@@ -4017,13 +4374,23 @@ impl Core {
                     }),
                 );
             } else if done.outcome.is_some() || done.forward_to.is_some() {
-                self.pending_publish.entry(tk.v()).or_default().push(pb::PublishEntry {
+                let mut entry = pb::PublishEntry {
                     task: Some(tk.pb()),
                     attempt: done.attempt,
                     peer: Some(self.router.identity.pb()),
                     outcome: done.outcome,
                     forward_to: done.forward_to,
-                });
+                };
+                // The class its result is published with (see replicas).
+                if let Some(pb::outcome::Value::Ok(obj)) = entry.outcome.as_mut().and_then(|o| o.value.as_mut()) {
+                    obj.durability = work.policy.durability;
+                }
+                if work.policy.durability() == pb::Durability::Retained {
+                    let (mesh, objects, tx) = (self.router.mesh.clone(), self.objects.clone(), self.me_tx.clone());
+                    crate::replicas::publish_when_retained(mesh, objects, entry, tx);
+                } else {
+                    self.pending_publish.entry(tk.v()).or_default().push(entry);
+                }
             }
         }
         if let Some(actor) = self.execs.get(&exec).and_then(|e| e.actor) {
@@ -4050,22 +4417,20 @@ impl Core {
         } else {
             w.spec.command_fingerprint.clone()
         };
-        let body = pb::shard_cmd::Body::ActorCommit(pb::ActorCommandCommit {
+        let commit = pb::ActorCommandCommit {
             actor: actor.to_vec(),
             generation: host.generation,
             cmd_id,
             fingerprint,
             prev_version: host.state_version,
-            new_state: done.durable_state.clone(),
+            new_state: Vec::new(),
             reply: Some(obj),
-        });
+        };
+        let stored = host.state_chunks.clone();
         let (router, tx, state) = (self.router.clone(), self.me_tx.clone(), done.durable_state);
         tokio::spawn(async move {
-            let ack = match router.propose(actor.vshard(), body).await {
-                Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Actor(a)) }) => Commit::Answered(Box::new(a)),
-                Ok(other) => Commit::Unknown(format!("unexpected commit reply: {other:?}")),
-                Err(e) => Commit::Unknown(e.to_string()),
-            };
+            // Inline, or as chunks when it is too large (actor_state).
+            let ack = actor_state::commit(&router, commit, &state, &stored).await;
             let _ = tx.send(CoreMsg::Committed { actor, work: Box::new(w), ack, reply: Box::new(reply), state }).await;
         });
     }
@@ -4084,6 +4449,7 @@ impl Core {
                 if let Some(h) = self.actors.get_mut(&actor) {
                     h.state_version = a.version;
                     h.durable_state = state;
+                    h.state_chunks = a.record.as_ref().map(|r| r.state_chunks.clone()).unwrap_or_default();
                 }
                 (Some(reply), false)
             }
@@ -4119,6 +4485,9 @@ impl Core {
                 (None, false)
             }
         };
+        if outcome.is_none() {
+            self.retry_in_order(actor, &w);
+        }
         if let Some(outcome) = outcome {
             self.pending_publish.entry(w.tk.v()).or_default().push(pb::PublishEntry {
                 task: Some(w.tk.pb()),
@@ -4275,6 +4644,7 @@ impl Core {
             detail: String::new(),
             placement_reason: "local peer had a warm executor and free CPU".into(),
             reservation: w.reservation(),
+            settings: w.settings(self.capacity),
         };
         self.push_attempt(w.tk, rec);
         cpu_measured
@@ -4325,7 +4695,7 @@ impl Core {
             cpus: w.cpus,
             oom: false,
         };
-        let req = Request { cpus: w.policy.cpus, memory: w.policy.memory, adaptive: w.policy.adaptive() };
+        let req = Request::of(&w.policy);
         let kills = self.mem_kills.back().is_some_and(|t| t.elapsed() < KILLS_RECENT);
         let now = self.epoch.elapsed().as_secs_f64();
         for d in self.profiles.record(&w.key(), &w.policy.fn_name, sample, w.arm, req, kills, now, now_ns()) {
@@ -4420,6 +4790,7 @@ impl Core {
         let info = self.execs.remove(&exec);
         self.actor_waits.retain(|(e, _), _| *e != exec);
         self.sup.forget(exec);
+        self.native_restart(exec); // gone from execs: nothing more is watched
         self.devices.release(exec);
         if let Some(e) = &info {
             self.cpu_used -= e.held_cpus;
@@ -4517,7 +4888,7 @@ impl Core {
                         h.inflight.remove(&(w.spec.handle, w.spec.seq));
                         let next = h.next_seq.entry(w.spec.handle).or_insert(0);
                         *next = (*next).min(w.spec.seq);
-                        h.mailbox.insert((w.spec.handle, w.spec.seq), w.clone());
+                        actor_limits::enqueue(h, w.clone());
                         continue;
                     }
                     // A started actor call is not replayed on a fresh instance.
@@ -4540,9 +4911,10 @@ impl Core {
                     // size or larger reserve 1.5× that.
                     let sample =
                         Sample { peak, arg_bytes: w.read_bytes, cpus: w.cpus, oom: true, ..Default::default() };
-                    let req = Request { cpus: w.policy.cpus, memory: w.policy.memory, adaptive: w.policy.adaptive() };
+                    let req = Request::of(&w.policy);
                     let now = self.epoch.elapsed().as_secs_f64();
-                    for d in self.profiles.record(&w.key(), &w.policy.fn_name, sample, None, req, true, now, now_ns()) {
+                    for d in self.profiles.record(&w.key(), &w.policy.fn_name, sample, w.arm, req, true, now, now_ns())
+                    {
                         self.decide(d);
                     }
                 }
@@ -4557,6 +4929,7 @@ impl Core {
                         end_reason: if oom.is_some() { "oom".into() } else { "killed".into() },
                         detail: reason.clone(),
                         granted: Some(w.policy.clone()),
+                        settings: w.settings(self.capacity),
                         ..Default::default()
                     },
                 );
@@ -4589,7 +4962,9 @@ impl Core {
     /// As leader of the actor's group: place a pending actor, and keep its
     /// host (this peer or another) informed of its record.
     fn on_actor_changed(&mut self, actor: Id) {
-        let Some(Some(rec)) = self.router.read(actor.vshard(), |kv| read::actor(kv, actor)) else { return };
+        let Some(Some(rec)) = self.router.read(actor.vshard(), |kv| actor_state::whole_record(kv, actor)) else {
+            return;
+        };
         // A placed actor's CPUs stop being held for it once it is gone, or once
         // it runs here (this peer's own count then includes them).
         let here = rec.host.as_ref().is_some_and(|h| h.peer == self.router.identity.peer.to_vec());
@@ -4622,7 +4997,9 @@ impl Core {
             if host.placing != Some(rec.generation) {
                 host.placing = Some(rec.generation);
                 let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-                match self.choose_actor_host(actor, &policy) {
+                let placement = self.choose_actor_host(actor, &policy);
+                self.note_actor_waiting(actor, matches!(placement, ActorPlacement::Wait).then_some(policy.cpus));
+                match placement {
                     ActorPlacement::Host(target) => self.propose(
                         actor.vshard(),
                         pb::shard_cmd::Body::ActorPlace(pb::ActorPlace {
@@ -4726,13 +5103,15 @@ impl Core {
     /// Where a new actor instance goes: this peer or the least loaded of two
     /// sampled live peers with room for its CPU.
     fn choose_actor_host(&mut self, actor: Id, policy: &pb::Policy) -> ActorPlacement {
-        let cpus = policy.cpus.max(0.0);
+        // A bundle's or rank's host takes CPUs its peer holds for it (Placement names that peer).
+        let cpus = if policy.launch.is_some() { 0.0 } else { policy.cpus.max(0.0) };
         let me = self.router.identity.pb();
         self.actor_holds.retain(|(.., at)| at.elapsed() < ACTOR_HOLD_TTL);
         let holds = &self.actor_holds;
         let held =
             |peer: &[u8]| holds.iter().filter(|(_, p, ..)| p.as_slice() == peer).map(|(_, _, c, _)| c).sum::<f64>();
-        let free_here = self.capacity - self.cpu_used - held(&me.peer);
+        // Cores that waiting calls' threads use are free to the actor they may wait for (native).
+        let free_here = self.capacity - self.cpu_used + self.native_yielding(Duration::MAX) - held(&me.peer);
         let Some(mesh) = self.router.mesh.clone() else {
             return if self.capacity + 1e-9 < cpus {
                 ActorPlacement::Infeasible
@@ -4801,6 +5180,7 @@ impl Core {
 
     fn hold_actor_cpus(&mut self, actor: Id, peer: &pb::PeerInc, cpus: f64) {
         if cpus > 0.0 {
+            self.native_placed(actor, &peer.peer, cpus);
             self.actor_holds.push((actor, peer.peer.clone(), cpus, Instant::now()));
         }
     }
@@ -4811,7 +5191,11 @@ impl Core {
     /// exhaust the machine. It then waits (retried from housekeeping) with a
     /// reason naming what holds the pool.
     fn start_actor(&mut self, actor: Id, run: Option<Id>, spec: &pb::ActorSpec) {
-        if let Some(why) = self.actor_memory_wait(actor) {
+        let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
+        // Devices other executors hold are never shared: the actor waits for
+        // them as for memory (a bundle's or rank's are held for it).
+        let devices = policy.launch.is_none().then(|| self.devices.wait_reason(policy.gpus, &policy.device)).flatten();
+        if let Some(why) = devices.or_else(|| self.actor_memory_wait(actor)) {
             if let Some(h) = self.actors.get_mut(&actor) {
                 h.waiting_memory = Some(why);
             }
@@ -4837,13 +5221,21 @@ impl Core {
         if let Some(h) = self.actors.get_mut(&actor) {
             h.waiting_memory = None;
         }
-        let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
         let threads = if policy.cpus > 0.0 { policy.cpus.ceil() as u32 } else { 1 };
         if let Some(env) = env {
             // An actor holds its devices for its life (as the CPU it asked for).
-            let key = match self.devices.key_for_actor(policy.gpus, &policy.device, &env.key(threads)) {
-                Want::Key(key) => key,
-                Want::None | Want::Wait | Want::Infeasible(_) => env.key(threads),
+            let key = match (&policy.launch, run) {
+                (Some(t), Some(run)) => match self.take_slot(run, t) {
+                    Ok(held) => self.devices.key_of(&env.key(threads), &held),
+                    Err(why) => {
+                        self.close_actor(actor, &why);
+                        return;
+                    }
+                },
+                _ => match self.devices.key_for(policy.gpus, &policy.device, &env.key(threads)) {
+                    Want::Key(key) => key,
+                    Want::None | Want::Wait | Want::Infeasible(_) => env.key(threads),
+                },
             };
             let exec = self.spawn_exec(&env, threads, &key, Some(actor));
             if let Some(id) = exec {
@@ -5001,10 +5393,21 @@ impl Core {
         host.restart = spec.restart();
         host.detached = spec.detached;
         host.durable = spec.durable;
-        host.class_digest = spec.class_digest.clone();
-        if rec.state_version >= host.state_version {
+        // A record read before an upgrade (from a lagging replica) never undoes it.
+        if spec.state_schema >= host.state_schema {
+            host.upgrade |= host.durable && !host.class_digest.is_empty() && host.class_digest != spec.class_digest;
+            host.class_digest = spec.class_digest.clone();
+            host.state_schema = spec.state_schema;
+            host.limits = spec.methods.clone();
+        }
+        // A record read without its chunks put back together (whole_record)
+        // carries none of the state they hold, and starts no instance: the
+        // leader's copy, which has them, does.
+        let whole = rec.state_chunks.is_empty() || !rec.durable_state.is_empty();
+        if rec.state_version >= host.state_version && whole {
             host.state_version = rec.state_version;
             host.durable_state = rec.durable_state.clone();
+            host.state_chunks = rec.state_chunks.clone();
         }
         host.run = run;
         match rec.state() {
@@ -5013,7 +5416,7 @@ impl Core {
                 let mine = rec.host.as_ref().is_some_and(|h| {
                     h.peer == self.router.identity.peer.to_vec() && h.inc == self.router.identity.incarnation
                 });
-                if mine && rec.generation > host.generation {
+                if mine && rec.generation > host.generation && whole {
                     if rec.generation != host.generation + 1 {
                         // It ran elsewhere since it was last here: where its
                         // handles stand is learned again (resolve_handles).
@@ -5149,7 +5552,7 @@ impl Core {
             }
             host.ctor = Some(w);
         } else {
-            host.mailbox.insert((w.spec.handle, w.spec.seq), w);
+            actor_limits::enqueue(host, w);
             if !host.known_handles.contains(&handle) {
                 self.resolve_handles(actor, Some(&[handle]));
             }
@@ -5357,16 +5760,12 @@ impl Core {
         let Some(host) = self.actors.get_mut(&actor) else { return };
         if host.durable && host.state_version > 0 && !host.constructed {
             // A durable actor resumes from its last committed state; its
-            // constructor ran once, before the first command.
+            // constructor ran once, before the first command. The restore
+            // uses the class its record names now.
             host.ctor = None;
             host.constructed = true;
-            let msg = pb::ExecRestore {
-                actor: actor.to_vec(),
-                fn_digest: host.class_digest.clone(),
-                state: host.durable_state.clone(),
-                version: host.state_version,
-            };
-            self.sup.send(exec, pb::PeerToExec { msg: Some(pb::peer_to_exec::Msg::Restore(msg)) });
+            host.upgrade = false;
+            self.send_restore(actor, exec);
             self.actor_pump(actor);
             return;
         }
@@ -5416,15 +5815,22 @@ impl Core {
             let Some(exec) = self.actors.get(&actor).and_then(|h| h.exec) else { return };
             let Some(e) = self.execs.get(&exec) else { return };
             let inflight = self.running.iter().filter(|r| r.exec == exec).count();
-            if e.state == ExecState::Starting || inflight >= e.concurrency {
+            // Calls of limited methods count against their own limits (actor_limits).
+            let limited = self.actors.get(&actor).is_some_and(|h| h.constructed && !h.limits.is_empty());
+            if e.state == ExecState::Starting || (inflight >= e.concurrency && !limited) {
                 return;
+            }
+            if inflight == 0 {
+                self.actor_upgrade_now(actor, exec);
             }
             // The constructor runs alone, before any method.
             let constructing = self.actors.get(&actor).is_some_and(|h| !h.constructed);
             if constructing && inflight > 0 {
                 return;
             }
-            if !self.actor_start_next(actor, exec) {
+            let started =
+                if limited { self.actor_start_limited(actor, exec) } else { self.actor_start_next(actor, exec) };
+            if !started {
                 return;
             }
         }
@@ -5473,6 +5879,8 @@ impl Core {
         if let Some(host) = self.actors.get_mut(&actor) {
             if w.kind() == pb::CallKind::CallActorCtor {
                 host.constructed = true;
+                // Built with the class it was created with: an upgraded one is rebuilt.
+                host.upgrade |= host.durable && w.spec.fn_digest != host.class_digest;
             } else {
                 host.inflight.remove(&(w.spec.handle, w.spec.seq));
             }
@@ -5529,12 +5937,15 @@ impl Core {
     // ---- housekeeping -----------------------------------------------------
 
     fn housekeeping(&mut self) {
+        self.expire_holds();
         self.spill();
         self.charge_budgets();
+        self.native_sample();
         // Actors that waited for CPUs: try again (each re-reads its record).
         for actor in std::mem::take(&mut self.actors_waiting) {
             self.on_actor_changed(actor);
         }
+        self.pump_limited_actors();
         // Handles still waiting on an earlier call that ran elsewhere.
         let waiting: Vec<Id> = self.actors.iter().filter(|(_, h)| !h.resolving.is_empty()).map(|(a, _)| *a).collect();
         for actor in waiting {
@@ -5542,6 +5953,15 @@ impl Core {
         }
         if let Some(mesh) = &self.router.mesh {
             self.log_ship.flush(mesh);
+        }
+        for (run, summary) in self.log_dedup.expire(Instant::now()) {
+            self.send_log(run, &summary);
+        }
+        // Sessions whose client did not come back to resume them.
+        let now = Instant::now();
+        let gone: Vec<u64> = self.sessions.iter().filter(|(_, s)| s.expired(now)).map(|(id, _)| *id).collect();
+        for id in gone {
+            self.end_session(id);
         }
         let now_hlc = self.router.hlc();
         // Deadlines: cancel queued or running work past its deadline.
@@ -5824,7 +6244,8 @@ impl Core {
                     let host = self.actors.values().find(|h| h.mailbox.values().any(|x| x.tk == tk)).expect("found");
                     let running =
                         self.running.iter().filter(|r| host.exec == Some(r.exec)).map(|r| r.remaining).sum::<usize>();
-                    self.actor_queue_reason(w, host.mailbox.len() - 1 + running)
+                    self.limit_reason(host, w)
+                        .unwrap_or_else(|| self.actor_queue_reason(w, host.mailbox.len() - 1 + running))
                 } else {
                     "granted; waiting for an actor or executor".into()
                 }
@@ -5882,7 +6303,7 @@ impl Core {
             cpus: policy.cpus,
             oom: false,
         };
-        let req = Request { cpus: policy.cpus, memory: policy.memory, adaptive: policy.adaptive() };
+        let req = Request::of(&policy);
         let kills = self.mem_kills.back().is_some_and(|t| t.elapsed() < KILLS_RECENT);
         let now = self.epoch.elapsed().as_secs_f64();
         for d in self.profiles.record(&r.key, &policy.fn_name, sample, None, req, kills, now, now_ns()) {
@@ -5906,6 +6327,9 @@ impl Core {
             actors: self.hosted_actors() as u32,
             object_bytes: self.objects.bytes_used(),
             draining: self.draining,
+            object_layout: crate::parts::OBJECT_LAYOUT,
+            demand: Some(self.demand()),
+            incarnation: self.router.identity.incarnation,
             ..Default::default()
         };
         let Some(mesh) = self.router.mesh.as_ref() else {
@@ -5938,6 +6362,12 @@ impl Core {
                     actors: v.load.as_ref().map_or(0, |l| l.actors),
                     object_bytes: v.load.as_ref().map_or(0, |l| l.object_bytes),
                     draining: v.load.as_ref().is_some_and(|l| l.stopping),
+                    object_layout: v.member.object_layout,
+                    demand: v.load.as_ref().and_then(|l| l.demand.clone()),
+                    load_age_ms: v.last_ok.map_or(0, |t| t.elapsed().as_millis() as u64),
+                    // A load report its core did not fill (mesh.rs's ping handler) says nothing.
+                    starting: v.load.as_ref().is_none_or(|l| l.draining && !l.stopping),
+                    incarnation: v.member.incarnation,
                 }
             })
             .collect()
@@ -5961,12 +6391,40 @@ impl Core {
                     applied: s.applied,
                     leading: s.leader == Some(self.router.node_id()),
                     max_lag: s.max_lag.unwrap_or(0),
+                    durability: crate::durability::group(&self.router, &s.voters).0.name().into(),
                 }
             })
             .collect()
     }
 
+    /// The actors this peer hosts, by state, every state listed. `pending`:
+    /// never started (placing, or waiting for memory); `starting`: its
+    /// constructor runs; `restarting`: its process ended and another is due;
+    /// `moving`: its peer drains. An actor that moved away is not counted.
+    fn actor_states(&self) -> HashMap<String, u32> {
+        const STATES: [&str; 6] = ["pending", "starting", "alive", "moving", "restarting", "dead"];
+        let mut by: HashMap<String, u32> = STATES.iter().map(|s| (s.to_string(), 0)).collect();
+        for h in self.actors.values().filter(|h| !h.moved) {
+            let state = if h.dead {
+                "dead"
+            } else if h.moving {
+                "moving"
+            } else if h.exec.is_none() || h.waiting_memory.is_some() {
+                if h.started.is_some() { "restarting" } else { "pending" }
+            } else if !h.constructed {
+                "starting"
+            } else {
+                "alive"
+            };
+            *by.get_mut(state).expect("every state is listed") += 1;
+        }
+        by
+    }
+
     fn status(&self) -> pb::StatusReply {
+        let durability = crate::durability::report(&self.router);
+        let mesh = self.router.mesh.as_ref();
+        let heartbeats = mesh.map(|m| m.heartbeats.samples()).unwrap_or_default();
         let busy = self.execs.values().filter(|e| e.state == ExecState::Busy).count() as u32;
         let mut reasons = Vec::new();
         if let Some(w) = self.queue.front() {
@@ -6001,6 +6459,8 @@ impl Core {
             object_bytes: self.objects.bytes_used(),
             pending_reasons: reasons,
             sessions: self.sessions.len() as u32,
+            session_bytes: self.sessions.values().map(|s| s.mailbox.queued_bytes() as u64).sum(),
+            session_backlog: self.sessions.values().map(|s| s.backlog() as u64).sum(),
             dispatch_p50_us: percentile(&self.dispatch_us, 0.50),
             dispatch_p99_us: percentile(&self.dispatch_us, 0.99),
             dispatch_samples: self.dispatch_us.len() as u64,
@@ -6012,9 +6472,27 @@ impl Core {
             memory_used: self.memory_used(),
             memory_available: self.available.unwrap_or(0),
             links: self.router.mesh.as_ref().map(|m| m.links()).unwrap_or_default(),
+            traffic: mesh.map(|m| m.traffic.status()).unwrap_or_default(),
+            mesh_rate: mesh.map_or(0, |m| m.traffic.rate() as u64),
+            heartbeat_p50_us: percentile(&heartbeats, 0.50),
+            heartbeat_p99_us: percentile(&heartbeats, 0.99),
+            fleet: self.fleet.as_ref().map(|f| f.view()),
+            tasks_by_state: [
+                ("queued", self.queue.len() as u64),
+                ("fetching_inputs", self.localizing.len() as u64),
+                ("running", self.running.iter().map(|r| r.remaining as u64).sum()),
+            ]
+            .into_iter()
+            .map(|(state, n)| (state.to_string(), n))
+            .collect(),
+            actors_by_state: self.actor_states(),
+            queue_oldest_seconds: self.queue.iter().map(|w| w.ready_at.elapsed().as_secs_f64()).fold(0.0, f64::max),
             nodes: self.nodes(),
             groups: self.group_status(),
             data_groups: if self.router.is_cluster() { self.router.data_groups().count() as u32 } else { 0 },
+            durability_requested: durability.0.name().into(),
+            durability_effective: durability.1.name().into(),
+            durability_degraded: durability.2,
             objects: Vec::new(), // filled by the ingress when asked (StatusRequest.objects)
             automatic: vec![
                 self.budget.describe(),

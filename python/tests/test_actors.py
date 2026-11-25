@@ -88,6 +88,21 @@ def test_concurrency_control_shows_overlap_and_reordering():
     assert sorted(items) == list(range(40)) and items != list(range(40)), "overlapping calls finish out of order"
 
 
+def test_a_rebuilt_handle_keeps_the_actors_concurrency():
+    # A handle rebuilt without the class's options (as one shipped to another
+    # process is) sends calls with no concurrency of their own: they still
+    # overlap as the constructor allowed, instead of running one at a time.
+    import cloudpickle
+
+    actor = Overlapping.remote()
+    actor.get.remote().result(timeout=30)
+    rebuilt = cloudpickle.loads(cloudpickle.dumps(actor))
+    futs = [rebuilt.append.remote(i, 0.3) for i in range(4)]
+    ch.get(futs, timeout=60)
+    _, max_active = rebuilt.get.remote().result(timeout=30)
+    assert max_active > 1, "calls through a rebuilt handle of a concurrency=4 actor should overlap"
+
+
 def test_async_methods_do_not_overlap_by_default():
     c = AsyncCounter.remote()
     ch.get((c.work.remote(i) for i in range(50)), timeout=60)

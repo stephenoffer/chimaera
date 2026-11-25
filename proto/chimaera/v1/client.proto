@@ -28,6 +28,15 @@ service Peer {
   rpc Shutdown(ShutdownRequest) returns (ShutdownReply);
   // Bring an object produced on another peer into this peer's store.
   rpc Localize(LocalizeRequest) returns (LocalizeReply);
+  // Copy objects this peer stores to other peers, other failure domains
+  // first, and answer once the copies are made (a retained ch.put).
+  rpc Retain(RetainRequest) returns (RetainReply);
+  // Hold (or release) stored files of another run for this session: they
+  // outlive that run's end until released (a ch.put handle unpickled here).
+  rpc Borrow(BorrowRequest) returns (BorrowReply);
+  // Hold resources on a peer's ledger for a gang generation or a
+  // reservation, all of them or none (forwarded to that peer).
+  rpc Hold(HoldRequest) returns (HoldReply);
   // Large values from clients that do not share the peer's filesystem: which
   // of these blobs the run lacks, upload one (checked against its digest),
   // and read an object back (by range).
@@ -99,6 +108,9 @@ message PutBlobChunk {
   bytes blob_id = 2;   // blake3 of the whole blob, first 16 bytes
   uint64 size = 3;
   bytes data = 4;
+  // On the first chunk: the peer makes no background copy of it (a ch.put
+  // whose durability is not the default).
+  bool keep_local = 5;
 }
 
 message PutBlobReply {}
@@ -147,6 +159,12 @@ message PeerInfo {
   // Records actor calls a driver ran directly (TaskSpec.ran, .direct): a
   // driver sends calls straight to actors here only when this is set.
   bool direct_actor_calls = 11;
+  // Copies this peer makes of each new object in the background (0: none).
+  // A writer that wants none of an object leaves a marker for it first.
+  uint32 replicas = 12;
+  // ch.auto(initial=...) on cpus or memory is learnable here (Policy.cpus_initial);
+  // an older peer treats an initial value as the caller's.
+  bool learns_initial = 13;
 }
 
 message CreateRunRequest {
@@ -208,7 +226,19 @@ message ClientMsg {
     StreamCredit stream_credit = 11;
     EndRun end_run = 12;         // finish or cancel a run by id (Run.finish / Run.cancel)
     ReleaseObjects release_objects = 13;
+    // Forget these dead letters (Run.retry_failed resubmitted them, or Run.discard_failed).
+    Release discard_failed = 14;
+    // Events received up to and including this SessionEvent.cursor. The first
+    // one (0 will do) asks the peer to keep what a resume needs.
+    uint64 ack_cursor = 15;
+    // Sent first on a new stream: continue a session whose stream broke.
+    ResumeSession resume = 16;
   }
+}
+
+message ResumeSession {
+  uint64 session = 1;   // SessionEvent.opened of the broken stream
+  uint64 cursor = 2;    // the last SessionEvent.cursor received on it
 }
 
 // ch.put values nothing refers to any more and whose readers have finished:
@@ -256,7 +286,19 @@ message SessionEvent {
     string error = 5;
     LogEvent log = 6;
     StreamItem stream_item = 7;
+    // The session's id, first on every stream (ResumeSession names it).
+    uint64 opened = 9;
+    // Answers a ResumeSession once this peer has taken the old session over:
+    // the seq of the last ClientMsg it handled. The client sends again what
+    // it sent after that, and nothing else before this arrives.
+    uint64 resumed = 10;
   }
+  // Outcomes, generator items and replies count up from 1, once the session
+  // has sent an ack_cursor; 0 on other events.
+  uint64 cursor = 8;
+  // Once the session has sent an ack_cursor: the seq of the last ClientMsg
+  // this peer has handled. The client keeps what it sent after it, for a resume.
+  uint64 taken = 11;
 }
 
 message ActorQuery {
@@ -298,6 +340,21 @@ message AttemptRecord {
   string placement_reason = 16;
   // CPU and memory this attempt reserved, and where each came from.
   string reservation = 17;
+  // The same, setting by setting (settings.rs): cpus, memory and batch.
+  repeated Setting settings = 18;
+}
+
+// One setting an attempt ran with. `value` was granted; `requested` is what
+// its source chose before a bound or limit applied (they differ only when
+// `source` is "clamped", and `reason` says why).
+message Setting {
+  string name = 1;         // cpus | memory (bytes) | batch (calls per executor round trip)
+  double value = 2;
+  double requested = 3;
+  double min = 4;          // ch.auto bounds; 0 = none
+  double max = 5;
+  string source = 6;       // user | initial | default | learned | trial | observed | raised | clamped
+  string reason = 7;
 }
 
 message Decision {
@@ -324,6 +381,9 @@ message ExplainReply {
 message StatusRequest {
   // Also gather what every live peer's object store holds (StatusReply.objects).
   bool objects = 1;
+  // Federation: only StatusReply.fleet, with this cell's own capacity first.
+  // The reply's size is bounded whatever the cell's size.
+  bool fleet = 2;
 }
 
 message StatusReply {
@@ -361,6 +421,75 @@ message StatusReply {
   repeated GroupStatus groups = 22;
   // How many data groups the cluster has (0 on a local peer).
   uint32 data_groups = 23;
+  // What an acknowledged commit survives ("process", "reboot", "machine"):
+  // asked for by this peer's CHIMAERA_RAFT_SYNC, and given by the weakest of
+  // the cluster's groups as their voters' syncing and machines allow.
+  string durability_requested = 24;
+  string durability_effective = 25;
+  // Why service is below what was asked: groups whose voters give less, a slow disk.
+  repeated string durability_degraded = 26;
+  // Events waiting in sessions' mailboxes for their readers, in bytes, and
+  // what waits beyond them for a slow reader to catch up (outcomes as their
+  // task keys, generator items).
+  uint64 session_bytes = 27;
+  uint64 session_backlog = 28;
+  // What this peer sent other peers in bulk, by traffic class, and the rate
+  // it paces them at (CHIMAERA_MESH_RATE, bytes per second; 0: unpaced).
+  repeated TrafficStatus traffic = 29;
+  uint64 mesh_rate = 30;
+  // Round trips of the Raft heartbeats (appends with no entries) this peer
+  // sent lately, which pacing keeps short.
+  double heartbeat_p50_us = 31;
+  double heartbeat_p99_us = 32;
+  // Federation (docs/federation.md): what this peer last read of its cell's
+  // view of the other cells; empty without a fleet.
+  FleetView fleet = 33;
+  // Calls on this peer, and the actors it hosts, by state. Each has a fixed
+  // set of states, every one present (zero included): Prometheus labels.
+  map<string, uint64> tasks_by_state = 34;
+  map<string, uint32> actors_by_state = 35;
+  // How long the longest-waiting call queued here has waited for a slot, in
+  // seconds (0 when none waits): the backlog's age, a scaling signal.
+  double queue_oldest_seconds = 36;
+}
+
+// One cell's free capacity of one resource class, as the fleet hears of it.
+message CellCapacity {
+  reserved 2;
+  string cell = 1;
+  string region = 3;    // its peers' `region` label
+  string resource = 4;  // the resource class: "cpu"
+  double free = 5;      // free, less what waits in its queues
+  double total = 6;
+  uint64 number = 7;    // when the cell made the report (unix ms, its clock): a newer one is larger
+  uint32 age = 8;       // rounds since, as the cells that passed it on counted: 0 is the cell's own, just made
+  // The reporting cell's FleetView.cell (0: a cell outside any fleet): a
+  // cell drops its own reports, which come back under other cells' names for it.
+  uint64 origin = 9;
+}
+
+message FleetCell {
+  string name = 1;
+  string endpoint = 2;
+}
+
+// What a cell's summary publisher learned, in the cell's own store for its
+// peers to read: reports of other cells (a bounded digest) and the cells it
+// may ask, from configuration and the directory.
+message FleetView {
+  repeated CellCapacity capacity = 1;
+  repeated FleetCell cells = 2;
+  uint64 directory_revision = 3;  // the directory's revision `cells` has caught up to (0: none read)
+  uint64 epoch = 4;               // the publisher's fencing token
+  bool publishing = 5;            // in a Status reply: the answering peer is its cell's publisher
+  uint64 cell = 6;                // this cell's id: the node id of its first publisher
+}
+
+message TrafficStatus {
+  string name = 1;      // foreground, shuffle, recovery, checkpoint
+  uint32 weight = 2;    // its share of the rate while other classes want it
+  uint64 bytes = 3;     // sent since the peer started
+  double waited_s = 4;  // time its sends waited for their turn
 }
 
 message GroupStatus {
@@ -371,6 +500,7 @@ message GroupStatus {
   uint64 applied = 5;
   bool leading = 6;       // this peer leads it
   uint64 max_lag = 7;     // when leading: entries the furthest-behind voter lacks
+  string durability = 8;  // what its acknowledged commits survive (see StatusReply.durability_effective)
 }
 
 message ClusterNode {
@@ -388,6 +518,11 @@ message ClusterNode {
   uint32 actors = 12;            // actor instances it hosts
   uint64 object_bytes = 13;      // bytes of values it stores
   bool draining = 14;            // stopping: it takes no new work
+  uint32 object_layout = 15;     // the newest layout of stored results it reads (Member.object_layout)
+  Demand demand = 16;            // from its last load report; unset from a peer too old to send one
+  uint64 load_age_ms = 17;       // how old its load report is (0 for the answering peer)
+  bool starting = 18;            // no load report yet: its core has not answered, or it was not probed yet
+  uint64 incarnation = 19;       // its incarnation: a restarted peer's counters start again
 }
 
 message ShutdownRequest {}
@@ -399,9 +534,54 @@ message LocalizeRequest {
   // The call whose result this is: when every copy is lost, the peer runs it
   // again (lineage) if it can be, else the reply says why not.
   TaskKey task = 3;
+  TrafficClass traffic = 4;  // why it is read: a shuffle's gather, or a call (the default)
 }
 
 message LocalizeReply {}
+
+message RetainRequest {
+  bytes run = 1;
+  repeated bytes object_ids = 2;
+}
+
+message RetainReply {}
+
+message BorrowRequest {
+  uint64 session = 1;              // the caller's session (SessionEvent.opened)
+  bytes run = 2;
+  repeated bytes object_ids = 3;   // a value's file and the files it links
+  bool release = 4;
+}
+
+message BorrowReply {}
+
+// Hold slots of resources on one peer for `owner` (a gang or a reservation),
+// every slot or none. A hold lasts until the owner releases it or lets
+// `ttl_ms` pass without renewing it; a call or actor carrying a slot's
+// LaunchToken takes that slot's resources as its own. A newer generation of
+// the owner ends an older one's hold on that peer.
+message HoldRequest {
+  string cluster = 1;              // set between peers
+  bytes peer = 2;                  // the peer to hold on; empty: the one asked
+  string owner = 3;                // empty: change nothing, only list the holds
+  uint64 generation = 4;
+  repeated HoldShape slots = 5;    // empty: release the owner's hold (this generation or older)
+  uint64 ttl_ms = 6;
+  bool renew = 7;                  // only extend a hold this generation already has
+}
+
+message HoldShape {
+  double cpus = 1;
+  double gpus = 2;
+  string device = 3;
+}
+
+message HoldReply {
+  bool held = 1;
+  string reason = 2;               // why not
+  repeated string holds = 3;       // what the peer holds now, one line per owner
+  bool never = 4;                  // not even with nothing else running there (too large, or no such device)
+}
 
 message ListActorsRequest {
   string prefix = 1;               // names starting with this; empty = all
@@ -425,18 +605,24 @@ message ListTasksRequest {
   bytes run = 1;
   bytes after_task = 2;   // exclusive cursor; empty = from the start
   uint32 limit = 3;
+  bool failed = 4;        // the run's dead letters instead (all of them, oldest first per vshard)
 }
 
 message ListTasksReply {
   repeated OutcomeEvent tasks = 1;   // outcome unset while the task is not done
   repeated TaskRecord.State states = 2;
   bytes next_after = 3;              // empty when there are no more
+  repeated DeadLetter failed = 4;    // with `failed`: the dead letters
+  repeated TaskKey failed_keys = 5;  // and their tasks, in the same order
 }
 
-// ch.Store: one write, or one read. A CHANGES read with wait_ms waits up to
-// that long for a change after after_revision (a watch's long poll).
+// ch.Store: one write, one transaction, or one read. A CHANGES read with
+// wait_ms waits up to that long for a change after after_revision (a watch's
+// long poll).
 message StoreRequest {
   StoreWrite write = 1;
   StoreRead read = 2;
   uint32 wait_ms = 3;
+  StoreTxn txn = 4;
+  StoreClaim claim = 5;
 }

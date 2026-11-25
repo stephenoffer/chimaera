@@ -57,6 +57,11 @@ message TaskSpec {
   // flight there (explain, deadlock messages) until its `ran` record
   // arrives. Never submitted to a shard.
   bool direct = 25;
+  // A durable workflow's call as the workflow describes it (JSON: its step,
+  // function, call site, argument preview and fingerprint), opaque to the
+  // shard: a replay that makes another call at this step is rejected with
+  // the recorded description and its own.
+  string workflow_step = 26;
 }
 
 // What the direct path reports for a call it ran (TaskSpec.ran).
@@ -159,6 +164,29 @@ message ActorSpec {
   // An unnamed actor's id is its creating run's child ("actor", nonce), so no
   // such id is ever another's (a named actor's comes from tenant and name).
   bytes nonce = 11;
+  // ch.durable.State(version=): the version of the durable state its class
+  // writes. Creating a named durable actor that exists with a lower one binds
+  // the actor to the new class (ActorUpgrade).
+  uint32 state_schema = 12;
+  // Per-method limits on the actor's calls (MethodLimit): a method's
+  // ch.Mailbox, and a batched method's queue. (A list, not a map: a record
+  // must encode to the same bytes on every replica.)
+  repeated MethodLimit methods = 13;
+}
+
+// How many calls of one actor method its actor may have at once, and what
+// becomes of a call past that. A mailbox (`reject`, or a `max_wait_ms`)
+// counts the method's calls queued at the actor's peer and those its process
+// holds (running, or waiting there for a thread); a batched method's queue
+// (neither) counts only those its process holds, and the rest wait at the
+// peer. Calls of a limited method do not wait for the actor's other calls'
+// room, so they cannot hold up its other methods.
+message MethodLimit {
+  string method = 1;
+  uint32 max_calls = 2;     // 0 = no limit on their number
+  uint64 max_bytes = 3;     // on their argument bytes; 0 = none (a larger call goes alone)
+  bool reject = 4;          // a call past the limit fails at once (OVERLOADED)
+  uint64 max_wait_ms = 5;   // else it waits for room this long, then fails; 0 = no bound
 }
 
 message ActorRecord {
@@ -179,6 +207,10 @@ message ActorRecord {
   ObjectRef checkpoint = 9;       // restart=checkpoint snapshot
   ErrorRecord death = 10;
   uint64 commands_retained = 11;
+  // Durable state too large to keep inline: the digests of its chunks, in
+  // order (each stored once per actor, keys::actor_chunk). ActorCommitRoot
+  // replaces the list whole; `durable_state` is then empty.
+  repeated bytes state_chunks = 12;
 }
 
 message ActorCommandRecord {
@@ -229,7 +261,28 @@ message ShardCmd {
     Subscribe unsubscribe = 34;
     // Calls here that cancelled calls in another vshard submitted (sent through the outbox).
     CancelChildren cancel_children = 35;
+    // Forget dead letters (retried elsewhere, or not wanted), releasing their inputs.
+    Release discard_dead = 36;
+    StoreTxn store_txn = 37;
+    // A chunk of a durable actor's state, written before the commit that names it.
+    ActorChunkPut actor_chunk_put = 38;
+    // A durable actor command whose state is in chunks (ActorRecord.state_chunks).
+    ActorCommitRoot actor_commit_root = 39;
+    // Bind a named durable actor to a class that writes a newer state version.
+    ActorUpgrade actor_upgrade = 40;
+    // A session holds (or releases) stored files of a run that is not its own.
+    LeaseObjects lease_objects = 41;
+    StoreClaim store_claim = 42;
   }
+}
+
+// A call that failed for good, kept so it can be retried (Run.failed()): its
+// spec with its arguments, its error, and when it ended. Its inputs stay
+// pinned until it is discarded, pushed out by newer ones, or its run ends.
+message DeadLetter {
+  TaskSpec spec = 1;
+  Outcome error = 2;
+  uint64 done_hlc = 3;
 }
 
 message RunCreate {
@@ -388,6 +441,36 @@ message ActorCheckpoint {
   ObjectRef snapshot = 4;
 }
 
+// Stored under the blake3 digest of `data` for this actor. Refused unless
+// `generation` is the actor's current one, so an instance that was replaced
+// cannot write. Chunks no commit names are dropped by the next commit or
+// placement of the actor.
+message ActorChunkPut {
+  bytes actor = 1;
+  uint64 generation = 2;
+  bytes data = 3;           // at most MAX_INLINE_STATE bytes
+}
+
+// As ActorCommandCommit (whose new_state stays empty), with the state given
+// as the digests of chunks already put. Refused if one is missing; otherwise
+// the record's chunk list is replaced in the same step, so a restore reads
+// either the old list or the new one, never a mixture.
+message ActorCommitRoot {
+  ActorCommandCommit commit = 1;
+  repeated bytes chunks = 2;
+}
+
+// Applied only to a live durable actor whose class writes an older state
+// version: the record then names `class_digest` and its `methods` limits,
+// and its host rebuilds the instance from the committed state with that
+// class (whose State(migrate=) converts it).
+message ActorUpgrade {
+  bytes actor = 1;
+  bytes class_digest = 2;
+  uint32 state_schema = 3;
+  repeated MethodLimit methods = 4;
+}
+
 message RunFinish {
   bytes run = 1;
   RunRecord.State state = 2;
@@ -395,6 +478,18 @@ message RunFinish {
 
 message Gc {
   uint32 max_keys = 1;
+}
+
+// A session's hold on stored files of a run (a ch.put handle unpickled where
+// another run is current). A held value outlives its run's end, until its
+// last holder releases it, or the holder's session ends, or its peer
+// incarnation is retired. Leases live in the run's own vshard.
+message LeaseObjects {
+  bytes run = 1;
+  repeated bytes object_ids = 2;   // the value's file and the files it links
+  PeerInc peer = 3;                // the holder's peer incarnation
+  uint64 holder = 4;               // the holder on that peer
+  bool release = 5;
 }
 
 // Directory-driven ownership: this group serves `vshards` at `epoch`.
@@ -500,6 +595,8 @@ message StoreLease {
   string holder = 1;
   uint64 token = 2;         // fencing token: grows with every grant
   uint64 expires_hlc = 3;
+  string item = 4;          // a claim (StoreClaim): the key it holds
+  string items = 5;         // and the prefix that key was claimed from
 }
 
 message StoreBarrier {
@@ -547,6 +644,39 @@ message StoreWrite {
   StoreFence fence = 13;    // reject the write unless this lease is still held
 }
 
+// Writes to several keys of one namespace that apply together or not at all.
+// Every condition is tested first: each check, and each op's own if_version,
+// fence and limits. Then the ops apply in order as one new revision, each
+// logging its own change. Ops are PUT, DELETE or ADD, each on a different key;
+// their tenant and namespace fields are not used.
+message StoreTxn {
+  string tenant = 1;
+  string namespace = 2;
+  repeated StoreCheck checks = 3;
+  repeated StoreWrite ops = 4;
+}
+
+// A StoreTxn condition: `key` is at `version` (0 = it does not exist).
+message StoreCheck {
+  string key = 1;
+  uint64 version = 2;
+}
+
+// Claim a key under `prefix` that nobody holds (a work queue's next item):
+// grant `holder` the lease lock_prefix + key for ttl_ms. An item claimed
+// before and given back or lapsed goes first, then the first key never
+// claimed. The namespace keeps an index of claims by when they lapse, so a
+// claim looks at a few keys, however many are queued or held; renewing or
+// unlocking the lease keeps that index current.
+message StoreClaim {
+  string tenant = 1;
+  string namespace = 2;
+  string prefix = 3;
+  string lock_prefix = 4;
+  string holder = 5;
+  uint64 ttl_ms = 6;
+}
+
 message StoreRead {
   enum Kind {
     GET = 0;
@@ -575,5 +705,7 @@ message StoreReply {
   StoreBarrier barrier = 7;
   repeated StoreChange changes = 8;
   bool compacted = 9;       // changes after after_revision were trimmed: scan again
-  bool more = 10;
+  bool more = 10;           // StoreClaim: keys are left under the prefix, all claimed
+  uint32 examined = 11;     // StoreClaim: index entries and keys it looked at
+  uint64 retry_ms = 12;     // StoreClaim, nothing claimable: until the first claim held lapses (0: none)
 }

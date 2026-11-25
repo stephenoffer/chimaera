@@ -593,6 +593,11 @@ pub struct LeakWatch {
 pub const LEAK_WINDOW: usize = 20;
 
 impl LeakWatch {
+    /// The baseline recorded after the last call, if any.
+    pub fn last(&self) -> Option<u64> {
+        self.recent.back().map(|b| *b as u64)
+    }
+
     /// Record the baseline after a call; `Some(reason)` means replace the
     /// executor after this call.
     pub fn after_call(&mut self, baseline: u64) -> Option<String> {

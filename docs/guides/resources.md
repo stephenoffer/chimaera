@@ -49,7 +49,10 @@ share one core. Thread pools follow the grant too: `OMP_NUM_THREADS`,
 `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`,
 `NUMEXPR_NUM_THREADS`, `RAYON_NUM_THREADS`, `POLARS_MAX_THREADS` and
 `NUMBA_NUM_THREADS` are set to the CPUs rounded up (1 for `cpus=0.25`) unless
-your run's environment sets them.
+your run's environment sets them. On a Linux host with several NUMA nodes, a
+worker whose threads fit in one node runs on that node's CPUs and its memory
+goes there first (`CHIMAERA_NUMA_BIND` in
+[configuration.md](../configuration.md#resources-and-memory)).
 
 Ask for something no peer could ever provide, and waiting on it raises
 `ch.Infeasible`, naming the constraint:
@@ -202,15 +205,21 @@ assert "memory not known yet" in frozen.explain()["attempts"][-1]["reservation"]
 <details>
 <summary>Adaptive modes and ch.auto</summary>
 
-Pass only `min=` and `max=` to `ch.auto` for `cpus` and `memory`. For now, an
-initial value (`cpus=ch.auto(2, max=4)`) is sent as if you'd set `cpus=2`, so
-learning never adjusts it.
+An initial value (`cpus=ch.auto(2, min=0.5, max=4)`) is what the first calls
+reserve; learning then moves it, never past `min` or `max`. A plain number
+(`cpus=2`) is never changed. A peer older than this rule reads an initial
+value as a plain number.
 
 | `adaptive=` | Effect |
 |---|---|
-| `"on"` | Default. Learned CPU and memory apply |
-| `"observe"` | Measure and say what would have been reserved, but reserve the defaults |
-| `"frozen"` | No learning: 1 CPU and no memory reservation unless you set them |
+| `"on"` | Default. Learned CPU, memory and batching apply |
+| `"observe"` | Measure, and say in `explain()` what would have been reserved (`not applied (adaptive="observe"): would reserve ...`), but reserve what `"frozen"` would and run each call on its own |
+| `"frozen"` | No learning: your values (an initial value included), else 1 CPU and no memory reservation; each call runs on its own |
+
+Observed and frozen calls never take part in a CPU trial, so they don't
+change what learning concludes for the same function's other calls. A map
+still groups its items into chunks in every mode (that is the driver's
+choice, not the peer's).
 
 </details>
 
@@ -349,12 +358,13 @@ bundle's CPUs at once), so give each parallel worker its own bundle.
 - `reserve()` returns at once. `ready(timeout)` waits, and on a timeout
   raises `TimeoutError` but keeps trying until you `release()`.
 - A reservation holds every bundle or none, so two that want the same CPUs
-  take turns instead of each holding half.
-- Holds come from the peers' load reports, not one atomic step. A burst of
-  reservations against stale reports can over-commit for a moment before
-  one backs off.
-- `strict_pack` checks free CPUs when you call `reserve()`. If no peer has
-  them free right then, it raises `ch.Infeasible` even when one could later.
+  or GPUs take turns instead of each holding half. Each peer holds bundles
+  only from what is free there.
+- The bundle's process starts with the first call or actor placed within
+  it. If your script dies before that, its bundles are free again within
+  15 s (`ch.dist.Reservation.HOLD_S`).
+- `strict_pack` and `strict_spread` raise `ch.Infeasible` at once when no
+  live peers could hold the bundles even idle.
 
 </details>
 

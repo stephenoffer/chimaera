@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 
 mod objects;
 mod plain;
+mod scatter;
 
 const BATCH_MAX: usize = 64;
 const BATCH_WINDOW: Duration = Duration::from_micros(200);
@@ -36,10 +37,23 @@ const SUBMITS_IN_FLIGHT: u64 = 2;
 /// A batch this large goes even while submissions are in flight.
 const BATCH_HARD: usize = 4096;
 const MAX_FRAME: usize = 1 << 30;
+/// Outcomes and generator items received between acknowledgements, which
+/// let the peer forget what a resume would send again.
+const ACK_EVERY: u64 = 256;
+/// Tries to resume a session whose stream broke, 100 ms apart and doubling
+/// (about 3 s; the peer keeps the session 5 s).
+const RESUME_TRIES: u32 = 5;
+/// How long a try waits for the peer to answer a resume before the next try.
+/// The peer answers once the old stream has ended there (it ends a stream it
+/// has not seen break after the request it is handling).
+const RESUME_ANSWER: Duration = Duration::from_secs(5);
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
+        if let Some(e) = chimaera_proto::uds::pair_refused() {
+            panic!("{e}"); // as building the runtime would, but saying why
+        }
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("chimaera-client")
@@ -143,6 +157,7 @@ fn kind_name(k: pb::error_record::Kind) -> &'static str {
         K::DataLost => "data_lost",
         K::ActorDied => "actor_died",
         K::CommandConflict => "command_conflict",
+        K::Overloaded => "overloaded",
         K::Budget => "budget",
     }
 }
@@ -253,10 +268,48 @@ fn outcome_from(t: &Bound<'_, PyTuple>) -> PyResult<pb::Outcome> {
     Ok(pb::Outcome { value: Some(value), ..Default::default() })
 }
 
+/// A peer's demand summary (pb::Demand) as the dict `Node.demand` holds
+/// (python/chimaera/_planner.py reads it). A release bound of 0 ("not known") is infinity.
+fn demand_dict<'py>(py: Python<'py>, m: &pb::Demand) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let shapes = m
+        .shapes
+        .iter()
+        .map(|s| {
+            let row = PyDict::new(py);
+            row.set_item("cpus", s.cpus)?;
+            row.set_item("memory", s.memory)?;
+            row.set_item("queued", s.queued)?;
+            row.set_item("wall_s", s.wall_s)?;
+            row.set_item("cold", s.cold)?;
+            row.set_item("actors", s.actors)?;
+            Ok(row)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    d.set_item("shapes", shapes)?;
+    let releases: Vec<(f64, f64)> =
+        m.releases.iter().map(|r| (if r.upper_s > 0.0 { r.upper_s } else { f64::INFINITY }, r.cores)).collect();
+    d.set_item("releases", releases)?;
+    d.set_item("started_total", m.started_total)?;
+    d.set_item("started_core_s_total", m.started_core_s_total)?;
+    d.set_item("oldest_ready_s", m.oldest_ready_s)?;
+    let excluded = PyDict::new(py);
+    excluded.set_item("labels", m.excluded_labels)?;
+    excluded.set_item("devices", m.excluded_devices)?;
+    d.set_item("excluded", excluded)?;
+    Ok(d)
+}
+
 /// Policy from a Python dict of option values.
 fn policy_from(d: &Bound<'_, PyDict>) -> PyResult<pb::Policy> {
     let get_f = |k: &str| -> PyResult<f64> { d.get_item(k)?.map_or(Ok(0.0), |v| v.extract()) };
     let get_u = |k: &str| -> PyResult<u64> { d.get_item(k)?.map_or(Ok(0), |v| v.extract()) };
+    // A count too wide for its 32-bit field is refused, not wrapped.
+    let get_u32 = |k: &str| -> PyResult<u32> {
+        let v = get_u(k)?;
+        u32::try_from(v)
+            .map_err(|_| PyValueError::new_err(format!("{k}: {v} is more than {}, the most there is", u32::MAX)))
+    };
     let get_b = |k: &str| -> PyResult<bool> { d.get_item(k)?.map_or(Ok(false), |v| v.extract()) };
     let get_s = |k: &str| -> PyResult<String> { d.get_item(k)?.map_or(Ok(String::new()), |v| v.extract()) };
     let accounting = match get_s("accounting")?.as_str() {
@@ -268,6 +321,12 @@ fn policy_from(d: &Bound<'_, PyDict>) -> PyResult<pb::Policy> {
         "observe" => pb::policy::Adaptive::Observe,
         "frozen" => pb::policy::Adaptive::Frozen,
         _ => pb::policy::Adaptive::On,
+    };
+    let durability = match get_s("durability")?.as_str() {
+        "ephemeral" => pb::Durability::Ephemeral,
+        "replayable" => pb::Durability::Replayable,
+        "retained" => pb::Durability::Retained,
+        _ => pb::Durability::Default,
     };
     let resources: BTreeMap<String, f64> = d.get_item("resources")?.map_or(Ok(BTreeMap::new()), |v| v.extract())?;
     let require: BTreeMap<String, String> = d.get_item("require")?.map_or(Ok(BTreeMap::new()), |v| v.extract())?;
@@ -281,8 +340,8 @@ fn policy_from(d: &Bound<'_, PyDict>) -> PyResult<pb::Policy> {
         resources: resources.into_iter().collect(),
         accounting: accounting as i32,
         adaptive: adaptive as i32,
-        concurrency: get_u("concurrency")? as u32,
-        range_size: get_u("range_size")? as u32,
+        concurrency: get_u32("concurrency")?,
+        range_size: get_u32("range_size")?,
         interactive: get_b("interactive")?,
         deterministic: get_b("deterministic")?,
         env_digest: get_s("env_digest")?,
@@ -290,12 +349,15 @@ fn policy_from(d: &Bound<'_, PyDict>) -> PyResult<pb::Policy> {
         prefer,
         source: get_s("source")?,
         fn_name: get_s("fn_name")?,
+        cpus_initial: get_b("cpus_initial")?,
+        memory_initial: get_b("memory_initial")?,
         cpus_min: get_f("cpus_min")?,
         cpus_max: get_f("cpus_max")?,
         memory_min: get_u("memory_min")?,
         memory_max: get_u("memory_max")?,
         priority: d.get_item("priority")?.map_or(Ok(0), |v| v.extract())?,
         max_in_flight: d.get_item("max_in_flight")?.map_or(Ok(0), |v| v.extract())?,
+        max_in_flight_bytes: get_u("max_in_flight_bytes")?,
         profile_digest: d.get_item("profile_digest")?.map_or(Ok(Vec::new()), |v| v.extract())?,
         items: d.get_item("items")?.map_or(Ok(0), |v| v.extract())?,
         budget_cpu_seconds: get_f("budget_cpu_seconds")?,
@@ -306,6 +368,14 @@ fn policy_from(d: &Bound<'_, PyDict>) -> PyResult<pb::Policy> {
             .transpose()?
             .filter(|k| k.len() == 32)
             .map(|k| pb::TaskKey { run: k[..16].to_vec(), task: k[16..].to_vec() }),
+        durability: durability as i32,
+        explained: d.get_item("explained")?.map_or(Ok(Vec::new()), |v| v.extract())?,
+        // (owner, generation, slot) of a hold on the peer's ledger: a gang rank or a bundle's host.
+        launch: d
+            .get_item("launch")?
+            .map(|v| v.extract::<(String, u64, u32)>())
+            .transpose()?
+            .map(|(owner, generation, slot)| pb::LaunchToken { owner, generation, slot }),
     })
 }
 
@@ -321,10 +391,21 @@ fn policy_py<'py>(py: Python<'py>, p: &pb::Policy) -> PyResult<Bound<'py, PyDict
     d.set_item("deterministic", p.deterministic)?;
     d.set_item("source", &p.source)?;
     d.set_item("max_in_flight", p.max_in_flight)?;
+    d.set_item("max_in_flight_bytes", p.max_in_flight_bytes)?;
     d.set_item("budget_cpu_seconds", p.budget_cpu_seconds)?;
     d.set_item("budget_gpu_seconds", p.budget_gpu_seconds)?;
     let root = p.budget_root.as_ref().map_or_else(Vec::new, |k| [k.run.as_slice(), k.task.as_slice()].concat());
     d.set_item("budget_root", PyBytes::new(py, &root))?;
+    let durability = match p.durability() {
+        pb::Durability::Default => "",
+        pb::Durability::Ephemeral => "ephemeral",
+        pb::Durability::Replayable => "replayable",
+        pb::Durability::Retained => "retained",
+    };
+    d.set_item("durability", durability)?;
+    if !p.explained.is_empty() {
+        d.set_item("explained", &p.explained)?;
+    }
     Ok(d)
 }
 
@@ -394,6 +475,9 @@ struct CallSpec {
     /// Sent straight to its actor's executor: the peer notes it in flight.
     #[pyo3(item, default)]
     direct: bool,
+    /// A durable workflow's call, described (JSON) for a replay that diverges.
+    #[pyo3(item, default)]
+    workflow_step: String,
 }
 
 impl CallSpec {
@@ -449,6 +533,7 @@ impl CallSpec {
                 })
                 .transpose()?,
             direct: self.direct,
+            workflow_step: self.workflow_step,
         })
     }
 }
@@ -467,14 +552,127 @@ struct Shared {
     /// Submit messages sent and not yet acknowledged.
     submits: AtomicU64,
     seq: AtomicU64,
-    up: mpsc::UnboundedSender<pb::ClientMsg>,
+    up: Mutex<Up>,
+    /// The peer's id for this session (0: it cannot be resumed), the last
+    /// cursor received and the last acknowledged, and the last request the
+    /// peer reported handled.
+    session: AtomicU64,
+    cursor: AtomicU64,
+    acked_cursor: AtomicU64,
+    taken: AtomicU64,
+}
+
+/// The stream to the peer (a closed one while a resume is under way), and
+/// the requests sent that the peer has not reported handled
+/// (SessionEvent.taken), which a resume sends again. None for a peer that
+/// cannot resume sessions.
+struct Up {
+    tx: mpsc::UnboundedSender<pb::ClientMsg>,
+    kept: Option<VecDeque<pb::ClientMsg>>,
 }
 
 impl Shared {
     fn send(&self, msg: pb::client_msg::Msg) -> u64 {
+        let mut up = self.up.lock().expect("up");
+        // Numbered under the lock, so requests go, and are kept, in seq order.
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.up.send(pb::ClientMsg { seq, msg: Some(msg) });
+        let msg = pb::ClientMsg { seq, msg: Some(msg) };
+        if let Some(kept) = &mut up.kept {
+            let taken = self.taken.load(Ordering::Acquire);
+            while kept.front().is_some_and(|m| m.seq <= taken) {
+                kept.pop_front();
+            }
+            // A resume carries the cursor itself.
+            if !matches!(msg.msg, Some(pb::client_msg::Msg::AckCursor(_))) {
+                kept.push_back(msg.clone());
+            }
+        }
+        let _ = up.tx.send(msg);
         seq
+    }
+
+    /// End the stream to the peer (the reader then resumes the session).
+    fn break_stream(&self) {
+        self.up.lock().expect("up").tx = mpsc::unbounded_channel().0;
+    }
+
+    /// An event from the peer.
+    fn receive(&self, ev: pb::SessionEvent) {
+        use pb::session_event::Event as E;
+        if let Some(E::Opened(id)) = ev.event {
+            self.session.store(id, Ordering::Release);
+            return;
+        }
+        if self.session.load(Ordering::Acquire) == 0 {
+            // The first event was not the session's id: a peer that cannot
+            // resume sessions, so nothing is kept for one.
+            self.up.lock().expect("up").kept = None;
+        }
+        if ev.taken != 0 {
+            self.taken.fetch_max(ev.taken, Ordering::AcqRel);
+        }
+        if ev.cursor != 0 {
+            self.cursor.store(ev.cursor, Ordering::Release);
+            if ev.cursor >= self.acked_cursor.load(Ordering::Acquire) + ACK_EVERY {
+                self.acked_cursor.store(ev.cursor, Ordering::Release);
+                self.send(pb::client_msg::Msg::AckCursor(ev.cursor));
+            }
+        }
+        let acks = matches!(ev.event, Some(E::Acks(_)));
+        self.events.lock().expect("events").push_back(ev);
+        self.ready.notify_all();
+        if acks {
+            self.acked();
+        }
+    }
+
+    /// The stream ended: continue the session on a new one, from the last
+    /// cursor received, unless the client was closed or the peer cannot.
+    /// Nothing else goes on the new stream until the peer has taken the
+    /// session over; then the requests the old stream did not deliver go
+    /// again (their replies, and those of the ones it did, come once).
+    async fn resume(&self, peer: &PeerClient) -> Option<tonic::Streaming<pb::SessionEvent>> {
+        self.break_stream(); // what is sent from now on waits in `kept`
+        let mut wait = Duration::from_millis(100);
+        for _ in 0..RESUME_TRIES {
+            let session = self.session.load(Ordering::Acquire);
+            if session == 0 || self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            let (up, up_rx) = mpsc::unbounded_channel();
+            let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+            let cursor = self.cursor.load(Ordering::Acquire);
+            let resume = pb::client_msg::Msg::Resume(pb::ResumeSession { session, cursor });
+            let _ = up.send(pb::ClientMsg { seq, msg: Some(resume) });
+            let attempt = async {
+                let ups = tokio_stream::wrappers::UnboundedReceiverStream::new(up_rx);
+                let mut down = peer.clone().session(ups).await?.into_inner();
+                Ok::<_, tonic::Status>(resumed(&mut down).await?.map(|answer| (answer, down)))
+            };
+            match tokio::time::timeout(RESUME_ANSWER, attempt).await {
+                Ok(Ok(Some(((id, taken), down)))) => {
+                    self.session.store(id, Ordering::Release);
+                    self.taken.fetch_max(taken, Ordering::AcqRel);
+                    let mut cur = self.up.lock().expect("up");
+                    if let Some(kept) = &mut cur.kept {
+                        kept.retain(|m| m.seq > taken);
+                        for msg in kept.iter() {
+                            let _ = up.send(msg.clone());
+                        }
+                    }
+                    cur.tx = up;
+                    return Some(down);
+                }
+                Ok(Ok(None)) => return None, // refused
+                // This stream broke too, or no answer came in time. The peer
+                // may have taken the session over all the same: it knows the
+                // session by the old id too.
+                Ok(Err(_)) | Err(_) => {}
+            }
+            tokio::time::sleep(wait).await;
+            wait *= 2;
+        }
+        None
     }
 
     /// Send everything pending now (before the caller waits on results).
@@ -504,6 +702,22 @@ impl Shared {
             self.flush_if_open();
         }
     }
+}
+
+/// Read a resumed stream up to the peer's answer: the session's new id and
+/// the last request the old stream delivered, or None if the peer refused.
+async fn resumed(down: &mut tonic::Streaming<pb::SessionEvent>) -> Result<Option<(u64, u64)>, tonic::Status> {
+    use pb::session_event::Event as E;
+    let mut id = 0;
+    while let Some(ev) = down.message().await? {
+        match ev.event {
+            Some(E::Opened(n)) => id = n,
+            Some(E::Resumed(taken)) => return Ok(Some((id, taken))),
+            Some(E::Error(_)) => return Ok(None),
+            _ => {}
+        }
+    }
+    Err(tonic::Status::unavailable("the stream ended before the peer answered the resume"))
 }
 
 /// Connection to a peer.
@@ -557,9 +771,14 @@ impl Client {
         d.set_item("changes", changes)?;
         d.set_item("compacted", r.compacted)?;
         d.set_item("more", r.more)?;
+        d.set_item("examined", r.examined)?;
+        d.set_item("retry_ms", r.retry_ms)?;
         Ok(d)
     }
 }
+
+/// One write of a store transaction: (op, key, value, delta, fence).
+type TxnOp = (String, String, Option<Vec<u8>>, i64, Option<(String, u64)>);
 
 fn rpc_err(e: tonic::Status) -> PyErr {
     match e.code() {
@@ -607,32 +826,33 @@ impl Client {
                     last_flush: Mutex::new(Instant::now() - Duration::from_secs(1)),
                     submits: AtomicU64::new(0),
                     seq: AtomicU64::new(0),
-                    up,
+                    up: Mutex::new(Up { tx: up, kept: Some(VecDeque::new()) }),
+                    session: AtomicU64::new(0),
+                    cursor: AtomicU64::new(0),
+                    acked_cursor: AtomicU64::new(0),
+                    taken: AtomicU64::new(0),
                 });
+                // First: the peer keeps what a resume of this session needs.
+                shared.send(pb::client_msg::Msg::AckCursor(0));
                 let mut down = peer
                     .session(tokio_stream::wrappers::UnboundedReceiverStream::new(up_rx))
                     .await
                     .map_err(rpc_err)?
                     .into_inner();
-                let s2 = shared.clone();
+                let (s2, p2) = (shared.clone(), peer.clone());
                 tokio::spawn(async move {
                     loop {
                         match down.message().await {
-                            Ok(Some(ev)) => {
-                                let acks = matches!(ev.event, Some(pb::session_event::Event::Acks(_)));
-                                s2.events.lock().expect("events").push_back(ev);
-                                s2.ready.notify_all();
-                                if acks {
-                                    s2.acked();
-                                }
-                            }
-                            _ => {
-                                s2.closed.store(true, Ordering::Release);
-                                s2.ready.notify_all();
-                                return;
-                            }
+                            Ok(Some(ev)) => s2.receive(ev),
+                            _ => match s2.resume(&p2).await {
+                                Some(d) => down = d,
+                                None => break,
+                            },
                         }
                     }
+                    s2.session.store(0, Ordering::Release);
+                    s2.closed.store(true, Ordering::Release);
+                    s2.ready.notify_all();
                 });
                 Ok(Client { peer, shared, info, tenant: Mutex::new("default".into()) })
             })
@@ -652,6 +872,7 @@ impl Client {
         d.set_item("version", &self.info.version)?;
         d.set_item("gpus", self.info.gpus.clone())?;
         d.set_item("direct_actor_calls", self.info.direct_actor_calls)?;
+        d.set_item("replicas", self.info.replicas)?;
         Ok(d)
     }
 
@@ -756,6 +977,20 @@ impl Client {
         self.shared.flush();
     }
 
+    /// End this session's stream as a broken connection would: the client
+    /// resumes the session on a new stream, where the peer sends again what
+    /// the client had not received.
+    fn reconnect(&self) {
+        self.shared.break_stream();
+    }
+
+    /// The last cursor received: outcomes and generator items count up from
+    /// 1, and what a resume sends again gets new ones.
+    #[getter]
+    fn cursor(&self) -> u64 {
+        self.shared.cursor.load(Ordering::Acquire)
+    }
+
     fn watch(&self, keys: Vec<Vec<u8>>) -> PyResult<()> {
         let tasks = keys.iter().map(|k| task_key(k)).collect::<PyResult<_>>()?;
         self.shared.send(pb::client_msg::Msg::Watch(pb::WatchMsg { tasks }));
@@ -790,8 +1025,10 @@ impl Client {
     }
 
     /// Create an actor; returns the seq whose ("actor", ...) event answers it.
+    /// `methods`: per-method limits, (method, max_calls, max_bytes, reject,
+    /// max_wait_ms) each; `state_schema`: a durable class's state version.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (actor, ctor, tenant, key, class_digest, restart, max_restarts, detached, durable=false, nonce=Vec::new()))]
+    #[pyo3(signature = (actor, ctor, tenant, key, class_digest, restart, max_restarts, detached, durable=false, nonce=Vec::new(), state_schema=0, methods=Vec::new()))]
     fn create_actor(
         &self,
         py: Python<'_>,
@@ -805,8 +1042,20 @@ impl Client {
         detached: bool,
         durable: bool,
         nonce: Vec<u8>,
+        state_schema: u32,
+        methods: Vec<(String, u32, u64, bool, u64)>,
     ) -> PyResult<u64> {
         let ctor = ctor.into_spec(py)?;
+        let methods = methods
+            .into_iter()
+            .map(|(method, max_calls, max_bytes, reject, max_wait_ms)| pb::MethodLimit {
+                method,
+                max_calls,
+                max_bytes,
+                reject,
+                max_wait_ms,
+            })
+            .collect();
         let spec = pb::ActorSpec {
             nonce,
             actor,
@@ -819,6 +1068,8 @@ impl Client {
             max_restarts,
             policy: ctor.policy.clone(),
             detached,
+            state_schema,
+            methods,
         };
         self.shared.flush();
         Ok(self
@@ -929,12 +1180,18 @@ impl Client {
                 d.set_item("actors", n.actors)?;
                 d.set_item("object_bytes", n.object_bytes)?;
                 d.set_item("draining", n.draining)?;
+                d.set_item("object_layout", n.object_layout)?;
+                d.set_item("demand", n.demand.as_ref().map(|m| demand_dict(py, m)).transpose()?)?;
+                d.set_item("load_age_s", n.load_age_ms as f64 / 1e3)?;
+                d.set_item("starting", n.starting)?;
+                d.set_item("incarnation", n.incarnation)?;
                 Ok(d)
             })
             .collect()
     }
 
-    /// An actor's record: (state, constructor task key, class digest), or None if unknown.
+    /// An actor's record: (state, constructor task key, class digest,
+    /// durable), or None if unknown.
     fn get_actor<'py>(&self, py: Python<'py>, actor: Vec<u8>) -> PyResult<Option<Bound<'py, PyTuple>>> {
         let mut peer = self.peer.clone();
         let rec = py.detach(|| runtime().block_on(async move { peer.get_actor(pb::ActorQuery { actor }).await }));
@@ -949,6 +1206,7 @@ impl Client {
                         format!("{:?}", r.state()).into_pyobject(py)?.into_any(),
                         PyBytes::new(py, &ctor).into_any(),
                         PyBytes::new(py, &spec.class_digest).into_any(),
+                        spec.durable.into_pyobject(py)?.to_owned().into_any(),
                     ],
                 )?))
             }
@@ -1026,7 +1284,73 @@ impl Client {
             parties,
             fence: fence.map(|(lock, token)| pb::StoreFence { lock, token }),
         };
-        self.store_call(py, pb::StoreRequest { write: Some(write), read: None, wait_ms: 0 })
+        self.store_call(py, pb::StoreRequest { write: Some(write), ..Default::default() })
+    }
+
+    /// A ch.Store transaction in `namespace`: `ops` are (op, key, value,
+    /// delta, fence) with op put, delete or add. They apply together once
+    /// every (key, version) of `checks` holds (0: absent) and each op could
+    /// apply alone, or none of them does.
+    fn store_txn<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: String,
+        checks: Vec<(String, u64)>,
+        ops: Vec<TxnOp>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        use pb::store_write::Op;
+        let ops = ops
+            .into_iter()
+            .map(|(op, key, value, delta, fence)| {
+                let op = match op.as_str() {
+                    "put" => Op::Put,
+                    "delete" => Op::Delete,
+                    "add" => Op::Add,
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "a store transaction puts, deletes and adds, not {other:?}"
+                        )));
+                    }
+                };
+                Ok(pb::StoreWrite {
+                    op: op as i32,
+                    key,
+                    value: value.unwrap_or_default(),
+                    delta,
+                    fence: fence.map(|(lock, token)| pb::StoreFence { lock, token }),
+                    ..Default::default()
+                })
+            })
+            .collect::<PyResult<_>>()?;
+        let txn = pb::StoreTxn {
+            tenant: self.tenant.lock().expect("lock").clone(),
+            namespace,
+            checks: checks.into_iter().map(|(key, version)| pb::StoreCheck { key, version }).collect(),
+            ops,
+        };
+        self.store_call(py, pb::StoreRequest { txn: Some(txn), ..Default::default() })
+    }
+
+    /// A ch.Store claim in `namespace`: the lease `lock_prefix` + key for
+    /// `holder` on the first key under `prefix` nobody holds.
+    fn store_claim<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: String,
+        prefix: String,
+        lock_prefix: String,
+        holder: String,
+        ttl_ms: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let claim = pb::StoreClaim {
+            tenant: self.tenant.lock().expect("lock").clone(),
+            namespace,
+            prefix,
+            lock_prefix,
+            holder,
+            ttl_ms,
+        };
+        self.store_call(py, pb::StoreRequest { claim: Some(claim), ..Default::default() })
     }
 
     /// A ch.Store read (`kind`: get, scan, changes, lease, barrier); `wait_ms`
@@ -1064,7 +1388,7 @@ impl Client {
             limit,
             keys_only,
         };
-        self.store_call(py, pb::StoreRequest { write: None, read: Some(read), wait_ms })
+        self.store_call(py, pb::StoreRequest { read: Some(read), wait_ms, ..Default::default() })
     }
 
     /// Ids among `blob_ids` the peer does not store yet (for a remote client's uploads).
@@ -1077,7 +1401,16 @@ impl Client {
     }
 
     /// Upload a content-addressed blob (`blob_id` = blake3 of `data`, 16 bytes) in 1 MiB chunks.
-    fn put_blob(&self, py: Python<'_>, run: Vec<u8>, blob_id: Vec<u8>, data: Vec<u8>) -> PyResult<()> {
+    /// `keep_local`: the peer makes no background copy of it.
+    #[pyo3(signature = (run, blob_id, data, keep_local=false))]
+    fn put_blob(
+        &self,
+        py: Python<'_>,
+        run: Vec<u8>,
+        blob_id: Vec<u8>,
+        data: Vec<u8>,
+        keep_local: bool,
+    ) -> PyResult<()> {
         let mut peer = self.peer.clone();
         let size = data.len() as u64;
         let mut chunks: Vec<pb::PutBlobChunk> =
@@ -1088,6 +1421,7 @@ impl Client {
         chunks[0].run = run;
         chunks[0].blob_id = blob_id;
         chunks[0].size = size;
+        chunks[0].keep_local = keep_local;
         py.detach(|| runtime().block_on(async move { peer.put_blob(tokio_stream::iter(chunks)).await }))
             .map(|_| ())
             .map_err(rpc_err)
@@ -1110,9 +1444,14 @@ impl Client {
         py.detach(|| {
             runtime().block_on(async move {
                 let missing = |e: tonic::Status| PyFileNotFoundError::new_err(e.message().to_string());
-                peer.localize(pb::LocalizeRequest { run: run.clone(), object_id: object_id.clone(), task })
-                    .await
-                    .map_err(missing)?;
+                peer.localize(pb::LocalizeRequest {
+                    run: run.clone(),
+                    object_id: object_id.clone(),
+                    task,
+                    ..Default::default()
+                })
+                .await
+                .map_err(missing)?;
                 let req = pb::GetObjectRequest { run, object_id, offset: 0, len: 0 };
                 let mut stream = peer.get_object(req).await.map_err(missing)?.into_inner();
                 let tmp = format!("{path}.part-{}", std::process::id());
@@ -1190,14 +1529,131 @@ impl Client {
     }
 
     /// Have the peer bring an object produced elsewhere into its store.
-    #[pyo3(signature = (run, object_id, task=None))]
-    fn localize(&self, py: Python<'_>, run: Vec<u8>, object_id: Vec<u8>, task: Option<Vec<u8>>) -> PyResult<()> {
+    /// `traffic`: why it is read ("shuffle" for a gather's parts; default: a
+    /// call reads it now), the class its holder paces the bytes as.
+    #[pyo3(signature = (run, object_id, task=None, traffic=""))]
+    fn localize(
+        &self,
+        py: Python<'_>,
+        run: Vec<u8>,
+        object_id: Vec<u8>,
+        task: Option<Vec<u8>>,
+        traffic: &str,
+    ) -> PyResult<()> {
         let mut peer = self.peer.clone();
         let task = task.map(|t| task_key(&t)).transpose()?;
-        let req = pb::LocalizeRequest { run, object_id, task };
+        let traffic = match traffic {
+            "" => pb::TrafficClass::TrafficForeground,
+            name => pb::TrafficClass::from_str_name(&format!("TRAFFIC_{}", name.to_ascii_uppercase()))
+                .ok_or_else(|| PyValueError::new_err(format!("no traffic class {name:?}")))?,
+        };
+        let req = pb::LocalizeRequest { run, object_id, task, traffic: traffic as i32 };
         py.detach(|| runtime().block_on(async move { peer.localize(req).await }))
             .map(|_| ())
             .map_err(|e| PyFileNotFoundError::new_err(e.message().to_string()))
+    }
+
+    /// Have the peer copy objects it stores to other peers and return once
+    /// the copies are made (a retained ch.put). ValueError: no other peer
+    /// can hold one; RuntimeError: a copy failed.
+    fn retain(&self, py: Python<'_>, run: Vec<u8>, object_ids: Vec<Vec<u8>>) -> PyResult<()> {
+        let mut peer = self.peer.clone();
+        let req = pb::RetainRequest { run, object_ids };
+        py.detach(|| runtime().block_on(async move { peer.retain(req).await })).map(|_| ()).map_err(rpc_err)
+    }
+
+    /// Hold slots of resources on `peer`'s ledger (empty: this peer's) for
+    /// `owner`'s `generation`, every one or none: `slots` are (cpus, gpus,
+    /// device); none releases the owner's hold, and `renew` only extends a
+    /// hold it has. Returns (held, why not, the peer's holds, one line each,
+    /// and whether that peer could never hold the slots, even idle).
+    #[pyo3(signature = (peer, owner, generation, slots, ttl_ms, renew=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn hold(
+        &self,
+        py: Python<'_>,
+        peer: Vec<u8>,
+        owner: String,
+        generation: u64,
+        slots: Vec<(f64, f64, String)>,
+        ttl_ms: u64,
+        renew: bool,
+    ) -> PyResult<(bool, String, Vec<String>, bool)> {
+        let mut client = self.peer.clone();
+        let slots = slots.into_iter().map(|(cpus, gpus, device)| pb::HoldShape { cpus, gpus, device }).collect();
+        let req = pb::HoldRequest { peer, owner, generation, slots, ttl_ms, renew, ..Default::default() };
+        let r = py.detach(|| runtime().block_on(async move { client.hold(req).await })).map_err(rpc_err)?.into_inner();
+        Ok((r.held, r.reason, r.holds, r.never))
+    }
+
+    /// Hold stored files of another run for this session, past that run's
+    /// end, until each hold is released (`release=True`, which returns at
+    /// once) or the session ends. A hold waits for its lease.
+    /// FileNotFoundError: the run ended, and the value with it.
+    #[pyo3(signature = (run, object_ids, release=false))]
+    fn borrow(&self, py: Python<'_>, run: Vec<u8>, object_ids: Vec<Vec<u8>>, release: bool) -> PyResult<()> {
+        let (shared, mut peer) = (self.shared.clone(), self.peer.clone());
+        let req = move |session| pb::BorrowRequest { session, run, object_ids, release };
+        if release {
+            let req = req(shared.session.load(Ordering::Acquire));
+            runtime().spawn(async move { peer.borrow(req).await });
+            return Ok(());
+        }
+        let held = py.detach(|| {
+            runtime().block_on(async move {
+                // The peer names the session first thing on its stream.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while shared.session.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                peer.borrow(req(shared.session.load(Ordering::Acquire))).await
+            })
+        });
+        held.map(|_| ()).map_err(|e| match e.code() {
+            tonic::Code::NotFound => PyFileNotFoundError::new_err(e.message().to_string()),
+            _ => rpc_err(e),
+        })
+    }
+
+    /// A run's dead letters (Run.failed()): [(key, fn_name, error outcome, spec bytes)].
+    fn failed<'py>(&self, py: Python<'py>, run: Vec<u8>) -> PyResult<Bound<'py, PyList>> {
+        let mut peer = self.peer.clone();
+        let reply = py
+            .detach(|| {
+                runtime().block_on(async move {
+                    peer.list_tasks(pb::ListTasksRequest { run, failed: true, ..Default::default() }).await
+                })
+            })
+            .map_err(rpc_err)?
+            .into_inner();
+        let out = PyList::empty(py);
+        for (key, d) in reply.failed_keys.iter().zip(&reply.failed) {
+            let spec = d.spec.clone().unwrap_or_default();
+            let name = pb::Policy::decode(spec.policy.as_slice()).map(|p| p.fn_name).unwrap_or_default();
+            let error = outcome_py(py, &d.error.clone().unwrap_or_default())?;
+            out.append((PyBytes::new(py, &key_bytes(key)), name, error, PyBytes::new(py, &spec.encode_to_vec())))?;
+        }
+        Ok(out)
+    }
+
+    /// Submit a dead letter's call again, as a new call `key` (Run.retry_failed).
+    fn resubmit(&self, spec: Vec<u8>, key: Vec<u8>) -> PyResult<()> {
+        let mut s = pb::TaskSpec::decode(spec.as_slice()).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        s.key = Some(task_key(&key)?);
+        s.parent = None; // the call that made it may have ended, even been cancelled
+        s.ran = None;
+        s.direct = false;
+        self.shared.pending.lock().expect("pending").push(s);
+        self.shared.flush();
+        Ok(())
+    }
+
+    /// Forget dead letters; resubmissions queued before this go first.
+    fn discard_failed(&self, keys: Vec<Vec<u8>>) -> PyResult<()> {
+        let tasks = keys.iter().map(|k| task_key(k)).collect::<PyResult<_>>()?;
+        self.shared.flush();
+        self.shared.send(pb::client_msg::Msg::DiscardFailed(pb::Release { tasks }));
+        Ok(())
     }
 
     /// One page of a run's tasks: ([(key, state, outcome|None)], next_cursor|None).
@@ -1212,7 +1668,7 @@ impl Client {
         let reply = py
             .detach(|| {
                 runtime().block_on(async move {
-                    peer.list_tasks(pb::ListTasksRequest { run, after_task: after, limit }).await
+                    peer.list_tasks(pb::ListTasksRequest { run, after_task: after, limit, failed: false }).await
                 })
             })
             .map_err(rpc_err)?
@@ -1265,6 +1721,18 @@ impl Client {
             ad.set_item("detail", &a.detail)?;
             ad.set_item("placement", &a.placement_reason)?;
             ad.set_item("reservation", &a.reservation)?;
+            let settings = PyDict::new(py);
+            for s in &a.settings {
+                let one = PyDict::new(py);
+                one.set_item("value", s.value)?;
+                one.set_item("requested", s.requested)?;
+                one.set_item("min", s.min)?;
+                one.set_item("max", s.max)?;
+                one.set_item("source", &s.source)?;
+                one.set_item("reason", &s.reason)?;
+                settings.set_item(&s.name, one)?;
+            }
+            ad.set_item("settings", settings)?;
             if let Some(g) = &a.granted {
                 ad.set_item("granted", policy_py(py, g)?)?;
             }
@@ -1324,7 +1792,11 @@ fn event_py<'py>(py: Python<'py>, ev: &pb::SessionEvent) -> PyResult<Bound<'py, 
             )
         }
         Some(E::Actor(a)) => {
+            // (.., status, state, generation, constructor task key, durable):
+            // an actor found by name was built by its record's constructor.
             let rec = a.record.clone().unwrap_or_default();
+            let spec = rec.spec.clone().unwrap_or_default();
+            let ctor = spec.ctor.map(|k| [k.run, k.task].concat()).unwrap_or_default();
             PyTuple::new(
                 py,
                 [
@@ -1333,6 +1805,8 @@ fn event_py<'py>(py: Python<'py>, ev: &pb::SessionEvent) -> PyResult<Bound<'py, 
                     format!("{:?}", a.status()).into_pyobject(py)?.into_any(),
                     format!("{:?}", rec.state()).into_pyobject(py)?.into_any(),
                     rec.generation.into_pyobject(py)?.into_any(),
+                    PyBytes::new(py, &ctor).into_any(),
+                    spec.durable.into_pyobject(py)?.to_owned().into_any(),
                 ],
             )
         }
@@ -1370,7 +1844,8 @@ fn event_py<'py>(py: Python<'py>, ev: &pb::SessionEvent) -> PyResult<Bound<'py, 
                 ],
             )
         }
-        None => PyTuple::new(py, ["none"]),
+        // `opened` and `resumed` stay in Shared::receive and resumed()
+        Some(E::Opened(_) | E::Resumed(_)) | None => PyTuple::new(py, ["none"]),
     }
 }
 
@@ -1605,6 +2080,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(timeout_error, m)?)?;
     objects::register(m)?;
     plain::register(m)?;
+    scatter::register(m)?;
     m.add("WIRE_VERSION", chimaera_proto::WIRE_VERSION)?;
+    // What the peer binary prints with --version; a wheel's two halves must agree.
+    m.add("VERSION", env!("CARGO_PKG_VERSION"))?;
+    m.add("PEER_LEVEL", chimaera_proto::PEER_LEVEL)?;
+    m.add("BUILD_ID", chimaera_proto::BUILD_ID)?;
     Ok(())
 }

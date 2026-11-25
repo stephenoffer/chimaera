@@ -114,13 +114,13 @@ class RemoteBlobSink:
         self._sent: set[tuple[bytes, bytes]] = set()
         self._lock = threading.Lock()
 
-    def put(self, run: bytes, blob_id: bytes, data: bytes | memoryview) -> None:
+    def put(self, run: bytes, blob_id: bytes, data: bytes | memoryview, keep_local: bool = False) -> None:
         key = (run, blob_id)
         with self._lock:
             if key in self._sent:
                 return
         if self.client.has_blobs(run, [blob_id]):
-            self.client.put_blob(run, blob_id, bytes(data))
+            self.client.put_blob(run, blob_id, bytes(data), keep_local)
         with self._lock:
             self._sent.add(key)
 
@@ -144,6 +144,13 @@ class Node(NamedTuple):
     actors: int = 0  # actor instances it hosts
     object_bytes: int = 0  # bytes of values it stores
     draining: bool = False  # stopping: it takes no new work
+    object_layout: int = 0  # the newest layout of stored results it reads (0: a peer too old to say)
+    # What more capacity would start sooner there (see _planner.py for its keys);
+    # None from a peer too old to send one.
+    demand: dict[str, Any] | None = None
+    load_age_s: float = 0.0  # how old its load report is
+    starting: bool = False  # no load report yet: just started, or not probed yet
+    incarnation: int = 0  # a restarted peer has a higher one (its counters start again)
 
 
 class Event(NamedTuple):

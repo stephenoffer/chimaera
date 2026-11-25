@@ -33,7 +33,11 @@ class NonRetryable(Exception):
 
 
 class OutcomeUnknown(ChimaeraError):
-    """A call with external effects may or may not have taken effect."""
+    """A call with external effects may or may not have taken effect. From a
+    durable workflow's activity (``ch.durable.record(activity, ...)``), ``key``
+    is the activity's key: ask the other system what it did under that key."""
+
+    key: str | None = None
 
 
 class Cancelled(ChimaeraError):
@@ -70,6 +74,13 @@ class WorkerCrashed(InfrastructureFailure):
 
 class OutOfMemory(InfrastructureFailure):
     """The call exceeded its memory limit after the escalation budget."""
+
+
+class OutOfDisk(ChimaeraError, OSError):
+    """A value could not be stored because the disk holding the objects is
+    full. It is an ``OSError`` with ``errno.ENOSPC``, so code catching either
+    keeps working; the message names the directory, its free space and the
+    value's size."""
 
 
 class ActorDied(InfrastructureFailure):
@@ -117,7 +128,49 @@ class SerializationError(PreflightError):
 
 
 class WorkflowDivergence(ChimaeraError):
-    """A durable workflow made different calls on replay than in its history."""
+    """A durable workflow made different calls on replay than in its history.
+
+    ``step`` is the step's number (the workflow's nth call). ``recorded`` is
+    the call its history holds at that step and ``received`` the one the replay
+    made, each a dict of ``function``, ``site`` (the workflow's file:line that
+    made it), ``args`` (a shortened repr) and ``fingerprint`` (hex), or None
+    for a call recorded without them."""
+
+    step: int | None = None
+    recorded: dict[str, Any] | None = None
+    received: dict[str, Any] | None = None
+
+
+def divergence(reason: str) -> WorkflowDivergence:
+    """The error for a replayed step the shard rejected: its reason holds the
+    recorded and received calls as JSON, ``[recorded, received]``. It runs on
+    the thread that settles every future, so it never raises: a reason of
+    another shape (text, or a call another version described otherwise) makes
+    a WorkflowDivergence that carries it as it came."""
+    try:
+        recorded, received = json.loads(reason.partition(": ")[2])
+        if not all(c is None or isinstance(c, dict) for c in (recorded, received)):
+            raise ValueError(reason)
+    except Exception:
+        return WorkflowDivergence(reason)
+
+    def call(c: dict[str, Any] | None) -> str:
+        if not c:
+            return "a call described by an older version of Chimaera"
+        fingerprint = str(c.get("fingerprint", ""))[:16]
+        return f"{c.get('function', '?')}{c.get('args', '')} at {c.get('site') or '?'} (fingerprint {fingerprint})"
+
+    step = (received or recorded or {}).get("step")
+    exc = WorkflowDivergence(
+        f"{f'step {step}' if step else 'a step'} of this durable workflow made a different call than its history "
+        "records:\n"
+        f"  history: {call(recorded)}\n"
+        f"  replay:  {call(received)}\n"
+        "A workflow must make the same calls in the same order every time it runs: get anything that varies "
+        "(the time, random numbers, reads) through ch.durable.now(), random() or record()."
+    )
+    exc.step, exc.recorded, exc.received = step, recorded, received
+    return exc
 
 
 class CommandConflict(ChimaeraError):
@@ -144,6 +197,7 @@ _BY_KIND: dict[str, type[ChimaeraError]] = {
     "data_lost": DataLost,
     "actor_died": ActorDied,
     "command_conflict": CommandConflict,
+    "overloaded": Overloaded,
 }
 
 _NEVER_RERAISE = (SystemExit, KeyboardInterrupt, GeneratorExit)

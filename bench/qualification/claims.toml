@@ -1,0 +1,356 @@
+# Every claim of speed, scale and fault tolerance the README makes, every
+# claim of its status table, and every measured section of
+# docs/qualification.md, with what backs it. build_manifest.py turns this into
+# a release's signed qualification manifest and refuses to while a claim is
+# not listed here, a quote or section is gone, or an artifact changed.
+#
+# kind: speed, scale, fault or function. tier: local, linux, launchers,
+# cluster, gpu or emulation (docs/qualification.md's labels).
+# quotes: README claims, exactly as build_manifest.readme_claims reads them.
+# sections: headings of docs/qualification.md the entry covers.
+# artifacts: raw results kept in the repository, with their sha256.
+# lanes: lanes (build_manifest.py lane NAME) whose passing record on the
+#   release's source backs the claim; its log is the artifact.
+# replay: the command that measures it again.
+# pending: why the claim is not traced to raw artifacts yet.
+# limit: the tested limit it sets.
+
+[[claim]]
+id = "ray-64-nodes"
+kind = "speed"
+tier = "cluster"
+quotes = [
+  "Faster than Ray on 7 of the 10 workloads we've benchmarked.",
+  "Chimaera against Ray on 64 machines: Chimaera is faster on seven workloads, from 1.1x to 150x; Ray is faster on shuffles (6.2x), calls on a value just made (1.6x) and CPU scaling (1.1x).",
+  "Same 64 machines, same ten workloads.",
+  "Chimaera wins seven.",
+  "The 150x is a map over tiny items: Chimaera batches tiny calls by itself, and neither side was batched by hand.",
+  "Ray still wins shuffles, calls on a value just made, and CPU scaling.",
+  "64 × c7i.4xlarge machines (1,024 vCPU), the same machine type for both runtimes, median of at least 45 s of repetitions (the machine-loss row is a single run).",
+  "Ray's actor, nested and machine-loss figures come from a separate run, because the first run hit its time limit before it reached Ray's passes.",
+  "| Independent no-op tasks | 5,188/s | 14,203/s |",
+  "| Map over tiny items, no hand batching | 5,171/s | 774,908/s |",
+  "| 32 MiB array passed straight to 2,048 calls | 3.51 s | 0.71 s |",
+  "| 512 MiB value to 2,048 readers | 0.407 s | 0.375 s |",
+  "| Actor calls | 9,482/s | 10,973/s |",
+  "| Nested tasks (4 parents per CPU, 8 children each) | 1.29 s | 0.82 s |",
+  "| CPU scaling efficiency | 0.656 | 0.605 |",
+  "| 10 calls on a 256 MiB value just made | 0.228 s | 0.376 s |",
+  "| Shuffle, 3.2M pairs | 0.135 s | 0.842 s |",
+]
+sections = ["Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22)"]
+replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait (eval-1node, eval-4node and eval-16node for the other sizes)"
+pending = "the round's raw results (multi_results.json) stayed in the cloud jobs' storage and were not kept"
+limit = { what = "machines in one cluster (c7i.4xlarge, 1,024 vCPU)", value = 64 }
+
+[[claim]]
+id = "machine-loss-64-nodes"
+kind = "fault"
+tier = "cluster"
+quotes = ["| A machine killed under one-second tasks | 18.5 s | 9.6 s |"]
+sections = ["Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22)"]
+replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait"
+pending = "the round's raw results (multi_results.json) stayed in the cloud jobs' storage and were not kept"
+
+[[claim]]
+id = "cluster-scale"
+kind = "scale"
+tier = "cluster"
+quotes = [
+  "Your Python, on every core of every machine, with one decorator.",
+  "| Clusters: replicated shard groups, failover, dead voters replaced | Working on localhost clusters and on up to 64 cloud machines |",
+]
+sections = ["Ray comparison (cluster, 64 nodes)"]
+replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait"
+pending = "the 64-node rounds' raw results stayed in the cloud jobs' storage and were not kept"
+limit = { what = "machines in one cluster (c7i.4xlarge, 1,024 vCPU)", value = 64 }
+
+[[claim]]
+id = "no-head-node"
+kind = "fault"
+tier = "local"
+quotes = [
+  "No head node to babysit.",
+  "On a laptop the first call starts a local peer for you; on a cluster, the same file runs unchanged.",
+  "Your script talks to any peer.",
+  "Four machines each run the same chimaera peer with Python workers.",
+  "Raft groups g1, g2 and g3 each live on three peers.",
+  "There is no head node.",
+  "There's no head node to size, babysit or lose.",
+  "Every machine runs the same `chimaera` peer, and the record of every call is replicated with Raft on three peers.",
+  "Kill a machine mid-run and its calls run somewhere else.",
+]
+sections = ["M2 Multi-peer (in progress)"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_cluster.py python/tests/test_node_loss.py -q"
+
+[[claim]]
+id = "m2-throughput"
+kind = "speed"
+tier = "local"
+sections = ["M2 Multi-peer (in progress)"]
+artifacts = [
+  { path = "bench/evals/results/local3-2026-11-21.json", sha256 = "97f68920135ccc6193a24643a0693efe9a307a32ef1a5e65a3c15f3949410bab" },
+  { path = "bench/evals/results/local3-2026-11-21.md", sha256 = "391a9657aa5287542f5e6bb895d2da57b62132f43c1ef69ebff426e1b86e94e3" },
+]
+replay = ".venv/bin/python bench/evals/local_cluster.py --ray-python .venv-bench/bin/python --rounds 3"
+pending = "the local3 run is the Before column and Ray's figures; the runs behind the After column were not kept"
+
+[[claim]]
+id = "functions-and-actors"
+kind = "function"
+tier = "local"
+quotes = ["| Functions, futures as dependencies, `map`, task groups (`ch.TaskGroup`), actors, pools | Working, on one machine and across peers |"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_api.py python/tests/test_actors.py python/tests/test_task_group.py python/tests/test_pool.py python/tests/test_cluster.py -q"
+
+[[claim]]
+id = "ray-compat"
+kind = "function"
+tier = "local"
+quotes = ["Most Ray Core programs port line by line, and a compatibility shim runs Ray Core programs unchanged (from-ray.md)."]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_compat_ray.py -q"
+
+[[claim]]
+id = "failures"
+kind = "fault"
+tier = "local"
+quotes = [
+  "| Retries, `ch.OutcomeUnknown` for external effects, memory limits, canceling calls, deadlines | Working |",
+  "A crashed worker's calls get retried; your own exceptions don't, unless you list them.",
+  "Mark a function that charges a card `effects=\"external\"` and it starts at most once: if its worker dies mid-call, you get `ch.OutcomeUnknown` instead of a second charge.",
+]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_recovery.py python/tests/test_retry_policy.py python/tests/test_failed_calls.py python/tests/test_cancel.py python/tests/test_cancel_timeouts.py python/tests/test_memory.py -q"
+
+[[claim]]
+id = "learned-resources"
+kind = "function"
+tier = "local"
+quotes = [
+  "| Learned CPU and memory reservations, memory-aware admission, large values stored once | Working; across peers, placement weighs input locality and memory |",
+  "`future.explain()` shows what it picked and why, and a `cpus=` or `memory=` you set always wins.",
+]
+sections = ["Smart defaults: learned reservations, memory, large values"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_learning.py python/tests/test_memory.py python/tests/test_locality.py python/tests/test_values.py python/tests/test_defaults.py -q"
+
+[[claim]]
+id = "memory-admission"
+kind = "fault"
+tier = "local"
+quotes = ["After three calls the peer reserves the memory peak it measured, so later calls wait for room instead of getting OOM-killed."]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_learning.py python/tests/test_memory.py -q"
+
+[[claim]]
+id = "measurements"
+kind = "function"
+tier = "linux"
+quotes = [
+  "| Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |",
+  "Every call leaves a trail on its peer: each attempt, what it printed, what it measured and why it waited.",
+]
+lanes = ["quick", "native"]
+replay = "make linux-pytest (python/tests/test_accounting.py reads the cgroup per attempt)"
+
+[[claim]]
+id = "reattach"
+kind = "fault"
+tier = "local"
+quotes = [
+  "| Reattaching to a run after the driver or the peer restarts (`ch.runs.attach`) | Working |",
+  "Detached runs outlive your script, and any process can pick one back up with `ch.runs.attach(run_id)`.",
+]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_recovery.py python/tests/test_runs_ops.py python/tests/test_cluster.py::test_detached_run_survives_its_ingress_and_attaches_through_another_peer -q"
+
+[[claim]]
+id = "security"
+kind = "function"
+tier = "local"
+quotes = ["| Cluster tokens, mutual TLS, tenants with CPU quotas | Working on localhost clusters |"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_cluster.py -k 'token or tls or tenant' -q && .venv/bin/python -m pytest python/tests/test_quotas.py -q"
+
+[[claim]]
+id = "durable"
+kind = "fault"
+tier = "local"
+quotes = ["| Durable actors (`ch.durable.State`) and durable workflows | Working |"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_durable.py python/tests/test_workflows.py -q"
+
+[[claim]]
+id = "streams"
+kind = "function"
+tier = "local"
+quotes = ["| Streaming generators (`ch.typing.Stream`) | Working |"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_streams.py -q"
+
+[[claim]]
+id = "gangs-and-nccl"
+kind = "scale"
+tier = "gpu"
+quotes = ["| Gangs and collectives (`ch.dist.group`, `.gang()`) | Working on CPU; NCCL checked on one node of 4 NVIDIA A10Gs |"]
+lanes = ["quick", "gpu-check"]
+replay = "anyscale job submit -f deploy/anyscale/gpu-check.job.yaml --wait (CPU gangs: python/tests/test_gang.py, test_gang_elastic.py)"
+limit = { what = "GPUs in one gang (NVIDIA A10G, one node)", value = 4 }
+
+[[claim]]
+id = "shuffle-speed"
+kind = "speed"
+tier = "cluster"
+quotes = ["| Shuffles (`reduce_by_key`) | Working; Ray is faster today |"]
+sections = ["Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22, evening)"]
+replay = "anyscale job submit -f deploy/anyscale/eval-4node.job.yaml --wait (eval-1node, eval-16node and eval-64node for the other sizes)"
+pending = "the evening round's raw results stayed in the cloud jobs' storage and were not kept"
+
+[[claim]]
+id = "launchers"
+kind = "scale"
+tier = "launchers"
+quotes = [
+  "| Kubernetes, Slurm and SSH launchers | Working in container tests (kind, slurmd, sshd); real clouds unverified |",
+  "One binary covers a laptop, SSH hosts (`chimaera up`), Kubernetes (`chimaera k8s render`) and Slurm (`chimaera slurm-launch`).",
+]
+lanes = ["kind-test", "slurm-test", "ssh-test"]
+replay = "make kind-test slurm-test ssh-test"
+
+[[claim]]
+id = "m0-foundations"
+kind = "fault"
+tier = "local"
+sections = ["M0 Foundations (commit fc34c1c)"]
+lanes = ["quick"]
+replay = "make check proptest-deep"
+
+[[claim]]
+id = "m1-local-runtime"
+kind = "fault"
+tier = "local"
+sections = ["M1 Local runtime (in progress)"]
+lanes = ["quick"]
+replay = "make check"
+
+[[claim]]
+id = "comparison-method"
+kind = "speed"
+tier = "local"
+sections = ["How a comparison is recorded (from 2026-11-23)"]
+lanes = ["quick"]
+replay = ".venv/bin/python -m pytest python/tests/test_bench_manifest.py -q"
+pending = "the local run behind its raft-entry and digest figures was not kept; the test reruns the method, not those figures"
+
+[[claim]]
+id = "node-loss-local"
+kind = "fault"
+tier = "local"
+sections = ["Node loss, repeated (local)"]
+replay = ".venv/bin/python bench/evals/node_loss.py --seeds 3 --out bench/evals/results"
+pending = "the 54-experiment run's raw JSON was not kept in the repository"
+
+[[claim]]
+id = "shuffle-phases-local"
+kind = "speed"
+tier = "local"
+sections = ["Shuffle phases (local, 2026-11-24)"]
+artifacts = [
+  { path = "bench/evals/results/shuffle-phases-3-2026-11-24.json", sha256 = "ceeda4c41b57fcdfc17907a8d11e12adad7b96b2a8d02dc3ef5747988013cea4" },
+  { path = "bench/evals/results/shuffle-phases-3-2026-11-24.md", sha256 = "d20c45de12ce086dd43f1bc5b61aaabb966d92ddb97a2395fbf94a22b5950e62" },
+]
+replay = "cargo build --release -p chimaera-peer && VIRTUAL_ENV=.venv .venv/bin/maturin develop --release -q && CHIMAERA_BIN=target/release/chimaera .venv/bin/python bench/evals/shuffle_phases.py --rounds 3"
+pending = "the phases across machines need a cloud round"
+
+[[claim]]
+id = "shuffle-larger-than-memory"
+kind = "scale"
+tier = "linux"
+sections = ["Shuffle phases, larger than memory and spilling (Linux container, 2026-11-24)"]
+artifacts = [
+  { path = "bench/evals/results/shuffle-phases-2-larger-than-memory-2026-11-24.json", sha256 = "0d4dd8e8014ef29acc0671cb9fcfa48e835af8632683a5e57df8871450e513cb" },
+  { path = "bench/evals/results/shuffle-phases-2-larger-than-memory-2026-11-24.md", sha256 = "eea3fe92776cbbb0b55aeec0ac444fe9b6853e738a5367899ee9dd9c45bde40a" },
+  { path = "bench/evals/results/shuffle-phases-2-spill-2026-11-24.json", sha256 = "6207b87fb3c20121bbd273e8400fb53290856b368f62cbfc60f42e67eaa7957d" },
+  { path = "bench/evals/results/shuffle-phases-2-spill-2026-11-24.md", sha256 = "1ad7e2f715c500beff8199db3fa38214b732e5b11c435369279b12b552e50308" },
+]
+replay = "in the dev image (deploy/dev/Dockerfile), with the peer and chimaera._native built there (RUSTFLAGS='-C debuginfo=0'): under docker run --memory 1g --memory-swap 1g, bench/evals/shuffle_phases.py --nodes 2 --cpus 1 --maps 2400 --per 200000 --partitions 256 --keys 4000037 --skews uniform --rounds 1 --name larger-than-memory; then with --shm-size 2560m and CHIMAERA_MEMORY_POOL=320MiB as well, the same with --maps 300 --name spill"
+pending = "the size of the larger run with objects in /dev/shm was OOM-killed; built in the dev profile, not release"
+
+[[claim]]
+id = "ray-1-node"
+kind = "speed"
+tier = "cluster"
+sections = ["Ray comparison (cluster, single node)"]
+replay = "anyscale job submit -f deploy/anyscale/eval.job.yaml --wait"
+pending = "the run's raw results stayed in the cloud job's storage and were not kept"
+
+[[claim]]
+id = "ray-4-nodes"
+kind = "speed"
+tier = "cluster"
+sections = ["Ray comparison (cluster, 4 nodes)"]
+replay = "anyscale job submit -f deploy/anyscale/eval-4node.job.yaml --wait"
+pending = "the runs' raw results stayed in the cloud jobs' storage and were not kept"
+
+[[claim]]
+id = "fsync-default"
+kind = "speed"
+tier = "cluster"
+sections = ["Ray comparison (cluster, 2026-11-23): the fsync default, and an A/B on one build"]
+replay = "EVAL_CHIMAERA_VARIANTS=CHIMAERA_RAFT_SYNC=none anyscale job submit -f deploy/anyscale/eval-4node.job.yaml --wait; cargo test -p chimaera-raft --release measure_group_commit_hold_on_a_slow_disk -- --ignored --nocapture"
+pending = "the jobs' raw results stayed in their cloud storage, and the slow-disk test's output was not kept"
+
+[[claim]]
+id = "ray-1-4-16-64-evening"
+kind = "speed"
+tier = "cluster"
+sections = ["Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22, evening)"]
+replay = "anyscale job submit -f deploy/anyscale/eval-64node.job.yaml --wait (eval-1node, eval-4node and eval-16node for the other sizes)"
+pending = "the evening round's raw results stayed in the cloud jobs' storage and were not kept"
+limit = { what = "machines in one cluster (c7i.4xlarge, 1,024 vCPU)", value = 64 }
+
+[[claim]]
+id = "ray-1-16-nodes"
+kind = "speed"
+tier = "cluster"
+sections = ["Ray comparison (cluster, 1 and 16 nodes)"]
+replay = "anyscale job submit -f deploy/anyscale/eval-16node.job.yaml --wait (eval-1node for one node)"
+pending = "the runs' raw results stayed in the cloud jobs' storage and were not kept"
+
+[[claim]]
+id = "smart-defaults"
+kind = "fault"
+tier = "local"
+sections = ["Smart defaults: learned reservations, memory, large values"]
+lanes = ["quick", "native"]
+replay = "make check linux-pytest"
+
+[[claim]]
+id = "memory-traps"
+kind = "fault"
+tier = "linux"
+sections = ["Smart defaults: learned reservations, memory, large values"]
+artifacts = [
+  { path = "bench/evals/gotchas/results/results.json", sha256 = "e2bc30c007fbcf50669c530b78ada825474483046606d6aa62dff51bfae277fa" },
+  { path = "bench/evals/gotchas/results/report.md", sha256 = "e2063fa97d428982c18fcb6d1f2f269490ba257657b3f3a3120c3d672abb60dd" },
+]
+replay = "deploy/dev/gotchas.sh"
+
+[[claim]]
+id = "mac-and-three-node-traps"
+kind = "speed"
+tier = "local"
+sections = ["Smart defaults: learned reservations, memory, large values"]
+replay = "cd bench/evals/gotchas && ../../../.venv/bin/python run.py --out results/ --reps 3; .venv-bench/bin/python cluster.py --runtime ray"
+pending = "the Mac and three-node trap runs' raw results were not kept"
+
+[[claim]]
+id = "fleet-emulation"
+kind = "scale"
+tier = "emulation"
+sections = ["M6 Fleet emulation"]
+lanes = ["fleet"]
+replay = "cargo run --release -p chimaera-fleet -- --weak-scaling"
+limit = { what = "peers emulated (512-peer cells)", value = 262144 }

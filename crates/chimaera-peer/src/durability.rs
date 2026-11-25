@@ -14,44 +14,168 @@
 //! and the group comes back with whatever its voters' disks kept (possibly
 //! missing its last moments of commits).
 //!
-//! The choice: `CHIMAERA_RAFT_SYNC` (`fsync`, `full`, `none`), else measured:
-//! keep `fsync` where it is cheap (local SSDs), skip it where a sync costs a
-//! millisecond or more (network volumes), since every call waits for commits.
+//! The choice: `CHIMAERA_RAFT_SYNC` (`fsync`, `full`, `none`), `fsync` unless
+//! told otherwise. A slow disk never lowers it: commits there wait longer and
+//! batch more (`chimaera_raft::DiskWriter`), and `chimaera status` says the
+//! service is degraded. Keeping commits in the page cache only (`none`) is
+//! always an explicit choice.
+//!
+//! What a commit survives is a property of its group, not of one peer: each
+//! peer advertises how it writes its log, and status reports the guarantee
+//! asked for next to the one the groups' voters give
+//! (`chimaera_core::durability`). Voter replacements and moves take only
+//! peers that keep the guarantee asked for.
 
-use chimaera_raft::DiskDurability;
+use crate::router::Router;
+use chimaera_core::durability::{self as guarantee, Guarantee};
+use chimaera_core::pb;
+use chimaera_raft::{DiskDurability, DiskReport, DiskStats};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-/// An fsync faster than this is kept on every commit.
-const FAST_FSYNC_US: f64 = 1000.0;
 const MARKER: &str = "raft-boot";
 
-static CHOSEN: OnceLock<String> = OnceLock::new();
+/// What `choose` decided, and why.
+static CHOSEN: OnceLock<(DiskDurability, &str)> = OnceLock::new();
+/// The raft log's disk writer, for status.
+static DISK: OnceLock<Arc<DiskStats>> = OnceLock::new();
 
-/// The durability for this peer's raft logs under `raft_dir`, and why.
-pub fn choose(raft_dir: &Path) -> io::Result<DiskDurability> {
-    let (d, why) = match std::env::var("CHIMAERA_RAFT_SYNC").ok().as_deref() {
-        None | Some("") => match fsync_p50_us(raft_dir, 20) {
-            Ok(us) if us < FAST_FSYNC_US => (DiskDurability::Os, format!("fsync p50 {us:.0} µs: fast")),
-            Ok(us) => (DiskDurability::Process, format!("fsync p50 {us:.0} µs: slow, replicas only")),
-            Err(e) => (DiskDurability::Os, format!("fsync probe failed ({e})")),
-        },
-        Some(v) => (parse(v)?, "CHIMAERA_RAFT_SYNC".to_string()),
-    };
-    let name = match d {
-        DiskDurability::Full => "full",
-        DiskDurability::Os => "fsync",
-        DiskDurability::Process => "none",
-    };
-    let _ = CHOSEN.set(format!("raft sync {name} ({why})"));
-    tracing::info!("raft sync {name} ({why})");
+/// The durability for this peer's raft logs: `CHIMAERA_RAFT_SYNC`, else `fsync`.
+pub fn choose() -> io::Result<DiskDurability> {
+    let (d, why) = decide(std::env::var("CHIMAERA_RAFT_SYNC").ok().as_deref())?;
+    let _ = CHOSEN.set((d, why));
+    tracing::info!("raft sync {} ({why})", name(d));
     Ok(d)
 }
 
-/// What `choose` decided, for `chimaera status`.
+fn decide(setting: Option<&str>) -> io::Result<(DiskDurability, &'static str)> {
+    match setting {
+        None | Some("") => Ok((DiskDurability::Os, "the default")),
+        Some(v) => Ok((parse(v)?, "CHIMAERA_RAFT_SYNC")),
+    }
+}
+
+fn name(d: DiskDurability) -> &'static str {
+    match d {
+        DiskDurability::Full => "full",
+        DiskDurability::Os => "fsync",
+        DiskDurability::Process => "none",
+    }
+}
+
+/// How a peer writing its raft log this way tells the others.
+pub fn advertised(d: DiskDurability) -> pb::RaftSync {
+    match d {
+        DiskDurability::Full => pb::RaftSync::Full,
+        DiskDurability::Os => pb::RaftSync::Fsync,
+        DiskDurability::Process => pb::RaftSync::Off,
+    }
+}
+
+/// Report on the raft log's disk writer in status.
+pub fn watch(disk: Arc<DiskStats>) {
+    let _ = DISK.set(disk);
+}
+
+/// The guarantee this peer asks of the groups it commits to. A local peer
+/// never syncs its log, so it asks for (and gives) `process`.
+pub fn requested() -> Guarantee {
+    CHOSEN.get().map_or(Guarantee::Process, |(d, _)| Guarantee::requested(advertised(*d)))
+}
+
+/// Whether `m` may take a voter seat: it syncs its log when this peer asks
+/// for more than `process`. Only the sync half of the floor: a peer on a
+/// machine that already holds a voter passes, and a group whose voters end up
+/// with a majority on one machine reports `reboot` (see `report`).
+pub fn meets_floor(m: &pb::Member) -> bool {
+    guarantee::meets(requested(), m)
+}
+
+/// What `choose` decided and how the disk has kept up, for `chimaera status`.
 pub fn describe() -> Option<String> {
-    CHOSEN.get().cloned()
+    let (d, why) = CHOSEN.get()?;
+    let mut line = format!("raft sync {} ({why})", name(*d));
+    if let Some(r) = DISK.get().map(|s| s.report()).filter(|r| r.commits > 0) {
+        line += &format!(
+            ": commits take p50 {} µs, p99 {} µs, {:.1} entries each; the oldest entry waits p99 {} µs",
+            r.commit_p50_us,
+            r.commit_p99_us,
+            r.operations as f64 / r.commits as f64,
+            r.wait_p99_us,
+        );
+        if r.hold_max_us > 0 {
+            line += &format!("; batches held open up to {} µs", r.hold_max_us);
+        }
+    }
+    Some(line)
+}
+
+/// A slow disk degrades service (commits wait on it) without lowering the
+/// guarantee: say so.
+fn slow_disk(r: &DiskReport) -> Option<String> {
+    let slow = u128::from(r.commit_p50_us) >= chimaera_raft::SLOW_COMMIT.as_micros();
+    slow.then(|| {
+        let mut line = format!(
+            "slow disk: raft commits take p50 {:.1} ms; every one still syncs",
+            f64::from(r.commit_p50_us) / 1000.0
+        );
+        if r.hold_max_us > 0 {
+            line += &format!(", and batches are held open up to {} µs so more entries share each", r.hold_max_us);
+        }
+        line
+    })
+}
+
+/// The guarantee a group with these voters gives, as this peer knows them,
+/// and why it is no stronger.
+pub fn group(router: &Router, voters: &[u64]) -> (Guarantee, Option<String>) {
+    let Some(mesh) = &router.mesh else { return local() };
+    let me = mesh.me.node_id;
+    let known = voters.iter().filter_map(|&n| {
+        let m = if n == me { Some(mesh.me.clone()) } else { mesh.member(n).map(|p| p.member) };
+        m.map(|m| (n, m))
+    });
+    qualify(&known.collect(), voters)
+}
+
+fn local() -> (Guarantee, Option<String>) {
+    (Guarantee::Process, Some("a local peer keeps its commits in the page cache".into()))
+}
+
+fn qualify(known: &BTreeMap<u64, pb::Member>, voters: &[u64]) -> (Guarantee, Option<String>) {
+    let voters: Vec<(u64, Option<&pb::Member>)> = voters.iter().map(|n| (*n, known.get(n))).collect();
+    guarantee::qualify(&voters)
+}
+
+/// For status: the guarantee asked for, the weakest the cluster's groups
+/// give, and why service is below what was asked.
+pub fn report(router: &Router) -> (Guarantee, Guarantee, Vec<String>) {
+    let requested = requested();
+    let (mut effective, mut degraded) = (Guarantee::Machine, Vec::new());
+    let mut each = |g: u32, (got, why): (Guarantee, Option<String>)| {
+        effective = effective.min(got);
+        if got < requested {
+            degraded.push(format!("group {g} gives {}: {}", got.name(), why.unwrap_or_default()));
+        }
+    };
+    match &router.mesh {
+        None => each(0, local()),
+        Some(mesh) => {
+            let mut known: BTreeMap<u64, pb::Member> =
+                mesh.members().into_iter().map(|p| (p.member.node_id, p.member)).collect();
+            known.insert(mesh.me.node_id, mesh.me.clone());
+            for g in 0..=*router.data_groups().end() {
+                let voters = router.hosted(g).map_or_else(|| mesh.voters_of(g), |h| h.view().1);
+                each(g, qualify(&known, &voters));
+            }
+        }
+    }
+    if requested > Guarantee::Process {
+        degraded.extend(DISK.get().and_then(|s| slow_disk(&s.report())));
+    }
+    (requested, effective, degraded)
 }
 
 fn parse(v: &str) -> io::Result<DiskDurability> {
@@ -167,6 +291,9 @@ pub fn mark_clean(dir: &Path) -> io::Result<()> {
     if m.unsynced {
         sync_tree(&dir.join("raft"))?;
     }
+    // A peer that syncs its log leaves its state machine's file unsynced as it
+    // runs (chimaera_raft): sync it now, so it is trusted at the next start.
+    chimaera_raft::mark_state_machine_clean(&dir.join("raft"))?;
     m.clean = true;
     write_synced(&dir.join(MARKER), m.encode().as_bytes())
 }
@@ -235,6 +362,27 @@ mod tests {
         assert!(trusted(Some(&marker("b1", true, false)), Some("b1")), "a process restart keeps the page cache");
         assert!(!trusted(Some(&marker("b1", true, false)), Some("b2")), "the machine rebooted mid-run");
         assert!(!trusted(Some(&marker("b1", true, false)), None), "no boot id: assume the worst");
+    }
+
+    #[test]
+    fn peers_sync_unless_told_not_to_and_a_slow_disk_degrades_without_lowering_it() {
+        // Nothing about the disk goes into the choice: a slow one cannot lower it.
+        assert_eq!(decide(None).unwrap().0, DiskDurability::Os);
+        assert_eq!(decide(Some("")).unwrap().0, DiskDurability::Os);
+        assert_eq!(decide(Some("none")).unwrap().0, DiskDurability::Process);
+        assert_eq!(Guarantee::requested(advertised(DiskDurability::Os)), Guarantee::Machine);
+        assert_eq!(Guarantee::requested(advertised(DiskDurability::Process)), Guarantee::Process);
+        // A 5 ms fsync volume is reported as degraded service; a fast disk is not.
+        let slow = DiskReport {
+            commits: 100,
+            operations: 800,
+            commit_p50_us: 5_200,
+            hold_max_us: 1_300,
+            ..Default::default()
+        };
+        let line = slow_disk(&slow).expect("a 5 ms commit is slow");
+        assert!(line.contains("5.2 ms") && line.contains("still syncs"), "{line}");
+        assert_eq!(slow_disk(&DiskReport { commit_p50_us: 150, ..slow }), None);
     }
 
     #[test]

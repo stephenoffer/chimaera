@@ -14,7 +14,7 @@ dependencies = ["cloudpickle>=3.1"]
 chimaera = "chimaera._cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-timeout", "numpy", "mypy>=1.10,<3"]
+dev = ["pytest>=8", "pytest-timeout", "numpy", "pyarrow", "mypy>=1.10,<3"]
 
 [tool.maturin]
 manifest-path = "crates/chimaera-py/Cargo.toml"

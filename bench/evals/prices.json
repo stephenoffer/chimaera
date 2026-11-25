@@ -1,0 +1,10 @@
+{
+  "date": "2026-11-24",
+  "source": "AWS EC2 on-demand list prices, Linux, us-east-1, as instances.vantage.sh showed them that day",
+  "currency": "USD",
+  "instances": {
+    "c7i.4xlarge": {"per_hour": 0.714, "vcpus": 16, "gpus": 0},
+    "c7i.16xlarge": {"per_hour": 2.856, "vcpus": 64, "gpus": 0},
+    "g5.12xlarge": {"per_hour": 5.672, "vcpus": 48, "gpus": 4}
+  }
+}

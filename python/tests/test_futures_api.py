@@ -46,6 +46,22 @@ def test_wait_returns_what_finished_and_what_did_not_in_order():
     slow.cancel()
 
 
+def test_thousands_of_calls_come_back_as_they_finish():
+    import asyncio
+
+    n = 3000
+    futures = [square.remote(i) for i in range(n)]
+    assert sorted(f.result() for f in ch.as_completed(futures, timeout=120)) == [i * i for i in range(n)]
+    done, pending = ch.wait(futures, timeout=60)
+    assert done == futures and pending == []
+
+    async def gather_as_they_finish():
+        more = [square.remote(i) for i in range(n)]
+        return sorted([(await f) async for f in ch.as_completed(more, timeout=120)])
+
+    assert asyncio.run(gather_as_they_finish()) == [i * i for i in range(n)]
+
+
 def test_cancel_returns_at_once():
     f = nap.remote(60, "never")
     t0 = time.monotonic()

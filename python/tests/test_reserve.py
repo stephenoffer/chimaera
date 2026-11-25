@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 
 import pytest
@@ -138,31 +139,77 @@ other.release()
     assert "OTHER_WAITS" in out and "TURN True" in out and "BOTH_HELD" not in out, out
 
 
-@ch.remote(max_attempts=1)
-def _dies():
-    os._exit(1)  # the holder's process is gone
+def test_a_refused_try_holds_nothing_and_a_later_try_holds_every_bundle(monkeypatch):
+    from chimaera import _ledger
 
+    real, refused = _ledger.Holds._ask, []
 
-class _DyingHolder:
-    """A holder whose process dies before it answers its probe."""
+    def ask(self, peer, slots, renew=False):
+        if slots and not renew and not refused:  # the first try's peer refuses (as a full one would)
+            refused.append(peer)
+            return False, "refused for the test", False
+        return real(self, peer, slots, renew)
 
-    class node:  # noqa: N801 - stands in for an actor's method
-        @staticmethod
-        def remote():
-            return _dies.remote()
-
-    def close(self):
-        pass
-
-
-def test_a_holder_that_dies_fails_only_that_try(monkeypatch):
-    real, dying = ch.dist.Reservation._place, iter(range(2))  # both holders of the first try die
-
-    def place(self, i, target):
-        return _DyingHolder() if next(dying, None) is not None else real(self, i, target)
-
-    monkeypatch.setattr(ch.dist.Reservation, "_place", place)
+    monkeypatch.setattr(_ledger.Holds, "_ask", ask)
     res = ch.dist.reserve([{"cpus": 0.25}] * 2).ready(timeout=120)
-    assert len(res._nodes) == 2, "held on a later try instead of failing the reservation"
+    assert refused and len(res._nodes) == 2, "held on a later try instead of failing the reservation"
+    owner = f"default/reserve/{res.id} "
+    [line] = [h for h in _ledger.holds_on() if h.startswith(owner)]
+    assert "2 of 2 slot(s) untaken" in line, line
     res.release()
+    assert not [h for h in _ledger.holds_on() if h.startswith(owner)]
 
+
+HOLD_THEN_DIE = """
+import chimaera as ch
+ch.dist.Reservation.HOLD_S = 10.0  # renewed every 3.3 s; ends 6.7 to 10 s after the driver
+res = ch.dist.reserve([{"cpus": cores, "gpus": 8}]).ready(timeout=60)
+print("HELD", flush=True)
+time.sleep(600)  # killed before anything is launched within it
+"""
+
+
+def test_bundles_held_by_a_driver_that_died_before_launch_are_free_by_expiry():
+    import shutil
+    import signal
+    import subprocess
+    import sys
+
+    from conftest import BIN, REPO, SCRIPTS
+
+    home = tempfile.mkdtemp(prefix="chr", dir="/tmp")
+    env = dict(os.environ, CHIMAERA_HOME=home, CHIMAERA_BIN=BIN, PYTHONPATH=os.path.join(REPO, "python"))
+    env["CHIMAERA_DEVICE_ROOT"] = os.path.join(REPO, "tests", "fixtures", "topology", "dgx-h100")  # 8 GPUs
+    script = os.path.join(tempfile.mkdtemp(dir=SCRIPTS), "driver.py")
+    with open(script, "w") as f:
+        f.write(FRESH_PEER + HOLD_THEN_DIE)
+    driver = subprocess.Popen([sys.executable, script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        assert driver.stdout.readline().decode().strip() == "HELD", driver.stderr.read().decode()[-3000:]
+        driver.send_signal(signal.SIGKILL)  # gone between ready() and any launch
+        driver.wait(timeout=30)
+        out = run_script(
+            FRESH_PEER
+            + """
+from chimaera._ledger import holds_on
+res = ch.dist.reserve([{"cpus": cores, "gpus": 8}])
+try:
+    res.ready(timeout=0.5)
+    print("FREED AT ONCE")  # its peer's ledger forgot it without the expiry: must not happen
+except TimeoutError:
+    pass
+start = time.time()
+res.ready(timeout=60)
+print("HELD AFTER", round(time.time() - start), "s", len(holds_on()), "hold(s)")
+res.release()
+""",
+            env={"CHIMAERA_HOME": home},
+            home=home,
+        )
+        assert out.returncode == 0, out.stderr[-3000:]
+        held = re.search(r"HELD AFTER (\d+) s 1 hold\(s\)", out.stdout)
+        assert held and int(held.group(1)) <= 20 and "FREED AT ONCE" not in out.stdout, out.stdout
+    finally:
+        driver.kill()
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=30)
+        shutil.rmtree(home, ignore_errors=True)

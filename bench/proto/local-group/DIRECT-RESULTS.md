@@ -49,3 +49,39 @@ The 2026-11-21 column is from `bench/microbench/RESULTS.md` (another day, anothe
 - **1:n rows:** one driver feeding many actors. The driver's own work per call (building the call, the in-flight
   notice and the record, two coalesced submissions) is the likely limit; not profiled yet.
 - **Async-actor 1:n / n:n:** the same two causes, with Ray's 1,000-wide concurrency.
+
+## Later the same day: applied, and measured on Linux
+
+The direct path is now in the runtime (on by default). Measured on a 32-core Linux workspace (Anyscale
+m6id.8xlarge) built from the current tree, empty calls, best of 3×400:
+
+| | Chimaera | Ray |
+|---|---:|---:|
+| Actor round trip, direct path | 212 µs | 426 µs |
+| Actor round trip, path off | 446 µs | |
+| Plain task round trip | 444 µs | 805 µs |
+| Plain task pipeline `f.remote(f.remote())` | 866 µs | 1,714 µs |
+| Same-actor pipeline | 760 µs (899 off) | 835 µs |
+| Two-actor pipeline `cons.consume.remote(prod.emit.remote())` | 1.87 ms | 0.79 ms |
+
+The two-actor pipeline was slow because a call whose input is another call's future took the peer path and waited
+for the input's record. Calls whose inputs are futures of this process now queue on their handle and go direct
+once the inputs land (a failed input still goes through the peer, which raises the causal error). On this laptop
+at load ~370, same binary, alternating: 2,117 / 1,923 µs p50 before, 1,197 / 1,104 µs after. The Linux number has
+not been re-measured.
+
+## Calls from inside tasks, mailbox limits (2026-11-23, applied)
+
+- **Calls made inside tasks and actors** to other actors on the same machine go direct too. An actor's calls to
+  itself stay on the peer, whose deadlock check needs to see them. Each handle now tracks its own latest call
+  through the peer, so the order rule works inside calls as well as in drivers.
+- **Methods with a mailbox limit** (`@ch.method(mailbox=ch.Mailbox(...))`) and handles whose class is not known
+  here take the peer path, which keeps the limits.
+- **Concurrent actors** promise no order, so a call through the peer no longer waits for the handle's direct calls.
+- **Sockets** are found from the peer socket's directory, as executors listen there (a long home moves it to /tmp).
+- **Found on the way (peer path, not fixed here):** a handle with the actor's class but no options (pickled, or
+  found by key) runs a `concurrency=4` actor's calls one at a time through the peer, 2.03 s against 0.51 s for
+  4 × `nap(0.5)`; the direct path avoids it because the executor uses the constructor's concurrency.
+
+Not measured yet: the one-to-many and many-to-many rows with calls from tasks going direct (needs a release build;
+the shared tree did not build for part of the day).

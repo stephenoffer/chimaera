@@ -15,7 +15,9 @@
 //! - a durable actor command id maps to one reply forever (within retention).
 
 mod actors;
+pub mod chunks;
 pub mod keys;
+pub mod leases;
 pub mod store;
 #[cfg(test)]
 mod tests;
@@ -29,6 +31,11 @@ use prost::Message;
 
 pub const MAX_FAILURE_HISTORY: usize = 8;
 pub const MAX_INLINE_STATE: usize = 1 << 20;
+/// Durable state larger than MAX_INLINE_STATE is committed in chunks, up to
+/// this much (what a record pushed to another peer can carry with it).
+pub const MAX_CHUNKED_STATE: usize = 128 << 20;
+/// Chunks one state may have: MAX_CHUNKED_STATE in chunks of chunks::MIN.
+pub const MAX_STATE_CHUNKS: usize = MAX_CHUNKED_STATE / chunks::MIN;
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 /// Pre-start losses of an external-effect task are safe to retry this many times.
 pub const EXTERNAL_PRESTART_RETRIES: u32 = 3;
@@ -121,6 +128,11 @@ pub enum Event {
     /// A run stopped being active (finished or cancelled): its non-detached
     /// actors end with it.
     RunEnded(Id),
+    /// Values of an ended run whose last lease went (leases.rs): they can go.
+    Unleased {
+        run: Id,
+        files: Vec<Vec<u8>>,
+    },
 }
 
 pub struct Applied {
@@ -267,6 +279,30 @@ fn tombstone(cx: &mut Cx, tk: Tk, rec: &pb::TaskRecord) -> pb::TaskRecord {
     }
 }
 
+/// Dead letters a run keeps; past this the oldest goes, releasing its inputs.
+pub const DEAD_MAX: u32 = 1000;
+
+/// A call that failed for good and can be run again as it was: a function
+/// call (not an actor's, a generator or a durable workflow's step) whose
+/// error a retry may fix. Cancelled, expired, infeasible calls and calls whose
+/// input failed are not dead letters (retrying the failed input reruns those).
+fn dead_letter(rec: &pb::TaskRecord, outcome: &pb::Outcome, now: u64) -> Option<pb::DeadLetter> {
+    let Some(pb::outcome::Value::Err(e)) = &outcome.value else { return None };
+    if !matches!(e.kind(), Kind::User | Kind::Infra | Kind::Oom | Kind::WorkerCrashed | Kind::DataLost) {
+        return None;
+    }
+    let spec = rec.spec.as_ref()?;
+    let plain = matches!(spec.kind(), pb::CallKind::CallFunction | pb::CallKind::CallMapItem);
+    if !plain || spec.stream || !spec.command_fingerprint.is_empty() {
+        return None;
+    }
+    Some(pb::DeadLetter { spec: Some(spec.clone()), error: Some(outcome.clone()), done_hlc: now })
+}
+
+fn dead_count(kv: &dyn KvRead, v: u16, run: &Id) -> u32 {
+    kv.get(&keys::dead_count(v, run)).map_or(0, |b| u32::from_be_bytes(b[..4].try_into().expect("u32")))
+}
+
 fn causal(producer: Tk, root: &pb::Outcome) -> pb::Outcome {
     let mut e = match &root.value {
         Some(pb::outcome::Value::Err(e)) => e.clone(),
@@ -351,9 +387,16 @@ impl ShardState {
             Body::RunFinish(r) => self.run_finish(cx, v, r),
             Body::StoreWrite(w) => reply(pb::shard_reply::Body::Store(store::write(cx, v, w))),
             Body::StoreRead(r) => reply(pb::shard_reply::Body::Store(store::read(cx.kv, v, r, cx.now))),
+            Body::StoreTxn(t) => reply(pb::shard_reply::Body::Store(store::txn(cx, v, t))),
+            Body::StoreClaim(c) => reply(pb::shard_reply::Body::Store(store::claim(cx, v, c))),
             Body::Charge(c) => self.charge(cx, v, c),
             Body::Unsubscribe(s) => self.unsubscribe(cx, v, s),
             Body::CancelChildren(c) => self.cancel_children(cx, v, c),
+            Body::DiscardDead(r) => self.discard_dead(cx, v, r),
+            Body::ActorChunkPut(a) => self.actor_chunk_put(cx, v, a),
+            Body::ActorCommitRoot(a) => self.actor_commit_root(cx, v, a),
+            Body::ActorUpgrade(a) => self.actor_upgrade(cx, v, a),
+            Body::LeaseObjects(l) => leases::apply(cx, v, l),
             Body::AdoptVshard(_) | Body::Retire(_) | Body::OutboxAck(_) | Body::Gc(_) => unreachable!(),
         }
     }
@@ -423,6 +466,7 @@ impl ShardState {
                 self.actor_lost(cx, v, actor, rec, reason, true);
                 affected += 1;
             }
+            leases::retire(cx, v, peer);
         }
         reply(pb::shard_reply::Body::Count(affected))
     }
@@ -448,6 +492,14 @@ impl ShardState {
                 // A run expires together with all of its tasks, in bounded steps.
                 let v = u16::from_be_bytes([target[0], target[1]]);
                 let run = Id::from_slice(&target[3..]).expect("16-byte run id");
+                if leases::held_any(cx.kv, v, &run) {
+                    // A session holds some of its files: look again a retention later.
+                    let retention = load::<pb::RunRecord>(cx.kv, &target).map_or(0, |r| r.retention_ms);
+                    cx.kv.delete(&ekey);
+                    cx.kv.put(keys::expiry(cx.now + hlc::from_ms(retention.max(1)), &target), Vec::new());
+                    deleted += 1;
+                    continue;
+                }
                 for prefix in [
                     keys::tasks_of_run(v, &run),
                     keys::pairs_of_run(v, keys::CHILD, &run),
@@ -458,6 +510,8 @@ impl ShardState {
                     keys::pairs_of_run(v, keys::HELD, &run),
                     keys::pairs_of_run(v, keys::PINS, &run),
                     keys::pairs_of_run(v, keys::REMOTE_PINS, &run),
+                    keys::pairs_of_run(v, keys::DEAD, &run),
+                    keys::pairs_of_run(v, keys::DEAD_COUNT, &run),
                 ] {
                     for (k, _) in cx.kv.scan_prefix(&prefix, budget - deleted) {
                         cx.kv.delete(&k);
@@ -589,11 +643,19 @@ impl ShardState {
                 // keys; one that asks for something else at a step diverged.
                 let stored = rec.spec.as_ref().map_or(&[][..], |s| s.command_fingerprint.as_slice());
                 if !stored.is_empty() && !spec.command_fingerprint.is_empty() && stored != spec.command_fingerprint {
+                    // Both calls as the workflow described them, `[recorded,
+                    // received]` in JSON (null for a call that kept none), for
+                    // the client to name the step, the call sites and arguments.
+                    let shown = |s: &pb::TaskSpec| match s.workflow_step.as_str() {
+                        "" => "null".to_string(),
+                        step => step.to_string(),
+                    };
                     let mut a = ack_rec(tk, Status::Rejected, &rec);
-                    a.reason = "workflow divergence: on replay this step made a different call than the run recorded \
-                                (a workflow must make the same calls in the same order; use ch.workflow.now/random/record \
-                                for anything that varies)"
-                        .into();
+                    a.reason = format!(
+                        "workflow divergence: [{}, {}]",
+                        rec.spec.as_ref().map_or_else(|| "null".to_string(), shown),
+                        shown(spec)
+                    );
                     acks.push(a);
                     continue;
                 }
@@ -1285,6 +1347,8 @@ impl ShardState {
         rec.set_state(TState::Done);
         rec.outcome = Some(outcome.clone());
         rec.done_hlc = cx.now;
+        // Failed for good: kept for a retry, and its inputs with it (below).
+        let dead = dead_letter(&rec, &outcome, cx.now);
         cx.events.push(Event::Done { task: tk, outcome });
         if pin_count(cx.kv, tk).unwrap_or(rec.pins) == 0 {
             let tomb = tombstone(cx, tk, &rec);
@@ -1299,13 +1363,63 @@ impl ShardState {
             rec.spec.as_ref().map_or_else(Default::default, |s| s.deps.iter().filter_map(Tk::parse).collect());
         for d in deps {
             cx.kv.delete(&keys::pair(tk.v(), keys::DEPENDENT, d.pair(), tk.pair()));
-            if d.v() == tk.v() {
+            if dead.is_some() {
+                continue; // the dead letter holds it until it is dropped
+            } else if d.v() == tk.v() {
                 self.unpin(cx, d);
             } else {
                 self.unpin_remote(cx, tk.v(), d);
             }
         }
+        if let Some(d) = dead {
+            self.keep_dead(cx, tk, d);
+        }
         rec
+    }
+
+    /// Keep a dead letter; past DEAD_MAX in its run, the oldest goes.
+    fn keep_dead(&self, cx: &mut Cx, tk: Tk, d: pb::DeadLetter) {
+        let v = tk.v();
+        cx.kv.put(keys::dead(v, &tk.run, d.done_hlc, &tk.task), d.encode_to_vec());
+        let count = dead_count(cx.kv, v, &tk.run) + 1;
+        cx.kv.put(keys::dead_count(v, &tk.run), count.to_be_bytes().to_vec());
+        if count > DEAD_MAX
+            && let Some((key, bytes)) = cx.kv.scan_prefix(&keys::pairs_of_run(v, keys::DEAD, &tk.run), 1).pop()
+            && let Ok(oldest) = pb::DeadLetter::decode(bytes.as_slice())
+        {
+            self.drop_dead(cx, v, &tk.run, &key, &oldest);
+        }
+    }
+
+    /// Forget a dead letter and release the inputs it held.
+    fn drop_dead(&self, cx: &mut Cx, v: u16, run: &Id, key: &[u8], d: &pb::DeadLetter) {
+        cx.kv.delete(key);
+        let count = dead_count(cx.kv, v, run).saturating_sub(1);
+        cx.kv.put(keys::dead_count(v, run), count.to_be_bytes().to_vec());
+        let deps: std::collections::BTreeSet<Tk> =
+            d.spec.as_ref().map_or_else(Default::default, |s| s.deps.iter().filter_map(Tk::parse).collect());
+        for dep in deps {
+            if dep.v() == v {
+                self.unpin(cx, dep);
+            } else {
+                self.unpin_remote(cx, v, dep);
+            }
+        }
+    }
+
+    /// Dead letters retried (as new calls) or not wanted.
+    fn discard_dead(&self, cx: &mut Cx, v: u16, r: &pb::Release) -> pb::ShardReply {
+        let mut dropped = 0u64;
+        for key in &r.tasks {
+            let Some(tk) = Tk::parse(key).filter(|t| t.v() == v) else { continue };
+            let Some(rec) = load::<pb::TaskRecord>(cx.kv, &tk.key()) else { continue };
+            let dkey = keys::dead(v, &tk.run, rec.done_hlc, &tk.task);
+            if let Some(d) = load::<pb::DeadLetter>(cx.kv, &dkey) {
+                self.drop_dead(cx, v, &tk.run, &dkey, &d);
+                dropped += 1;
+            }
+        }
+        reply(pb::shard_reply::Body::Count(dropped))
     }
 
     /// One fewer call in `v` reads the remote `producer`; the last one
@@ -1521,6 +1635,17 @@ pub mod read {
             .or_else(|| load(kv, &keys::notified(vshard, (&producer.run, &producer.task))))
     }
 
+    /// A run's dead letters in this vshard, oldest first.
+    pub fn dead_letters(kv: &dyn KvRead, v: u16, run: Id) -> Vec<(Tk, pb::DeadLetter)> {
+        kv.scan_prefix(&keys::pairs_of_run(v, keys::DEAD, &run), usize::MAX)
+            .into_iter()
+            .filter_map(|(key, bytes)| {
+                let task = Id::from_slice(&key[key.len() - 16..]).ok()?;
+                Some((Tk { run, task }, pb::DeadLetter::decode(bytes.as_slice()).ok()?))
+            })
+            .collect()
+    }
+
     pub fn run(kv: &dyn KvRead, run: Id) -> Option<pb::RunRecord> {
         run_in(kv, run.vshard(), run)
     }
@@ -1577,6 +1702,19 @@ pub mod read {
 
     pub fn actor(kv: &dyn KvRead, actor: Id) -> Option<pb::ActorRecord> {
         load(kv, &keys::actor(actor.vshard(), &actor))
+    }
+
+    /// A durable actor's committed state as one blob: inline, or its chunks
+    /// put back together. None if a chunk the record names is missing.
+    pub fn actor_state(kv: &dyn KvRead, actor: Id, rec: &pb::ActorRecord) -> Option<Vec<u8>> {
+        if rec.state_chunks.is_empty() {
+            return Some(rec.durable_state.clone());
+        }
+        let mut out = Vec::new();
+        for digest in &rec.state_chunks {
+            out.extend_from_slice(&kv.get(&keys::actor_chunk(actor.vshard(), &actor, digest))?);
+        }
+        Some(out)
     }
 
     /// The actor records `vshard` holds, at most `limit`.

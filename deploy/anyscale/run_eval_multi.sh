@@ -24,6 +24,8 @@ if ! command -v cargo >/dev/null; then
   source "$HOME/.cargo/env"
 fi
 export CARGO_INCREMENTAL=0
+# The run's manifest records the profile: the binary is copied out of target/.
+export EVAL_CARGO_PROFILE=release
 cargo --version
 time cargo build -q --release -p chimaera-peer
 PY=${RAY_PYTHON:-python3}
@@ -37,3 +39,6 @@ cp /tmp/chimaera-wheels/chimaera-*.whl "$DIST/"
 "$DIST/chimaera" cluster token > "$DIST/token"
 "$PY" -c 'import ray; ray.init(address="auto"); print("nodes", len([n for n in ray.nodes() if n["Alive"]]), "cpus", ray.cluster_resources().get("CPU"))'
 "$PY" bench/evals/multi_node.py --dist "$DIST" --out "$OUT"
+# The raw results into the job's log too: the lane that submitted the job
+# rebuilds them from its log (bench/qualification/build_manifest.py emit).
+"$PY" bench/qualification/build_manifest.py emit "$OUT"/multi_*

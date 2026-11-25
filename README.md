@@ -142,7 +142,14 @@ pip install maturin && maturin develop --release
 ```
 
 For machines without Rust, `make wheel` builds a wheel with the peer binary
-inside it (same OS and CPU architecture as the build machine).
+inside it (same OS and CPU architecture as the build machine). Wheels are
+made for macOS on arm64 and x86_64 and for Linux with glibc 2.28 or newer on
+x86_64 and aarch64 (`make wheel-linux` builds that one in Docker), and each
+serves CPython 3.11 to 3.14, though not their free-threaded builds.
+`make wheel-smoke PYTHONS="python3.11 python3.14"` installs the wheel into a
+fresh venv for each interpreter and runs a task, an actor and a 64 MiB
+result. [.github/workflows/wheels.yml](.github/workflows/wheels.yml) does
+this for every OS and CPU.
 
 ## Status
 
@@ -150,7 +157,7 @@ Chimaera is early software. This is what works today:
 
 | Area | State |
 |---|---|
-| Functions, futures as dependencies, `map`, actors, pools | Working, on one machine and across peers |
+| Functions, futures as dependencies, `map`, task groups (`ch.TaskGroup`), actors, pools | Working, on one machine and across peers |
 | Retries, `ch.OutcomeUnknown` for external effects, memory limits, canceling calls, deadlines | Working |
 | Learned CPU and memory reservations, memory-aware admission, large values stored once | Working; across peers, placement weighs input locality and memory |
 | Per-call measurements (`future.explain()`, `chimaera explain`) | Working; per-attempt cgroup readings on Linux |

@@ -107,6 +107,7 @@ pub struct Supervisor {
     conns: Mutex<HashMap<u32, mpsc::UnboundedSender<pb::PeerToExec>>>,
     pids: Mutex<HashMap<u32, u32>>,
     next_id: AtomicU32,
+    numa: crate::numa::Domains,
 }
 
 impl Supervisor {
@@ -115,10 +116,11 @@ impl Supervisor {
         log_dir: PathBuf,
         welcome: pb::ExecWelcome,
         events: mpsc::Sender<ExecEvent>,
+        numa: crate::numa::Domains,
     ) -> io::Result<Arc<Supervisor>> {
         let _ = std::fs::remove_file(&socket);
         std::fs::create_dir_all(&log_dir)?;
-        let listener = UnixListener::bind(&socket)?;
+        let listener = UnixListener::bind(&socket).map_err(|e| crate::doctor::bind_error(&socket, e))?;
         restrict_to_owner(&socket)?;
         let sup = Arc::new(Supervisor {
             socket,
@@ -128,6 +130,7 @@ impl Supervisor {
             conns: Mutex::default(),
             pids: Mutex::default(),
             next_id: AtomicU32::new(1),
+            numa,
         });
         let s2 = sup.clone();
         tokio::spawn(async move {
@@ -144,13 +147,15 @@ impl Supervisor {
     }
 
     /// Start an executor; it reports `Ready` once connected. With `cgroup`, the
-    /// child joins that cgroup before it executes Python.
+    /// child joins that cgroup before it executes Python. It may be bound to
+    /// a NUMA domain: that of its devices (`near`, one node per device), if any.
     pub fn spawn(
         &self,
         env: &ExecEnv,
         threads: u32,
         extra_env: &[(&str, Option<String>)],
         cgroup: Option<&Path>,
+        near: &[Option<u32>],
     ) -> io::Result<(u32, u32)> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let log = std::fs::File::create(self.log_dir.join(format!("executor-{id}.log")))?;
@@ -234,9 +239,16 @@ impl Supervisor {
         if let Some(group) = cgroup {
             join_cgroup_before_exec(&mut cmd, group)?;
         }
+        let domain = self.numa.pick(threads, near);
+        if let Some(node) = &domain {
+            crate::numa::bind_before_exec(&mut cmd, node);
+        }
         let mut child = cmd.spawn()?;
         let pid = child.id().unwrap_or(0);
         self.pids.lock().expect("pids").insert(id, pid);
+        if let Some(node) = domain {
+            self.numa.bound(id, node.id, threads.max(1));
+        }
         let events = self.events.clone();
         tokio::spawn(async move {
             let status = child.wait().await;
@@ -295,6 +307,7 @@ impl Supervisor {
     pub fn forget(&self, exec: u32) {
         self.conns.lock().expect("conns").remove(&exec);
         self.pids.lock().expect("pids").remove(&exec);
+        self.numa.forget(exec);
     }
 
     async fn serve(self: Arc<Self>, stream: UnixStream) -> io::Result<()> {

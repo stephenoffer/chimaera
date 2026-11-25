@@ -12,11 +12,24 @@ and retry as one. ``fn.options(ranks=4).gang(*args)``.
 
 Every rank gets the environment torch, JAX and DeepSpeed read: RANK,
 WORLD_SIZE, LOCAL_RANK, LOCAL_WORLD_SIZE, MASTER_ADDR and MASTER_PORT (rank
-0's host and a free port there), plus CHIMAERA_GANG and
-CHIMAERA_GANG_GENERATION. If any rank is lost (its worker or peer dies), the
-whole generation is cancelled and the gang starts again as a new generation,
-up to ``max_attempts`` times; resume from your own checkpoint. A rank that
-raises fails the gang with that error.
+0's host and a port it holds there until its code starts), plus CHIMAERA_GANG
+and CHIMAERA_GANG_GENERATION. If any rank is lost (its worker or peer dies),
+the whole generation is cancelled and the gang starts again as a new
+generation, up to ``max_attempts`` times; resume from your own checkpoint. A
+rank that raises fails the gang with that error.
+
+A generation is admitted all or none: the peers' ledgers hold a slot (its
+CPUs and devices) for every rank before any rank starts, and each rank starts
+on its own slot with a launch token (see ``_ledger``). A gang that does not
+fit waits holding nothing, so two gangs that each need the whole cluster run
+one after the other instead of each holding half. One that could not fit even
+on idle peers fails at once as ``ch.Infeasible``, naming the first rank that
+does not fit. Admitted, the generation commits one rendezvous record (the
+ranks' peers, the deadline, rank 0's endpoint); every rank must reach the
+rendezvous within ``rendezvous_timeout`` (default 300 s), or the generation
+is lost with each missing rank's stage (queued on its peer and why, or
+started). A rank of a generation that was replaced cannot start, join a
+collective or torch's store of the next one: it raises ``GangFailed``.
 
 ``ranks=ch.auto(initial, min=, max=)`` makes the gang elastic: each
 generation has as many ranks as the live peers can hold (by CPUs, and GPUs
@@ -34,10 +47,26 @@ rank last entered and names the ranks holding the others up. A collective's
 wait includes its name, so ranks on different code paths hang where
 ``explain()`` names them instead of mixing their data.
 
-shortcut: ranks meet through a ch.coord.Store rendezvous and are placed one by one,
-so a gang larger than the free capacity waits at the rendezvous (and retries
-after ``RENDEZVOUS_S``). All-or-nothing placement arrives with the shard's
-gang commit (plan P5).
+A rank waits in a store collective, or in ``torch()`` for the other ranks,
+at most ``collective_timeout`` seconds (default 600; torch's process group
+gets the same timeout). Past it the generation is lost: the rank that gives
+up closes the collective, so either every rank passes it or none does, and
+records why. Every rank raises that ``GangFailed``: at once in that
+collective, within a second in another, or at its next one, so none waits
+out the deadline alone. A function gang then starts its next generation, as
+for a lost rank; an actor gang's calls raise it until ``restart()``. A
+``torch.distributed`` ``DistError`` out of a rank or out of ``torch()``
+(torch's watchdog timed a collective out, or it lost a peer) loses the
+generation the same way. A collective's own ``timeout=`` closes it with a
+``TimeoutError`` instead, raised in every rank that waits in it or enters
+it: the rank's error, which fails the gang.
+
+A collective value that pickles to more than the peer's inline limit (64
+KiB) goes through the object plane: the sender stores it with ``ch.put``,
+the store carries only its handle, and the sender frees it once every rank
+has read it. A copy that a rank on another peer fetched stays on that peer
+until the run ends.
+
 """
 
 from __future__ import annotations
@@ -46,34 +75,43 @@ import functools
 import math
 import operator
 import os
+import pickle
 import socket
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, NoReturn, TypeVar
 
-from ._errors import InfrastructureFailure
+import cloudpickle
+
+from . import _ledger
+from ._errors import InfrastructureFailure, VersionConflict
 from ._future import Future
 from ._native import blake3_digest
-from ._options import Auto
+from ._options import Auto, Placement, _pos_float
 from ._remote import Actor, remote
 
 R = TypeVar("R")
 
-RENDEZVOUS_S = 300.0
+RENDEZVOUS_S = 300.0  # rendezvous_timeout's default
+COLLECTIVE_S = 600.0  # collective_timeout's default: torch's own for NCCL
 TTL = "24h"  # rendezvous and collective keys expire
 # The rank options a gang passes on: what a rank needs, not how the gang retries.
 _RANK_OPTIONS = ("cpus", "memory", "memory_limit", "gpus", "device", "resources", "placement", "priority", "deadline")
 
 
 class GangFailed(InfrastructureFailure):
-    """Every attempt of a gang lost a rank (``max_attempts`` generations)."""
+    """Every attempt of a gang lost a rank (``max_attempts`` generations). In
+    a rank: its generation was given up (a collective outlasted
+    ``collective_timeout``) or replaced, so the rank must stop."""
 
 
-# The gang whose torch.distributed group this worker process initialized.
+# The gang whose torch.distributed group this worker process initialized,
+# and torch's DistError (its backend, network and store errors) then.
 _torch_group: tuple[str, int] | None = None
+_torch_error: type[BaseException] | None = None
 
 
 def _end_torch_group() -> None:
@@ -82,6 +120,19 @@ def _end_torch_group() -> None:
     if _torch_group is not None and dist is not None and dist.is_initialized():
         dist.destroy_process_group()
     _torch_group = None
+
+
+def _torch_failure(e: BaseException, group: Group) -> GangFailed | None:
+    """`e`, out of a rank, as its generation's loss if it is torch's
+    ``DistError`` from this gang's process group: torch's watchdog timed a
+    collective out, or torch lost a peer. The gang reforms, as it does when a
+    store collective stalls."""
+    if _torch_group != (group.id, group.generation) or _torch_error is None or not isinstance(e, _torch_error):
+        return None
+    from ._store import Store
+
+    why = f"rank {group.rank}: torch.distributed raised {type(e).__name__}: {e}"
+    return _abandon(Store(f"gang/{group._root}"), group._root, group.generation, why)
 
 
 class Group:
@@ -94,10 +145,15 @@ class Group:
         self.local_size = int(env["LOCAL_WORLD_SIZE"])
         self.generation = int(env["CHIMAERA_GANG_GENERATION"])
         self.id = env["CHIMAERA_GANG"]
+        self._root = self.id  # the gang's own id (a mesh axis's id names its axis)
         self.master = (env["MASTER_ADDR"], int(env["MASTER_PORT"]))
         self.ranks = list(range(self.size))  # members, as ranks of the gang (a mesh axis lists a subset)
         self._axis = ""  # set on a mesh axis
-        self._seq = 0
+        self._seq = 0  # this group's last collective
+        # Each group's last collective by id, shared with its mesh axes: an
+        # axis built again by a later mesh() goes on from its last number.
+        self._seqs: dict[str, int] = {}
+        self._stall: float | None = None  # collective_timeout, read from the record when first needed
 
     def __repr__(self) -> str:
         axis = f" axis {self._axis}" if self._axis else ""
@@ -130,7 +186,8 @@ class Group:
             axis.__dict__.update(self.__dict__)
             axis.id = f"{self.id}/mesh-{'.'.join(f'{a}{n}' for a, n in axes.items())}/{name}/{fixed}"
             axis.ranks = [self.ranks[first + k * stride] for k in range(shape[i])]
-            axis.rank, axis.size, axis._axis, axis._seq = coords[i], shape[i], name, 0
+            axis.rank, axis.size, axis._axis = coords[i], shape[i], name
+            axis._seq = self._seqs.get(axis.id, 0)
             out[name] = axis
         return out
 
@@ -150,54 +207,214 @@ class Group:
                 f"mesh axis {self._axis!r} has no process group of its own: after the gang's group.torch(), "
                 "use torch's init_device_mesh, or dist.new_group(axis.ranks) on every rank"
             )
+        from ._store import Store
+
+        _fence(Store(f"gang/{self._root}"), self._root, self.generation)
+        from datetime import timedelta
+
         import torch.distributed as dist
 
-        global _torch_group
+        global _torch_group, _torch_error
         if dist.is_initialized() and _torch_group != (self.id, self.generation):
             dist.destroy_process_group()  # left by another gang in this reused worker
         if not dist.is_initialized():
-            addr, port = self.master
-            dist.init_process_group(
-                backend or self.backend, init_method=f"tcp://{addr}:{port}", rank=self.rank, world_size=self.size
-            )
-            _torch_group = (self.id, self.generation)
+            error = getattr(dist, "DistError", None)
+            try:
+                store = self._torch_store(dist)
+                timeout = timedelta(seconds=self._deadline())  # torch's collectives get the store's deadline
+                dist.init_process_group(
+                    backend or self.backend, store=store, rank=self.rank, world_size=self.size, timeout=timeout
+                )
+            except Exception as e:
+                if error is None or not isinstance(e, error):
+                    raise
+                # torch's store or backend gave up meeting the other ranks: as a stalled collective
+                why = f"rank {self.rank}: torch.distributed raised {type(e).__name__} setting up: {e}"
+                raise _abandon(Store(f"gang/{self._root}"), self._root, self.generation, why) from e
+            _torch_group, _torch_error = (self.id, self.generation), error
         return dist
 
-    # Small-object collectives through the store: no torch needed. Each one
-    # records where this rank is, for explain().
+    def _torch_store(self, dist: Any) -> Any:
+        """torch's store for this generation. Rank 0 binds its committed
+        endpoint again or, if something took that port since its code
+        started, another port, and hands the bound socket to torch (so
+        nothing can take it in between), committing where it serves as the
+        record's next endpoint; the others connect there. Its keys are this
+        generation's, so a stale rank could not mix in."""
+        from datetime import timedelta
 
-    def _collective(self, op: str, timeout: float | None, value: Any = None, send: bool = False) -> tuple[Any, str]:
         from ._store import Store
 
-        self._seq += 1
+        store = Store(f"gang/{self._root}")
+        timeout = self._deadline()  # meeting in torch's store is a collective too
+        addr, port = self.master
+        wait = timedelta(seconds=timeout)
+        if self.rank == 0:
+            sock = socket.socket()
+            try:
+                sock.bind(("", port))
+            except OSError:  # taken since rank 0's code started
+                sock.close()
+                sock = socket.socket()
+                sock.bind(("", 0))
+            sock.listen()
+            port = sock.getsockname()[1]
+            fd = sock.detach()  # torch's server listens on it from here
+            server = dist.TCPStore(addr, port, self.size, True, wait, wait_for_workers=False, master_listen_fd=fd)
+            _publish(store, self.generation, addr, port, serving=True)
+        else:
+            addr, port = _serving(store, self._root, self.generation, timeout)
+            server = dist.TCPStore(addr, port, self.size, False, wait)
+        self.master = (addr, port)
+        os.environ["MASTER_PORT"] = str(port)
+        return dist.PrefixStore(f"{self._root}/{self.generation}", server)
+
+    def _deadline(self) -> float:
+        """How long this rank waits in a collective before its generation is
+        lost: the gang's collective_timeout, from its record."""
+        if self._stall is None:
+            from ._store import Store
+
+            record = Store(f"gang/{self._root}").get(f"{self.generation}/record") or {}
+            self._stall = float(record.get("collective_timeout", COLLECTIVE_S))
+        return self._stall
+
+    # Collectives through the store: no torch needed. Each one records where
+    # this rank is, for explain().
+
+    def _collective(
+        self, op: str, timeout: float | None, value: Any = None, send: bool = False, read: Sequence[int] = ()
+    ) -> list[Any]:
+        """Enter collective `op`: send `value` if `send`, wait for every rank,
+        and return the values ranks `read` sent, in order. A value larger than
+        the peer's inline limit goes through the object plane (``ch.put``):
+        the store holds its handle, and the sender keeps it until every rank
+        has read it."""
+        from ._future import put
+        from ._runtime import Runtime
+        from ._store import Store
+
+        _fence(Store(f"gang/{self._root}"), self._root, self.generation)
+        self._seq = self._seqs[self.id] = self._seqs.get(self.id, 0) + 1
         store, key = Store(f"gang/{self.id}"), f"{self.generation}/c{self._seq}/{op}"
         store.put(f"{self.generation}/at/{self.rank}", (self._seq, op, time.time()), ttl=TTL)
+        held = None  # this rank's stored value, freed when the collective returns
         if send:
+            if _pickled_bytes(value) > Runtime.get().inline_limit:
+                held = put(value, durability="ephemeral")  # a lost peer loses the generation anyway: no copy
+                assert held._put is not None  # a ch.put future carries its handle
+                value = _Stored(held._put)
             store.put(f"{key}/{self.rank}", value, ttl=TTL)
-        try:
-            store.barrier(key, self.size).wait(timeout)
-        except TimeoutError:
-            held = _summary(_positions(store, self.generation, self.size))
-            raise TimeoutError(f"{op} #{self._seq} of {self!r} timed out: {held}") from None
-        return store, key
+        self._wait(store, key, op, timeout)
+        values = [store.get(f"{key}/{r}") for r in read]
+        if any(type(v) is _Stored for v in values):
+            from ._leases import unpickle
+
+            try:
+                values = [unpickle(*v.put).result() if type(v) is _Stored else v for v in values]
+            except Exception:
+                # A sender that gave up freed its value: raise why it gave up, not the read's error.
+                _fence(Store(f"gang/{self._root}"), self._root, self.generation)
+                if store.version(f"{key}/read/closed"):
+                    self._refused(store, f"{key}/read/closed")
+                raise
+            self._wait(store, f"{key}/read", op, timeout)  # every rank has read: the senders free theirs
+        return values
+
+    def _wait(self, store: Any, key: str, op: str, timeout: float | None) -> None:
+        """Arrive at `key` and wait for every rank: up to `timeout`, then a
+        TimeoutError (the caller's own deadline), else up to the gang's
+        collective_timeout, then the generation is lost. A rank that gives up
+        closes the collective first, unless the last rank came in meanwhile;
+        the ranks waiting in it and any that arrive later raise its error, so
+        either every rank passes or none does. A waiting rank also sees,
+        within a second, its generation given up anywhere else."""
+        from ._future import waiting
+        from ._store import Store, _raise
+
+        root, closed = Store(f"gang/{self._root}"), f"{key}/closed"
+        r = store._txn([(closed, 0)], [("add", key, None, 1)])  # arrive, unless closed
+        if not r["ok"]:
+            if not r["error"].startswith("version mismatch"):
+                _raise(r)
+            self._refused(store, closed)
+        wait = self._deadline() if timeout is None else timeout
+        deadline, check, pause = time.monotonic() + wait, time.monotonic() + 1.0, 0.005
+        while True:
+            arrived, version = store.get_versioned(key, 0)
+            if arrived >= self.size:
+                return
+            if arrived < 0:  # closed: the count drops below zero
+                self._refused(store, closed)
+            now = time.monotonic()
+            if now >= check:
+                _fence(root, self._root, self.generation)
+                check = now + 1.0
+            if now >= deadline:
+                break
+            with waiting():
+                time.sleep(pause)
+            pause = min(pause * 2, 0.2)
+        held = _summary(_positions(store, self.generation, self.size))
+        if timeout is None:
+            why = f"{op} #{self._seq} of {self!r} waited {wait:g} s (collective_timeout): {held}"
+        else:
+            why = f"{op} #{self._seq} of {self!r} timed out: {held}"
+        # Close it at the count just read: refused if a rank arrived (or closed it) since.
+        close = [("put", closed, pickle.dumps((timeout is not None, why)), 0), ("add", key, None, -self.size)]
+        while not (r := store._txn([(key, version), (closed, 0)], close))["ok"]:
+            if not r["error"].startswith("version mismatch"):
+                _raise(r)
+            arrived, version = store.get_versioned(key, 0)
+            if arrived >= self.size:
+                return  # the last rank came in meanwhile: the collective completed
+            if arrived < 0:
+                self._refused(store, closed)
+        if timeout is not None:
+            raise TimeoutError(why)
+        raise _abandon(root, self._root, self.generation, why)
+
+    def _refused(self, store: Any, closed: str) -> NoReturn:
+        """Raise what the rank that closed a collective raised: a TimeoutError
+        (its own ``timeout=``) or its generation's loss."""
+        from ._store import Store
+
+        explicit, why = store.get(closed)
+        if explicit:
+            raise TimeoutError(why)
+        raise _abandon(Store(f"gang/{self._root}"), self._root, self.generation, why)
 
     def barrier(self, timeout: float | None = None) -> None:
         self._collective("barrier", timeout)
 
     def all_gather(self, obj: Any, timeout: float | None = None) -> list[Any]:
-        """Every rank's `obj`, in rank order (picklable values up to 1 MiB)."""
-        store, key = self._collective("all_gather", timeout, obj, send=True)
-        return [store.get(f"{key}/{r}") for r in range(self.size)]
+        """Every rank's `obj`, in rank order (any picklable value; large ones
+        go through the object plane)."""
+        return self._collective("all_gather", timeout, obj, send=True, read=range(self.size))
 
     def all_reduce(self, obj: Any, op: Callable[[Any, Any], Any] = operator.add, timeout: float | None = None) -> Any:
         """Every rank's `obj` combined with `op` (sum by default), on every rank."""
-        store, key = self._collective("all_reduce", timeout, obj, send=True)
-        return functools.reduce(op, [store.get(f"{key}/{r}") for r in range(self.size)])
+        return functools.reduce(op, self._collective("all_reduce", timeout, obj, send=True, read=range(self.size)))
 
     def broadcast(self, obj: Any = None, src: int = 0, timeout: float | None = None) -> Any:
         """Rank `src`'s `obj`, on every rank."""
-        store, key = self._collective("broadcast", timeout, obj, send=self.rank == src)
-        return store.get(f"{key}/{src}")
+        return self._collective("broadcast", timeout, obj, send=self.rank == src, read=(src,))[0]
+
+
+class _Stored(NamedTuple):
+    """A collective value stored with ``ch.put``: its handle, as the store holds it."""
+
+    put: tuple[Any, ...]
+
+
+def _pickled_bytes(value: Any) -> int:
+    """`value`'s size pickled, without copying its buffers (NumPy arrays)."""
+    buffers: list[pickle.PickleBuffer] = []
+    try:
+        data = pickle.dumps(value, protocol=5, buffer_callback=buffers.append)
+    except (pickle.PicklingError, TypeError, AttributeError):
+        data = cloudpickle.dumps(value, protocol=5, buffer_callback=buffers.append)
+    return len(data) + sum(b.raw().nbytes for b in buffers)
 
 
 def _positions(store: Any, generation: int, size: int) -> list[Any]:
@@ -301,10 +518,82 @@ def _size(want: int | Auto, opts: dict[str, Any], first: bool) -> tuple[int, str
     return (size, f"{size} ranks: the live peers hold {fits} of this shape (min {want.min}, max {want.max})")
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+def _ended(store: Any, gang: str, generation: int) -> GangFailed | None:
+    """Why a rank of `generation` must stop, if it must: a rank gave the
+    generation up (``_abandon``), or its successor replaced it."""
+    record = store.get(f"{generation + 1}/record")
+    if record is None:
+        return None
+    if "lost" in record:
+        return GangFailed(f"gang {gang}: generation {generation} is lost: {record['lost']}")
+    return GangFailed(
+        f"gang {gang}: generation {generation} was replaced by generation {generation + 1}; this rank is stale"
+    )
+
+
+def _fence(store: Any, gang: str, generation: int) -> None:
+    """Raise in a rank of a generation that was given up or replaced: it must
+    not go on, or join (or wait for) the next one."""
+    ended = _ended(store, gang, generation)
+    if ended is not None:
+        raise ended
+
+
+def _abandon(store: Any, gang: str, generation: int, why: str) -> GangFailed:
+    """Give `generation` up for `why`, unless a rank did first or a successor
+    replaced it: the successor's record slot holds the reason until that
+    generation's own record replaces it, so every rank raises the same error
+    at its next collective or ``torch()``. Returns that error."""
+    try:
+        store.put(f"{generation + 1}/record", {"lost": why}, if_version=0, ttl=TTL)
+    except VersionConflict:
+        pass  # given up already, or replaced
+    return _ended(store, gang, generation) or GangFailed(f"gang {gang}: generation {generation} is lost: {why}")
+
+
+def _publish(store: Any, generation: int, addr: str, port: int, serving: bool) -> None:
+    """Commit rank 0's endpoint to the generation's record as its next
+    version: bound (held for its code) or `serving` torch's store."""
+    key = f"{generation}/record"
+    while True:
+        record, version = store.get_versioned(key)
+        n = record["endpoint"][2] + 1 if record["endpoint"] else 1
+        try:
+            store.put(key, {**record, "endpoint": (addr, port, n, serving)}, if_version=version, ttl=TTL)
+            return
+        except VersionConflict:
+            continue
+
+
+def _serving(store: Any, gang: str, generation: int, timeout: float) -> tuple[str, int]:
+    """The endpoint rank 0 committed as serving torch's store, once it has;
+    past `timeout` (the collective_timeout) the generation is lost."""
+    from ._future import waiting
+
+    deadline, pause = time.monotonic() + timeout, 0.01
+    while True:
+        endpoint = store.get(f"{generation}/record")["endpoint"]
+        if endpoint[3]:
+            return endpoint[0], endpoint[1]
+        _fence(store, gang, generation)
+        if time.monotonic() > deadline:
+            why = f"rank 0 started no torch store in {timeout:g} s (collective_timeout)"
+            raise _abandon(store, gang, generation, why)
+        with waiting():
+            time.sleep(pause)
+        pause = min(pause * 2, 0.2)
+
+
+# Rank 0's endpoints, bound from when they are committed until the rank's
+# code starts (`_hand_off`), so nothing else takes the port meanwhile.
+_listeners: dict[tuple[str, int], socket.socket] = {}
+
+
+def _hand_off(gang: str, generation: int) -> None:
+    """Free rank 0's held port for its code (torch binds it)."""
+    sock = _listeners.pop((gang, generation), None)
+    if sock is not None:
+        sock.close()
 
 
 def _host_addr() -> str:
@@ -317,23 +606,59 @@ def _host_addr() -> str:
         return "127.0.0.1"
 
 
-def _rendezvous(gang: str, generation: int, rank: int, world: int) -> dict[str, str]:
-    """Meet the other ranks of this generation; return this rank's environment."""
+def _record(
+    store: Any, generation: int, peers: Sequence[str | None], timeout: float, collective: float = COLLECTIVE_S
+) -> None:
+    """Commit a generation's rendezvous record: its ranks' peers, its
+    deadlines (to meet, and in each collective), and rank 0's endpoint once
+    it adds it. Its successor's record replacing it makes every rank of it
+    stale."""
+    record = {"ranks": peers, "timeout": timeout, "collective_timeout": collective, "endpoint": None}
+    store.put(f"{generation}/record", record, ttl=TTL)
+
+
+def _rendezvous(gang: str, generation: int, rank: int, world: int, collective: float = COLLECTIVE_S) -> dict[str, str]:
+    """Meet the other ranks of this generation, within its record's deadline;
+    return this rank's environment. Rank 0 binds the endpoint it commits and
+    holds it until its code starts (`_hand_off`). A record the members
+    create waits `collective` seconds in each collective."""
     from . import _context
     from ._store import Store
 
     store = Store(f"gang/{gang}")
+    while True:
+        record, version = store.get_versioned(f"{generation}/record")
+        if record is not None and "lost" not in record:
+            break
+        # A group's generation named by its members (ch.dist.GroupHandle):
+        # the first creates it, over why its predecessor was given up.
+        try:
+            record = {
+                "ranks": [None] * world, "timeout": RENDEZVOUS_S, "collective_timeout": collective, "endpoint": None
+            }
+            store.put(f"{generation}/record", record, if_version=version, ttl=TTL)
+            break
+        except VersionConflict:
+            continue
+    _fence(store, gang, generation)
     node = _context.context().node
     store.put(f"{generation}/at/{rank}", (0, "rendezvous", time.time()), ttl=TTL)
     if rank == 0:
-        store.put(f"{generation}/master", (_host_addr(), _free_port()), ttl=TTL)
+        sock = socket.socket()
+        sock.bind(("", 0))
+        _listeners[(gang, generation)] = sock
+        _publish(store, generation, _host_addr(), sock.getsockname()[1], serving=False)
     store.put(f"{generation}/node/{rank}", node, ttl=TTL)
+    timeout = record["timeout"]
     try:
-        store.barrier(f"{generation}/start", world).wait(RENDEZVOUS_S)
+        store.barrier(f"{generation}/start", world).wait(timeout)
     except TimeoutError:
-        raise InfrastructureFailure(f"gang rendezvous: not every rank started within {RENDEZVOUS_S:.0f} s") from None
+        missing = [r for r, p in enumerate(_positions(store, generation, world)) if p is None]
+        raise InfrastructureFailure(
+            f"gang rendezvous: rank(s) {_names(missing)} did not arrive within {timeout:g} s"
+        ) from None
     nodes = [store.get(f"{generation}/node/{r}") for r in range(world)]
-    addr, port = store.get(f"{generation}/master")
+    addr, port = store.get(f"{generation}/record")["endpoint"][:2]
     env = {
         "RANK": str(rank),
         "WORLD_SIZE": str(world),
@@ -351,13 +676,21 @@ def _rendezvous(gang: str, generation: int, rank: int, world: int) -> dict[str, 
 def _rank(fn: Any, gang: str, generation: int, rank: int, world: int, args: tuple, kwargs: dict) -> Any:
     from . import _context
 
-    env = _rendezvous(gang, generation, rank, world)
+    try:
+        env = _rendezvous(gang, generation, rank, world)
+    finally:
+        _hand_off(gang, generation)
     saved = {k: os.environ.get(k) for k in env}
     os.environ.update(env)  # read by torch, JAX and DeepSpeed at init
     ctx = _context.context()
-    ctx.gang = Group(env)
+    ctx.gang = group = Group(env)
     try:
         return fn(*args, **kwargs)
+    except Exception as e:
+        lost = _torch_failure(e, group)
+        if lost is None:
+            raise
+        raise lost from e
     finally:
         _end_torch_group()
         ctx.gang = None
@@ -368,57 +701,139 @@ def _rank(fn: Any, gang: str, generation: int, rank: int, world: int, args: tupl
                 os.environ[k] = v
 
 
+def _require(opts: dict[str, Any]) -> dict[str, str]:
+    placement = opts.get("placement")
+    return dict(placement.require) if placement else {}
+
+
+def _pinned(opts: dict[str, Any], peer: str) -> dict[str, Any]:
+    """Rank options that place it on `peer` (where its slot is held)."""
+    placement = opts.get("placement") or Placement()
+    return {**opts, "placement": Placement(require={**placement.require, "node": peer}, prefer=placement.prefer)}
+
+
+def _stages(store: Any, generation: int, futures: list[Future[Any]], peers: list[str]) -> str:
+    """Where each rank that has not reached the rendezvous is: queued on its
+    peer (and why it waits) or started."""
+    from ._runtime import Runtime
+
+    client, out = Runtime.get().client, []
+    for r, at in enumerate(_positions(store, generation, len(futures))):
+        if at is None:
+            why = "" if futures[r].done() else str(client.explain(futures[r].key).get("pending_reason") or "")
+            stage = why if why not in ("", "running") else "started, not at the rendezvous yet"
+            stage = "ended" if futures[r].done() else stage
+            out.append(f"rank {r} (peer {peers[r][:12]}): {stage}")
+    return "; ".join(out)
+
+
 @remote(cpus=0.01, latency="interactive")
-def _supervise(fn: Any, args: tuple, kwargs: dict, want: int | Auto, attempts: int, rank_opts: dict) -> list[Any]:
-    """Run a function gang to its end: start its ranks together; when one is
-    lost, stop the others and start the next generation (resized if
-    elastic), up to `attempts`. A rank's own error fails the gang. Each
-    generation is reported, for ``Gang.generation``, ``decisions`` and ``explain``.
+def _supervise(
+    fn: Any,
+    args: tuple,
+    kwargs: dict,
+    want: int | Auto,
+    attempts: int,
+    rank_opts: dict,
+    timeout: float,
+    collective: float = COLLECTIVE_S,
+) -> list[Any]:
+    """Run a function gang to its end: admit each generation's ranks all or
+    none, start them on their slots and wait for them; when one is lost (or a
+    rank misses the rendezvous deadline, or the ranks give the generation up
+    after a collective outlasts `collective` seconds), stop the others and
+    start the next generation (resized if elastic), up to `attempts`. A
+    rank's own error fails the gang. Each generation is reported, for
+    ``Gang.generation``, ``decisions`` and ``explain``.
 
     If the supervisor itself is lost with its peer, its retry carries on: the
     gang is named by this call and its generations are counted in the
-    replicated store, so the next one never reuses a rendezvous."""
+    replicated store, so the next one never reuses a rendezvous, and its holds
+    replace the lost one's (or those expire)."""
     from ._context import context
-    from ._future import as_completed
+    from ._future import wait
+    from ._runtime import Runtime
     from ._store import Store
 
-    from ._runtime import Runtime
-
-    ctx = context()
+    ctx, rt = context(), Runtime.get()
     gang = blake3_digest(ctx.run + ctx.task)[:8].hex()
     store = Store(f"gang/{gang}")
     generations = store.counter("generation")
-    submit = _rank.options(**rank_opts) if rank_opts else _rank
     while True:
         generation = generations.add(1)
         # A supervisor lost with its peer left its generation's ranks waiting
         # in a collective, holding their CPUs: end them before the next.
         for k in store.get(f"ranks/{generation - 1}", []) if generation > 1 else []:
-            Runtime.get().client.cancel(bytes.fromhex(k), True)
+            rt.client.cancel(bytes.fromhex(k), True)
         size, why = _size(want, rank_opts, first=generation == 1)
-        futures = [submit.remote(fn, gang, generation, r, size, args, kwargs) for r in range(size)]
-        store.put(f"ranks/{generation}", [f.key.hex() for f in futures], ttl="24h")
-        report = {"gang": gang, "generation": generation, "size": size, "ranks": [f.key.hex() for f in futures]}
-        ctx.report(**report, **({"decision": f"generation {generation}: {why}"} if why else {}))
-        lost: BaseException | None = None
-        lost_rank = -1
+        waits: list[str] = []
+
+        def note(reason: str, generation: int = generation) -> None:
+            if reason not in waits[-1:]:  # one report per new reason
+                waits.append(reason)
+                ctx.report(gang=gang, generation=generation, ranks=[], admission=reason)
+
+        def rank(r: int, size: int = size) -> str:
+            return f"rank {r} of {size}"
+
+        holds = _ledger.admit(
+            f"{rt.tenant}/gang/{gang}",
+            generation,
+            [_ledger.shape(rank_opts)] * size,
+            name=rank,
+            require=_require(rank_opts),
+            note=note,
+        )
+        assert holds is not None  # admit returns None only when told to stop
         try:
-            for f in as_completed(futures):
-                lost_rank = futures.index(f)
-                f.result()  # raises the rank's error
-        except InfrastructureFailure as e:
-            lost = e
-            _await_peer_loss(store.get(f"{generation}/node/{lost_rank}"))
-        except BaseException:
+            _record(store, generation, holds.peers, timeout, collective)
+            futures = [_launch(fn, gang, generation, r, size, args, kwargs, rank_opts, holds) for r in range(size)]
+            store.put(f"ranks/{generation}", [f.key.hex() for f in futures], ttl="24h")
+            report = {"gang": gang, "generation": generation, "size": size, "ranks": [f.key.hex() for f in futures]}
+            ctx.report(**report, **({"decision": f"generation {generation}: {why}"} if why else {}))
+            lost: BaseException | None = None
+            lost_rank, arrived = -1, False
+            try:
+                deadline, pending = time.monotonic() + timeout, futures
+                while pending:
+                    done, pending = wait(pending, num_returns=1, timeout=None if arrived else 0.25)
+                    for f in done:
+                        lost_rank = futures.index(f)
+                        f.result()  # raises the rank's error
+                    arrived = arrived or sum(1 for _ in store.keys(f"{generation}/at/")) >= size
+                    if not arrived and time.monotonic() > deadline:
+                        raise InfrastructureFailure(f"not every rank reached the rendezvous within {timeout:g} s")
+            except InfrastructureFailure as e:
+                where = "" if arrived else f"; {_stages(store, generation, futures, holds.peers)}"
+                lost = InfrastructureFailure(f"{e}{where}") if where else e
+                if not isinstance(e, GangFailed):  # a rank that gave its generation up lives on: no peer to wait for
+                    _await_peer_loss(store.get(f"{generation}/node/{lost_rank}"))
+            except BaseException:
+                for f in futures:
+                    f.cancel(force=True)  # the others may be blocked in a collective with it
+                raise
+            if lost is None:
+                return [f.result() for f in futures]
             for f in futures:
-                f.cancel(force=True)  # the others may be blocked in a collective with it
-            raise
-        if lost is None:
-            return [f.result() for f in futures]
-        for f in futures:
-            f.cancel(force=True)
-        if generation >= attempts:
-            raise GangFailed(f"gang {gang}: generation {generation} lost a rank: {lost}")
+                f.cancel(force=True)
+            if generation >= attempts:
+                if isinstance(lost, GangFailed):
+                    raise lost  # it names the gang, the generation and why
+                raise GangFailed(f"gang {gang}: generation {generation} lost a rank: {lost}")
+        finally:
+            holds.release()
+
+
+def _launch(
+    fn: Any, gang: str, generation: int, rank: int, world: int, args: tuple, kwargs: dict, rank_opts: dict, holds: Any
+) -> Future[Any]:
+    """Start a rank on its peer, with its slot's launch token."""
+    from ._remote import CALL_FUNCTION, Runtime, submit_call
+
+    view = _rank.options(**_pinned(rank_opts, holds.peers[rank]))
+    call = (fn, gang, generation, rank, world, args, kwargs)
+    extra = {"launch": holds.tokens[rank]}
+    return submit_call(Runtime.get(), _rank._fn, call, {}, kind=CALL_FUNCTION, eff=view.policy(), policy_extra=extra)
 
 
 class Gang(Future[list[R]]):
@@ -454,7 +869,9 @@ class Gang(Future[list[R]]):
             pending = [str(self._rt.client.explain(bytes.fromhex(k)).get("pending_reason") or "") for k in ranks]
             info.update(_explain(gang, self.generation, len(ranks), pending))
         else:
-            info.update(generation=0, ranks=[], summary="starting: no rank placed yet")
+            waits = self._latest("admission")
+            summary = f"waiting for every rank's slot to be free: {waits}" if waits else "starting: no rank placed yet"
+            info.update(generation=self.generation, ranks=[], summary=summary)
         return info
 
     def result(self, timeout: float | None = None) -> list[R]:
@@ -489,14 +906,15 @@ def start(fn: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Gang[Any]:
     eff = fn.policy()
     rank_opts = {k: v for k, v in eff.values.items() if k in _RANK_OPTIONS and eff.sources.get(k) != "default"}
     held = tuple(opaque(a) for a in args), {k: opaque(v) for k, v in kwargs.items()}
-    supervisor = (fn, *held, _wanted(eff.get("ranks")), int(eff.get("max_attempts") or 3), rank_opts)
+    timeout = float(eff.get("rendezvous_timeout") or RENDEZVOUS_S)
+    collective = float(eff.get("collective_timeout") or COLLECTIVE_S)
+    want, attempts = _wanted(eff.get("ranks")), int(eff.get("max_attempts") or 3)
+    supervisor = (fn, *held, want, attempts, rank_opts, timeout, collective)
     rt = Runtime.get()
     # The supervisor runs on this program's own peer. Elsewhere, losing its
     # peer would leave its retry queued behind the ranks it has to cancel,
     # which hold every CPU of a full cluster; this peer lives as long as the
     # program that waits for the gang.
-    from ._options import Placement
-
     here = _supervise.options(placement=Placement(require={"node": bytes(rt.info["peer"]).hex()}))
     return submit_call(rt, _supervise._fn, supervisor, {}, kind=CALL_FUNCTION, eff=here.policy(), site=_site(3), future_cls=Gang)
 
@@ -509,7 +927,10 @@ class _RankHost:
     def __init__(self, cls: type, gang: str, generation: int, rank: int, world: int, args: tuple, kwargs: dict) -> None:
         from . import _context
 
-        env = _rendezvous(gang, generation, rank, world)
+        try:
+            env = _rendezvous(gang, generation, rank, world)
+        finally:
+            _hand_off(gang, generation)
         os.environ.update(env)
         self.group = Group(env)
         _context.context().gang = self.group
@@ -519,7 +940,13 @@ class _RankHost:
         from . import _context
 
         _context.context().gang = self.group
-        return getattr(self.obj, method)(*args, **kwargs)
+        try:
+            return getattr(self.obj, method)(*args, **kwargs)
+        except Exception as e:
+            lost = _torch_failure(e, self.group)
+            if lost is None:
+                raise
+            raise lost from e
 
 
 @remote(cpus=0.01)
@@ -560,9 +987,14 @@ class GangActor:
     set up ``torch.distributed``). ``g.method.remote(...)`` runs on every rank
     and gives one future of the list of results; ``g[i]`` is one rank.
 
-    A lost rank breaks the gang: its calls raise ``ch.ActorDied``. Then
-    ``restart()`` builds every rank again as the next generation (restore from
-    your checkpoint in ``__init__``), and ``resize(n)`` does so with n ranks.
+    A lost rank breaks the gang: its calls raise ``ch.ActorDied``. So does a
+    collective that outlasts ``collective_timeout``: every rank's collectives
+    raise the same ``GangFailed``. Then ``restart()`` builds every rank again
+    as the next generation (restore from your checkpoint in ``__init__``), and
+    ``resize(n)`` does so with n ranks.
+
+    Each generation is admitted all or none, as a function gang's: building
+    one waits until the peers hold a slot for every rank.
     """
 
     def __init__(self, cls_view: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
@@ -571,11 +1003,13 @@ class GangActor:
         self._methods = {n for n in dir(self._cls) if not n.startswith("_") and callable(getattr(self._cls, n))}
         rank_opts = {k: v for k, v in eff.values.items() if k in _RANK_OPTIONS and eff.sources.get(k) != "default"}
         self._rank_opts = rank_opts
-        self._host = _RankHost.options(**rank_opts) if rank_opts else _RankHost
         self._args, self._kwargs = args, kwargs
         self.id = blake3_digest(os.urandom(16))[:8].hex()
         self.generation = 0
+        self._timeout = float(eff.get("rendezvous_timeout") or RENDEZVOUS_S)
+        self._collective_timeout = float(eff.get("collective_timeout") or COLLECTIVE_S)
         self._hosts: list[Any] = []
+        self._holds: _ledger.Holds | None = None
         self._want = _wanted(eff.get("ranks"))
         self.decisions: list[str] = []
         self._build(self._sized(first=True))
@@ -587,11 +1021,30 @@ class GangActor:
         return size
 
     def _build(self, size: int) -> None:
+        from ._remote import Runtime, _create_actor
+        from ._store import Store
+
         self.generation += 1
-        self._hosts = [
-            self._host.remote(self._cls, self.id, self.generation, r, size, self._args, self._kwargs)
-            for r in range(size)
-        ]
+        rt = Runtime.get()
+        # An actor holds only the CPUs it asks for: so does its slot.
+        holds = _ledger.admit(
+            f"{rt.tenant}/gang/{self.id}",
+            self.generation,
+            [_ledger.shape(self._rank_opts, cpus=0.0)] * size,
+            name=lambda r: f"rank {r} of {size}",
+            require=_require(self._rank_opts),
+        )
+        assert holds is not None  # admit returns None only when told to stop
+        self._holds = holds
+        try:
+            _record(Store(f"gang/{self.id}"), self.generation, holds.peers, self._timeout, self._collective_timeout)
+            for r in range(size):
+                view = _RankHost.options(**_pinned(self._rank_opts, holds.peers[r]))
+                ctor = (self._cls, self.id, self.generation, r, size, self._args, self._kwargs)
+                self._hosts.append(_create_actor(rt, view._cls, view.policy(), ctor, {}, {"launch": holds.tokens[r]}))
+        except BaseException:
+            self.close()  # the ranks built so far end, and the slots not taken are free again
+            raise
 
     def __len__(self) -> int:
         return len(self._hosts)
@@ -620,6 +1073,8 @@ class GangActor:
         for h in self._hosts:
             h.close()
         self._hosts = []
+        if self._holds is not None:
+            self._holds.release()
 
     def explain(self) -> dict[str, Any]:
         """Where each rank is (its last collective); ``summary`` names the ranks holding the others up."""
@@ -652,6 +1107,7 @@ class GroupHandle:
     key: str
     generation: int
     members: tuple[str, ...]
+    collective_timeout: float = COLLECTIVE_S  # for a generation its members create
 
     def join(self) -> Group:
         from . import _context
@@ -666,7 +1122,12 @@ class GroupHandle:
         with lock:  # one rendezvous per member, even with concurrent calls
             joined = _joined.get(entry)
             if joined is None:
-                env = _rendezvous(f"group-{self.key}", self.generation, self.members.index(me), len(self.members))
+                gang = f"group-{self.key}"
+                try:
+                    rank, world = self.members.index(me), len(self.members)
+                    env = _rendezvous(gang, self.generation, rank, world, self.collective_timeout)
+                finally:
+                    _hand_off(gang, self.generation)
                 joined = _joined[entry] = Group(env)
             return joined
 
@@ -675,10 +1136,15 @@ class GroupHandle:
         return _explain(f"group-{self.key}", self.generation, len(self.members))
 
 
-def group(*actors: Any, name: str | None = None) -> GroupHandle:
+def group(*actors: Any, name: str | None = None, collective_timeout: float = COLLECTIVE_S) -> GroupHandle:
     """Make `actors` one collective group (ranks in the order given). Calling it
-    again with the same ``name`` starts a new generation, for a changed set."""
+    again with the same ``name`` starts a new generation, for a changed set.
+    A member waits in one collective at most ``collective_timeout`` seconds;
+    past it the generation is lost, and every member's collectives raise
+    ``GangFailed`` until a new generation."""
     from ._store import Store
+
+    collective = _pos_float("collective_timeout", collective_timeout)
 
     if not actors:
         raise ValueError("ch.dist.group needs at least one actor")
@@ -689,5 +1155,7 @@ def group(*actors: Any, name: str | None = None) -> GroupHandle:
     if len(set(ids)) != len(ids):
         raise ValueError("ch.dist.group: an actor appears more than once")
     key = name or os.urandom(8).hex()
-    generation = Store(f"gang/group-{key}").counter("declared").add(1)
-    return GroupHandle(key, generation, ids)
+    store = Store(f"gang/group-{key}")
+    generation = store.counter("declared").add(1)
+    _record(store, generation, [None] * len(ids), RENDEZVOUS_S, collective)
+    return GroupHandle(key, generation, ids, collective)

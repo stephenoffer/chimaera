@@ -18,7 +18,7 @@ impl openraft::testing::log::StoreBuilder<TypeConfig, LogStore, StateMachine, te
         let sm_db = Arc::new(Database::create(dir.path().join("sm.redb")).unwrap());
         create_tables(&log_db, &sm_db).unwrap();
         std::fs::create_dir_all(dir.path().join("snap")).unwrap();
-        let writer = DiskWriter::start(log_db.clone()).unwrap();
+        let writer = DiskWriter::start(log_db.clone(), MAX_COMMIT_DELAY, None).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1 << 16);
         std::mem::forget(rx); // the suite never reads events; keep sends from failing
         let log = LogStore::new(7, log_db, writer);
@@ -264,7 +264,7 @@ async fn reads_racing_flushes_never_see_a_gap() {
     let log_db = Arc::new(open_db(&dir.path().join("log.redb"), DiskDurability::Process).unwrap());
     let sm_db = Arc::new(open_db(&dir.path().join("sm.redb"), DiskDurability::Process).unwrap());
     create_tables(&log_db, &sm_db).unwrap();
-    let writer = DiskWriter::start(log_db.clone()).unwrap();
+    let writer = DiskWriter::start(log_db.clone(), MAX_COMMIT_DELAY, None).unwrap();
     let mut log = LogStore::new(3, log_db, writer);
     let last = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -440,6 +440,68 @@ async fn a_new_snapshot_deletes_the_one_it_replaces() {
     wait_leader(&g).await;
     g.linearizable().await.unwrap();
     assert_eq!(g.read(|kv| read::ready(kv, 3, 1000).len()).unwrap(), 60);
+}
+
+/// A peer that syncs its log leaves its state machine's file unsynced: after
+/// a machine restart without a clean stop the file may be torn, and is
+/// rebuilt from the snapshot file, with the log replaying what came after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_restart_rebuilds_the_state_from_the_snapshot_and_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (host, rx) = RaftHost::open(dir.path(), 1, Arc::new(NoTransport), DiskDurability::Os).unwrap();
+        std::mem::forget(rx);
+        let g = host.start_group(0, members(&[1]), true).await.unwrap();
+        wait_leader(&g).await;
+        setup_run(&g, 3).await;
+        for i in 0..20 {
+            g.propose(&submit(3, i)).await.unwrap();
+        }
+        let applied = g.raft.metrics().borrow_watched().last_applied.unwrap().index;
+        g.raft.trigger().snapshot().await.unwrap();
+        wait_snapshot_past(&g, applied).await;
+        for i in 20..40 {
+            g.propose(&submit(3, i)).await.unwrap(); // in the log only
+        }
+        g.shutdown().await;
+    }
+    // The machine restarts: the marker is from another boot, and the file
+    // never synced is garbage (as a torn one could be).
+    std::fs::write(dir.path().join("raft-sm.state"), "another-boot\nrunning\n").unwrap();
+    std::fs::write(dir.path().join("raft-sm.redb"), vec![7u8; 4096]).unwrap();
+    let mut reopened = None;
+    for _ in 0..100 {
+        match RaftHost::open(dir.path(), 1, Arc::new(NoTransport), DiskDurability::Os) {
+            Ok(h) => {
+                reopened = Some(h);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let (host, _rx) = reopened.expect("reopened after rebuilding the state machine");
+    let g = host.start_group(0, members(&[1]), true).await.unwrap();
+    wait_leader(&g).await;
+    g.linearizable().await.unwrap();
+    assert_eq!(g.read(|kv| read::ready(kv, 3, 1000).len()).unwrap(), 40, "20 from the snapshot, 20 replayed");
+    let r = g.propose(&submit(3, 39)).await.unwrap();
+    let Some(pb::shard_reply::Body::Tasks(acks)) = r.body else { panic!("{r:?}") };
+    assert_eq!(acks.acks[0].status(), pb::task_ack::Status::Duplicate, "the replayed call is known");
+    let marker = std::fs::read_to_string(dir.path().join("raft-sm.state")).unwrap();
+    assert!(marker.ends_with("running\n") && !marker.starts_with("another-boot"), "{marker}");
+}
+
+#[test]
+fn the_state_machine_file_is_trusted_unless_a_machine_restart_may_have_torn_it() {
+    use crate::state_machine::{mark_sm, sm_trusted};
+    let dir = tempfile::tempdir().unwrap();
+    assert!(sm_trusted(dir.path()), "no marker: new, or synced by an earlier version");
+    mark_sm(dir.path(), false).unwrap();
+    assert!(sm_trusted(dir.path()), "running in this boot: a process restart keeps the page cache");
+    std::fs::write(dir.path().join("raft-sm.state"), "another-boot\nrunning\n").unwrap();
+    assert!(!sm_trusted(dir.path()), "another boot, no clean stop: maybe torn");
+    std::fs::write(dir.path().join("raft-sm.state"), "another-boot\nclean\n").unwrap();
+    assert!(sm_trusted(dir.path()), "stopped cleanly: synced before the restart");
 }
 
 /// Snapshots follow the log's size: once the log since the last snapshot
@@ -677,4 +739,438 @@ async fn a_swapped_out_voter_stops_hearing_from_the_leader_that_dropped_it() {
     assert!(gone > Duration::from_secs(1) && kept < Duration::from_secs(1), "removed {gone:?}, kept {kept:?}");
     assert_eq!(group(1).since_leader_contact(), None, "the leader does not count contact with itself");
     drop(h4);
+}
+
+/// A disk whose every sync takes `delay`, as a network volume's does; it
+/// counts the syncs it was asked for. Once `gone` is set it takes no more
+/// writes, as when the machine loses its power or its volume.
+#[derive(Debug)]
+struct SlowDisk {
+    inner: backend::OsSyncBackend,
+    delay: Duration,
+    syncs: Arc<std::sync::atomic::AtomicU64>,
+    gone: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SlowDisk {
+    fn here(&self) -> Result<(), redb::BackendError> {
+        if self.gone.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("the disk is gone").into());
+        }
+        Ok(())
+    }
+}
+
+impl redb::StorageBackend for SlowDisk {
+    fn len(&self) -> Result<u64, redb::BackendError> {
+        self.inner.len()
+    }
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), redb::BackendError> {
+        self.inner.read(offset, out)
+    }
+    fn set_len(&self, len: u64) -> Result<(), redb::BackendError> {
+        self.here()?;
+        self.inner.set_len(len)
+    }
+    fn sync_data(&self) -> Result<(), redb::BackendError> {
+        self.here()?;
+        std::thread::sleep(self.delay);
+        self.syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.sync_data()
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), redb::BackendError> {
+        self.here()?;
+        self.inner.write(offset, data)
+    }
+    fn close(&self) -> Result<(), redb::BackendError> {
+        self.inner.close()
+    }
+    fn try_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, redb::BackendError> {
+        self.inner.try_lock_range(start, end)
+    }
+}
+
+/// What a closed loop of writers saw on a slow disk.
+struct Loop {
+    per_second: f64,
+    wait_p99_us: u64,
+    disk: DiskReport,
+    syncs: u64,
+}
+
+/// `clients` groups, each writing one record after another for `run` on a
+/// disk whose syncs take `sync`, with batches held open at most `max_hold`.
+/// With `with_wal` each batch is first synced in a write-ahead file and then
+/// put in redb unsynced, as on every syncing peer (`RaftHost::open`); `sync`
+/// then slows only redb's checkpoints, since the wal syncs a plain file.
+/// Without it every commit is a synced redb transaction.
+async fn closed_loop(clients: u32, sync: Duration, max_hold: Duration, run: Duration, with_wal: bool) -> Loop {
+    use openraft::storage::RaftLogStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let syncs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let disk = backend::OsSyncBackend::open(&dir.path().join("log.redb"), true).unwrap();
+    let db = Database::builder().create_with_backend(SlowDisk {
+        inner: disk,
+        delay: sync,
+        syncs: syncs.clone(),
+        gone: Arc::default(),
+    });
+    let db = Arc::new(db.unwrap());
+    let txn = db.begin_write().unwrap();
+    txn.open_table(log_store::LOG).unwrap();
+    txn.open_table(log_store::LOG_META).unwrap();
+    txn.commit().unwrap();
+    let wal = with_wal.then(|| wal::Wal::recover(&db, &dir.path().join("log.wal"), false).unwrap().0);
+    let writer = DiskWriter::start(db.clone(), max_hold, wal).unwrap();
+    let stats = writer.stats();
+    let before = syncs.load(std::sync::atomic::Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
+    let mut joins = Vec::new();
+    for g in 0..clients {
+        let mut log = LogStore::new(g, db.clone(), writer.clone());
+        joins.push(tokio::spawn(async move {
+            let mut waits = Vec::new();
+            for i in 1.. {
+                if t0.elapsed() >= run {
+                    break;
+                }
+                let t = std::time::Instant::now();
+                log.save_committed(Some(openraft::testing::log_id::<TypeConfig>(1, 1, i))).await.unwrap();
+                waits.push(t.elapsed().as_micros() as u64);
+            }
+            waits
+        }));
+    }
+    let mut waits = Vec::new();
+    for j in joins {
+        waits.extend(j.await.unwrap());
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    waits.sort_unstable();
+    Loop {
+        per_second: waits.len() as f64 / elapsed,
+        wait_p99_us: waits[waits.len() * 99 / 100],
+        disk: stats.report(),
+        syncs: syncs.load(std::sync::atomic::Ordering::Relaxed) - before,
+    }
+}
+
+/// On a disk whose fsync takes 5 ms every commit still syncs (the durability
+/// asked for is kept), the slowness shows in the writer's report, and the
+/// writer holds batches open (never past its maximum) so more operations
+/// share each fsync than when it commits whatever happens to be queued.
+/// It runs without the wal, whose sync cannot be slowed here; the writer
+/// times a commit, holds and reports the same way on both paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_slow_disk_keeps_every_commit_synced_and_batches_more() {
+    let sync = Duration::from_millis(5);
+    let run = Duration::from_millis(1500);
+    let max = Duration::from_micros(1000); // under a quarter of a commit: the maximum binds
+    let eager = closed_loop(8, sync, Duration::ZERO, run, false).await;
+    let held = closed_loop(8, sync, max, run, false).await;
+    let per_commit = |l: &Loop| l.disk.operations as f64 / l.disk.commits as f64;
+    for (name, l) in [("eager", &eager), ("held", &held)] {
+        eprintln!(
+            "{name}: {:.0} ops/s, p99 wait {} us, {:.1} ops per commit, commit p50 {} us, held at most {} us",
+            l.per_second,
+            l.wait_p99_us,
+            per_commit(l),
+            l.disk.commit_p50_us,
+            l.disk.hold_max_us
+        );
+        assert!(l.syncs >= l.disk.commits && l.disk.commits > 0, "{name}: a commit skipped its fsync");
+        assert!(u64::from(l.disk.commit_p50_us) >= 5000, "{name}: the report hides the slow disk");
+    }
+    assert_eq!(eager.disk.hold_max_us, 0, "with no hold allowed the writer held a batch open");
+    assert!(held.disk.hold_max_us > 0, "the writer never held a batch open on a slow disk");
+    assert!(held.disk.hold_max_us <= 1000, "a batch was held {} us, past its maximum", held.disk.hold_max_us);
+    assert!(
+        per_commit(&held) > per_commit(&eager) * 1.2,
+        "holding did not batch more: {:.1} vs {:.1} operations per commit",
+        per_commit(&held),
+        per_commit(&eager)
+    );
+}
+
+/// Commits per second and p99 wait on a slow disk, with and without holding
+/// batches open. Run with `--ignored --nocapture`; MEASURE_SYNC_US sets the
+/// disk's sync time (default 5000) and MEASURE_CLIENTS the writers (16).
+/// MEASURE_SYNC_US=0 runs the path a syncing peer takes, through the wal; to
+/// measure a real volume, set it and TMPDIR to a directory on the volume. Any
+/// other value adds that sleep to redb's sync and runs without the wal, every
+/// commit a synced redb transaction, since the wal's sync cannot be slowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "measurement: run with --ignored --nocapture"]
+async fn measure_group_commit_hold_on_a_slow_disk() {
+    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let sync = Duration::from_micros(env("MEASURE_SYNC_US", 5000));
+    let clients = env("MEASURE_CLIENTS", 16) as u32;
+    let with_wal = sync.is_zero();
+    let path = if with_wal { "wal" } else { "synced redb" };
+    // Each setting twice, in mirrored order, so drift in the machine's load
+    // does not favor one.
+    for max in [Duration::ZERO, MAX_COMMIT_DELAY, MAX_COMMIT_DELAY, Duration::ZERO] {
+        let l = closed_loop(clients, sync, max, Duration::from_secs(5), with_wal).await;
+        eprintln!(
+            "{path}, sync +{sync:?}, {clients} writers, hold at most {max:?}: {:.0} ops/s, p99 wait {} us, {:.1} \
+             ops per commit, commit p50 {} us, p99 {} us, held at most {} us",
+            l.per_second,
+            l.wait_p99_us,
+            l.disk.operations as f64 / l.disk.commits as f64,
+            l.disk.commit_p50_us,
+            l.disk.commit_p99_us,
+            l.disk.hold_max_us
+        );
+    }
+}
+
+/// How a transfer damages the snapshot it carries.
+#[derive(Clone, Copy, Debug)]
+enum Damage {
+    /// Keep only the first bytes, as a stream cut short.
+    Cut(usize),
+    /// Flip a byte, counted from the end when negative.
+    Flip(isize),
+}
+
+/// Delivers snapshots damaged in turn as `damage` lists, then whole.
+struct Damaging {
+    net: Arc<LocalNet>,
+    damage: Mutex<std::collections::VecDeque<Damage>>,
+}
+
+impl Transport for Damaging {
+    fn call(&self, target: NodeId, addr: &str, group: u32, kind: RpcKind, body: Vec<u8>) -> RpcFuture {
+        self.net.call(target, addr, group, kind, body)
+    }
+
+    fn send_snapshot(
+        &self,
+        target: NodeId,
+        _addr: &str,
+        _group: u32,
+        header: Vec<u8>,
+        mut file: std::fs::File,
+    ) -> RpcFuture {
+        use std::io::Read;
+        let g = self.net.nodes.lock().unwrap().get(&target).cloned();
+        let scratch = self.net.scratch.lock().unwrap().clone().unwrap();
+        let damage = self.damage.lock().unwrap().pop_front();
+        Box::pin(async move {
+            let g = g.ok_or_else(|| std::io::Error::other(format!("node {target} is down")))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            match damage {
+                Some(Damage::Cut(n)) => bytes.truncate(n),
+                Some(Damage::Flip(at)) => {
+                    let at = if at < 0 { bytes.len() - at.unsigned_abs() } else { at as usize };
+                    bytes[at] ^= 0x01;
+                }
+                None => {}
+            }
+            let path = scratch.join(format!("incoming-{target}-{}.snap", std::process::id()));
+            std::fs::write(&path, &bytes)?;
+            let r = handle_snapshot(&g, &header, &path).await;
+            let _ = std::fs::remove_file(&path);
+            r
+        })
+    }
+}
+
+/// A leader whose group's log before its snapshot is purged, so a new
+/// member can only catch up from that snapshot. Returns the snapshot file.
+async fn leader_with_a_snapshot(h: &RaftHost, net: &LocalNet, dir: &std::path::Path) -> (Group, std::path::PathBuf) {
+    let leader = h.start_group(0, members(&[1]), true).await.unwrap();
+    net.nodes.lock().unwrap().insert(1, leader.clone());
+    wait_leader(&leader).await;
+    setup_run(&leader, 9).await;
+    for i in 0..30 {
+        leader.propose(&submit(9, i)).await.unwrap();
+    }
+    let applied = leader.raft.metrics().borrow_watched().last_applied.unwrap().index;
+    leader.raft.trigger().snapshot().await.unwrap();
+    wait_snapshot_past(&leader, applied).await;
+    leader.raft.trigger().purge_log(applied).await.unwrap();
+    for _ in 0..200 {
+        if leader.raft.metrics().borrow_watched().purged.is_some_and(|p| p.index >= applied) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let file = dir.join("snapshots").join(snapshot_files(dir).pop().unwrap());
+    (leader, file)
+}
+
+/// A snapshot transfer interrupted at each point (in the meta, in the
+/// checksum, before the first record, part way, at the last byte) or changed
+/// in transit (the checksum, a record) is refused by the receiving replica
+/// without stopping its group, and the next whole transfer installs: the
+/// learner ends with the leader's state and one snapshot, never a prefix of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_damaged_snapshot_transfer_is_refused_and_the_next_whole_one_installs() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    *net.scratch.lock().unwrap() = Some(dir.path().to_path_buf());
+    let damaging = Arc::new(Damaging { net: net.clone(), damage: Mutex::default() });
+    let (h1, rx) = RaftHost::open(&dir.path().join("n1"), 1, damaging.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let (leader, file) = leader_with_a_snapshot(&h1, &net, &dir.path().join("n1")).await;
+    let bytes = std::fs::read(&file).unwrap();
+    // The header is `[u32 len][meta, format, group, hash]`; the records follow it.
+    let (size, head) = (bytes.len(), 4 + u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize);
+    *damaging.damage.lock().unwrap() = [
+        Damage::Cut(0),
+        Damage::Cut(6),
+        Damage::Cut(head - 16),
+        Damage::Cut(head),
+        Damage::Cut(size / 2),
+        Damage::Cut(size - 1),
+        Damage::Flip(head as isize - 1),
+        Damage::Flip(size as isize / 2),
+        Damage::Flip(-1),
+    ]
+    .into_iter()
+    .collect();
+    let (h2, rx) = RaftHost::open(&dir.path().join("n2"), 2, damaging.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let learner = h2.start_group(0, BTreeMap::new(), false).await.unwrap();
+    net.nodes.lock().unwrap().insert(2, learner.clone());
+    tokio::time::timeout(Duration::from_secs(120), leader.add_learner(2, "node-2")).await.unwrap().unwrap();
+    assert!(damaging.damage.lock().unwrap().is_empty(), "every damaged transfer was tried");
+    for _ in 0..200 {
+        if learner.read(|kv| read::ready(kv, 9, 1000).len()).unwrap() == 30 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(learner.read(|kv| read::ready(kv, 9, 1000).len()).unwrap(), 30);
+    assert_eq!(snapshot_files(&dir.path().join("n2")), snapshot_files(&dir.path().join("n1")));
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.path().is_file()).collect();
+    assert!(leftovers.is_empty(), "transfers left {leftovers:?}");
+    drop((h1, h2));
+}
+
+/// Installing a damaged snapshot file over one the group already installed
+/// fails before anything changes: the group keeps its state, position and
+/// snapshot, and the damaged file is not kept. So does an install whose disk
+/// stops taking writes after the new file is in place but before the commit
+/// that points at it, once the peer restarts. The whole file then installs
+/// and replaces the old snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_damaged_snapshot_install_leaves_the_state_it_had() {
+    use openraft::storage::RaftStateMachine;
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    let n1 = dir.path().join("n1");
+    let (h1, rx) = RaftHost::open(&n1, 1, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let (leader, first) = leader_with_a_snapshot(&h1, &net, &n1).await;
+    let (old_meta, old) = (snapshot_file::check(&first, 0).unwrap(), std::fs::read(&first).unwrap());
+    // The leader's next snapshot, ten commands later: the one to install over the first.
+    for i in 30..40 {
+        leader.propose(&submit(9, i)).await.unwrap();
+    }
+    let applied = leader.raft.metrics().borrow_watched().last_applied.unwrap().index;
+    leader.raft.trigger().snapshot().await.unwrap();
+    wait_snapshot_past(&leader, applied).await;
+    let name = snapshot_files(&n1).pop().unwrap();
+    let file = n1.join("snapshots").join(&name);
+    let (meta, good) = (snapshot_file::check(&file, 0).unwrap(), std::fs::read(&file).unwrap());
+
+    let d = dir.path().join("n2");
+    std::fs::create_dir_all(d.join("snapshots")).unwrap();
+    let log_db = Database::create(d.join("log.redb")).unwrap();
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let disk = SlowDisk {
+        inner: backend::OsSyncBackend::open(&d.join("sm.redb"), true).unwrap(),
+        delay: Duration::ZERO,
+        syncs: Arc::default(),
+        gone: gone.clone(),
+    };
+    let sm_db = Arc::new(Database::builder().create_with_backend(disk).unwrap());
+    create_tables(&log_db, &sm_db).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    std::mem::forget(rx);
+    let mut sm = StateMachine::new(0, sm_db.clone(), tx.clone(), d.join("snapshots"));
+    let bad = d.join("bad");
+    std::fs::write(&bad, &old).unwrap();
+    sm.install_snapshot(&old_meta, std::fs::File::open(&bad).unwrap()).await.unwrap();
+    let state = |db: &Database| GroupRead::open(db, 0).unwrap().scan_prefix(b"", usize::MAX);
+    let ready = |db: &Database| read::ready(&GroupRead::open(db, 0).unwrap(), 9, 1000).len();
+    let (before, files) = (state(&sm_db), snapshot_files(&d));
+    assert_eq!((ready(&sm_db), files.len()), (30, 1));
+
+    let mut flipped = good.clone();
+    flipped[good.len() / 3] ^= 0x04;
+    // Cut, cut by a byte, changed, and whole but taken at another position than the leader said.
+    let damaged =
+        [(good[..good.len() / 2].to_vec(), &meta), (good[..good.len() - 1].to_vec(), &meta), (flipped, &meta)];
+    for (bytes, said) in damaged.into_iter().chain([(good.clone(), &old_meta)]) {
+        std::fs::write(&bad, &bytes).unwrap();
+        let r = sm.install_snapshot(said, std::fs::File::open(&bad).unwrap()).await;
+        assert!(r.is_err(), "a damaged snapshot installed");
+        assert_eq!(sm.applied_state().await.unwrap().0, old_meta.last_log_id, "the position moved");
+        assert_eq!(sm.get_current_snapshot().await.unwrap().unwrap().meta, old_meta, "the snapshot pointer moved");
+        assert!(state(&sm_db) == before, "the state changed");
+        assert_eq!(snapshot_files(&d), files);
+    }
+    // The disk stops taking writes once the whole file is checked and renamed
+    // into place, so the commit that points at it fails. The peer restarts:
+    // the database has its last commit, and opening deletes the file no group
+    // points at (and the temporary file a stop before the rename leaves).
+    gone.store(true, std::sync::atomic::Ordering::Relaxed);
+    std::fs::write(&bad, &good).unwrap();
+    assert!(sm.install_snapshot(&meta, std::fs::File::open(&bad).unwrap()).await.is_err(), "it committed");
+    assert!(snapshot_files(&d).contains(&name), "the new file was not in place before the commit");
+    std::fs::write(d.join("snapshots").join(&name).with_extension("tmp"), &good).unwrap();
+    drop((sm, sm_db));
+    let sm_db = Arc::new(Database::create(d.join("sm.redb")).unwrap());
+    state_machine::prune_snapshots(&sm_db, &d.join("snapshots"), &d).unwrap();
+    let mut sm = StateMachine::new(0, sm_db.clone(), tx, d.join("snapshots"));
+    assert_eq!(sm.applied_state().await.unwrap().0, old_meta.last_log_id, "the position moved");
+    assert_eq!(sm.get_current_snapshot().await.unwrap().unwrap().meta, old_meta, "the snapshot pointer moved");
+    assert!(state(&sm_db) == before, "the state changed");
+    assert_eq!(snapshot_files(&d), files);
+
+    std::fs::write(&bad, &good).unwrap();
+    sm.install_snapshot(&meta, std::fs::File::open(&bad).unwrap()).await.unwrap();
+    assert_eq!(sm.applied_state().await.unwrap().0, meta.last_log_id);
+    assert_eq!((ready(&sm_db), snapshot_files(&d)), (40, vec![name]), "the old snapshot is deleted");
+    drop(h1);
+}
+
+/// A leader whose own snapshot was damaged on disk does not send it on: it
+/// takes a new one from its state, and a learner catches up from that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_replaces_a_damaged_snapshot_before_sending_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let net = Arc::new(LocalNet::default());
+    *net.scratch.lock().unwrap() = Some(dir.path().to_path_buf());
+    let n1 = dir.path().join("n1");
+    let (h1, rx) = RaftHost::open(&n1, 1, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let (leader, file) = leader_with_a_snapshot(&h1, &net, &n1).await;
+    let mut bytes = std::fs::read(&file).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x01;
+    std::fs::write(&file, &bytes).unwrap();
+    let (h2, rx) = RaftHost::open(&dir.path().join("n2"), 2, net.clone(), DiskDurability::Os).unwrap();
+    std::mem::forget(rx);
+    let learner = h2.start_group(0, BTreeMap::new(), false).await.unwrap();
+    net.nodes.lock().unwrap().insert(2, learner.clone());
+    tokio::time::timeout(Duration::from_secs(20), leader.add_learner(2, "node-2")).await.unwrap().unwrap();
+    for _ in 0..200 {
+        if learner.read(|kv| read::ready(kv, 9, 1000).len()).unwrap() == 30 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(learner.read(|kv| read::ready(kv, 9, 1000).len()).unwrap(), 30);
+    let current = n1.join("snapshots").join(snapshot_files(&n1).pop().unwrap());
+    snapshot_file::check(&current, 0).unwrap();
+    drop((h1, h2));
 }

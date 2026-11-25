@@ -8,6 +8,10 @@ exits non-zero if any fails.
 - concurrent ``gpus=1`` calls get different GPUs; a CPU call sees none;
 - a 2-rank gang initializes NCCL through ``group.torch()`` and all-reduces on
   the GPUs;
+- two gangs that each need every GPU run one after the other, each on all of
+  them, and leave no hold on the peer's ledger;
+- an NCCL all-reduce one rank never joins is timed out by torch's watchdog
+  at the gang's ``collective_timeout``, and the gang reforms;
 - a CUDA tensor passed between calls is rebuilt where its reader is: on a GPU
   call's GPU, on a CPU call's CPU, and on the driver's GPU;
 - the node's driver files are copied to OUT/fixture, a real topology tree to
@@ -74,6 +78,30 @@ def nccl_rank() -> tuple[int, float, str]:
     return g.rank, t.item(), dist.get_backend()
 
 
+@ch.remote(gpus=1)
+def nccl_rank_late_once() -> tuple[int, float]:
+    import torch
+
+    g = ch.context().gang
+    dist = g.torch()
+    t = torch.tensor([float(g.rank + 1)], device="cuda:0")
+    dist.all_reduce(t)  # both ranks: NCCL's communicator is up
+    if g.generation == 1 and g.rank == 1:
+        time.sleep(600)  # never joins the next: torch's watchdog times rank 0's out at collective_timeout
+    dist.all_reduce(t)
+    return g.generation, t.item()
+
+
+@ch.remote(gpus=1, cpus=0.25)
+def whole_node_rank() -> tuple[float, float, str]:
+    g = ch.context().gang
+    start = time.time()
+    g.barrier()
+    time.sleep(2.0)  # both gangs would overlap here if each held part of the node
+    g.barrier()
+    return start, time.time(), os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
+
 def capture(out: str) -> int:
     """Copy the files CUDA discovery reads into OUT/fixture; the number of GPUs found there."""
     root = os.path.join(out, "fixture")
@@ -130,6 +158,23 @@ def main() -> int:
     if len(uuids) >= 2:
         ranks = nccl_rank.options(ranks=2).gang().result(timeout=600)
         check("a 2-rank gang all-reduces over NCCL", ranks == [(0, 3.0, "nccl"), (1, 3.0, "nccl")], ranks=ranks)
+        from chimaera._ledger import holds_on
+
+        gangs = [whole_node_rank.options(ranks=len(uuids)).gang() for _ in range(2)]
+        spans = [g.result(timeout=600) for g in gangs]
+        (_, first_end), (second_start, _) = sorted((min(r[0] for r in s), max(r[1] for r in s)) for s in spans)
+        check("two gangs that each need every GPU run one after the other", first_end <= second_start)
+        check("each such gang has every GPU", all(sorted(r[2] for r in s) == uuids for s in spans), spans=spans)
+        check("no hold remains on the peer's ledger", holds_on() == [], holds=holds_on())
+        start = time.monotonic()
+        late = nccl_rank_late_once.options(ranks=2, collective_timeout=30).gang().result(timeout=600)
+        seconds = time.monotonic() - start
+        check(
+            "an NCCL all-reduce a rank never joins reforms the gang at collective_timeout",
+            late == [(2, 6.0), (2, 6.0)] and seconds < 180,
+            ranks=late,
+            seconds=round(seconds, 1),
+        )
     return 1 if failed else 0
 
 

@@ -636,6 +636,213 @@ def test_a_large_plain_dict_round_trips_through_put_an_argument_and_a_result():
     assert back == d and type(back["k1"][4]) is bool and type(back["k1"][5]) is tuple
 
 
+class _DriverA:
+    """Another program (driver A, a run of its own): it stores `held` (64 MiB)
+    and `loose` (both escaped, so only their run's end frees them), runs
+    `handover` to pass `held` on, and exits when told to."""
+
+    CODE = """
+import os, pickle, sys
+import numpy as np
+import chimaera as ch
+
+held = ch.put(np.full(1 << 23, 7.0))
+loose = ch.put(np.full(1 << 20, 1.0))
+pickle.dumps(loose)
+{handover}
+names = lambda f: [os.path.basename(p) for p in f._owned]
+print(held._put[0].hex(), ",".join(names(held)), ",".join(names(loose)), flush=True)
+sys.stdin.readline()
+"""
+
+    def __init__(self, handover: str) -> None:
+        import subprocess
+
+        from conftest import REPO
+
+        env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
+        code = self.CODE.format(handover=handover)
+        pipe = subprocess.PIPE
+        self.proc = subprocess.Popen([sys.executable, "-c", code], stdin=pipe, stdout=pipe, text=True, env=env)
+        self.run, self.held, self.loose = self.proc.stdout.readline().split()
+        assert all(self.exists(self.held)) and all(self.exists(self.loose)), (self.held, self.loose)
+
+    def exists(self, names: str) -> list[bool]:
+        return [os.path.exists(os.path.join(Runtime.get().object_dir, self.run, n)) for n in names.split(",")]
+
+    def exit(self) -> None:
+        """A exits: its run ends, and its values with it, but not `held`."""
+        self.proc.communicate("go\n", timeout=60)
+        deadline = time.monotonic() + 60
+        while any(self.exists(self.loose)) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not any(self.exists(self.loose)), "A's run ended, and its values with it"
+        assert all(self.exists(self.held)), "a value another run holds stays"
+
+    def stored(self) -> int:
+        """Bytes the peer stores for A's run (``chimaera objects --json``)."""
+        import subprocess
+
+        from conftest import BIN
+
+        out = subprocess.run([BIN, "--dir", Runtime.get().home, "objects", "--json"], capture_output=True, text=True)
+        return sum(r["memory_bytes"] + r["disk_bytes"] for r in json.loads(out.stdout)["runs"] if r["run"] == self.run)
+
+    def wait_reclaimed(self) -> None:
+        deadline = time.monotonic() + 60
+        while self.stored() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert self.stored() == 0, "the last holder let go: the peer reclaims the value"
+        assert not any(self.exists(self.held))
+
+
+def test_a_value_another_driver_holds_outlives_its_driver_until_released(tmp_path):
+    # This driver (B, another run) unpickles A's handle, and so holds the
+    # value: it reads it after A exits, and once it lets go the peer reclaims it.
+    import pickle
+
+    handle = tmp_path / "handle"
+    a = _DriverA(f"open({str(handle)!r}, 'wb').write(pickle.dumps(held))")
+    h = pickle.loads(handle.read_bytes())
+    a.exit()
+    v = h.result(timeout=60)
+    assert v.shape == (1 << 23,) and float(v.sum()) == 7.0 * (1 << 23)
+    del v, h
+    gc.collect()
+    a.wait_reclaimed()
+
+
+def test_a_value_held_again_as_its_last_handle_goes_stays_held(tmp_path):
+    # A dropped handle's release is sent without waiting, and unpickling the
+    # value again sends a hold straight after it: the peer commits the two in
+    # that order, so each of these values outlives A.
+    import pickle
+
+    from chimaera import _leases
+
+    handle = tmp_path / "handles"
+    a = _DriverA(
+        "many = [ch.put(np.full(1 << 13, float(i))) for i in range(64)]\n"
+        f"open({str(handle)!r}, 'wb').write(pickle.dumps((held, [pickle.dumps(v) for v in many])))"
+    )
+    h, many = pickle.loads(handle.read_bytes())
+    kept = []
+    for data in many:
+        pickle.loads(data)  # held, and let go at once
+        kept.append(pickle.loads(data))
+    assert len(_leases._releases) == 1 + len(kept), "each dropped handle let go as it went"
+    a.exit()
+    assert [float(k.result(timeout=60)[0]) for k in kept] == [float(i) for i in range(64)]
+    del h, kept
+    gc.collect()
+    a.wait_reclaimed()
+
+
+def test_an_actor_holds_a_value_another_run_passed_it_until_it_lets_go():
+    # The actor is this run's; A's call hands it a handle to A's value, which
+    # it keeps past A's end.
+    @ch.remote
+    class Keeper:
+        def keep(self, box):
+            self.box = box
+
+        def total(self) -> float:
+            return float(self.box[0].result().sum())
+
+        def drop(self) -> None:
+            self.box = None
+
+    k = Keeper.options(name="test_values/keeper").remote()
+    a = _DriverA('ch.actor("test_values/keeper").keep.remote(ch.handles([held])).result(timeout=60)')
+    a.exit()
+    assert k.total.remote().result(timeout=60) == 7.0 * (1 << 23)
+    k.drop.remote().result(timeout=60)
+    a.wait_reclaimed()
+
+
+@pytest.mark.parametrize("error", [ConnectionError, ValueError, RuntimeError, FileNotFoundError])
+def test_a_handle_whose_hold_is_refused_still_unpickles(monkeypatch, error):
+    # The peer refused the hold: the value is gone (DataLost when read), or
+    # the hold failed for now (a leader change, a session not open yet) and
+    # the handle reads the value, unheld, while its run lasts.
+    from chimaera import _leases
+
+    class Peer:
+        run = os.urandom(16)  # the current run: not the handle's
+
+        def __init__(self) -> None:
+            self.client = self
+
+        def borrow(self, run: bytes, files: list[bytes], release: bool = False) -> None:
+            raise error("refused")
+
+    resolved = _leases._resolved_future
+
+    def unheld(*put):
+        f = resolved(*put)
+        f._rt = Peer()
+        return f
+
+    monkeypatch.setattr(_leases, "_resolved_future", unheld)
+    put = (os.urandom(16), os.urandom(16), None, 1 << 20, (os.urandom(16),), "")
+    if error is FileNotFoundError:
+        f = _leases.unpickle(*put)
+        assert isinstance(f._exc, ch.errors.DataLost)
+    else:
+        with pytest.warns(UserWarning, match="not held past its run's end"):
+            f = _leases.unpickle(*put)
+        assert f._exc is None
+    assert f not in _leases._releases, "nothing to let go of"
+
+
+@pytest.mark.parametrize("passed", ["argument", "handles"])
+def test_a_held_value_passed_to_a_call_stays_until_the_call_has_read_it(tmp_path, passed):
+    # Driver B holds A's value and, once A has exited, passes it to a call of
+    # its own that starts after B dropped its handle: as an argument (the call
+    # reads A's files) or inside ch.handles (pickled again). The call reads
+    # it, and the peer reclaims the value once B ends.
+    import pickle
+    import subprocess
+
+    from conftest import REPO
+
+    handle = tmp_path / "handle"
+    a = _DriverA(f"open({str(handle)!r}, 'wb').write(pickle.dumps(held))")
+    arg = "h" if passed == "argument" else "ch.handles([h])"
+    code = f"""
+import gc, pickle, sys, time
+import chimaera as ch
+
+@ch.remote
+def pause():
+    time.sleep(2)
+
+@ch.remote
+def argument(_, x):
+    return float(x.sum())
+
+@ch.remote
+def handles(_, box):
+    return float(box[0].result().sum())
+
+h = pickle.loads(open({str(handle)!r}, "rb").read())
+print("HELD", flush=True)
+sys.stdin.readline()
+out = {passed}.remote(pause.remote(), {arg})
+del h
+gc.collect()
+print("READ", out.result(timeout=60), flush=True)
+"""
+    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
+    pipe = subprocess.PIPE
+    b = subprocess.Popen([sys.executable, "-c", code], stdin=pipe, stdout=pipe, stderr=pipe, text=True, env=env)
+    assert b.stdout.readline().strip() == "HELD", b.stderr.read()[-3000:]
+    a.exit()
+    out, err = b.communicate("go\n", timeout=120)
+    assert f"READ {7.0 * (1 << 23)}" in out, out + err[-3000:]
+    a.wait_reclaimed()
+
+
 def test_object_locations_name_the_peer_storing_each_value():
     import numpy as np
 

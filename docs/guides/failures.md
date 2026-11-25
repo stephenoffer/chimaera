@@ -521,8 +521,11 @@ where the error is the exception it would raise.
 
 A run that isn't detached ends with its script: a normal exit waits for
 calls you never waited on, an exception or Ctrl-C cancels them, and if the
-connection drops (the process was killed), the run is canceled
-([tasks.md](tasks.md)).
+connection drops (the process was killed), the run is canceled once the peer
+has waited five seconds for the script to reconnect ([tasks.md](tasks.md)).
+The other way round, a script whose connection breaks while it runs picks
+its session up again on a new one and loses no result. If its peer is gone,
+the script gives up after about three seconds of tries.
 
 Inside a script started this way, `ch.runs.current_run()` returns its run. See [../cli.md](../cli.md) for
 `chimaera logs` and `chimaera inspect`.
@@ -571,7 +574,8 @@ the answer:
 |---|---|
 | `await ch.durable.now()` | the `time.time()` of the first run of this step |
 | `await ch.durable.random()` | the same number in [0, 1) |
-| `await ch.durable.record(fn, *args, **kwargs)` | `fn`'s first result; pass a module-level function |
+| `await ch.durable.record(fn, *args, **kwargs)` | `fn`'s first result; pass a module-level function that reads or computes (a lost attempt runs it again) |
+| `await ch.durable.record(activity, *args, key=...)` | the receipt of a write to another system, done once (below) |
 | `await ch.durable.sleep(seconds)` | once the first run's sleep is over (a replay waits only for what is left) |
 
 Finished steps return their recorded result, and running ones are joined rather
@@ -586,8 +590,88 @@ async def careless() -> str:
         os._exit(1)
     return "done"
 
-assert isinstance(careless.remote().exception(), ch.errors.WorkflowDivergence)
+err = careless.remote().exception()
+assert isinstance(err, ch.errors.WorkflowDivergence)
+assert err.step == 1                                     # the workflow's first call
+assert err.recorded["args"] != err.received["args"]      # what the history holds, and what the replay asked
 ```
+
+The error names the step, and for the recorded call and the replay's: the
+function, the workflow's `file:line` that made it, a short repr of its
+arguments and its fingerprint (as `err.recorded` and `err.received`).
+
+A write to another system (a charge, an email) goes through an activity:
+subclass `ch.durable.Activity`, implement `run(key, *args)`, and say what is
+safe to repeat. The key names the operation to that system: pass your own
+(an order id), or leave it out and the run gives the step one that stays the
+same on every replay.
+
+```python run
+LEDGER = tempfile.mkdtemp()
+
+class Payments(ch.durable.Activity[str]):
+    idempotent = True                        # a repeat under the same key changes nothing
+
+    def run(self, key: str, cents: int) -> str:
+        try:
+            with open(os.path.join(LEDGER, key), "x") as f:
+                f.write(str(cents))
+        except FileExistsError:
+            pass                             # charged already: same receipt
+        return f"receipt-{key}"
+
+@ch.remote(workflow="durable")
+async def checkout(order_id: str) -> str:
+    receipt = await ch.durable.record(Payments(), 500, key=order_id)
+    if ch.context().attempt == 1:
+        os._exit(1)                          # the worker dies after the charge
+    return receipt
+
+assert checkout.remote("order-18").result() == "receipt-order-18"
+assert os.listdir(LEDGER) == ["order-18"]   # charged once
+```
+
+An attempt lost after `run` started may or may not have done its write.
+What happens next is what the activity declares:
+
+| The activity | A lost attempt |
+|---|---|
+| `idempotent = True` | runs again under the same key |
+| defines `status(key)`, returning the receipt or None | is settled by asking; None runs it again |
+| neither | raises `ch.OutcomeUnknown`, whose `key` is the activity's |
+
+`compensate(key, receipt)` on the activity undoes an operation (a refund);
+`await ch.durable.compensate(activity, key, receipt)` runs it once as a step.
+A lost attempt of it runs again if the activity is idempotent, and otherwise
+raises `ch.OutcomeUnknown` with the key: `status(key)` describes the
+operation, not its undoing, so it is not asked.
+
+A replay runs the workflow function's code from when the call was submitted.
+That code travels with the call, and so do the module-level values it names,
+as they were then: constants, dicts and the `@ch.remote` functions it calls.
+Other functions and classes it names, from its own module or another, are
+looked up by name where the replay runs, as in any call; a worker that
+imported their module before a deployment keeps what it imported. Give a
+definition a `version`, and a new one can declare which older histories it
+continues: a replay after the deployment then runs the new code against the
+recorded steps, which it must make in the same order. To find the version
+deployed, a replay runs the module's source again on whichever worker it lands
+(so code the module runs on import runs again). The run records that the
+history moved, so later replays stay on that version's code even after another
+deployment replaces it, until a newer version lists that one in its
+`compatible`.
+
+```python
+@ch.remote(workflow="durable", version=2, compatible=1)   # takes over version 1's histories
+async def checkout(order_id: str) -> str: ...
+```
+
+A definition without `version` is version 1. Functions are matched to the
+recorded steps by name (`module.qualname`) and arguments, so a step whose code
+changed is still the same step; a lambda or nested function is matched by its
+code too. Upgrading Chimaera itself can change how steps are matched, so
+finish or cancel durable workflows in flight first: a history recorded by
+another release may diverge at its first step.
 
 A durable workflow is retried for lost workers up to 100 times by default, but
 your exceptions still fail it unless you list them in `retry_exceptions`.

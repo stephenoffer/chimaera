@@ -81,10 +81,17 @@ fn apple_gpu() -> Option<Device> {
     mps_device(arch, &brand, memsize)
 }
 
+/// Where the peer reads its devices: `/`, or the captured host tree named by
+/// `CHIMAERA_DEVICE_ROOT` (`tests/fixtures/topology/dgx-h100`: a peer with
+/// eight H100s, for testing allocation without them).
+fn device_root() -> PathBuf {
+    std::env::var_os("CHIMAERA_DEVICE_ROOT").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
 /// This host's devices as the peer advertises them (`PeerInfo.gpus`, `Member.gpus`).
 pub fn shape_gpus() -> Vec<chimaera_core::topology::Gpu> {
     let env: BTreeMap<String, String> = std::env::vars().collect();
-    discover(Path::new("/"), &env)
+    discover(&device_root(), &env)
         .devices
         .into_iter()
         .map(|d| chimaera_core::topology::Gpu {
@@ -180,10 +187,10 @@ pub enum Want {
 const DEV: &str = "|dev=";
 
 impl Devices {
-    /// This host's devices (`/` and the peer's own environment).
+    /// This host's devices (`/`, or `CHIMAERA_DEVICE_ROOT`, and the peer's own environment).
     pub fn discover() -> Devices {
         let env: BTreeMap<String, String> = std::env::vars().collect();
-        let inv = discover(Path::new("/"), &env);
+        let inv = discover(&device_root(), &env);
         if !inv.devices.is_empty() {
             let names: Vec<String> =
                 inv.devices.iter().map(|d| format!("{}:{} {}", d.kind.as_str(), d.index, d.model)).collect();
@@ -219,8 +226,7 @@ impl Devices {
         };
         let total = self.alloc.total(selector.as_ref());
         if total < n {
-            let what = if device.is_empty() { "accelerator(s)".to_string() } else { format!("{device} device(s)") };
-            return Want::Infeasible(format!("needs {n} {what}; this peer has {total}"));
+            return Want::Infeasible(format!("needs {n} {}; this peer has {total}", what(device)));
         }
         match self.alloc.choose(n, selector.as_ref(), false) {
             Some(chosen) => Want::Key(self.key(base, &chosen)),
@@ -228,24 +234,69 @@ impl Devices {
         }
     }
 
-    /// As `key_for`, but when the devices are held, the lowest matching ones
-    /// anyway: an actor shares them rather than wait (as before P5).
-    /// shortcut: GPU actors queue for free devices once reservations land.
-    pub fn key_for_actor(&self, gpus: f64, device: &str, base: &str) -> Want {
-        match self.key_for(gpus, device, base) {
-            Want::Wait => {
-                let (n, selector) = self.want(gpus, device).ok().flatten().expect("key_for checked");
-                let chosen = self.alloc.choose(n, selector.as_ref(), true).expect("key_for checked the total");
-                tracing::warn!(device, gpus, "every matching device is held: the actor shares them");
-                Want::Key(self.key(base, &chosen))
-            }
-            other => other,
-        }
+    /// Why a call needing `gpus` devices matching `device` waits here (held
+    /// by other calls, actors or holds), or None: they are free, or this peer
+    /// never has them (`key_for` says so).
+    pub fn wait_reason(&self, gpus: f64, device: &str) -> Option<String> {
+        let Ok(Some((n, selector))) = self.want(gpus, device) else { return None };
+        let total = self.alloc.total(selector.as_ref());
+        (total >= n && self.alloc.choose(n, selector.as_ref(), false).is_none()).then(|| {
+            let free = self.alloc.free(selector.as_ref());
+            format!("needs {n} {}; {free} of {total} free", what(device))
+        })
     }
 
     fn key(&self, base: &str, chosen: &[usize]) -> String {
-        let ids: Vec<&str> = chosen.iter().map(|&i| self.alloc.devices[i].id.as_str()).collect();
+        let chosen: Vec<Device> = chosen.iter().map(|&i| self.alloc.devices[i].clone()).collect();
+        self.key_of(base, &chosen)
+    }
+
+    /// The pool key of an executor that may use exactly `devices`.
+    pub fn key_of(&self, base: &str, devices: &[Device]) -> String {
+        if devices.is_empty() {
+            return base.to_string();
+        }
+        let ids: Vec<&str> = devices.iter().map(|d| d.id.as_str()).collect();
         format!("{base}{DEV}{}", ids.join(","))
+    }
+
+    /// Why this peer could never hold the devices of every one of `slots`
+    /// (gpus, device) at once, even with all of its devices free: too few
+    /// matching ones, or a bad selector. None if it could.
+    pub fn never(&self, slots: &[(f64, &str)]) -> Option<String> {
+        let mut need: Vec<(&str, usize, Option<Selector>)> = Vec::new();
+        for &(gpus, device) in slots {
+            match self.want(gpus, device) {
+                Err(e) => return Some(e),
+                Ok(None) => {}
+                Ok(Some((n, selector))) => match need.iter_mut().find(|(d, ..)| *d == device) {
+                    Some(same) => same.1 += n,
+                    None => need.push((device, n, selector)),
+                },
+            }
+        }
+        need.iter().find_map(|(device, n, selector)| {
+            let total = self.alloc.total(selector.as_ref());
+            (total < *n).then(|| format!("needs {n} {}; this peer has {total}", what(device)))
+        })
+    }
+
+    /// `gpus` devices matching `device`, now held for a slot of the resource
+    /// ledger until [`Devices::give`]; why not, when they are not all free.
+    pub fn take(&mut self, gpus: f64, device: &str) -> Result<Vec<Device>, String> {
+        let Some((n, selector)) = self.want(gpus, device)? else { return Ok(Vec::new()) };
+        let total = self.alloc.total(selector.as_ref());
+        if total < n {
+            return Err(format!("needs {n} {}; this peer has {total}", what(device)));
+        }
+        self.alloc.take(n, selector.as_ref()).ok_or_else(|| {
+            format!("needs {n} {}; {} of {total} free", what(device), self.alloc.free(selector.as_ref()))
+        })
+    }
+
+    /// Devices a ledger slot held, free again.
+    pub fn give(&mut self, devices: &[Device]) {
+        self.alloc.give(devices);
     }
 
     fn granted(&self, key: &str) -> Vec<Device> {
@@ -282,6 +333,15 @@ impl Devices {
     pub fn env_for_key(&self, key: &str) -> Vec<(&'static str, Option<String>)> {
         grant_env(&self.inv, &self.granted(key))
     }
+
+    /// The NUMA node of each device in pool `key`'s grant.
+    pub fn numa_for_key(&self, key: &str) -> Vec<Option<u32>> {
+        self.granted(key).iter().map(|d| d.numa).collect()
+    }
+}
+
+fn what(device: &str) -> String {
+    if device.is_empty() { "accelerator(s)".to_string() } else { format!("{device} device(s)") }
 }
 
 /// The environment of an executor that may use exactly `granted`: for every
@@ -433,12 +493,34 @@ mod tests {
         assert_eq!(devs.key_for(0.5, "", "py|1"), devs.key_for(1.0, "", "py|1"));
         devs.release(7);
         assert!(matches!(devs.key_for(8.0, "", "py|1"), Want::Key(_)));
-        // An actor that finds its devices held shares them, and releasing it frees nothing it did not hold.
+        // Held devices are never shared: another call for them waits, and says why.
         devs.hold(1, &k6);
-        let Want::Key(shared) = devs.key_for_actor(8.0, "", "py|1") else { panic!() };
-        devs.hold(2, &shared);
-        devs.release(2);
-        assert_eq!(devs.alloc.free(None), 2, "the 6 held by exec 1 stay held");
+        assert_eq!(devs.key_for(8.0, "", "py|1"), Want::Wait);
+        assert_eq!(devs.wait_reason(8.0, "").as_deref(), Some("needs 8 accelerator(s); 2 of 8 free"));
+        assert_eq!(devs.wait_reason(2.0, ""), None);
+        assert_eq!(devs.wait_reason(1.0, "rocm"), None, "never on this peer: not a wait");
         assert_eq!(devs.env_for_key("py|1")[0], ("CUDA_VISIBLE_DEVICES", Some(String::new())));
+    }
+
+    #[test]
+    fn a_ledger_slot_takes_free_devices_until_given_back() {
+        let root = fixture("dgx-h100");
+        let mut devs = Devices::new(discover(&root, &env_of(&root)));
+        let slot = devs.take(6.0, "cuda").unwrap();
+        assert_eq!(devs.take(3.0, "").unwrap_err(), "needs 3 accelerator(s); 2 of 8 free");
+        assert_eq!(devs.take(9.0, "").unwrap_err(), "needs 9 accelerator(s); this peer has 8");
+        // Busy devices are a wait; too few of them, even all free, never fit.
+        assert_eq!(devs.never(&[(3.0, ""), (2.0, "cuda"), (0.0, "")]), None);
+        assert_eq!(
+            devs.never(&[(5.0, "cuda"), (0.5, "cuda"), (3.0, "cuda")]).unwrap(),
+            "needs 9 cuda device(s); this peer has 8"
+        );
+        assert_eq!(devs.never(&[(1.0, "rocm")]).unwrap(), "needs 1 rocm device(s); this peer has 0");
+        assert_eq!(devs.key_for(6.0, "", "py|1"), Want::Wait, "a slot's devices go to no call");
+        let key = devs.key_of("py|1", &slot);
+        assert_eq!(devs.env_for_key(&key)[0].1.as_deref().unwrap().split(',').count(), 6);
+        devs.give(&slot);
+        assert!(matches!(devs.key_for(8.0, "", "py|1"), Want::Key(_)));
+        assert_eq!(devs.take(0.0, "").unwrap(), Vec::new());
     }
 }

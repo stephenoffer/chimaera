@@ -39,6 +39,25 @@ pub static REPLICATION_FAILURES: Counter = Counter::new(
     "Objects this peer wrote whose replica on the next peer could not be made.",
 );
 
+pub static FLEET_SUMMARIES_SERVED: Counter = Counter::new(
+    "fleet_summaries_served_total",
+    "Capacity summaries this peer answered for other cells' publishers (Status asked with fleet).",
+);
+pub static STORE_REQUESTS: Counter = Counter::new(
+    "store_requests_total",
+    "Store requests this peer's client endpoint served (ch.Store, and other cells' directory reads and renewals).",
+);
+pub static FLEET_DIRECTORY_LISTINGS: Counter = Counter::new(
+    "fleet_directory_listings_total",
+    "Whole listings of the fleet directory this peer read as its cell's publisher (else it reads only changes).",
+);
+pub static SPILLED_BYTES: Counter = Counter::new(
+    "spilled_bytes_total",
+    "Bytes of objects this peer's store moved out of memory, to disk or object storage.",
+);
+pub static SPILL_MICROSECONDS: Counter =
+    Counter::new("spill_microseconds_total", "Time this peer's store spent moving objects out of memory.");
+
 pub static ALL: &[&Counter] = &[
     &PROPOSALS,
     &PROPOSAL_FAILURES,
@@ -47,4 +66,9 @@ pub static ALL: &[&Counter] = &[
     &OOM_KILLS,
     &CANCEL_KILLS,
     &REPLICATION_FAILURES,
+    &FLEET_SUMMARIES_SERVED,
+    &STORE_REQUESTS,
+    &FLEET_DIRECTORY_LISTINGS,
+    &SPILLED_BYTES,
+    &SPILL_MICROSECONDS,
 ];

@@ -7,6 +7,7 @@
 pub mod adapt;
 pub mod cell;
 pub mod devices;
+pub mod durability;
 pub mod hlc;
 pub mod ids;
 pub mod kv;

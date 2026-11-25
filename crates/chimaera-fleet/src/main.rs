@@ -445,7 +445,7 @@ fn pct(measured: f64, expected: f64) -> f64 {
     if expected == 0.0 { 0.0 } else { (measured - expected) / expected * 100.0 }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let a = Args::parse();
     let t0 = Instant::now();
     // One full cell in detail (cells share nothing on the common path).
@@ -501,6 +501,9 @@ fn main() {
         weak = Some((one, two, two / one));
         ok &= two / one >= 1.8;
     }
+    let pass = ok && state_ok && full.false_dead == 0;
+    // A failed gate fails the run, so that the lane recording it fails too.
+    let code = std::process::ExitCode::from(u8::from(!pass));
     let report = serde_json::json!({
         "label": "emulation: real SWIM, shard apply and cell summaries for whole cells, scaled by cell count",
         "cell": {
@@ -514,11 +517,11 @@ fn main() {
         "rows": rows.iter().map(|(p, n, g, w, d, k)| serde_json::json!({"peers": p, "row": n, "emulated": g, "appendix": w, "diff_pct": d, "within_10pct": k})).collect::<Vec<_>>(),
         "weak_scaling_1k_to_2k": weak.map(|(a1, a2, r)| serde_json::json!({"items_per_s_1k": a1, "items_per_s_2k": a2, "ratio": r})),
         "wall_s": t0.elapsed().as_secs_f64(),
-        "pass": ok && state_ok && full.false_dead == 0,
+        "pass": pass,
     });
     if a.json {
         println!("{}", serde_json::to_string_pretty(&report).expect("json"));
-        return;
+        return code;
     }
     println!(
         "Fleet emulation (real SWIM, shard apply and cell summaries; one {}-peer cell in detail, scaled by cells)\n",
@@ -572,9 +575,6 @@ fn main() {
     ];
     let (name, used) = limits.iter().copied().fold(("", 0.0), |b, x| if x.1 > b.1 { x } else { b });
     println!("\nfirst binding limit at this mix: {name}, at {:.1}% of its budget", used * 100.0);
-    println!(
-        "result: {} (emulation; wall {:.1} s)",
-        if ok && state_ok && full.false_dead == 0 { "PASS" } else { "FAIL" },
-        t0.elapsed().as_secs_f64()
-    );
+    println!("result: {} (emulation; wall {:.1} s)", if pass { "PASS" } else { "FAIL" }, t0.elapsed().as_secs_f64());
+    code
 }

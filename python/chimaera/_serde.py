@@ -22,7 +22,9 @@ import errno
 import functools
 import inspect
 import io
+import itertools
 import mmap
+import operator
 import os
 import pickle
 import struct
@@ -34,6 +36,7 @@ from typing import Any, Callable
 import cloudpickle
 
 from . import _native
+from ._errors import OutOfDisk
 
 MAGIC = b"CHO1"
 _HEAD = struct.Struct("<4sIIIQ")
@@ -48,6 +51,16 @@ _SEQ_ITEM = struct.Struct("<QQ")  # offset, length
 # element's bytes from another peer. Same header as SEQ_MAGIC.
 PARTS_MAGIC = b"CHP1"
 _PART_ITEM = struct.Struct("<16sQQ")  # part object id (zeros: in this file), offset, length
+# A tuple of values that are empty dicts but for a few (see Sparse), stored as
+# those few: the ids of the ones kept in files of their own, then an entry per
+# stored value, sorted by position, which a reader of one finds by bisection.
+# The parts' count is where PARTS_MAGIC keeps its count, so a reader of either
+# header knows how much to read for the ids.
+SPARSE_MAGIC = b"CHQ1"
+SPARSE_LAYOUT = 1  # the object_layout a peer advertises once it reads SPARSE_MAGIC (Member.object_layout)
+_SPARSE_HEAD = struct.Struct("<4sIIIQ")  # magic, reserved, parts kept apart, entries, count
+# position, part (its place among the ids, from 1; 0: in this file), offset, length
+_SPARSE_ITEM = struct.Struct("<QQQQ")
 _ALIGN = 64
 _OOB_MIN = 64 * 1024  # smaller buffers stay inside the pickle
 EXTERNAL = 1  # header flag: a blob-id table follows the buffer lengths
@@ -333,17 +346,50 @@ def dumps_seq(
     return pack_seq([dumps_parts(v, external) for v in value])
 
 
+class Sparse:
+    """`count` values, each an empty dict but those in `present` (position:
+    value): a shuffle scatter's buckets, which a scatter into a million
+    partitions mostly leaves empty. Stored as the present values alone (see
+    SPARSE_MAGIC); it reads as the tuple it stands for."""
+
+    __slots__ = ("count", "present")
+
+    def __init__(self, count: int, present: dict[int, Any]) -> None:
+        self.count, self.present = count, present
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __getitem__(self, index: int) -> Any:
+        if not 0 <= index < self.count:
+            raise IndexError(f"position {index} of {self.count}")
+        return self.present.get(index, {})
+
+    def __iter__(self) -> Any:
+        return (self.present.get(i, {}) for i in range(self.count))
+
+
 def pack_seq(
-    encoded: list[tuple[list[bytes | memoryview], int, int]], ids: list[bytes | None] | None = None
+    encoded: list[tuple[list[bytes | memoryview], int, int]],
+    ids: list[bytes | None] | None = None,
+    positions: list[int] | None = None,
+    count: int = 0,
 ) -> tuple[list[bytes | memoryview], int, int]:
     """A tuple from its elements as ``dumps_parts`` encodes them; same result
     shape. An element with an id in `ids` is already stored as that object
-    and is only named here (see PARTS_MAGIC). Elements start on aligned
-    offsets, so their buffers stay aligned in a mapped file."""
+    and is only named here (see PARTS_MAGIC). With `positions` (ascending),
+    the elements are those a Sparse of `count` holds (see SPARSE_MAGIC).
+    Elements start on aligned offsets, so their buffers stay aligned in a
+    mapped file."""
     ids = ids or [None] * len(encoded)
     split = any(ids)
-    item = _PART_ITEM if split else _SEQ_ITEM
-    head = _SEQ_HEAD.pack(PARTS_MAGIC if split else SEQ_MAGIC, 0, len(encoded))
+    if positions is not None:
+        apart = [part for part in ids if part is not None]
+        item = _SPARSE_ITEM
+        head = _SPARSE_HEAD.pack(SPARSE_MAGIC, 0, len(apart), len(encoded), count) + b"".join(apart)
+    else:
+        item = _PART_ITEM if split else _SEQ_ITEM
+        head = _SEQ_HEAD.pack(PARTS_MAGIC if split else SEQ_MAGIC, 0, len(encoded))
     pos = len(head) + item.size * len(encoded)
     spans = []
     for (_, size, _), part in zip(encoded, ids):
@@ -353,7 +399,13 @@ def pack_seq(
         pos += _pad(pos)
         spans.append((pos, size))
         pos += size
-    if split:
+    if positions is not None:
+        numbers = itertools.accumulate(part is not None for part in ids)  # each part's place among the ids
+        table = b"".join(
+            _SPARSE_ITEM.pack(position, k if part is not None else 0, o, n)
+            for position, k, part, (o, n) in zip(positions, numbers, ids, spans)
+        )
+    elif split:
         table = b"".join(_PART_ITEM.pack(part or _NO_BLOB, o, n) for part, (o, n) in zip(ids, spans))
     else:
         table = b"".join(_SEQ_ITEM.pack(o, n) for o, n in spans)
@@ -378,7 +430,57 @@ def _seq_spans(view: memoryview) -> list[tuple[bytes, int, int]] | None:
     return [_PART_ITEM.unpack_from(view, _SEQ_HEAD.size + _PART_ITEM.size * i) for i in range(n)]
 
 
+def _sparse_ids(view: memoryview) -> list[bytes]:
+    """A stored Sparse's ids of the values kept in files of their own."""
+    parts = _SPARSE_HEAD.unpack_from(view, 0)[2]
+    return [bytes(view[_SPARSE_HEAD.size + 16 * i : _SPARSE_HEAD.size + 16 * (i + 1)]) for i in range(parts)]
+
+
+def _sparse_spans(view: memoryview) -> list[tuple[int, tuple[bytes, int, int]]]:
+    """A stored Sparse's table: (position, (part id or zeros, offset, length)) per value it holds."""
+    ids = _sparse_ids(view)
+    entries = _SPARSE_HEAD.unpack_from(view, 0)[3]
+    table = _SPARSE_HEAD.size + 16 * len(ids)
+    out = []
+    for i in range(entries):
+        position, part, off, n = _SPARSE_ITEM.unpack_from(view, table + _SPARSE_ITEM.size * i)
+        out.append((position, (ids[part - 1] if part else _NO_BLOB, off, n)))
+    return out
+
+
+# The entry of a value a Sparse leaves out: an empty dict.
+_ABSENT = (_NO_BLOB, 0, 0)
+
+
+def _sparse_entry(read: Callable[[int, int], Any], index: int, count: int) -> tuple[bytes, int, int] | None:
+    """Entry `index` of a stored Sparse of `count` values (_ABSENT if it
+    leaves that one out), its header and table read through `read(offset,
+    length)`: bisecting reads a few entries of a million. None when the bytes
+    are not a Sparse of `count`."""
+    head = read(0, _SPARSE_HEAD.size)
+    if len(head) < _SPARSE_HEAD.size:
+        return None
+    magic, _, parts, entries, n = _SPARSE_HEAD.unpack(head)
+    if magic != SPARSE_MAGIC or n != count:
+        return None
+    table = _SPARSE_HEAD.size + 16 * parts
+    # Every value present (a scatter whose pairs touched each partition): entry i is position i.
+    lo, hi = (index, index + 1) if entries == count else (0, entries)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        position, part, off, length = _SPARSE_ITEM.unpack(read(table + _SPARSE_ITEM.size * mid, _SPARSE_ITEM.size))
+        if position < index:
+            lo = mid + 1
+        elif position > index:
+            hi = mid
+        else:
+            return (bytes(read(_SPARSE_HEAD.size + 16 * (part - 1), 16)) if part else _NO_BLOB, off, length)
+    return _ABSENT
+
+
 def _element(view: memoryview, entry: tuple[bytes, int, int], blob_dir: str | None) -> Any:
+    if entry is _ABSENT:
+        return {}
     part, off, n = entry
     if part == _NO_BLOB:
         return loads(view[off : off + n], blob_dir)
@@ -387,62 +489,114 @@ def _element(view: memoryview, entry: tuple[bytes, int, int], blob_dir: str | No
     return loads(_blob_view(blob_dir, part), blob_dir)  # fetched from the peer that wrote it
 
 
-def table_size(count: int) -> int:
-    """Bytes that hold the table of a stored tuple of `count` values, in either layout."""
-    return _SEQ_HEAD.size + _PART_ITEM.size * count
-
-
 def part_id(data: bytes | memoryview | mmap.mmap, index: int, count: int) -> bytes | None:
-    """The object element `index` of a stored tuple of `count` values is kept
-    in, when it is an object of its own (see PARTS_MAGIC). `data` needs only
-    the table (see table_size)."""
-    view = memoryview(data)
-    if bytes(view[:4]) != PARTS_MAGIC or _SEQ_HEAD.unpack_from(view, 0)[2] != count:
-        return None  # one file, or not the count the reader expects (an error when it is read)
-    part = _PART_ITEM.unpack_from(view, _SEQ_HEAD.size + _PART_ITEM.size * index)[0]
-    return None if part == _NO_BLOB else part
+    """The object element `index` of a stored tuple (or Sparse) of `count`
+    values is kept in, when it is an object of its own (see PARTS_MAGIC and
+    SPARSE_MAGIC). `data` needs only the header and table; ``part_of``
+    reads them from a file."""
+    entry = _seq_entry(memoryview(data), index, count)
+    # None: one file, or not the count the reader expects (an error when it is read).
+    return None if entry is None or entry[0] == _NO_BLOB else entry[0]
 
 
 def loads_part(data: bytes | memoryview | mmap.mmap, index: int, count: int, blob_dir: str | None = None) -> Any:
     """Element `index` of a stored tuple of `count` values: only that element
     is decoded (and fetched) when it was stored element by element."""
     view = memoryview(data)
-    spans = _seq_spans(view)
-    if spans is None or len(spans) != count:
+    entry = _seq_entry(view, index, count)
+    if entry is None:
         from ._future import pick
 
         return pick(loads(view, blob_dir), index, count)
-    return _element(view, spans[index], blob_dir)
+    return _element(view, entry, blob_dir)
 
 
-def read_part(path: str, index: int, count: int, blob_dir: str | None = None) -> Any:
+def _seq_entry(view: memoryview, index: int, count: int) -> tuple[bytes, int, int] | None:
+    """Entry `index` of a stored tuple's table (see _seq_spans), when `view`
+    holds a stored tuple of `count` values: that entry alone is decoded (a
+    1024-way scatter's table has 1024). _ABSENT for a value a Sparse leaves out."""
+    magic = bytes(view[:4])
+    if magic == SPARSE_MAGIC:
+        return _sparse_entry(lambda o, n: view[o : o + n], index, count)
+    if magic not in (SEQ_MAGIC, PARTS_MAGIC) or _SEQ_HEAD.unpack_from(view, 0)[2] != count:
+        return None
+    if magic == SEQ_MAGIC:
+        return (_NO_BLOB, *_SEQ_ITEM.unpack_from(view, _SEQ_HEAD.size + _SEQ_ITEM.size * index))
+    return _PART_ITEM.unpack_from(view, _SEQ_HEAD.size + _PART_ITEM.size * index)
+
+
+class PartAway(Exception):
+    """The element ``read_part`` was asked for without fetching is kept in a
+    file of its own, `part`, that is not in this peer's store."""
+
+    def __init__(self, part: bytes) -> None:
+        super().__init__(part.hex())
+        self.part = part
+
+
+def read_part(path: str, index: int, count: int, blob_dir: str | None = None, fetch: bool = True) -> Any:
     """``loads_part`` of the object file at `path`, reading only the stored
-    tuple's table and that element's bytes: a shuffle's gather wants one
-    bucket of each of many 64-bucket files, and reading whole files read 64
-    times the data it decoded. A file too large to read whole is mapped
-    instead (pages are read when touched), and so is anything that is not a
-    stored tuple of `count` values."""
+    tuple's header, that element's entry of its table and that element's
+    bytes: a shuffle's gather wants one bucket of each of many 64-bucket
+    files, and reading whole files read 64 times the data it decoded. A file
+    too large to read whole is mapped instead (pages are read when touched),
+    and so is anything that is not a stored tuple of `count` values. With
+    `fetch` false, an element in a file of its own that is not here raises
+    PartAway, for the caller to fetch with others, not alone."""
     fd = os.open(path, os.O_RDONLY)
     try:
-        size = os.fstat(fd).st_size
-        # Either layout's table fits in table_size(count) bytes (a small file
-        # may be shorter: then it is read whole).
-        table = os.pread(fd, min(size, table_size(count)), 0) if size <= _READ_MAX else b""
-        if len(table) >= _SEQ_HEAD.size and _SEQ_HEAD.unpack_from(table, 0)[2] == count:
-            spans = _seq_spans(memoryview(table))
-            if spans is not None:
-                part, off, n = spans[index]
-                if part != _NO_BLOB:
-                    return _element(memoryview(table), spans[index], blob_dir)
-                # Out-of-band buffers (64 KiB and up) keep their alignment
-                # in page-aligned memory; anything smaller has none.
-                buf: bytearray | mmap.mmap = bytearray(n) if n < _OOB_MIN else mmap.mmap(-1, n)
-                if os.preadv(fd, [buf], off) != n:
-                    raise ValueError(f"object file {path} changed while it was read")
-                return loads(buf, blob_dir)
+        entry = _file_entry(fd, index, count) if os.fstat(fd).st_size <= _READ_MAX else None
+        if entry is not None:
+            if entry is _ABSENT:
+                return {}
+            part, off, n = entry
+            if part != _NO_BLOB:
+                if not fetch:
+                    _here(part, blob_dir)
+                return _element(memoryview(b""), entry, blob_dir)
+            # Out-of-band buffers (64 KiB and up) keep their alignment
+            # in page-aligned memory; anything smaller has none.
+            buf: bytearray | mmap.mmap = bytearray(n) if n < _OOB_MIN else mmap.mmap(-1, n)
+            if os.preadv(fd, [buf], off) != n:
+                raise ValueError(f"object file {path} changed while it was read")
+            return loads(buf, blob_dir)
     finally:
         os.close(fd)
-    return loads_part(_map(path), index, count, blob_dir)
+    data = _map(path)
+    entry = None if fetch else _seq_entry(memoryview(data), index, count)
+    if entry is not None and entry[0] != _NO_BLOB:
+        _here(entry[0], blob_dir)
+    return loads_part(data, index, count, blob_dir)
+
+
+def _file_entry(fd: int, index: int, count: int) -> tuple[bytes, int, int] | None:
+    """``_seq_entry`` of the object file open as `fd`, from its header and
+    that entry alone."""
+    head = os.pread(fd, _SPARSE_HEAD.size, 0)  # either header
+    if head[:4] == SPARSE_MAGIC:
+        return _sparse_entry(lambda o, n: head[o : o + n] if o + n <= len(head) else os.pread(fd, n, o), index, count)
+    item = {SEQ_MAGIC: _SEQ_ITEM, PARTS_MAGIC: _PART_ITEM}.get(head[:4])
+    if item is None or len(head) < _SEQ_HEAD.size or _SEQ_HEAD.unpack_from(head)[2] != count:
+        return None
+    raw = os.pread(fd, item.size, _SEQ_HEAD.size + item.size * index)
+    return (_NO_BLOB, *item.unpack(raw)) if item is _SEQ_ITEM else item.unpack(raw)
+
+
+def part_of(path: str, index: int, count: int) -> bytes | None:
+    """The object element `index` of the stored tuple of `count` values at
+    `path` is kept in, when it is an object of its own (see PARTS_MAGIC),
+    read from the file's header and that element's entry alone."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        entry = _file_entry(fd, index, count)
+    finally:
+        os.close(fd)
+    return None if entry is None or entry[0] == _NO_BLOB else entry[0]
+
+
+def _here(part: bytes, blob_dir: str | None) -> None:
+    if blob_dir is not None and not os.path.exists(os.path.join(blob_dir, part.hex())):
+        raise PartAway(part)
 
 
 def loads(data: bytes | memoryview | mmap.mmap, blob_dir: str | None = None) -> Any:
@@ -452,6 +606,9 @@ def loads(data: bytes | memoryview | mmap.mmap, blob_dir: str | None = None) -> 
     spans = _seq_spans(view)
     if spans is not None:
         return tuple(_element(view, e, blob_dir) for e in spans)
+    if bytes(view[:4]) == SPARSE_MAGIC:
+        present = {position: _element(view, e, blob_dir) for position, e in _sparse_spans(view)}
+        return Sparse(_SPARSE_HEAD.unpack_from(view, 0)[4], present)
     magic, flags, n, _, main_len = _HEAD.unpack_from(view, 0)
     if magic != MAGIC:
         raise ValueError("not a Chimaera object")
@@ -494,6 +651,8 @@ def external_blobs(head: bytes | memoryview) -> list[bytes]:
     view = memoryview(head)
     if bytes(view[:4]) == PARTS_MAGIC:
         return [part for part, _, _ in _seq_spans(view) or () if part != _NO_BLOB]
+    if bytes(view[:4]) == SPARSE_MAGIC:
+        return _sparse_ids(view)
     magic, flags, n, _, _ = _HEAD.unpack_from(view, 0)
     if magic != MAGIC or not flags & EXTERNAL:
         return []
@@ -559,7 +718,7 @@ def write_file(path: str, parts: list[bytes | memoryview]) -> None:
             free = f"{st.f_bavail * st.f_frsize >> 20} MiB free"
         except OSError:
             free = "free space unknown"
-        raise OSError(
+        raise OutOfDisk(
             errno.ENOSPC,
             f"no space left on the disk holding {directory} ({free}) for a {size >> 20} MiB object. "
             "A run's stored arguments are deleted when it ends; free space there, or set CHIMAERA_HOME "
@@ -663,15 +822,64 @@ def run_dir(object_dir: str, run: bytes) -> str:
     return os.path.join(object_dir, run.hex())
 
 
-def dump_code(obj: Any) -> bytes:
+def dump_code(obj: Any, names: types.ModuleType | None = None) -> bytes:
     """Callables ship by value from __main__ and notebooks, by reference from
-    modules. cloudpickle erases source filenames (for deterministic output), so
-    the origin file travels alongside and is restored for readable tracebacks."""
+    modules. A durable workflow's function always ships by value, so a retry
+    runs the code its history started with, not what is deployed by then.
+    cloudpickle erases source filenames (for deterministic output), so the
+    origin file travels alongside and is restored for readable tracebacks.
+
+    `names` is a module run apart from sys.modules (a deployment newer than
+    the copy this process imported): what of it would go by name if it were
+    the imported copy goes by name too."""
     try:
         origin = inspect.getsourcefile(obj)
     except TypeError:
         origin = None
-    return cloudpickle.dumps((obj, origin), protocol=5)
+    if isinstance(obj, (types.FunctionType, functools.partial)) and getattr(obj, "__chimaera_workflow__", False):
+        obj = _unnamed(obj)
+    if names is None:
+        return cloudpickle.dumps((obj, origin), protocol=5)
+    out = io.BytesIO()
+    _ByName(out, names).dump((obj, origin))
+    return out.getvalue()
+
+
+class _ByName(cloudpickle.Pickler):
+    """Pickles the functions and classes of `module` (and what pickles as a
+    global, such as an lru_cache function) by name, as cloudpickle does those
+    of the module sys.modules has: they load as the loading process's own."""
+
+    def __init__(self, file: Any, module: types.ModuleType) -> None:
+        super().__init__(file, protocol=5)
+        self.module = module
+
+    def reducer_override(self, obj: Any) -> Any:
+        name = getattr(obj, "__qualname__", None)
+        if isinstance(name, str) and getattr(obj, "__module__", None) == self.module.__name__:
+            get = operator.attrgetter(name)
+            try:
+                found = get(self.module) is obj
+            except AttributeError:  # a nested function or class: by value
+                found = False
+            if found and (isinstance(obj, (types.FunctionType, type)) or isinstance(obj.__reduce_ex__(5), str)):
+                return get, (self.module,)  # the module itself pickles by name
+        return super().reducer_override(obj)
+
+
+def _unnamed(fn: Any) -> Any:
+    """A copy of `fn` (of a partial's function) that no module names, which
+    cloudpickle sends by value."""
+    if isinstance(fn, functools.partial):
+        func = _unnamed(fn.func) if isinstance(fn.func, (types.FunctionType, functools.partial)) else fn.func
+        bound = functools.partial(func, *fn.args, **fn.keywords)
+        bound.__dict__.update(fn.__dict__)
+        return bound
+    copy = types.FunctionType(fn.__code__, fn.__globals__, fn.__name__, fn.__defaults__, fn.__closure__)
+    copy.__kwdefaults__, copy.__qualname__, copy.__module__ = fn.__kwdefaults__, fn.__qualname__, fn.__module__
+    copy.__doc__ = fn.__doc__
+    copy.__dict__.update(fn.__dict__)
+    return copy
 
 
 def load_code(blob: bytes) -> Any:

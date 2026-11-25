@@ -32,7 +32,8 @@ MAX_VALUE = 1 << 20
 
 
 class Event(NamedTuple):
-    """One change seen by a watch: ``kind`` is ``"put"`` or ``"delete"``."""
+    """One change seen by a watch: ``kind`` is ``"put"`` or ``"delete"``, or
+    ``"resync"`` when the watch fell behind (see ``Watch``)."""
 
     kind: str
     key: str
@@ -89,6 +90,27 @@ class Store:
     def _read(self, kind: str, key: str = "", **kw: Any) -> dict[str, Any]:
         return Runtime.get().client.store_read(self.namespace, kind, key, **kw)
 
+    def _txn(
+        self, checks: list[tuple[str, int]], ops: list[tuple[str, str, bytes | None, int]], fence: Lease | None = None
+    ) -> dict[str, Any]:
+        """Apply `ops` ((op, key, pickled value, delta): put, delete or add)
+        together, once each (key, version) of `checks` holds and `fence` is
+        still held, or none of them; return the reply."""
+        f = fence._fence() if fence is not None else None
+        return Runtime.get().client.store_txn(self.namespace, checks, [(*op, f) for op in ops])
+
+    def _claim(
+        self, prefix: str, lock_prefix: str, ttl: float | str | timedelta
+    ) -> tuple[dict[str, Any], Lease | None]:
+        """Claim the first key under `prefix` that nobody holds: the reply,
+        and the held lease on `lock_prefix` + key if one was granted."""
+        lease = Lease(self, lock_prefix, _ms(ttl), None)
+        r = Runtime.get().client.store_claim(self.namespace, prefix, lock_prefix, lease.holder, lease._ttl_ms)
+        if not r["ok"]:
+            return r, None
+        lease.key += r["entry"]["key"]
+        return r, lease._held(r["lease"][1])
+
     # ---- keys ----------------------------------------------------------------
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -99,6 +121,12 @@ class Store:
         """The key's version (0 if it does not exist)."""
         r = self._read("get", key)
         return r["entry"]["version"] if r["ok"] else 0
+
+    def get_versioned(self, key: str, default: Any = None) -> tuple[Any, int]:
+        """The key's value and version from one read, for a compare-and-set
+        (``put(..., if_version=version)``); ``(default, 0)`` if it does not exist."""
+        r = self._read("get", key)
+        return (_value(r["entry"]), r["entry"]["version"]) if r["ok"] else (default, 0)
 
     def put(
         self,
@@ -134,16 +162,10 @@ class Store:
         _raise(r)
         return False
 
-    def scan(self, prefix: str = "") -> Iterator[tuple[str, Any]]:
-        """(key, value) for every key starting with `prefix`, in key order."""
-        after = ""
-        while True:
-            r = self._read("scan", prefix, start_after=after)
-            for e in r["entries"]:
-                yield e["key"], _value(e)
-                after = e["key"]
-            if not r["more"]:
-                return
+    def scan(self, prefix: str = "") -> Scan:
+        """(key, value) for every key starting with `prefix`, in key order;
+        ``.revision`` is where to start a watch that keeps it current."""
+        return Scan(self, prefix)
 
     def keys(self, prefix: str = "") -> Iterator[str]:
         """Keys starting with `prefix`, in order, without fetching their values."""
@@ -227,16 +249,20 @@ class Lease:
         while True:
             r = self._store._write("lock", self.key, ttl_ms=self._ttl_ms, holder=self.holder)
             if r["ok"]:
-                self.token = r["lease"][1]
-                self._lost = False
-                self._stop.clear()
-                threading.Thread(target=self._renew, name=f"lease-{self.key}", daemon=True).start()
-                return self
+                return self._held(r["lease"][1])
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"lock {self.key!r} is held by {r['lease'][0] if r['lease'] else 'another holder'}")
             with waiting():
                 time.sleep(pause if deadline is None else min(pause, max(0.0, deadline - time.monotonic())))
             pause = min(pause * 2, 0.5)
+
+    def _held(self, token: int) -> Lease:
+        """Granted with `token`: renewed in the background until released."""
+        self.token = token
+        self._lost = False
+        self._stop.clear()
+        threading.Thread(target=self._renew, name=f"lease-{self.key}", daemon=True).start()
+        return self
 
     def _renew(self) -> None:
         while not self._stop.wait(self._ttl_ms / 3000):
@@ -293,12 +319,50 @@ class Barrier:
             pause = min(pause * 2, 0.2)
 
 
+class Scan:
+    """(key, value) pairs under a prefix in key order (``store.scan``), read a
+    page at a time from a cursor, the last key read.
+
+    ``revision`` is the revision its first page was read at; later pages are
+    no older, so writes during the scan may or may not show. A watch from it,
+    ``store.watch(prefix, start=scan.revision)``, delivers every change the
+    pages may have missed: applying its events to the pairs gives the
+    namespace as it is now, with some changes seen twice and none missed.
+    """
+
+    def __init__(self, store: Store, prefix: str) -> None:
+        self._store, self._prefix = store, prefix
+        self._page: deque[tuple[str, Any]] = deque()
+        self._after, self._more = "", True
+        self.revision: int = self._fetch()
+
+    def _fetch(self) -> int:
+        r = self._store._read("scan", self._prefix, start_after=self._after)
+        for e in r["entries"]:
+            self._page.append((e["key"], _value(e)))
+            self._after = e["key"]
+        self._more = r["more"]
+        return int(r["revision"])
+
+    def __iter__(self) -> Iterator[tuple[str, Any]]:
+        return self
+
+    def __next__(self) -> tuple[str, Any]:
+        while not self._page:
+            if not self._more:
+                raise StopIteration
+            self._fetch()
+        return self._page.popleft()
+
+
 class Watch:
     """Changes to a prefix in revision order; iterate it (sync or async).
 
-    If it falls behind the namespace's bounded change log, it delivers the
-    current value of every key under the prefix and continues from there
-    (``resyncs`` counts this): a change may then be seen twice, never missed.
+    If it falls behind the namespace's bounded change log, it delivers a
+    ``resync`` event, then the current value of every key under the prefix
+    as ``put`` events, and continues from there (``resyncs`` counts this): a
+    key those puts leave out was deleted meanwhile. A change may be seen
+    twice, never missed.
     """
 
     _WAIT_MS = 30_000
@@ -319,9 +383,10 @@ class Watch:
             r = self._store._read("changes", self._prefix, after_revision=self._after, wait_ms=self._WAIT_MS)
         if r["compacted"]:
             self.resyncs += 1
-            for key, value in self._store.scan(self._prefix):
-                self._buffer.append(Event("put", key, value, r["revision"]))
-            self._after = r["revision"]
+            scan = self._store.scan(self._prefix)
+            self._buffer.append(Event("resync", self._prefix, None, scan.revision))
+            self._buffer.extend(Event("put", key, value, scan.revision) for key, value in scan)
+            self._after = scan.revision
             return
         for c in r["changes"]:
             value = c["counter"] if c["is_counter"] else (None if c["deleted"] else pickle.loads(c["value"]))

@@ -99,6 +99,14 @@ pub fn render(s: &pb::StatusReply) -> String {
     gauge("proposals_in_flight", "Shard commands proposed and not yet answered.", s.proposals_in_flight as f64);
     gauge("dispatch_p50_microseconds", "Median grant-to-handoff latency of recent calls.", s.dispatch_p50_us);
     gauge("dispatch_p99_microseconds", "99th percentile grant-to-handoff latency of recent calls.", s.dispatch_p99_us);
+    gauge("raft_heartbeat_p50_microseconds", "Median round trip of recent Raft heartbeats.", s.heartbeat_p50_us);
+    gauge("raft_heartbeat_p99_microseconds", "99th percentile Raft heartbeat round trip.", s.heartbeat_p99_us);
+    gauge("mesh_rate_bytes", "Bytes per second this peer paces bulk sends at (0: unpaced).", s.mesh_rate as f64);
+    gauge(
+        "queue_oldest_seconds",
+        "How long the longest-waiting queued call has waited for a slot (0 when none waits).",
+        s.queue_oldest_seconds,
+    );
     if s.data_groups > 0 {
         let led: std::collections::BTreeSet<u32> =
             s.nodes.iter().filter(|n| n.alive).flat_map(|n| n.leading.iter().copied()).collect();
@@ -108,6 +116,34 @@ pub fn render(s: &pb::StatusReply) -> String {
             (0..=s.data_groups).filter(|g| !led.contains(g)).count() as f64,
         );
     }
+    if let Some(f) = &s.fleet {
+        let cells: std::collections::BTreeSet<&str> = f.capacity.iter().map(|c| c.cell.as_str()).collect();
+        gauge("fleet_cells", "Other cells this cell's fleet view has a recent report of.", cells.len() as f64);
+        gauge(
+            "fleet_publishing",
+            "1 when this peer publishes its cell's fleet view.",
+            f64::from(u8::from(f.publishing)),
+        );
+        gauge("fleet_epoch", "The fencing token of the fleet view's publisher, as last read.", f.epoch as f64);
+    }
+    for (name, help, by_state) in [
+        ("tasks", "Calls on this peer, by state.", s.tasks_by_state.iter().map(|(k, v)| (k, *v)).collect::<Vec<_>>()),
+        (
+            "actors",
+            "Actors this peer hosts, by state.",
+            s.actors_by_state.iter().map(|(k, v)| (k, u64::from(*v))).collect(),
+        ),
+    ] {
+        if by_state.is_empty() {
+            continue; // an older peer's status
+        }
+        let _ = writeln!(out, "# HELP chimaera_{name} {help}\n# TYPE chimaera_{name} gauge");
+        let mut by_state = by_state;
+        by_state.sort();
+        for (state, n) in by_state {
+            let _ = writeln!(out, "chimaera_{name}{{state=\"{state}\"}} {n}");
+        }
+    }
     for c in crate::counters::ALL {
         let _ = writeln!(
             out,
@@ -116,6 +152,24 @@ pub fn render(s: &pb::StatusReply) -> String {
             c.help,
             c.get()
         );
+    }
+    if !s.traffic.is_empty() {
+        let _ = writeln!(
+            out,
+            "# HELP chimaera_mesh_sent_bytes_total Bytes sent to other peers in bulk, by traffic class.\n\
+             # TYPE chimaera_mesh_sent_bytes_total counter"
+        );
+        for t in &s.traffic {
+            let _ = writeln!(out, "chimaera_mesh_sent_bytes_total{{class=\"{}\"}} {}", t.name, t.bytes);
+        }
+        let _ = writeln!(
+            out,
+            "# HELP chimaera_mesh_wait_seconds_total Time bulk sends waited for their class's turn.\n\
+             # TYPE chimaera_mesh_wait_seconds_total counter"
+        );
+        for t in &s.traffic {
+            let _ = writeln!(out, "chimaera_mesh_wait_seconds_total{{class=\"{}\"}} {}", t.name, t.waited_s);
+        }
     }
     if s.data_groups > 0 {
         let _ = writeln!(
@@ -150,6 +204,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn calls_and_actors_by_state_and_the_backlog_age_are_series() {
+        let s = pb::StatusReply {
+            tasks_by_state: [("queued".to_string(), 7), ("running".to_string(), 3)].into(),
+            actors_by_state: [("alive".to_string(), 2), ("restarting".to_string(), 1)].into(),
+            queue_oldest_seconds: 12.5,
+            ..Default::default()
+        };
+        let out = render(&s);
+        let samples: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
+        assert!(samples.contains(&"chimaera_tasks{state=\"queued\"} 7"));
+        assert!(samples.contains(&"chimaera_tasks{state=\"running\"} 3"));
+        assert!(samples.contains(&"chimaera_actors{state=\"alive\"} 2"));
+        assert!(samples.contains(&"chimaera_actors{state=\"restarting\"} 1"));
+        assert!(samples.contains(&"chimaera_queue_oldest_seconds 12.5"));
+        let empty = render(&pb::StatusReply::default());
+        assert!(!empty.contains("chimaera_actors"), "an older peer's status has no actor series");
+    }
+
+    #[test]
     fn renders_parseable_gauges() {
         let s = pb::StatusReply {
             queued: 7,
@@ -165,6 +238,7 @@ mod tests {
                 pb::GroupStatus { group: 1, leading: true, max_lag: 4, ..Default::default() },
                 pb::GroupStatus { group: 2, ..Default::default() },
             ],
+            traffic: vec![pb::TrafficStatus { name: "checkpoint".into(), weight: 1, bytes: 9, waited_s: 0.5 }],
             ..Default::default()
         };
         let text = render(&s);
@@ -184,6 +258,8 @@ mod tests {
         assert!(samples.contains(&"chimaera_group_max_lag_entries{group=\"1\"} 4"));
         assert!(!text.contains("chimaera_group_max_lag_entries{group=\"2\"}"), "only a leader knows the lag");
         assert!(text.contains("# TYPE chimaera_proposals_total counter"));
+        assert!(samples.contains(&"chimaera_mesh_sent_bytes_total{class=\"checkpoint\"} 9"));
+        assert!(samples.contains(&"chimaera_mesh_wait_seconds_total{class=\"checkpoint\"} 0.5"));
         // Every sample has HELP and TYPE lines before it.
         for name in samples.iter().map(|l| l.split(['{', ' ']).next().unwrap()) {
             assert!(text.contains(&format!("# HELP {name} ")) && text.contains(&format!("# TYPE {name} ")), "{name}");

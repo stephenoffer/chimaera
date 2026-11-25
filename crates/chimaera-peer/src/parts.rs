@@ -3,7 +3,10 @@
 //! header (magic, reserved, count), then per value its part id (zeros: kept
 //! in the result's file), offset and length. A consumer of one value fetches
 //! only that part. The peer reads the list to free parts with their result
-//! and to know which peer to fetch them from.
+//! and to know which peer to fetch them from. A result of many values most
+//! of which are left out (Python `_serde.SPARSE_MAGIC`, a shuffle scatter's
+//! buckets) lists the ids of its parts right after its header, and counts
+//! them where the other layout counts its values.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -15,11 +18,24 @@ const HEAD: usize = 12;
 const ITEM: usize = 32;
 /// Python's `SEQ_MAX`: no result lists more values.
 const MAX_PARTS: usize = 4096;
+const SPARSE: &[u8; 4] = b"CHQ1";
+const SPARSE_HEAD: usize = 24;
+/// Parts of a sparse result read at most: each holds a value of 64 KiB or
+/// more, so a result lists fewer unless it is over 64 GiB.
+const MAX_SPARSE_PARTS: usize = 1 << 20;
 /// Hints kept before they are dropped and learned again.
 const MAX_HINTS: usize = 1 << 16;
+/// The newest layout of stored results this peer and the executors of its
+/// install read, advertised to the others (`Member.object_layout`): 1, the
+/// sparse one. A shuffle writes it only while every live peer reads it.
+pub const OBJECT_LAYOUT: u32 = 1;
 
 /// The part ids a result's bytes list (empty for any other object).
 pub fn ids(bytes: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.len() >= SPARSE_HEAD && &bytes[..4] == SPARSE {
+        let n = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes")) as usize;
+        return bytes[SPARSE_HEAD..].chunks_exact(16).take(n.min(MAX_SPARSE_PARTS)).map(<[u8]>::to_vec).collect();
+    }
     if bytes.len() < HEAD || &bytes[..4] != MAGIC {
         return Vec::new();
     }
@@ -38,11 +54,16 @@ pub fn ids(bytes: &[u8]) -> Vec<Vec<u8>> {
 pub fn file_ids(path: &Path) -> Vec<Vec<u8>> {
     let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
     let mut head = [0u8; HEAD];
-    if f.read_exact(&mut head).is_err() || &head[..4] != MAGIC {
+    if f.read_exact(&mut head).is_err() {
         return Vec::new();
     }
-    let n = (u32::from_le_bytes(head[8..12].try_into().expect("4 bytes")) as usize).min(MAX_PARTS);
-    let mut bytes = vec![0u8; HEAD + n * ITEM];
+    let n = u32::from_le_bytes(head[8..12].try_into().expect("4 bytes")) as usize;
+    let len = match &head[..4] {
+        m if m == MAGIC => HEAD + n.min(MAX_PARTS) * ITEM,
+        m if m == SPARSE => SPARSE_HEAD + n.min(MAX_SPARSE_PARTS) * 16,
+        _ => return Vec::new(),
+    };
+    let mut bytes = vec![0u8; len];
     bytes[..HEAD].copy_from_slice(&head);
     if f.read_exact(&mut bytes[HEAD..]).is_err() {
         return Vec::new();
@@ -117,5 +138,30 @@ mod tests {
         std::fs::write(&path, b"CHO1 not a result of several values").unwrap();
         hints.learn(b"run2", &path, 4);
         assert!(file_ids(&path).is_empty() && hints.holder(b"run2", &[1; 16]).is_empty());
+    }
+
+    #[test]
+    fn a_sparse_result_lists_its_parts_after_its_header() {
+        // As Python's pack_seq writes one: magic, reserved, parts, entries,
+        // count, the parts' ids, then one entry (position, part, offset, length) per value.
+        let mut b = SPARSE.to_vec();
+        b.extend(0u32.to_le_bytes());
+        b.extend(2u32.to_le_bytes());
+        b.extend(3u32.to_le_bytes());
+        b.extend(1_000_000u64.to_le_bytes());
+        b.extend([[4u8; 16], [5u8; 16]].concat());
+        for (position, part) in [(7u64, 1u64), (70, 0), (700_000, 2)] {
+            for v in [position, part, 0, 9] {
+                b.extend(v.to_le_bytes());
+            }
+        }
+        assert_eq!(ids(&b), [vec![4; 16], vec![5; 16]]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r");
+        std::fs::write(&path, &b).unwrap();
+        assert_eq!(file_ids(&path), [vec![4; 16], vec![5; 16]], "read from its header, not its entries");
+        std::fs::write(&path, &b[..SPARSE_HEAD + 16]).unwrap();
+        assert!(file_ids(&path).is_empty(), "a short list is not read");
+        assert_eq!(ids(&b[..SPARSE_HEAD + 16]), [vec![4; 16]], "a short list yields only whole ids");
     }
 }

@@ -36,8 +36,11 @@ stop them all.
 Each rank gets the gang's `cpus`, `memory`, `memory_limit`, `gpus`,
 `device`, `placement`, `priority` and `deadline` (see
 [resources.md](resources.md)). `max_attempts` (default 3) counts
-generations, not retries of one rank. The gang's supervisor is a small call
-(0.01 CPU) on your script's own peer.
+generations, not retries of one rank. `rendezvous_timeout` (default 300 s)
+is how long the ranks of a generation have to meet once it starts, and
+`collective_timeout` (default 600 s) how long a rank waits in one
+collective (see [Survive a lost rank](#survive-a-lost-rank)). The gang's
+supervisor is a small call (0.01 CPU) on your script's own peer.
 
 `gang()` without `ranks=` raises `TypeError`, and `.remote()` with `ranks=`
 raises `ch.OptionsError`.
@@ -65,7 +68,7 @@ assert envs[0]["MASTER_ADDR"] == envs[1]["MASTER_ADDR"]
 |---|---|
 | `RANK`, `WORLD_SIZE` | This rank, and how many there are |
 | `LOCAL_RANK`, `LOCAL_WORLD_SIZE` | The same among ranks on this peer |
-| `MASTER_ADDR`, `MASTER_PORT` | Rank 0's host and a free port there |
+| `MASTER_ADDR`, `MASTER_PORT` | Rank 0's host and a port it holds there until your code starts |
 | `CHIMAERA_GANG`, `CHIMAERA_GANG_GENERATION` | The gang's id and its current generation |
 
 <details>
@@ -80,9 +83,9 @@ calls never see a stale `RANK`.
 
 </details>
 
-## Exchange small values
+## Exchange values without torch
 
-Small values? Four collectives pass them between ranks with no torch:
+Four collectives pass Python values between ranks with no torch:
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -100,10 +103,15 @@ assert exchange.options(ranks=3).gang().result() == [(["worker-0", "worker-1", "
 <details>
 <summary>What each collective returns</summary>
 
-They go through the cluster's replicated store, so they're good for configs,
-seeds, metrics and file lists that pickle to at most 1 MiB each. Move
-tensors with `torch.distributed`. Every rank has to run the same sequence of
-collectives.
+A value that pickles to 64 KiB or less goes through the cluster's
+replicated store: configs, seeds, metrics, file lists. A bigger one, such as
+a NumPy array, goes through the object plane: the sender stores it as
+`ch.put` would, the store carries only its handle, and the sender frees it
+once every rank has read it. A copy that a rank on another peer fetched
+stays on that peer until the run ends, so a long loop of large collectives
+across peers fills their object stores. Move that kind of data, and GPU
+tensors, with `torch.distributed`.
+Every rank has to run the same sequence of collectives.
 
 | Collective | Returns |
 |---|---|
@@ -217,7 +225,9 @@ with Worker.options(ranks=3).gang(100) as workers:
 
 Lose any rank and the class gang breaks: its calls raise `ch.ActorDied`, and
 nothing restarts until you call `workers.restart()`. Restore your checkpoint
-in `__init__`.
+in `__init__`. A collective that outlasts `collective_timeout` breaks it
+too: every rank's collectives raise the same `ch.errors.GangFailed` until
+you restart it.
 
 - `workers.method.remote(...)` runs on every rank and gives one future of
   the results in rank order; `workers[i].method.remote(...)` runs on rank
@@ -310,6 +320,38 @@ except ch.errors.GangFailed as e:
 
 </details>
 
+A rank that stops making progress counts as lost too. A rank waits in one
+collective, or in `g.torch()` for the other ranks, at most
+`collective_timeout` seconds (default 600, torch's own default for NCCL), and
+`g.torch()` gives torch's process group the same timeout. When a wait runs
+out, the rank gives the generation up, every other rank raises the same
+`ch.errors.GangFailed` (within a second if it is waiting too, else at its
+next collective), and the gang starts its next generation:
+
+```python run
+@ch.remote(cpus=0.5)
+def stuck_once() -> tuple:
+    g = ch.context().gang
+    if g.generation == 1 and g.rank == 1:
+        time.sleep(60)                   # stuck: never reaches the barrier
+    g.barrier()                          # rank 0 gives generation 1 up after 2 s
+    return g.rank, g.generation
+
+assert stuck_once.options(ranks=2, collective_timeout=2).gang().result() == [(0, 2), (1, 2)]
+```
+
+The deadline counts from when a rank enters the collective, so one rank's
+long work before it counts against the others. If rank 0 downloads the data
+for 20 minutes while the others wait in `g.barrier()`, give the gang a
+`collective_timeout` longer than that, or every generation is given up at
+10 minutes until `max_attempts` runs out.
+
+A `torch.distributed` `DistError` out of a rank or out of `g.torch()`
+(torch's watchdog timed a collective out, or torch lost a peer) loses the
+generation the same way. A collective's own `timeout=` is different: it
+raises `TimeoutError` in every rank that waits in that collective or enters
+it later, which fails the gang as your error.
+
 A rank that raises is different. That's your bug, not a lost machine, so the
 gang fails at once with that rank's own exception and cancels the others:
 
@@ -330,12 +372,25 @@ except ValueError as e:
 <details>
 <summary>When not all ranks fit</summary>
 
-Heads up: ranks are placed one at a time today, not all or nothing, so size
-each gang to what's free when it starts.
+A generation starts all or none. The peers first hold every rank's CPUs and
+GPUs, and only then does any rank start, each on what was held for it. A
+gang that doesn't fit yet waits holding nothing, and `explain()` says why
+(`waiting for every rank's slot to be free: ...`). So two gangs that each
+need all eight GPUs run one after the other, never four and four. Actors
+that asked for `cpus=` or `gpus=` keep them while they live, so a gang
+waits for those too.
 
-If free capacity runs short, whichever ranks fit start and wait at the
-rendezvous. If some rank hasn't shown up within 300 s, the generation counts
-as lost and the next one tries again.
+A gang that couldn't fit even on idle peers fails at once with
+`ch.Infeasible`, naming the first rank that doesn't fit. Once a generation
+starts, every rank has `rendezvous_timeout` seconds to reach the
+rendezvous. If one doesn't, the generation counts as lost, and the error
+says where each missing rank is: queued on its peer and why, or started
+but not there yet.
+
+A rank of a generation that was replaced can't join the next one: its
+collectives and `g.torch()` raise `ch.errors.GangFailed`. If something
+takes `MASTER_PORT` before `g.torch()` binds it, rank 0 serves torch's
+store on another port, and the other ranks connect to that one.
 
 </details>
 
@@ -374,6 +429,11 @@ Each member's first `join()` waits for all of them; later ones return that
 `Group`. Changed the set of actors? Call `ch.dist.group(..., name="k")`
 again with the same name to start a new generation. `join()` anywhere but
 inside a member's method raises `ValueError`.
+
+A member waits in one collective at most 600 seconds, or what you pass as
+`ch.dist.group(..., collective_timeout=s)`. Past it the generation is given
+up, and every member's collectives raise `ch.errors.GangFailed` until you
+start a new one.
 
 </details>
 

@@ -205,15 +205,9 @@ def wait(
         return not isinstance(r, ch.Future) or r.done()
 
     pending = [r for r in refs if not is_ready(r)]
-    if sum(1 for r in refs if is_ready(r)) < num_returns and pending:
-        need = num_returns - (len(refs) - len(pending))
-        try:
-            for _ in ch.as_completed(pending, timeout=timeout):
-                need -= 1
-                if need <= 0:
-                    break
-        except TimeoutError:
-            pass
+    need = num_returns - (len(refs) - len(pending))
+    if need > 0:
+        ch.wait(pending, num_returns=need, timeout=timeout)
     ready = [r for r in refs if is_ready(r)][:num_returns]
     chosen = {id(r) for r in ready}
     return ready, [r for r in refs if id(r) not in chosen]

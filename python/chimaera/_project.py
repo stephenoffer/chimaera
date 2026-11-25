@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shutil
 import site
 import subprocess
@@ -216,6 +217,42 @@ def _extract(tar: tarfile.TarFile, dest: str) -> None:
         tar.extractall(dest)  # members checked above
 
 
+# This machine's GPU driver versions (NVIDIA, ROCm), for locks that hold GPU packages.
+ACCELERATOR_FILES = ("/proc/driver/nvidia/version", "/opt/rocm/.info/version")
+
+
+def _env_key(project: str, lock: bytes, uv_version: str) -> str:
+    """The name of the environment `project`'s uv.lock (`lock`) is installed
+    into. Besides the lock it covers everything else that decides what the
+    install holds or whether it loads, so an environment built for one
+    interpreter or machine never serves another: the project's pyproject.toml
+    (its dependency groups and [tool.uv] settings choose what `uv sync
+    --frozen` installs), uv's version, this interpreter's version and ABI (a
+    debug or free-threaded build), the platform and libc, and, when the lock
+    holds GPU packages, this machine's GPU driver versions."""
+    try:
+        with open(os.path.join(project, "pyproject.toml"), "rb") as f:
+            pyproject = f.read()
+    except OSError:
+        pyproject = b""
+    try:
+        libc = os.confstr("CS_GNU_LIBC_VERSION") or ""  # glibc's version; SOABI tells glibc from musl
+    except (ValueError, OSError):
+        libc = ""
+    drivers = b""
+    if re.search(rb"nvidia|cuda|rocm", lock):
+        for path in ACCELERATOR_FILES:
+            try:
+                with open(path, "rb") as f:
+                    drivers += f.readline()
+            except OSError:
+                pass
+    abi = "|".join(
+        [sys.version, sys.abiflags, str(sysconfig.get_config_var("SOABI")), sysconfig.get_platform(), libc, uv_version]
+    )
+    return blake3_digest(b"\0".join([lock, pyproject, drivers, abi.encode()]))[:16].hex()
+
+
 def _use_locked_env(project: str, envs: str) -> None:
     """Install `project`'s uv.lock for this interpreter (once per peer) and put
     its packages first on sys.path."""
@@ -224,19 +261,23 @@ def _use_locked_env(project: str, envs: str) -> None:
 
     with open(os.path.join(project, "uv.lock"), "rb") as f:
         lock = f.read()
-    key = blake3_digest(lock + sys.version.encode() + sysconfig.get_platform().encode())[:16].hex()
-    env = os.path.join(envs, key)
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError("the project has a uv.lock, but uv is not on this peer's PATH: install uv on the peers")
+    uv_version = subprocess.run([uv, "--version"], capture_output=True, text=True, timeout=60).stdout.strip()
+    env = os.path.join(envs, _env_key(project, lock, uv_version))
     os.makedirs(envs, exist_ok=True)
     with open(env + ".lock", "w") as guard:
         fcntl.flock(guard, fcntl.LOCK_EX)  # one install per peer; the others wait for it
         if not os.path.exists(os.path.join(env, ".chimaera-ready")):
-            uv = shutil.which("uv")
-            if uv is None:
-                raise RuntimeError("the project has a uv.lock, but uv is not on this peer's PATH: install uv on the peers")
             limit = float(os.environ.get("CHIMAERA_ENV_BUILD_TIMEOUT", "900"))
             try:
+                # Never a chimaera from the lock: the run uses the peer's own
+                # package and peer binary, and a second copy first on sys.path
+                # would stand in for it.
                 done = subprocess.run(
-                    [uv, "sync", "--frozen", "--no-install-project", "--python", sys.executable],
+                    [uv, "sync", "--frozen", "--no-install-project", "--no-install-package", "chimaera"]
+                    + ["--python", sys.executable],
                     cwd=project,
                     env={**os.environ, "UV_PROJECT_ENVIRONMENT": env},
                     capture_output=True,

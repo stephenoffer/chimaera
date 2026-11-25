@@ -210,3 +210,87 @@ def test_pythons_without_tar_filters_unpack_and_refuse_the_same(tmp_path, monkey
     with pytest.raises(ValueError, match="only plain files"):
         _project._extract(tarfile.open(fileobj=buf), str(dest))
     assert not (tmp_path / "evil.py").exists()
+
+
+def test_an_environment_serves_only_the_interpreter_and_machine_it_was_built_for(tmp_path, monkeypatch):
+    import sys
+    import sysconfig
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+    lock = b'[[package]]\nname = "toolz"\n'
+    key = lambda: _project._env_key(str(tmp_path), lock, "uv 0.11.7")  # noqa: E731
+    base = key()
+    assert base == key(), "the same inputs name the same environment"
+    assert _project._env_key(str(tmp_path), lock, "uv 0.12.0") != base
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n[tool.uv]\ndefault-groups = ["gpu"]\n')
+    assert key() != base, "pyproject.toml decides what `uv sync --frozen` installs"
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+    assert key() == base
+
+    def changed(patch):
+        with monkeypatch.context() as m:
+            patch(m)
+            return key()
+
+    soabi = sysconfig.get_config_var("SOABI")
+    config_var = sysconfig.get_config_var
+    other_abi = {"SOABI": f"{soabi}d"}
+    assert changed(lambda m: m.setattr(sysconfig, "get_config_var", lambda k: other_abi.get(k, config_var(k)))) != base
+    assert changed(lambda m: m.setattr(sys, "abiflags", sys.abiflags + "t")) != base
+    assert changed(lambda m: m.setattr(sysconfig, "get_platform", lambda: "linux-x86_64")) != base
+    assert changed(lambda m: m.setattr(_project.os, "confstr", lambda name: "glibc 2.17")) != base
+    assert changed(lambda m: m.setattr(sys, "version", sys.version + " (another build)")) != base
+
+    # The GPU driver counts only for a lock that holds GPU packages.
+    driver = tmp_path / "nvidia-version"
+    monkeypatch.setattr(_project, "ACCELERATOR_FILES", (str(driver),))
+    gpu_lock = b'[[package]]\nname = "nvidia-cublas-cu12"\n'
+    gpu = lambda: _project._env_key(str(tmp_path), gpu_lock, "uv 0.11.7")  # noqa: E731
+    driver.write_text("NVRM version: NVIDIA UNIX x86_64 Kernel Module  550.54.15\n")
+    before = (key(), gpu())
+    driver.write_text("NVRM version: NVIDIA UNIX x86_64 Kernel Module  570.86.10\n")
+    assert key() == before[0]
+    assert gpu() != before[1]
+
+
+def _wheel(where, name: str, version: str) -> str:
+    """A minimal pure-Python wheel of package `name` (no build step, no index)."""
+    import zipfile
+
+    path = os.path.join(where, f"{name}-{version}-py3-none-any.whl")
+    info = f"{name}-{version}.dist-info"
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr(f"{name}/__init__.py", f"WHO = {name!r}\n")
+        z.writestr(f"{info}/METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+        z.writestr(f"{info}/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        z.writestr(f"{info}/RECORD", "")
+    return os.path.basename(path)
+
+
+def test_a_lock_that_pins_chimaera_does_not_install_a_second_one(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    import sys
+
+    if shutil.which("uv") is None:
+        pytest.skip("needs uv")
+    project = tmp_path / "project"
+    project.mkdir()
+    ours, dep = _wheel(project, "chimaera", "9.9.9"), _wheel(project, "tinydep", "1.0")
+    (project / "pyproject.toml").write_text(
+        '[project]\nname = "app"\nversion = "0"\nrequires-python = ">=3.11"\n'
+        'dependencies = ["chimaera", "tinydep"]\n\n'
+        f'[tool.uv.sources]\nchimaera = {{ path = "{ours}" }}\ntinydep = {{ path = "{dep}" }}\n'
+    )
+    monkeypatch.setenv("UV_OFFLINE", "1")  # every package is a local wheel
+    done = subprocess.run(["uv", "lock", "--python", sys.executable], cwd=project, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))  # the env's .pth files may add finders
+    _project._use_locked_env(str(project), str(tmp_path / "envs"))
+    packages = sys.path[0]
+    assert packages.startswith(str(tmp_path / "envs"))
+    installed = os.listdir(packages)
+    assert "tinydep" in installed
+    assert not [n for n in installed if n.startswith("chimaera")], installed

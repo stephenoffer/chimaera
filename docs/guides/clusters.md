@@ -197,7 +197,9 @@ chimaera status --cluster lab
 ```text
 peer 000000002b7d (incarnation 1) · 0.00/2.00 CPU in use · 4 executors (0 busy) · 0 queued · 0 running · 0 sessions · 0 object bytes
   ...
-  automatic: raft sync fsync (fsync p50 71 µs: fast)
+  durability: commits survive a machine loss (asked for: machine)
+  ...
+  automatic: raft sync fsync (the default): commits take p50 266 µs, p99 2850 µs, 1.2 entries each; the oldest entry waits p99 5004 µs
   peers:
     127.0.0.1:17704 · 0.0/2.0 CPU in use · 0 queued
     127.0.0.1:17702 · 0.0/2.0 CPU in use · 0 queued · leads 0, 1, 2, 3, 4, 5, 6, 7, 8

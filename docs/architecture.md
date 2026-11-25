@@ -166,6 +166,11 @@ floor the real path builds on, not Chimaera's.
 - **Inline apply:** an attached run's calls apply in the proposing task, with no hop to the group's thread
   ([design](../bench/proto/local-group/INLINE-APPLY.md)). On the live tree, interleaved with Ray: local actor calls
   190.5 µs against Ray's 145 µs, and local task calls 192.5 µs against Ray's 378 µs.
+- **Direct actor path** (stage 2, in the tree): a local caller sends an eligible actor call straight to the actor's
+  executor over a Unix socket and records it with the peer afterwards; calls whose inputs are futures go once the
+  inputs land. Local actor calls: 118–196 µs against Ray's 224–452 µs on this laptop, 212 µs against 426 µs on a
+  32-core Linux machine ([results](../bench/proto/local-group/DIRECT-RESULTS.md)). Calls made inside tasks and
+  actors go direct too, except an actor's calls to itself and methods with a mailbox limit, which the peer keeps.
 
 The journal reuses the shard state machine that exists today (`crates/chimaera-core/src/shard`). The transitions,
 fencing and exactly-one-winner rules are the same; only the replication changes. Raft groups apply commands from a

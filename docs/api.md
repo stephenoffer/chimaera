@@ -157,18 +157,19 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 
 | Option | Meaning |
 |---|---|
-| `cpus`, `memory` | Reserve capacity. `ch.auto(...)` leaves the value to the runtime. An actor that asks for `cpus` holds them while it lives, and waits until some peer has them free; an actor no peer could ever hold fails as `ch.Infeasible`. |
+| `cpus`, `memory` | Reserve capacity. `ch.auto(...)` leaves the value to the runtime, starting from its initial value if it has one. An actor that asks for `cpus` holds them while it lives, and waits until some peer has them free; an actor no peer could ever hold fails as `ch.Infeasible`. |
 | `memory_limit` | Enforced; going over raises `ch.OutOfMemory` with the measured peak. |
 | `gpus`, `device` | Accelerators (P5 assigns and isolates them; see Tier 3). |
 | `effects` | `"none"` (default), `"idempotent"` or `"external"`. External calls start at most once. |
+| `durability` | What the result survives if its peer is lost: by default a background copy on another peer, and the call runs again; `"ephemeral"` (no copy, lost with its peer), `"replayable"` (no copy, the call runs again) or `"retained"` (the call succeeds only once copies on other peers, other racks first, exist). See [objects](objects.md#fault-tolerance). |
 | `max_attempts`, `retry_exceptions` | Infrastructure failures are retried; your exceptions only when listed. |
 | `deadline` | Relative (`"30s"`) or a `datetime`; children inherit the earliest one. |
 | `concurrency` | Calls an actor may run at once (default 1). |
-| `max_in_flight`, `max_in_flight_bytes` | Bounds for a map's window. |
+| `max_in_flight`, `max_in_flight_bytes` | Bounds for a map's window, and for how far a generator runs ahead of you. |
 | `name`, `detach`, `restart`, `max_restarts` | Actor identity and recovery. |
 | `replicas` | Pool size, or `ch.auto(...)` (P4 controller). |
 | `latency="interactive"` | Never batch these calls. |
-| `adaptive` | `"on"` (default: learned reservations apply), `"observe"` (record proposals only) or `"frozen"` (no learning). See [resources](guides/resources.md). |
+| `adaptive` | `"on"` (default: learned reservations apply), `"observe"` (say what would be reserved, apply nothing learned) or `"frozen"` (no learning). See [resources](guides/resources.md). |
 | `cache` | `True` (keep results 7 days) or a time to live (`"30d"`): a repeat of a call returns its stored result. See [Caching results](#caching-results). |
 
 ### Caching results
@@ -213,6 +214,41 @@ assert ch.get(futures) == [0, 1, 2, 3, 4]
 assert sorted(f.result() for f in ch.as_completed(futures)) == [0, 1, 2, 3, 4]
 ```
 
+### Task groups
+
+`ch.TaskGroup` owns the calls you add to it, as `asyncio.TaskGroup` owns its
+tasks. Leaving the block (`with` or `async with`) waits for every call, and
+there the first call to fail cancels the others still running. Unlike
+`asyncio.TaskGroup`, it looks for failures only once the block's code ends: a
+call that fails while that code still runs doesn't stop it or the other calls.
+The errors of every call that failed on its own, and the block's own error,
+are then raised together as an `ExceptionGroup`. A call that never ran because
+a call of the group it takes as an argument failed isn't counted again: that
+call's error is. Calls that finished keep
+their results. Inside a call, the wait (`with` or `async with`) lends the
+call's CPU as `result()` does, so groups nest. **Runs today:**
+
+```python run
+with ch.TaskGroup() as g:
+    counts = [g.add(word_count.remote(t)) for t in ("a", "a b")]
+assert [f.result() for f in counts] == [1, 2]
+
+@ch.remote
+def check(n: int) -> int:
+    if n < 0:
+        raise ValueError(f"{n} is negative")
+    return n
+
+try:
+    with ch.TaskGroup() as g:
+        kept = g.add(check.remote(1))
+        bad = [g.add(check.remote(-1)), g.add(check.remote(-2))]
+        ch.wait([kept, *bad])  # both fail before either is cancelled
+except* ValueError as group:
+    assert len(group.exceptions) == 2
+assert kept.result() == 1
+```
+
 ### Large values
 
 `ch.put` stores a value once; pass the reference to as many calls as you like.
@@ -229,7 +265,15 @@ assert ch.get([count.remote(words, "blue"), count.remote(words, "sky")]) == [50_
 ```
 
 `ch.put` returns an already-finished `Future[T]`, so there is one handle
-type everywhere: pass it like any other future.
+type everywhere: pass it like any other future. `durability="ephemeral"`
+skips the background copy on another peer (the value is lost with its
+peer); `durability="retained"` returns only once copies on other peers
+exist. **Runs today:**
+
+```python run
+scratch = ch.put(["blue"] * 50_000, durability="ephemeral")
+assert count.remote(scratch, "blue").result() == 50_000
+```
 
 ### Errors
 
@@ -257,6 +301,7 @@ except ch.Infeasible as e:
 | Your own exception | Your code raised it; it ran once (unless listed in `retry_exceptions`). |
 | `ch.InfrastructureFailure`, `ch.errors.WorkerCrashed` | Workers kept dying until the attempts ran out. |
 | `ch.OutOfMemory` | Over `memory_limit`; carries the peak and the limit. |
+| `ch.errors.OutOfDisk` | A value could not be stored: the disk holding objects is full. An `OSError` with `errno.ENOSPC`; the message names the directory and its free space. |
 | `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died. |
 | `ch.Infeasible` | Nothing can ever run this request; the message names the constraint. |
 | `ch.Cancelled`, `ch.DeadlineExceeded` | The call was stopped. |
@@ -267,7 +312,8 @@ except ch.Infeasible as e:
 `ch.NotFound` means nothing exists under a name (`ch.actor(name)`), `ch.errors.Closed`
 that a queue or topic was closed, `ch.errors.VersionConflict` that a store's
 compare-and-set lost, and `ch.errors.LeaseLost` that a fenced write's lock passed to
-someone else. `ch.errors.GangFailed` means every generation of a gang lost a rank.
+someone else. `ch.errors.GangFailed` means every generation of a gang lost a rank
+(or, from a class gang's call, that its generation was given up).
 `ch.errors.QuorumLost` (an `InfrastructureFailure`) means a group of the cluster lost
 the majority of its peers and took no writes for a minute; the message names
 the group, and calls go through again once enough of its peers are back.
@@ -337,6 +383,45 @@ shout.remote("kept").result()
 assert any(line.endswith("stdout| KEPT") for line in ch.runs.current_run().logs())
 ```
 
+A call that failed for good, by an error it raised or by crashes and memory
+kills that used up its attempts, stays with its run: `run.failed()` lists it
+(id, function, error), `run.retry_failed()` runs it again as a new call once the
+cause is fixed, and `run.discard_failed()` lets it go. Each keeps the inputs it
+read until then, the newest 1,000 per run. A call that never ran because its
+input failed is not listed: retrying that input runs it again. From a shell,
+`chimaera retry RUN` lists them and `--yes` retries them. **Runs today:**
+
+```python run
+fixed = ch.coord.Store("docs-failed-rows")
+
+@ch.remote
+def parse_row(row: str) -> int:
+    if not fixed.get("yes"):
+        raise ValueError(f"bad row {row!r}")
+    return int(row)
+
+def failed_rows():
+    return [c for c in ch.runs.current_run().failed() if c.function.endswith("parse_row")]
+
+try:
+    parse_row.remote("7").result()
+except ValueError:
+    pass
+(failed,) = failed_rows()
+assert isinstance(failed.error, ValueError)
+
+fixed.put("yes", True)                        # the cause is fixed: run it again
+(again,) = ch.runs.current_run().retry_failed([failed])
+assert again.result() == 7 and not failed_rows()
+
+fixed.delete("yes")
+try:
+    parse_row.remote("x").result()
+except ValueError:
+    pass
+assert ch.runs.current_run().discard_failed(failed_rows()) == 1 and not failed_rows()
+```
+
 ### Dynamic graphs and multiple returns
 
 A call can return another call's future: the caller receives the final value,
@@ -377,7 +462,11 @@ for capacity on a peer (higher first); it never stops a running call.
 
 `.options()` on a method sets things for one call. `@ch.method` sets them for
 every call of a method. A concurrency group runs its methods beside the actor's
-other calls, so a slow call does not block them. `ch.actor(name)` finds a named
+other calls, so a slow call does not block them.
+`@ch.method(mailbox=ch.Mailbox(max_calls=N, on_full="reject"))` lets the actor
+hold at most N of a method's calls; the rest raise `ch.errors.Overloaded`, at
+once or (`on_full="wait"`) after waiting `max_wait` for room, so a flood of one
+method never takes the room its others need. `ch.actor(name)` finds a named
 actor from anywhere. An actor handle reserves the names `close` and `id`
 (`handle.close()` ends the actor), so give methods other names. **Runs today:**
 
@@ -415,8 +504,13 @@ assert ch.actor("docs/service").ping.remote().result() == "pong"
 A `ch.coord.Queue` is a bounded first-in, first-out queue any process can use: pass
 it to calls, or share it by `name=`. A full queue makes `put` wait. Iterating
 takes items until the queue is closed and empty. A `ch.coord.Topic` keeps a bounded
-log and delivers every item to every subscriber. Both are held by an actor,
-so they last as long as their run and are not replicated. **Runs today:**
+log and delivers every item to every subscriber. A subscriber that falls
+behind the log skips ahead, and `sub.gaps` names each run of offsets it
+missed as a `ch.coord.Gap(first_missed, first_available)`. Subscribing with
+`cursor="name"` lets `sub.ack()` record how far it got, and subscribing with
+that name again resumes there. Both are held by an actor, so they (and a
+topic's cursors) last as long as their run and are not replicated.
+**Runs today:**
 
 ```python run
 q = ch.coord.Queue(maxsize=100)
@@ -460,32 +554,51 @@ try:
 except ch.errors.VersionConflict as e:
     assert e.version == v2
 assert store.get("config") == {"lr": 1e-4}
+config, version = store.get_versioned("config")           # one read: value and version
+store.put("config", {**config, "warmup": 100}, if_version=version)
 assert store.counter("seen").add(2) == 2
 
 with store.lock("leader", ttl="10s") as lease:            # renewed while held
     assert store.holder("leader") == lease.holder
     store.put("state", "mine", fence=lease)               # refused if the lease was lost
 
-changes = store.watch("jobs/")
+snapshot = store.scan("jobs/")                            # read a page at a time
+view = dict(snapshot)
+changes = store.watch("jobs/", start=snapshot.revision)   # what the pages missed, then what comes next
 store.put("jobs/1", "queued")
 event = next(changes)
 assert (event.kind, event.key, event.value) == ("put", "jobs/1", "queued")
 ```
 
-`lock()` returns a lease: its `token` grows with every grant, and a write with
-`fence=lease` fails with `ch.errors.LeaseLost` once another holder has taken over.
+`get_versioned(key)` returns a key's value and version from one read, the pair
+a read-modify-write loop passes back as `if_version`. `lock()` returns a lease:
+its `token` grows with every grant, and a write with `fence=lease` fails with
+`ch.errors.LeaseLost` once another holder has taken over.
 This is the safe way to elect a leader. `barrier(key, parties).wait()` blocks
 until that many participants arrive, round after round. `ttl=` makes a key
-expire. A watch that falls behind the namespace's bounded change log delivers
-the current value of every key and continues; it may repeat a change, but it
-never misses one. Anyone who holds the cluster token can write values that
-readers unpickle, the same trust that running calls requires.
+expire. `scan(prefix)` reads keys a page at a time, and writes made meanwhile
+may or may not show; its `revision` is where a watch picks up, so applying
+that watch's events to the scanned keys gives the namespace as it is now. A
+watch that falls behind the namespace's bounded change log yields a `resync`
+event, then the current value of every key, and continues: drop what you
+hold when you see it. A watch may repeat a change, but it never misses one.
+Anyone who holds the cluster token can write values that readers unpickle,
+the same trust that running calls requires.
 
 `ch.coord.WorkQueue(name)` keeps a queue of work items in a store, so it outlives any
 process. A consumer `claim`s an item: the item is removed when the block
 finishes, and delivered again if the block raises or the consumer dies. Its
 methods are synchronous (`put` returns once the item is stored, `get` returns
-the item), unlike `Queue`'s futures.
+the item), unlike `Queue`'s futures. A `put` is one replicated command, so a
+producer that dies partway stores the whole item or nothing, and finishing a
+claim removes the item and counts it in one command too. After `close()`,
+consumers get `ch.errors.Closed` only once no item is left, so an item whose
+consumer dies after the close is still delivered. A claim is one command
+that looks at a couple of keys however long the queue: an item given back or
+whose consumer died goes first, then the oldest. A consumer with nothing to
+claim waits for the queue to change instead of polling it. The queue keeps
+its `maxsize`: the first open that gives one stores it, opens without one use
+it, and opening the queue with a different one raises `ValueError`.
 **Runs today:**
 
 ```python run
@@ -579,7 +692,9 @@ shared.close()
 and calls it for one item. The actor collects calls until it has `max_size` or
 the first has waited `max_wait`, runs the method once, and gives each caller
 its element of the returned list. If the method raises, every call in the
-batch gets the error. **Runs today:**
+batch gets the error. `max_bytes=` ("32MiB") also bounds the argument bytes of
+the calls the actor holds; a call that would go over waits at its peer.
+**Runs today:**
 
 ```python run
 @ch.remote
@@ -595,9 +710,10 @@ assert ch.get((embedder.embed.remote(t) for t in ["a", "bb", "ccc"])) == [1, 2, 
 ### Partitioned data
 
 `ch.data.partitions(...)` cuts input into partitions: a list, a file glob (one
-partition per file; `.jsonl`, `.csv`, `.parquet` or lines), or any
-`ext.Source`. `columns=` and `filter=` are pushed down where the format
-allows. `reduce_by_key` regroups `(key, value)` results by key between calls,
+partition per file, several for a file over 128 MiB unless it is CSV; `.jsonl`,
+`.csv`, `.parquet` or lines), or any `ext.Source`. `columns=` and `filter=` are pushed
+down where the format allows. A partition streams its rows, and
+`partition.batches()` gives a Parquet one as Arrow record batches. `reduce_by_key` regroups `(key, value)` results by key between calls,
 so the data moves between workers, not through the driver. Its result is a
 `ch.data.Partitioned`: iterate it for each partition's dict (key to value; to
 the list of values without a combine), or call `to_dict()`.
@@ -630,8 +746,13 @@ assert manifest["rows"] == 4 and len(manifest["parts"]) == 2
 
 Durable actors, durable workflows and placement on peer labels work today;
 [actors](guides/actors.md), [failures](guides/failures.md) and
-[resources](guides/resources.md) run them. A per-call environment is still
-planned.
+[resources](guides/resources.md) run them. A workflow's writes to other
+systems are `ch.durable.Activity` steps with a key, and `version=` with
+`compatible=` lets a new definition take over histories in flight. A durable
+actor's state, up to 128 MiB, is committed after each call (in chunks past
+1 MiB, writing only those that changed), and `ch.durable.State(version=2,
+migrate=fn)` lets a newer class take over a named actor's state. A per-call
+environment is still planned.
 
 ```python
 # Durable actors: state survives the process; a repeated command id returns
@@ -698,7 +819,13 @@ DeepSpeed code runs unchanged; `group.torch()` initializes
 `torch.distributed` with the devices' backend (`gloo` on CPU). If a rank is
 lost, every rank stops and the gang starts again as the next `generation`
 (resume from your checkpoint), up to `max_attempts`; a rank that raises fails
-the gang with its error. **Runs today:**
+the gang with its error. A rank stuck in one collective, or in
+`group.torch()` waiting for the others, longer than `collective_timeout`
+(default 600 s; torch's process group gets the same timeout) loses the
+generation too: every rank raises the same `ch.errors.GangFailed`, and the
+gang starts again. The store collectives take
+any picklable value: one larger than 64 KiB goes through the object plane,
+and the store carries only its handle. **Runs today:**
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -759,7 +886,8 @@ group, ranked in the order given. Pass the handle to them; inside a member,
 `handle.join()` is its `Group`, with the same collectives and `torch()` as a
 gang's rank. The first `join()` in each member waits for all of them.
 `ch.dist.group(..., name=k)` again with the same key starts a new generation, for a
-changed set of actors. **Runs today:**
+changed set of actors. `collective_timeout=` (default 600 s) bounds each
+collective's wait, as in a gang. **Runs today:**
 
 ```python run
 @ch.remote(cpus=0.5)
@@ -789,9 +917,15 @@ print(gang.explain()["summary"])
 # rank 5 last entered #41 (all_gather, 312 s ago); ranks 0, 1, 2, 3, 4, 6, 7 wait in #42 (barrier)
 ```
 
-Ranks are placed one by one today and meet through the replicated store, so a
-gang larger than the free capacity waits at the rendezvous. Coming with the
-shard's gang commit (P5): all-or-nothing placement.
+A generation starts all or none: the peers hold every rank's CPUs and
+devices before any rank starts, so a gang that does not fit waits holding
+nothing (two gangs that each need the whole cluster run one after the other),
+and one that could not fit even on idle peers raises `ch.Infeasible` naming
+the first rank that does not. Every rank then has `rendezvous_timeout`
+seconds (default 300) to reach the rendezvous, or the generation is lost with
+each missing rank's stage in the error. A rank of a replaced generation
+cannot join the next one: its collectives and `torch()` raise
+`ch.errors.GangFailed`.
 
 `group.mesh(dp=2, tp=4)` splits a group's ranks into a grid (the last axis
 varies fastest, as in torch's DeviceMesh) and gives this rank's group along
@@ -831,14 +965,12 @@ with ch.dist.reserve([{"cpus": 1}, {"cpus": 1}], strategy="pack") as res:
     assert tally.increment.remote(2).result() == 2
 ```
 
-A reservation holds every bundle or none. If it can't hold them all in time,
-it gives back what it took and tries again after a random pause, so
-reservations competing for the same CPUs take turns instead of each holding
-part. `ready(timeout)` raises `TimeoutError` while it keeps trying;
-`release()` gives up. The holds are taken from the peers' load reports, not
-in one atomic step: a burst against stale reports can over-commit briefly
-before one reservation backs off. Atomic holds come with the shard's gang
-commit.
+A reservation holds every bundle or none: each peer holds its bundles' CPUs
+and devices on its own ledger only from what is free, so reservations
+competing for the same capacity take turns instead of each holding part.
+`ready(timeout)` raises `TimeoutError` while it keeps trying; `release()`
+gives up. The driver renews its holds; if it dies, bundles nothing was
+started in yet are free again within `ch.dist.Reservation.HOLD_S` (15 s).
 
 ### Budgets
 
@@ -896,7 +1028,16 @@ reply = fast.remote("hello").result()
 Sources, sinks and serializers plug in today. Sources and sinks are pickled to
 the workers that use them, so keep their state small. A sink's `write` may run
 more than once for a part (a retried call) and must be idempotent; `commit`
-runs once with every part's receipt. **Runs today:**
+gets every part's receipt. `begin(key)` gives the sink a key unique to the
+write, and `effects` says what a lost commit does: `"external"` (the default)
+never starts it again and raises `ch.OutcomeUnknown`, `"idempotent"` runs it
+again with the same key. A source's `residual(part, filter)` names the filter
+triples its `read` left to Chimaera, and a source that reads columns can define
+`batches(part, columns, filter)` to give Arrow record batches. A sink gets a
+partition that is an Arrow table through `write_batches(part_id, batches)`, a
+`pyarrow.RecordBatchReader` (by default, its rows go to `write`).
+`FileSink(directory, store=ext.S3Store(bucket))` writes to an object store, an
+`ext.ObjectStore`, with conditional puts in place of renames. **Runs today:**
 
 ```python run
 class Squares(ext.Source):

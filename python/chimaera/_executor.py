@@ -31,7 +31,7 @@ from typing import Any
 
 import cloudpickle
 
-from . import _batch, _direct, _context, _future, _objects, _project, _serde
+from . import _batch, _direct, _context, _future, _leases, _objects, _project, _serde, _statecodec, _workflow
 from ._errors import ActorDied, NonRetryable
 from . import _native
 from ._native import ExecConn, blake3_digest, child_id
@@ -44,6 +44,8 @@ from ._serde import Dep
 _helper_cpu_ns = getattr(_native, "helper_cpu_ns", None)
 
 CODE_CACHE = 256
+# How long a restore waits for its class's code, which its peer is fetching.
+CODE_FETCH_WAIT_S = 60.0
 # Threads that start and finish an actor's async calls (their awaiting holds none).
 ASYNC_STEP_THREADS = 4
 # Growth in a worker's anonymous memory after which freed memory glibc keeps
@@ -304,6 +306,10 @@ class Executor:
         # defined in a loop each have their own digest.
         self.code: collections.OrderedDict[bytes, Any] = collections.OrderedDict()
         self.instance: Any = None
+        # The actor's concurrency, from its constructor: a call through a
+        # handle rebuilt without the class's options (pickled, by key) carries
+        # none, and sizing lanes by it ran a concurrency=4 actor one at a time.
+        self.actor_concurrency = 0
         self.actor_loop: asyncio.AbstractEventLoop | None = None
         self.loop_lock = threading.Lock()
         # Generator calls: how far each consumer has read (from ExecCredit).
@@ -325,14 +331,20 @@ class Executor:
         # arrives meanwhile is a guest: the peer sends one only while every
         # call here waits on futures, and it runs on a thread of its own.
         self.main_busy = False
-        # Calls waiting on futures (keys), and guests' threads while their code
-        # runs (the ones a cancel can interrupt, see interrupt).
-        self.waiting: set[bytes] = set()
+        # Calls waiting on futures (keys), each with whether its wait started its
+        # batch's next call and the keys named by each of its waits still going
+        # on (see blocked in main), and guests' threads while their code runs
+        # (the ones a cancel can interrupt, see interrupt).
+        self.waiting: dict[bytes, tuple[bool, list[list[bytes]]]] = {}
+        self.waiting_lock = threading.Lock()
         self.guests: dict[bytes, int] = {}
         self.guest_lock = threading.Lock()
         self.code_lock = threading.Lock()  # a guest may load code beside its host
         # exit_actor() ran in this worker's actor: later calls fail at once.
         self.exited = False
+        # A restore whose state would not load (a failing State(migrate=)):
+        # the error and its traceback, raised by every call until one loads.
+        self.restore_error: tuple[BaseException, Any] | None = None
         self.terminating = False  # on_terminate ran: the peer is closing this worker
         self.stdout: _Stdout | None = None  # set by main()
         self.running: dict[bytes, _context.TaskContext] = {}
@@ -361,6 +373,18 @@ class Executor:
             else:
                 self.code.move_to_end(digest)
             return fn
+
+    def load_fetched(self, digest: bytes) -> Any:
+        """`load` code that the peer may still be fetching (a restore's class:
+        see Core::send_restore), waiting for it up to CODE_FETCH_WAIT_S."""
+        deadline = time.monotonic() + CODE_FETCH_WAIT_S
+        while True:
+            try:
+                return self.load(digest)
+            except FileNotFoundError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def value(self, outcome: tuple[Any, ...]) -> Any:
         if outcome[0] != "ok":
@@ -424,15 +448,11 @@ class Executor:
         self.localize_all([k for k in results if not os.path.exists(_serde.object_path(self.object_dir, *k))])
         missing = []
         for (run, obj), xs in results.items():
-            if not xs:
-                continue  # read whole
-            try:
-                with open(_serde.object_path(self.object_dir, run, obj), "rb") as f:
-                    head = f.read(_serde.table_size(max(x.count for x in xs)))  # the table alone, not the values
-            except FileNotFoundError:
-                continue  # fails when read (see part)
-            for x in xs:
-                part = _serde.part_id(head, x.index, x.count)
+            for x in xs:  # none: read whole
+                try:  # the header and that value's entry alone, in any layout
+                    part = _serde.part_of(_serde.object_path(self.object_dir, run, obj), x.index, x.count)
+                except FileNotFoundError:
+                    break  # fails when read (see part)
                 if part is not None and not os.path.exists(_serde.object_path(self.object_dir, run, part)):
                     missing.append((run, part))
         self.localize_all(missing)
@@ -495,9 +515,9 @@ class Executor:
 
     # ---- outputs ----------------------------------------------------------
 
-    def ok(self, key: bytes, attempt: int, value: Any) -> tuple[Any, ...]:
+    def ok(self, key: bytes, attempt: int, value: Any, keep_local: bool = False) -> tuple[Any, ...]:
         run = key[:16]
-        return self.ok_object(run, child_id(run, [key[16:], attempt.to_bytes(4, "little")]), value)
+        return self.ok_object(run, child_id(run, [key[16:], attempt.to_bytes(4, "little")]), value, keep_local)
 
     def splits(self, count: int, size: int) -> bool:
         """Whether a result of `count` values and `size` bytes is stored as parts
@@ -514,7 +534,7 @@ class Executor:
                 pass  # the peer could not say; the last count stands (1: never split)
         return worth_splitting(count, size, self.peers)
 
-    def ok_object(self, run: bytes, obj: bytes, value: Any) -> tuple[Any, ...]:
+    def ok_object(self, run: bytes, obj: bytes, value: Any, keep_local: bool = False) -> tuple[Any, ...]:
         """Store `value` as object `obj` of `run` (inline when small). Arena
         arrays in it are linked, not copied (see _objects); their blobs carry
         the run's prefix, so they live as long as the result itself, and the
@@ -523,7 +543,8 @@ class Executor:
         (the frame alone may be a few inline bytes). Blobs are named from
         `obj` in order, so running the call again (lineage, the same attempt)
         writes the same ids the frame of the first run names; they keep the
-        run's prefix (`obj` has it)."""
+        run's prefix (`obj` has it). With `keep_local` (a durability class
+        other than the default) the peer makes no background copy of them."""
         rdir = _serde.run_dir(self.object_dir, run)
         blobs: list[tuple[bytes, int]] = []
         tried = 0
@@ -534,7 +555,7 @@ class Executor:
                 return None
             name = child_id(obj, [b"blob", tried.to_bytes(4, "little")])
             tried += 1
-            got = _objects.claim(view, rdir, blob=name)
+            got = _objects.claim(view, rdir, blob=name, keep_local=keep_local)
             if got is not None:
                 try:
                     blobs.append((got[0], os.stat(os.path.join(rdir, got[0].hex())).st_size))
@@ -542,10 +563,12 @@ class Executor:
                     blobs.append((got[0], view.nbytes))
             return got
 
-        if type(value) is tuple and 2 <= len(value) <= SEQ_MAX:
+        sparse = sorted(value.present) if type(value) is _serde.Sparse else None
+        if sparse is not None or type(value) is tuple and 2 <= len(value) <= SEQ_MAX:
             # Possibly several values (returns=N): each readable on its own.
+            # Of a Sparse, only the values it holds (see _serde.SPARSE_MAGIC).
             encoded, weights = [], []
-            for v in value:
+            for v in value if sparse is None else [value.present[i] for i in sparse]:
                 linked = len(blobs)
                 encoded.append(_serde.dumps_parts(v, external=claim))
                 # Its frame and the arena buffers it links (blobs of their own).
@@ -561,18 +584,24 @@ class Executor:
                 ]
                 for part, (p, _, _) in zip(ids, encoded):
                     if part is not None:
-                        _serde.write_file(_serde.object_path(self.object_dir, run, part), p)
-            parts, size, oob = _serde.pack_seq(encoded, ids)
+                        self.write(run, part, p, keep_local)
+            parts, size, oob = _serde.pack_seq(encoded, ids, sparse, len(value))
             if ids is not None and any(ids):  # never inline: the peer frees and finds parts through this file
-                _serde.write_file(_serde.object_path(self.object_dir, run, obj), parts)
+                self.write(run, obj, parts, keep_local)
                 return ("ok", run, obj, size, None, oob, blobs)
         else:
             parts, size, oob = _serde.dumps_parts(value, external=claim)
         if size <= self.inline_limit:
             data = b"".join(bytes(p) if isinstance(p, memoryview) else p for p in parts)
             return ("ok", run, obj, size, data, oob, blobs)
-        _serde.write_file(_serde.object_path(self.object_dir, run, obj), parts)
+        self.write(run, obj, parts, keep_local)
         return ("ok", run, obj, size, None, oob, blobs)
+
+    def write(self, run: bytes, obj: bytes, parts: list[Any], keep_local: bool) -> None:
+        path = _serde.object_path(self.object_dir, run, obj)
+        if keep_local:
+            _objects.mark_local(path)
+        _serde.write_file(path, parts)
 
     @staticmethod
     def err(exc: BaseException) -> tuple[Any, ...]:
@@ -709,7 +738,7 @@ class Executor:
                         result._rt.client.flush()
                         outcome = ("forward", result.key)
                     else:
-                        outcome = self.ok(key, attempt, result)
+                        outcome = self.ok(key, attempt, result, bool(msg["policy"].get("durability")))
                         if msg.get("durable"):
                             state = _durable_state(self.instance)
                 except BaseException as exc:  # an unpicklable value, a failing durable state
@@ -733,7 +762,7 @@ class Executor:
             if token is not None:
                 _context.reset(token)
             self.running.pop(key, None)
-            self.waiting.discard(key)
+            self.waiting.pop(key, None)
         self.trimmer((time.time_ns() - entry) / 1e9)
         if "direct" in msg:  # straight back to the caller, who records it with the peer
             msg["direct"].done(key, outcome, entry, msg["cpu0"])
@@ -766,12 +795,17 @@ class Executor:
         kind = msg["kind"]
         args, kwargs = self.call_args(args_ref, deps)
         if kind == CALL_ACTOR_CTOR:
+            _leases.own_run = getattr(_context.current_task(), "run", None)  # holds what other runs pass it
             cls = self.load(msg["fn_digest"])
+            self.actor_concurrency = int(msg["policy"].get("concurrency") or 1)
             self.instance = cls(*args, **kwargs)
             _direct.listen(self, msg)  # callers on this machine may now call it directly
             return None
         if kind == CALL_ACTOR_METHOD:
             if self.instance is None:
+                if self.restore_error is not None:
+                    exc, tb = self.restore_error
+                    raise exc.with_traceback(tb)
                 raise RuntimeError("actor method called before its constructor ran")
             if msg["method"] == _context.SHUTDOWN_METHOD:
                 return self.shut_down()
@@ -785,6 +819,7 @@ class Executor:
         if getattr(fn, "__chimaera_workflow__", False):
             ctx = _context.current_task()
             if ctx is not None:
+                fn = _workflow.definition(fn, ctx.attempt)  # a replay: its history's version, or a compatible one
                 ctx.workflow = True
         result = fn(*args, **kwargs)
         if inspect.isgenerator(result) or inspect.isasyncgen(result):
@@ -803,26 +838,44 @@ class Executor:
 
     def stream(self, msg: dict[str, Any], gen: Any) -> int:
         """Send a generator's items as it yields them, at most a window ahead
-        of the consumer. The call's result is the number of items."""
+        of the consumer, in items and in stored bytes. The call's result is
+        the number of items."""
         from ._runtime import STREAM_WINDOW
 
         ctx = _context.current_task()
         assert ctx is not None
         key = ctx.run + ctx.task
         window = int(msg["policy"].get("max_in_flight") or STREAM_WINDOW)
+        # A consumer that credits by bytes sends its byte window. 0 comes from
+        # a driver older than byte credits, which credits by items only:
+        # waiting on bytes would wait for a credit it never sends.
+        window_bytes = int(msg["policy"].get("max_in_flight_bytes") or 0)
         sent = 0
+        # Stored sizes of the items sent that the consumer has not credited,
+        # oldest first, and their sum. An item larger than the whole window
+        # still goes, alone.
+        ahead: collections.deque[int] = collections.deque()
+        ahead_bytes = 0
 
         def put(item: Any) -> bool:
-            nonlocal sent
+            nonlocal sent, ahead_bytes
             with self.credit_cond:
-                while sent >= self.credit.get(key, 0) + window:
+                while True:
+                    credit = self.credit.get(key, 0)
+                    while len(ahead) > max(0, sent - credit):
+                        ahead_bytes -= ahead.popleft()
+                    if sent < credit + window and (not window_bytes or ahead_bytes < window_bytes or not ahead):
+                        break
                     if ctx._cancelled.is_set():
                         return False
                     self.credit_cond.wait(0.5)
             index = sent
             run = key[:16]
             obj = child_id(run, [key[16:], ctx.attempt.to_bytes(4, "little"), b"item", index.to_bytes(8, "little")])
-            self.conn.send_yield(key, ctx.attempt, index, self.ok_object(run, obj, item))
+            outcome = self.ok_object(run, obj, item)
+            self.conn.send_yield(key, ctx.attempt, index, outcome)
+            ahead.append(outcome[3])  # the stored size the consumer counts too (Stream._deliver)
+            ahead_bytes += outcome[3]
             sent += 1
             return not ctx._cancelled.is_set()
 
@@ -955,7 +1008,7 @@ class Executor:
         """
         from ._remote import _lane_limits
 
-        total = int(msg["policy"].get("concurrency") or 1)
+        total = max(self.actor_concurrency, int(msg["policy"].get("concurrency") or 1))
         cls = type(self.instance)
         limits = self.lane_limits.get(cls)
         if limits is None:
@@ -1050,22 +1103,38 @@ class Executor:
 
     def restore(self, msg: dict[str, Any]) -> None:
         """Make the actor instance equal to its committed state, without
-        running ``__init__``."""
-        if not msg["state"]:
+        running ``__init__``, as an instance of the class its record names:
+        bound to a newer class, state an older one wrote goes through that
+        class's ``State(migrate=)``. If it will not load, every call fails
+        with the error until a restore succeeds."""
+        try:
+            cls = self.load_fetched(msg["fn_digest"])
+        except BaseException as exc:  # noqa: BLE001 - the actor's calls report it
+            exc.add_note("raised loading the class to restore a durable actor's state with")
+            self.instance, self.restore_error = None, (exc, exc.__traceback__)
             return
-        cls = self.load(msg["fn_digest"])
-        obj = cls.__new__(cls)
-        state = pickle.loads(msg["state"])
-        if getattr(type(obj), "__setstate__", None) is not None:
-            obj.__setstate__(state)
-        elif state is not None:
-            obj.__dict__.update(state)
-        self.instance = obj
+        blob = msg["state"]
+        if not blob:
+            if self.instance is None or type(self.instance) is cls:
+                return
+            blob = _durable_state(self.instance)  # bound to a newer class before any commit: its live state
+        try:
+            state = _statecodec.restore(cls, blob)
+            obj = cls.__new__(cls)
+            if getattr(type(obj), "__setstate__", None) is not None:
+                obj.__setstate__(state)
+            elif state is not None:
+                obj.__dict__.update(state)
+        except BaseException as exc:  # noqa: BLE001 - the actor's calls report it
+            exc.add_note(f"raised restoring the durable state of {cls.__qualname__} (State(migrate=) or __setstate__)")
+            self.instance, self.restore_error = None, (exc, exc.__traceback__)
+            return
+        self.instance, self.restore_error = obj, None
 
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 # How long a cancelled call has to stop by itself before it is interrupted.
-CANCEL_INTERRUPT_S = 2.0
+CANCEL_INTERRUPT_S = float(os.environ.get("CHIMAERA_CANCEL_INTERRUPT_SECONDS") or 2.0)  # the peer checked it at its start
 # How long an executor outlives its peer's connection (time to exit by itself).
 PEER_GONE_EXIT_S = 2.0
 
@@ -1142,8 +1211,8 @@ def _report_failure(f: concurrent.futures.Future[Any]) -> None:
 
 def _durable_state(instance: Any) -> bytes:
     """A durable actor's state: what ``__getstate__`` returns (its attributes
-    by default), pickled."""
-    return cloudpickle.dumps(instance.__getstate__(), protocol=5)
+    by default), pickled under its class's state version (_statecodec)."""
+    return _statecodec.dumps(instance)
 
 
 async def _awaitable(x: Any) -> Any:
@@ -1186,18 +1255,30 @@ def main() -> None:
         logging.basicConfig(level=level, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 
     def blocked(ctx: _context.TaskContext, is_blocked: bool, waiting: list[bytes]) -> None:
+        """A wait of `ctx`'s call starts or ends (naming the same `waiting`
+        keys both times). Coroutines or threads of one call may wait at once
+        (two task groups gathered): the call is blocked from the first wait
+        to the end of the last, on the keys they name between them."""
         key = ctx.run + ctx.task
-        on_block = getattr(ex.local, "on_block", None) if is_blocked else None
-        helper = on_block is not None and on_block()
-        # Offer to host a guest only for a wait on futures (polls of a store or
-        # queue name none) by a plain call: not an actor's, not a gang rank,
-        # and not one whose batch already goes on beside it.
-        host = is_blocked and bool(waiting) and ex.instance is None and ctx.gang is None and not helper
-        if is_blocked:
-            ex.waiting.add(key)
-        else:
-            ex.waiting.discard(key)
-        conn.send_blocked(key, is_blocked, waiting, host)
+        with ex.waiting_lock:
+            helper, waits = ex.waiting.get(key, (False, []))
+            if is_blocked:
+                if not waits:
+                    on_block = getattr(ex.local, "on_block", None)
+                    helper = on_block is not None and on_block()
+                waits.append(waiting)
+            elif waiting in waits:
+                waits.remove(waiting)
+            if not waits:
+                ex.waiting.pop(key, None)
+                conn.send_blocked(key, False, [], False)
+                return
+            ex.waiting[key] = (helper, waits)
+            # Offer to host a guest only while every wait is on futures (polls
+            # of a store or queue name none) by a plain call: not an actor's,
+            # not a gang rank, and not one whose batch already goes on beside it.
+            host = all(waits) and ex.instance is None and ctx.gang is None and not helper
+            conn.send_blocked(key, True, list(dict.fromkeys(k for w in waits for k in w)), host)
 
     _future._executor_hook = blocked
 

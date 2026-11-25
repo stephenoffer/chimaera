@@ -1,0 +1,29 @@
+/proc/self/status:Name:	grep
+/proc/self/status:Cpus_allowed_list:	0-127
+/sys/devices/system/cpu/online:0-3,64-67
+/sys/devices/system/cpu/cpu0/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu0/topology/core_id:0
+/sys/devices/system/cpu/cpu0/topology/core_cpus_list:0,64
+/sys/devices/system/cpu/cpu1/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu1/topology/core_id:1
+/sys/devices/system/cpu/cpu1/topology/core_cpus_list:1,65
+/sys/devices/system/cpu/cpu2/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu2/topology/core_id:2
+/sys/devices/system/cpu/cpu2/topology/core_cpus_list:2,66
+/sys/devices/system/cpu/cpu3/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu3/topology/core_id:3
+/sys/devices/system/cpu/cpu3/topology/core_cpus_list:3,67
+/sys/devices/system/cpu/cpu64/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu64/topology/core_id:0
+/sys/devices/system/cpu/cpu64/topology/core_cpus_list:0,64
+/sys/devices/system/cpu/cpu65/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu65/topology/core_id:1
+/sys/devices/system/cpu/cpu65/topology/core_cpus_list:1,65
+/sys/devices/system/cpu/cpu66/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu66/topology/core_id:2
+/sys/devices/system/cpu/cpu66/topology/core_cpus_list:2,66
+/sys/devices/system/cpu/cpu67/topology/physical_package_id:0
+/sys/devices/system/cpu/cpu67/topology/core_id:3
+/sys/devices/system/cpu/cpu67/topology/core_cpus_list:3,67
+/sys/devices/system/node/node0/cpulist:0-3,64-67
+/sys/devices/system/node/node0/meminfo:Node 0 MemTotal:       16777216 kB

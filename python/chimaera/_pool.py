@@ -15,13 +15,15 @@ import itertools
 import threading
 import time
 import warnings
-from collections.abc import Iterable
+from collections.abc import AsyncIterable, Iterable
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 from ._future import Future, Results
 from ._native import blake3_digest
 from ._options import Auto, Effective, signature_of, validate
+from ._sources import map_source
+from ._width import lane
 
 C = TypeVar("C")
 
@@ -129,22 +131,22 @@ class Pool(Generic[C]):
         from ._errors import VersionConflict
 
         while True:
-            version = self._store.version("members")
+            names, version = self._store.get_versioned("members", [])
             try:
-                self._store.put("members", change(self._store.get("members", [])), if_version=version)
-                self._seen_version = self._store.version("members")
-                return
+                new = self._store.put("members", change(names), if_version=version)
             except VersionConflict:
                 continue
+            if version == self._seen_version:  # nothing else changed since this process looked
+                self._seen_version = new
+            return
 
     def _refresh(self, force: bool = False) -> None:
         if self._store is None or (not force and time.monotonic() - self._last_refresh < self._REFRESH_S):
             return
         self._last_refresh = time.monotonic()
-        version = self._store.version("members")
+        names, version = self._store.get_versioned("members", [])
         if version == self._seen_version:
             return
-        names = self._store.get("members", [])
         with self._lock:
             have = {r.name: r for r in self._replicas}
             self._replicas = [have.get(n) or _Replica(self._spawn(n), n) for n in names]
@@ -345,6 +347,15 @@ class _PoolMethod:
         f._on_done(done)
         return f
 
-    def map(self, source: Iterable[Any], *, ordered: bool = True) -> Results[Any]:
-        window = 16 * max(1, len(self._pool))
-        return Results(lambda i, item: self.remote(item), iter(source), ordered=ordered, window=window)
+    def map(self, source: Iterable[Any] | AsyncIterable[Any], *, ordered: bool = True) -> Results[Any]:
+        replicas = max(1, len(self._pool))
+        cls = self._pool._cls_view._cls
+        # Until a result's size is known, one item per call the replicas run at once.
+        parallel = replicas * lane(cls, getattr(cls, self._name, None), self._pool._eff)
+        return Results(
+            lambda i, item: self.remote(item),
+            map_source((source,)),
+            ordered=ordered,
+            window=16 * replicas,
+            parallel=parallel,
+        )

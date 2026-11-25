@@ -1,5 +1,7 @@
 """Run every workload for both runtimes, each in a fresh process, and write
-results.json plus a markdown report.
+results.json (with the run's manifest, manifest.py) plus a markdown report.
+The report is refused when the manifest lacks a runtime's version or the
+local peer's durability class.
 
     python bench/evals/run_evals.py --out results/ [--only latency,tasks]
 """
@@ -9,13 +11,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
 import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import manifest  # noqa: E402
 from common import CORES  # noqa: E402
 
 # Workload names, in order (both suites implement the same set).
@@ -66,11 +68,23 @@ def main() -> None:
             rec = run_one(runtime, name, a.timeout)
             records.append(rec)
             print(json.dumps(rec), flush=True)
-    meta = {"host": f"{platform.node()} {platform.system()} {platform.machine()}", "cores": CORES, "python": platform.python_version()}
+    # The local peer the Chimaera suite ran on (CHIMAERA_HOME, else the default home).
+    home = os.environ.get("CHIMAERA_HOME") or os.path.join(os.path.expanduser("~"), ".chimaera", "local")
+    binary = manifest.running_binary(home)
+    durability = manifest.durability([manifest.status(binary, home)])
+    for rec in records:
+        if rec["runtime"] == "chimaera":
+            rec["durability"] = durability
+    meta = manifest.collect(binary, {rt: interpreter(rt) for rt in SUITES}, durability=durability)
+    doc = {"manifest": meta, "results": records}
     with open(os.path.join(a.out, "results.json"), "w") as f:
-        json.dump({"meta": meta, "records": records}, f, indent=2)
+        json.dump(doc, f, indent=2)
+    manifest.validate(doc)
+    v = meta["versions"]
     with open(os.path.join(a.out, "report.md"), "w") as f:
-        f.write(f"# Ray vs Chimaera, single node\n\n{meta['host']} · {CORES} cores · Python {meta['python']}\n\n")
+        pythons = ", ".join(f"{rt} {x}" for rt, x in v["python"].items())
+        f.write(f"# Ray vs Chimaera, single node\n\n{meta['host']['platform']} · {CORES} cores · Python {pythons} · "
+                f"Ray {v['ray']} · {v['chimaera']} · durability {durability['effective']}\n\n")
         f.write("| Workload | Ray | Chimaera |\n|---|---|---|\n")
         for name in names:
             cells = []

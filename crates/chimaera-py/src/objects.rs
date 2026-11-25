@@ -68,6 +68,43 @@ fn free_bytes(f: &std::fs::File) -> Option<u64> {
     (unsafe { libc::fstatvfs(f.as_raw_fd(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }
 
+/// Reserve `len` bytes of disk for `f` (posix_fallocate; F_PREALLOCATE on
+/// macOS), as the peer's stores::preallocate does.
+fn preallocate(f: &std::fs::File, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: posix_fallocate on a descriptor we own; it returns the error.
+        match unsafe { libc::posix_fallocate(f.as_raw_fd(), 0, len as libc::off_t) } {
+            0 | libc::EOPNOTSUPP => Ok(()),
+            e => Err(io::Error::from_raw_os_error(e)),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut store = libc::fstore_t {
+            fst_flags: libc::F_ALLOCATEALL,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: len as libc::off_t,
+            fst_bytesalloc: 0,
+        };
+        // SAFETY: F_PREALLOCATE reads and fills `store` for a descriptor we own.
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_PREALLOCATE, &mut store) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (f.as_raw_fd(), len);
+        Ok(())
+    }
+}
+
 fn no_space(path: &Path, want: usize, free: u64) -> io::Error {
     io::Error::new(
         io::ErrorKind::StorageFull,
@@ -231,30 +268,53 @@ fn over_limit(len: u64) -> bool {
     })
 }
 
+/// When a write to each spill directory last failed, in this process.
+static SPILL_FAILED: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// A spill directory whose write failed is tried after the others for this long.
+const SPILL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Where an object of `total` bytes headed for `path` should be written
-/// instead, when memory is over the limit: its spill path, or None.
-fn spill_target(path: &Path, total: usize) -> Option<PathBuf> {
+/// instead, when memory is over the limit: its spill paths to try in turn,
+/// starting from the next directory round-robin, those with no failed write
+/// in the last SPILL_RETRY_AFTER first. Empty: it stays in memory.
+fn spill_targets(path: &Path, total: usize) -> Vec<(PathBuf, PathBuf)> {
     if !over_limit(total as u64) {
-        return None;
+        return Vec::new();
     }
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let cfg = CONFIG.read().expect("lock");
-    let cfg = cfg.as_ref()?;
-    let root = cfg.root.as_ref()?;
+    let Some((cfg, root)) = cfg.as_ref().and_then(|c| Some((c, c.root.as_ref()?))) else { return Vec::new() };
+    let Ok(rel) = path.strip_prefix(root) else { return Vec::new() };
     let n = cfg.spill.len();
-    let spill = cfg.spill.get(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % n.max(1))?;
-    Some(spill.join(path.strip_prefix(root).ok()?))
+    let start = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let failed = SPILL_FAILED.lock().expect("lock");
+    let recent = |d: &PathBuf| failed.iter().any(|(f, at)| f == d && at.elapsed() < SPILL_RETRY_AFTER);
+    let mut dirs: Vec<&PathBuf> = (0..n).map(|k| &cfg.spill[(start + k) % n]).collect();
+    dirs.sort_by_key(|d| recent(d)); // stable: round-robin order within each
+    dirs.into_iter().map(|d| (d.clone(), d.join(rel))).collect()
 }
 
 /// Write `parts` (concatenated) to `path` atomically: a temporary name, then
 /// a rename. Returns the bytes written. Over the memory limit the object is
-/// written to the spill directory on disk and `path` becomes a symlink to it
+/// written to a spill directory on disk and `path` becomes a symlink to it
 /// (spilled at birth: nothing waits and nothing is moved later); readers map
-/// it either way.
+/// it either way. Its bytes are reserved there first; a spill directory
+/// that is full or fails leaves no file behind, and the next one is tried.
 pub fn write_parts(path: &Path, parts: &[&[u8]]) -> io::Result<u64> {
     let total: usize = parts.iter().map(|p| p.len()).sum();
-    if let Some(target) = spill_target(path, total) {
-        let n = write_file(&target, parts, total)?;
+    let mut last = None;
+    for (dir, target) in spill_targets(path, total) {
+        let n = match write_file(&target, parts, total, true) {
+            Ok(n) => n,
+            Err(e) => {
+                let mut failed = SPILL_FAILED.lock().expect("lock");
+                failed.retain(|(d, _)| *d != dir);
+                failed.push((dir, std::time::Instant::now()));
+                last = Some(e);
+                continue;
+            }
+        };
         let link = tmp_name(path);
         let r = std::os::unix::fs::symlink(&target, &link).or_else(|e| {
             if e.kind() != io::ErrorKind::NotFound {
@@ -270,12 +330,18 @@ pub fn write_parts(path: &Path, parts: &[&[u8]]) -> io::Result<u64> {
         }
         return Ok(n);
     }
-    let n = write_file(path, parts, total)?;
+    if let Some(e) = last {
+        return Err(e); // every spill directory failed; memory is over its limit
+    }
+    let n = write_file(path, parts, total, false)?;
     note_written(n);
     Ok(n)
 }
 
-fn write_file(path: &Path, parts: &[&[u8]], total: usize) -> io::Result<u64> {
+/// Write `parts` to `path` through a temporary file; `on_disk` (a spill
+/// directory): its bytes are reserved first, so a full disk fails before any
+/// is written.
+fn write_file(path: &Path, parts: &[&[u8]], total: usize, on_disk: bool) -> io::Result<u64> {
     let tmp = tmp_name(path);
     let reserve = CONFIG.read().expect("lock").as_ref().and_then(|c| c.reserve.clone());
     let warm = reserve.is_some_and(|dir| total >= 1 << RESERVE_MIN_CLASS && take_reserve(&dir, total, &tmp));
@@ -292,6 +358,12 @@ fn write_file(path: &Path, parts: &[&[u8]], total: usize) -> io::Result<u64> {
             && (free as usize) < total
         {
             return Err(no_space(path, total, free));
+        }
+        if on_disk {
+            preallocate(&file, total as u64).map_err(|e| match free_bytes(&file) {
+                Some(free) if e.raw_os_error() == Some(libc::ENOSPC) => no_space(path, total, free),
+                _ => e,
+            })?;
         }
         file.set_len(total as u64)?; // a reserve file shrinks to fit
         // Shared mappings of a disk file fault and allocate blocks page by page;

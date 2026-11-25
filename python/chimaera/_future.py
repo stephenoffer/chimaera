@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import os
 import queue
 import sys
@@ -11,10 +12,11 @@ import time
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Generator, Iterable, Iterator
-from typing import Any, Generic, NamedTuple, TypeVar, overload
+from typing import Any, Generic, Literal, NamedTuple, TypeVar, overload
 
 from . import _context, _serde, _values
-from ._errors import StreamInterrupted, from_outcome
+from ._completions import Completions, any_done, wake
+from ._errors import Infeasible, InfrastructureFailure, OptionsError, StreamInterrupted, from_outcome
 
 T = TypeVar("T")
 
@@ -23,6 +25,13 @@ _serial = {"site": None, "count": 0, "warned": set()}
 _SERIAL_WARN_AT = 200
 # A wait this long on a call that has not started prints why (once).
 STALL_NOTICE_S = float(os.environ.get("CHIMAERA_STALL_NOTICE_S", "60"))
+# Held while a future takes its outcome and hands out its callbacks, and while
+# a callback is added or dropped, never while one runs: a callback added as the
+# call finishes is handed out or runs at once, and only the first outcome
+# counts. One lock for every future, held for a few attribute reads. It is
+# reentrant: the collector may run an abandoned as_completed's __del__, which
+# drops its callbacks, on a thread that holds it.
+_done_lock = threading.RLock()
 
 
 class Future(Generic[T]):
@@ -44,8 +53,9 @@ class Future(Generic[T]):
         self._site = site
         self._escaped = False
         self._arg_bytes = 0
-        # For a value stored with ch.put: (run, object_id, inline or None, size).
-        self._put: tuple[bytes, bytes, bytes | None, int] | None = None
+        # For a value stored with ch.put: (run, object_id, inline or None, size,
+        # the files it is stored in, its durability class or "" for the default).
+        self._put: tuple[bytes, bytes, bytes | None, int, tuple[bytes, ...], str] | None = None
         self._returns: int | None = None  # the call's `returns=` option, for split()
         # Files of a ch.put value this handle owns: deleted with it unless it
         # escaped (was pickled or passed by reference to a call).
@@ -73,19 +83,22 @@ class Future(Generic[T]):
         return self._outcome is not None or self._exc is not None
 
     def _set(self, outcome: tuple[Any, ...]) -> None:
-        if self.done():
-            return
-        self._outcome = outcome
-        self._run_callbacks()
+        with _done_lock:  # the first outcome wins, and takes every callback added before it
+            if self.done():
+                return
+            self._outcome = outcome
+            cbs, self._callbacks = self._callbacks, []
+        self._run_callbacks(cbs)
 
     def _set_exception(self, exc: BaseException) -> None:
-        if self.done():
-            return
-        self._exc = exc
-        self._run_callbacks()
+        with _done_lock:
+            if self.done():
+                return
+            self._exc = exc
+            cbs, self._callbacks = self._callbacks, []
+        self._run_callbacks(cbs)
 
-    def _run_callbacks(self) -> None:
-        cbs, self._callbacks = self._callbacks, []
+    def _run_callbacks(self, cbs: list[Callable[[Future[T]], object]]) -> None:
         for cb in cbs:
             try:
                 cb(self)
@@ -97,20 +110,32 @@ class Future(Generic[T]):
         else on a thread for callbacks, in the order they were added, so a
         slow callback delays only the callbacks after it, never results."""
         self._seen = True  # the callback reads the outcome
-        if self.done():
-            fn(self)
-        else:
-            self._callbacks.append(lambda f: _callback_queue().put((fn, f)))
+        with _done_lock:  # the check and the append, with no outcome between them
+            if not self.done():
+                self._callbacks.append(lambda f: _callback_queue().put((fn, f)))
+                return
+        fn(self)
 
-    def _on_done(self, fn: Callable[[Future[T]], object]) -> None:
+    def _on_done(self, fn: Callable[[Future[T]], object]) -> Callable[[Future[T]], object] | None:
         """For the runtime's own bookkeeping: ``fn`` runs on the thread that
-        delivers outcomes, so it must be quick and never wait."""
-        if self.done():
-            fn(self)
-        else:
-            self._callbacks.append(fn)
+        delivers outcomes, so it must be quick and never wait. Returns what
+        ``_off_done`` takes to drop it (None: it has run)."""
+        with _done_lock:
+            if not self.done():
+                self._callbacks.append(fn)
+                return fn
+        fn(self)
+        return None
 
-    def _wait(self, timeout: float | None) -> bool:
+    def _off_done(self, fn: Callable[[Future[T]], object]) -> None:
+        """Drop a callback ``_on_done`` kept, unless it has run: its waiter stopped waiting."""
+        with _done_lock:
+            if fn in self._callbacks:
+                self._callbacks.remove(fn)
+
+    def _wait(self, timeout: float | None, between: Callable[[], None] | None = None) -> bool:
+        """Until the call finishes (False if `timeout` passes first).
+        `between` runs, outside rt.cond, each time outcomes arrive meanwhile."""
         if self.done():
             return True
         start_pending()
@@ -133,13 +158,18 @@ class Future(Generic[T]):
                         if not noticed and now - start >= STALL_NOTICE_S:
                             break
                         rt.cond.wait(min(1.0, deadline - now) if deadline is not None else 1.0)
+                        if between is not None:
+                            break
                     else:
                         return True
-                noticed = True
-                self._stall_notice(time.monotonic() - start)
+                if between is not None:
+                    between()
+                if not noticed and time.monotonic() - start >= STALL_NOTICE_S:
+                    noticed = True
+                    self._stall_notice(time.monotonic() - start)
         finally:
             if blocked:
-                _executor_hook(ctx, False, [])
+                _executor_hook(ctx, False, [self.key])
 
     def _stall_notice(self, waited: float) -> None:
         """Say once why a wait is long when the call has not started: Ray
@@ -178,7 +208,10 @@ class Future(Generic[T]):
         if self._outcome[0] == "ok":
             # A call's result names its call, which can run again if every
             # copy is lost; a put value has no call to remake it.
-            self._value = self._rt.read_value(self._outcome, self.key if self._put is None else None)
+            if self._put is None:
+                self._value = self._rt.read_value(self._outcome, self.key)
+            else:
+                self._value = self._rt.read_value(self._outcome, None, durability=self._put[5])
             self._has_value = True
             if self._put is None:
                 _values.fetched.note_fetched(self._value, self._outcome[4])
@@ -233,15 +266,14 @@ class Future(Generic[T]):
 
     def __await__(self) -> Generator[Any, None, T]:
         if not self.done():
-            loop = asyncio.get_running_loop()
-            waiter = loop.create_future()
-
-            def wake(_: Future[T]) -> None:
-                loop.call_soon_threadsafe(lambda: waiter.done() or waiter.set_result(None))
-
-            self._on_done(wake)
+            waiter = asyncio.get_running_loop().create_future()
+            fn = self._on_done(lambda _: wake(waiter))
             self._rt.client.flush()
-            yield from waiter.__await__()
+            try:
+                yield from waiter.__await__()
+            finally:  # cancelled or timed out: nothing stays waiting on the call
+                if fn is not None:
+                    self._off_done(fn)
         return self._value_or_raise()
 
     def __reduce__(self) -> tuple[Any, ...]:
@@ -249,7 +281,10 @@ class Future(Generic[T]):
             self._escaped = True  # copies may outlive this handle: keep its files for the run
             if self._device_holds:
                 _values.keep_device_holds(self._device_holds)  # and its shared GPU memory
-            return (_resolved_future, self._put)
+            from ._leases import keep, unpickle  # unpickled under another run, it holds the value (see _leases)
+
+            keep(self)  # and another run's value held here stays held for the session
+            return (unpickle, self._put)
         # An embedded future is a handle: it pins its result for the run's
         # lifetime and can be awaited wherever it is unpickled.
         self._escaped = True
@@ -382,8 +417,8 @@ class _Part(Future[Any]):
     def done(self) -> bool:
         return self._parent.done()
 
-    def _wait(self, timeout: float | None) -> bool:
-        return self._parent._wait(timeout)
+    def _wait(self, timeout: float | None, between: Callable[[], None] | None = None) -> bool:
+        return self._parent._wait(timeout, between)
 
     def _value_or_raise(self) -> Any:
         return pick(self._parent._value_or_raise(), self._index, self._count)
@@ -391,8 +426,11 @@ class _Part(Future[Any]):
     def add_done_callback(self, fn: Callable[[Future[Any]], object]) -> None:
         self._parent.add_done_callback(lambda _: fn(self))
 
-    def _on_done(self, fn: Callable[[Future[Any]], object]) -> None:
-        self._parent._on_done(lambda _: fn(self))
+    def _on_done(self, fn: Callable[[Future[Any]], object]) -> Callable[[Future[Any]], object] | None:
+        return self._parent._on_done(lambda _: fn(self))
+
+    def _off_done(self, fn: Callable[[Future[Any]], object]) -> None:
+        self._parent._off_done(fn)
 
     def cancel(self, *, force: bool = False) -> bool:
         """Cancels the whole call the part belongs to."""
@@ -470,6 +508,7 @@ class _Chunk(list):  # type: ignore[type-arg]
 # enough to keep items flowing and a lost chunk cheap to redo.
 CHUNK_TARGET_S = 0.1
 MAX_CHUNK = 4096
+_ASYNC_SOURCE = "this map takes its items from an async iterable: read it with async for"
 
 # A function's map made by the driver submits nothing until it is read, or the
 # driver submits or waits on anything else: reduce_by_key can then run the
@@ -499,22 +538,27 @@ def _future_from_key(key: bytes) -> Future[Any]:
 
 
 # Set by the executor: tells the peer a task is blocked waiting on futures.
+# A wait passes the same keys when it starts (True) and when it ends.
 _executor_hook: Callable[[Any, bool, list[bytes]], None] | None = None
 
 
 class waiting:
     """Mark a wait inside a call (a lock, a barrier, a watch) as blocked, as a
     future's ``result()`` does: the peer may lend the call's CPU meanwhile, and
-    the executor starts the next call of its batch."""
+    the executor starts the next call of its batch. Naming the `keys` of the
+    calls waited on also offers the worker to host another call meanwhile."""
+
+    def __init__(self, keys: list[bytes] | None = None) -> None:
+        self.keys = keys or []
 
     def __enter__(self) -> None:
         self.ctx = _context.current_task()
         if self.ctx is not None and _executor_hook is not None:
-            _executor_hook(self.ctx, True, [])
+            _executor_hook(self.ctx, True, self.keys)
 
     def __exit__(self, *exc: object) -> None:
         if self.ctx is not None and _executor_hook is not None:
-            _executor_hook(self.ctx, False, [])
+            _executor_hook(self.ctx, False, self.keys)
 
 
 def _note_serial_wait(f: Future[Any]) -> None:
@@ -559,14 +603,17 @@ def _load_object(run: bytes, object_id: bytes, inline: bytes | None) -> Any:
     return read_object(Runtime.get().object_dir, run, object_id)
 
 
-def _resolved_future(run: bytes, object_id: bytes, inline: bytes | None, size: int) -> Future[Any]:
-    """A finished future for a stored value (what ch.put returns)."""
+def _resolved_future(
+    run: bytes, object_id: bytes, inline: bytes | None, size: int, files: tuple[bytes, ...] = (), durability: str = ""
+) -> Future[Any]:
+    """A finished future for a stored value (what ch.put returns): `files`
+    are those it is stored in, which a holder in another run leases."""
     from ._runtime import Runtime
 
     rt = Runtime.get()
     f: Future[Any] = Future(rt, run + object_id)
     f._escaped = True  # nothing to release: the value lives as long as its run
-    f._put = (run, object_id, inline, size)
+    f._put = (run, object_id, inline, size, files, durability)
     f._outcome = ("ok", inline, run, object_id, size, 0)
     return f
 
@@ -579,12 +626,24 @@ def _resolved_future(run: bytes, object_id: bytes, inline: bytes | None, size: i
 PUT_INLINE = 4 << 10
 
 
-def put(value: T) -> Future[T]:
+def put(value: T, *, durability: Literal["default", "ephemeral", "retained"] | None = None) -> Future[T]:
     """Store `value` once and return a finished future for it. Pass the
     future to any number of calls: each reads the stored value instead of
-    receiving a copy. Identical values share one copy."""
+    receiving a copy. Identical values share one copy.
+
+    ``durability`` is what the value survives. By default it is copied to
+    another peer in the background. ``"ephemeral"`` makes no copy: it is lost
+    with the peer that holds it. ``"retained"`` returns only once copies on
+    other peers, in other zones, racks and machines first, are made, and
+    raises ``Infeasible`` where there is no other peer. A put has no call to
+    run again, so it cannot be ``"replayable"``."""
     from ._runtime import Runtime
 
+    if durability not in (None, "default", "ephemeral", "retained"):
+        raise OptionsError(
+            f"ch.put: durability={durability!r}: expected 'default', 'ephemeral' or 'retained' "
+            "(a put has no call to make it again, so it cannot be 'replayable')"
+        )
     rt = Runtime.get()
     ctx = _context.current_task()
     run = ctx.run if ctx is not None else rt.run
@@ -596,8 +655,21 @@ def put(value: T) -> Future[T]:
     prefix = run[:4] if ctx is not None else b""
     holds: list[Any] = []
     limit = min(rt.inline_limit, PUT_INLINE)
-    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, limit, prefix, holds)
-    f = _resolved_future(run, object_id, inline, size)
+    files: list[bytes] = []
+    keep_local = durability in ("ephemeral", "retained")  # retained: copied below, not in the background
+    object_id, inline, size, owned = _values.store(value, run, rt.blob_sink, limit, prefix, holds, keep_local, files)
+    if durability == "retained" and files:
+        try:
+            rt.client.retain(run, files)
+        except (ValueError, RuntimeError, ConnectionError) as e:
+            for path in owned:  # no handle refers to them
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise (Infeasible if isinstance(e, ValueError) else InfrastructureFailure)(f"ch.put: {e}") from None
+    kind = "" if durability is None or durability == "default" else durability
+    f = _resolved_future(run, object_id, inline, size, tuple(files), kind)
     if holds:
         f._device_holds = holds  # readers on this machine may map them while the future lives
     if type(value) in _values._COLLECTIONS:
@@ -646,15 +718,18 @@ def wait(
         raise ValueError(f"num_returns={num_returns}: there are {len(fs)} futures")
     deadline = None if timeout is None else time.monotonic() + timeout
     if fs:
-        rt = fs[0]._rt
-        rt.client.flush()
-        with rt.cond:
-            while sum(f.done() for f in fs) < want:
-                left = None if deadline is None else deadline - time.monotonic()
-                if left is not None and left <= 0:
-                    break
-                rt.cond.wait(1.0 if left is None else min(1.0, left))
-    done = [f for f in fs if f.done()]
+        fs[0]._rt.client.flush()
+    # Both lists come from one reading of each future, so one finishing
+    # meanwhile lands in exactly one of them.
+    flags = [f.done() for f in fs]
+    if sum(flags) < want and (deadline is None or time.monotonic() < deadline):  # a poll only looks
+        finished = Completions(fs)  # one callback each: no rescan per completion
+        try:
+            finished.wait(want, deadline)
+        finally:
+            finished.close()
+        flags = [f.done() for f in fs]
+    done = [f for f, d in zip(fs, flags) if d]
     if fetch_local and done:
         from . import _objects
 
@@ -662,7 +737,7 @@ def wait(
         for f in done:
             if f._outcome is not None:
                 _objects.prefetch(f._outcome, rt.object_dir, rt.localize)
-    return done, [f for f in fs if not f.done()]
+    return done, [f for f, d in zip(fs, flags) if not d]
 
 
 def _values_of(futures: list[Future[T]], timeout: float | None) -> list[T]:
@@ -717,83 +792,46 @@ def _note_gathered(held: int, done: int, total: int) -> None:
     )
 
 
-class _AsyncWaker:
-    """Wakes one event loop when any registered future completes.
-
-    Each future gets a single callback, so waiting repeatedly over a shrinking
-    set stays linear; cancelling the awaiting coroutine leaves nothing running.
-    """
-
-    def __init__(self) -> None:
-        self._registered: set[int] = set()
-        self._event: asyncio.Event | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-    def watch(self, futures: Iterable[Future[Any]]) -> None:
-        loop = asyncio.get_running_loop()
-        if self._loop is not loop:
-            self._loop, self._event, self._registered = loop, asyncio.Event(), set()
-        for f in futures:
-            if id(f) not in self._registered:
-                self._registered.add(id(f))
-                f._on_done(self._wake)
-
-    def _wake(self, _: Future[Any]) -> None:
-        loop, event = self._loop, self._event
-        if loop is not None and event is not None:
-            loop.call_soon_threadsafe(event.set)
-
-    async def wait(self, timeout: float | None) -> None:
-        assert self._event is not None
-        await asyncio.wait_for(self._event.wait(), timeout)
-        self._event.clear()
-
-
 class as_completed(Generic[T]):  # noqa: N801 -- mirrors concurrent.futures.as_completed
     """Iterate futures in completion order (sync or async)."""
 
+    _left = 0  # futures not yet taken (none until __init__ has subscribed to them)
+
     def __init__(self, futures: Iterable[Future[T]], *, timeout: float | None = None) -> None:
-        self._pending = list(futures)
+        fs = list(futures)
+        self._rt: Any = fs[0]._rt if fs else None
         self._deadline = None if timeout is None else time.monotonic() + timeout
-        self._waker = _AsyncWaker()
+        self._completions = Completions(fs)
+        self._left = len(fs)
 
     def __iter__(self) -> Iterator[Future[T]]:
         return self
 
     def __next__(self) -> Future[T]:
-        if not self._pending:
+        if not self._left:
             raise StopIteration
-        rt = self._pending[0]._rt
-        rt.client.flush()
-        with rt.cond:
-            while True:
-                for i, f in enumerate(self._pending):
-                    if f.done():
-                        return self._pending.pop(i)
-                left = None if self._deadline is None else self._deadline - time.monotonic()
-                if left is not None and left <= 0:
-                    raise TimeoutError(f"{len(self._pending)} futures did not complete in time")
-                rt.cond.wait(left if left is not None else 1.0)
+        self._rt.client.flush()
+        return self._took(self._completions.take(self._deadline))
 
     def __aiter__(self) -> AsyncIterator[Future[T]]:
         return self
 
     async def __anext__(self) -> Future[T]:
-        if not self._pending:
+        if not self._left:
             raise StopAsyncIteration
-        self._pending[0]._rt.client.flush()
-        while True:
-            for i, f in enumerate(self._pending):
-                if f.done():
-                    return self._pending.pop(i)
-            self._waker.watch(self._pending)
-            left = None if self._deadline is None else self._deadline - time.monotonic()
-            if left is not None and left <= 0:
-                raise TimeoutError(f"{len(self._pending)} futures did not complete in time")
-            try:
-                await self._waker.wait(left)
-            except asyncio.TimeoutError:
-                raise TimeoutError(f"{len(self._pending)} futures did not complete in time") from None
+        self._rt.client.flush()
+        return self._took(await self._completions.take_async(self._deadline))
+
+    def _took(self, f: Future[T] | None) -> Future[T]:
+        if f is None:
+            raise TimeoutError(f"{self._left} futures did not complete in time")
+        self._left -= 1
+        return f
+
+    def __del__(self) -> None:
+        # Left before the end (a break, a timeout): the rest drop their callbacks.
+        if self._left and not sys.is_finalizing():
+            self._completions.close()
 
 
 class Outcome(NamedTuple):
@@ -805,10 +843,14 @@ class Outcome(NamedTuple):
 class _Slot:
     """Calls in flight for a Results: one item, or a chunk of ``k`` items."""
 
-    __slots__ = ("first", "fut", "k", "chunk", "size")
+    __slots__ = ("first", "fut", "k", "chunk", "args", "size", "measured", "timed")
 
-    def __init__(self, first: int, fut: Future[Any], k: int, chunk: bool, size: int) -> None:
-        self.first, self.fut, self.k, self.chunk, self.size = first, fut, k, chunk, size
+    def __init__(self, first: int, fut: Future[Any], k: int, chunk: bool, args: int, estimate: int) -> None:
+        self.first, self.fut, self.k, self.chunk = first, fut, k, chunk
+        # Bytes charged to the window: its arguments, and its result's
+        # estimated size until the result is measured.
+        self.args, self.size, self.measured = args, args + estimate, False
+        self.timed = False  # its chunk's time per item was learned (see _behind_head)
 
 
 class Results(Generic[T]):
@@ -822,18 +864,27 @@ class Results(Generic[T]):
     error is raised at its position; if caught, iteration continues. Leaving a
     ``with`` block or calling ``close()`` cancels outstanding items and closes
     the source.
+
+    A map over an async iterable is read with ``async for``, which takes
+    items from it only as the window allows, and sends them as they arrive.
+    An error the iterable raises is raised after the items before it.
+    Leaving that loop early (a break, an error, cancellation), an ``async
+    with`` block, or ``aclose()`` closes the map and the source. ``close()``
+    and a ``with`` block cannot wait for the source: its ``finally`` runs
+    then only if it was producing an item, else when it is collected.
     """
 
     def __init__(
         self,
         submit: Callable[[int, Any], Future[T]],
-        source: Iterator[Any],
+        source: Iterator[Any] | AsyncIterator[Any],
         *,
         ordered: bool,
         window: int,
         window_bytes: int = 256 << 20,
         chunk: Callable[[int, list[Any]], Future[Any]] | None = None,
         parallel: int = 1,
+        at_once: int | None = None,
         grow_window: bool = False,
         origin: tuple[Any, Any, bool] | None = None,
     ) -> None:
@@ -843,19 +894,31 @@ class Results(Generic[T]):
         # value is a _Chunk. Chunks start at one item and grow only by the
         # worker time items are measured to take (A1), so slow items are never
         # grouped. A window the caller chose is a hard cap; a default one
-        # widens so every worker can hold two chunks.
+        # widens so every one of the `parallel` workers can hold two chunks.
+        # Until a result's size is known, the window is `at_once` (the calls
+        # that can run at once; default `parallel`, see _room).
         self._submit = submit
         self._chunk = chunk
         self._parallel = max(1, parallel)
+        self._at_once = max(1, at_once or parallel)
         self._grow_window = grow_window
         self._item_s: float | None = None
-        self._source = source
+        # An async source is pulled by async reads only (see _apump).
+        is_async = not hasattr(source, "__next__") and hasattr(source, "__anext__")
+        self._source: Iterator[Any] | None = None if is_async else source  # type: ignore[assignment]
+        self._asource: AsyncIterator[Any] | None = source if is_async else None  # type: ignore[assignment]
+        self._pull: asyncio.Task[None] | None = None  # taking items from the async source
+        self._pulled: list[Any] = []  # items it took, not sent yet
+        self._pull_error: Exception | None = None  # what the async source raised
+        self._pull_waiters: list[asyncio.Future[None]] = []  # reads woken when its items can go out
         self._ordered = ordered
         self._window = max(1, window)
         self._window_bytes = max(1, window_bytes)
+        self._cap = self._k = self._refill_at = 0  # see _limits
         self._slots: dict[int, _Slot] = {}  # by first index, in submission order
         self._items = 0  # items in flight
-        self._bytes = 0
+        self._bytes = 0  # what the window holds: the slots' sizes, and _held
+        self._held = 0  # result bytes of the items in _buf
         self._out_total = 0
         self._out_n = 0
         self._next = 0
@@ -864,10 +927,10 @@ class Results(Generic[T]):
         self._buf: deque[tuple[int, Any, BaseException | None, _Slot, int]] = deque()
         self._exhausted = False
         self._closed = False
-        self._waker = _AsyncWaker()
         self._registry: set[Any] | None = None
         self._origin = origin
         self._started = False
+        self._limits()
         if origin is None:
             self._start()
         else:
@@ -893,7 +956,7 @@ class Results(Generic[T]):
         yet, taken from this stream (which then yields nothing), for a caller
         that runs the function itself (reduce_by_key); None otherwise."""
         with _unstarted_lock:
-            if self._started or self._origin is None:
+            if self._started or self._origin is None or self._source is None:
                 return None
             self._started = self._closed = True
             _unstarted.discard(self)
@@ -911,37 +974,120 @@ class Results(Generic[T]):
             return 1
         return max(1, min(MAX_CHUNK, int(CHUNK_TARGET_S / max(self._item_s, 1e-7))))
 
-    def _fill(self) -> None:
-        # In flight is bounded by items and by argument bytes (A3). Refill in
-        # bulk once half the window has drained, so the peer receives large
-        # groups instead of a trickle of single items.
+    def _room(self, refill: bool) -> int:
+        """How many items to take from the source next (0: none now). The
+        window bounds the items taken and not handed out yet (in flight,
+        finished and waiting to be read, or taken from an async source and
+        not sent yet) and their bytes (A3). A `refill` waits until half the
+        window has drained, so the peer receives large groups instead of a
+        trickle of single items."""
+        if self._exhausted:
+            return 0
+        held = self._items + len(self._buf) + len(self._pulled)
+        if refill:
+            if self._slots and held > self._refill_at and self._bytes < self._window_bytes // 2:
+                return 0
+            self._measure()
+            self._limits()
+        window = self._cap if self._out_n else min(self._cap, self._at_once)  # no size known yet: one per running call
+        if held >= window or self._bytes >= self._window_bytes:
+            return 0
+        return max(1, min(self._k, window - held))
+
+    def _limits(self) -> None:
+        """The window in items, the most items one call takes, and the items
+        held at which a refill starts, by what has been measured so far."""
         window = self._window
         k = min(self._chunk_size(), window)
+        if self._out_total:  # and its results, by their mean size, at most half the bytes
+            k = min(k, max(1, self._window_bytes * self._out_n // (2 * self._out_total)))
         if self._grow_window:
             window = max(window, 2 * self._parallel * k)
-        if self._slots and self._items > window // 2 and self._bytes < self._window_bytes // 2:
-            return
+        # A chunk is at most half the window: the next runs while it is read.
+        self._cap, self._k, self._refill_at = window, min(k, max(1, window // 2)), window // 2
+
+    def _fill(self) -> None:
+        if self._source is None:
+            return  # an async source: async reads fill (see _apump)
+        want = self._room(True)
+        while want:
+            items = list(itertools.islice(self._source, want))
+            self._exhausted = len(items) < want
+            if items:
+                self._send(items)
+            want = self._room(False)
+
+    def _apump(self) -> None:
+        """``_fill`` for an async source. A task of its own takes items from
+        it while the window has room (_take), so a read never waits on the
+        source while results are ready, and a read cancelled while it waits
+        takes nothing. What it took goes out a batch at a time, and part of
+        a batch only once nothing runs or the task has stopped, so items that
+        come a loop step apart still share calls."""
+        if self._pulled:
+            self._limits()  # batches grow while the task takes items
+            while self._pulled and (len(self._pulled) >= self._k or not self._items or self._pull is None):
+                items = self._pulled[: self._k]
+                del self._pulled[: self._k]  # in place: _take appends to this list as its await ends
+                self._send(items)
+        if self._pull is None and self._room(True):
+            self._pull = asyncio.ensure_future(self._take())
+
+    async def _take(self) -> None:
+        """Take items of the async source into _pulled while the window has
+        room, waking the reads that wait whenever what it took can go out."""
+        assert self._asource is not None
+        try:
+            while self._room(False):
+                self._pulled.append(await anext(self._asource))
+                if len(self._pulled) >= self._k or not self._items:
+                    self._wake_reads()
+        except StopAsyncIteration:
+            self._exhausted = True
+        except Exception as e:  # raised once the items before it are read
+            self._exhausted, self._pull_error = True, e
+        finally:
+            self._pull = None
+            self._wake_reads()
+
+    def _wake_reads(self) -> None:
+        for w in self._pull_waiters:  # on this loop: the task that takes items runs on it
+            if not w.done():
+                w.set_result(None)
+
+    def _send(self, items: list[Any]) -> None:
         out_avg = self._out_total // self._out_n if self._out_n else 0
-        while not self._exhausted and self._items < window and self._bytes < self._window_bytes:
-            want = max(1, min(k, window - self._items))
-            items: list[Any] = []
-            while len(items) < want:
-                try:
-                    items.append(next(self._source))
-                except StopIteration:
-                    self._exhausted = True
-                    break
-            if not items:
-                break
-            if self._chunk is not None and isinstance(items[0], Future):
-                self._chunk = None  # chained stages pass futures: one call each
-            if self._chunk is None:
-                for item in items:
-                    f = self._submit(self._next, item)
-                    self._add(_Slot(self._next, f, 1, False, getattr(f, "_arg_bytes", 0) + out_avg))
-            else:
-                f = self._chunk(self._next, items)
-                self._add(_Slot(self._next, f, len(items), True, getattr(f, "_arg_bytes", 0) + out_avg * len(items)))
+        if self._chunk is not None and isinstance(items[0], Future):
+            self._chunk = None  # chained stages pass futures: one call each
+        if self._chunk is None:
+            for item in items:
+                f = self._submit(self._next, item)
+                self._add(_Slot(self._next, f, 1, False, getattr(f, "_arg_bytes", 0), out_avg))
+        else:
+            f = self._chunk(self._next, items)
+            self._add(_Slot(self._next, f, len(items), True, getattr(f, "_arg_bytes", 0), out_avg * len(items)))
+
+    def _measure(self) -> None:
+        """Charge each slot whose call has finished its result's stored
+        bytes, in place of the estimate it was submitted with: results that
+        wait behind a slow first item count as what they are."""
+        for slot in self._slots.values():
+            if not slot.measured and slot.fut.done():
+                size = slot.args + self._learn(slot)
+                self._bytes += size - slot.size
+                slot.size = size
+
+    def _learn(self, slot: _Slot) -> int:
+        """The stored bytes of a finished slot's result (none for an error).
+        The first time, the mean result size (the estimate for calls still
+        running) learns them."""
+        out = slot.fut._outcome
+        size = out[4] if out is not None and out[0] == "ok" else 0
+        if not slot.measured:
+            slot.measured = True
+            self._out_total += size
+            self._out_n += slot.k
+        return size
 
     def _add(self, slot: _Slot) -> None:
         self._slots[slot.first] = slot
@@ -962,7 +1108,30 @@ class Results(Generic[T]):
         self._fill()
         return slot
 
-    def _pop_done(self) -> _Slot:
+    def _behind_head(self) -> None:
+        """While an ordered read waits on its first call: until a result's
+        size is known the window is one item per call that can run at once
+        (see _room), and until an item's time is known a call takes one item
+        (_chunk_size). Once a call behind the first has finished, learn both
+        from it and fill the window."""
+        if self._out_n:
+            return
+        self._measure()
+        if not self._out_n:
+            return
+        if self._chunk is not None and self._item_s is None:
+            for slot in self._slots.values():
+                out = slot.fut._outcome
+                if slot.chunk and out is not None and out[0] == "ok":
+                    try:  # read before its turn: its value carries the worker's time per item
+                        self._time(slot.fut._value_or_raise())
+                        slot.timed = True
+                    except Exception:  # noqa: BLE001 -- not kept: raised again at its turn (_expand)
+                        pass
+                    break
+        self._fill()
+
+    def _first_done(self) -> _Slot:
         """The finished slot with the lowest index (completion order)."""
         first = next(iter(self._slots.values())).fut
         rt = first._rt
@@ -974,17 +1143,20 @@ class Results(Generic[T]):
                     slot = min(done, key=lambda s: s.first)
                     break
                 rt.cond.wait(1.0)
-        self._remove(slot)
-        self._fill()
         return slot
+
+    def _time(self, value: Any) -> None:
+        """Learn the worker time per item from a chunk's value (A1)."""
+        if isinstance(value, _Chunk) and value:
+            per = value.elapsed / len(value)
+            self._item_s = per if self._item_s is None else 0.7 * self._item_s + 0.3 * per
 
     def _expand(self, slot: _Slot) -> None:
         """Move a finished slot's items into the buffer."""
         f = slot.fut
-        outcome = f._outcome
-        if outcome is not None and outcome[0] == "ok":
-            self._out_total += outcome[4]
-            self._out_n += slot.k
+        size = self._learn(slot)
+        self._held += size
+        self._bytes += size
         try:
             value = f._value_or_raise()
         except Exception as e:  # the call failed as a whole: every item has its error
@@ -994,9 +1166,8 @@ class Results(Generic[T]):
         if not slot.chunk:
             self._buf.append((slot.first, value, None, slot, 0))
             return
-        if isinstance(value, _Chunk) and value:
-            per = value.elapsed / len(value)
-            self._item_s = per if self._item_s is None else 0.7 * self._item_s + 0.3 * per
+        if not slot.timed:
+            self._time(value)
         for j, v in enumerate(value):
             if isinstance(v, ItemFailed):
                 self._buf.append((slot.first + j, None, from_outcome(v.err), slot, j))
@@ -1006,18 +1177,40 @@ class Results(Generic[T]):
     def _next_item(self) -> tuple[int, Any, BaseException | None, _Slot, int]:
         self._start()
         if self._buf:
-            return self._buf.popleft()
-        if self._closed or not self._slots:
+            return self._handout()
+        if self._asource is not None and not self._closed:
+            raise TypeError(_ASYNC_SOURCE)
+        if self._drained():
             self._end()
             self._finished = not self._closed
             raise StopIteration
         if self._ordered:
-            slot = self._pop_ordered()
-            slot.fut._wait(None)
+            slot = next(iter(self._slots.values()))
+            slot.fut._wait(None, self._behind_head)
         else:
-            slot = self._pop_done()
-        self._expand(slot)
-        return self._buf.popleft()
+            slot = self._first_done()
+        self._remove(slot)
+        self._expand(slot)  # its items are still held: handing them out makes room (see _handout)
+        if self._items + len(self._buf) <= self._refill_at:
+            self._fill()
+        return self._handout()
+
+    def _drained(self) -> bool:
+        """True once nothing is left to read: closed, or nothing in flight
+        and nothing more to take (a batch it held may have held items back)."""
+        if not self._slots and not self._closed:
+            self._fill()
+        return self._closed or not self._slots and self._pull is None
+
+    def _handout(self) -> tuple[int, Any, BaseException | None, _Slot, int]:
+        item = self._buf.popleft()
+        if not self._buf:  # its call's last item: nothing of its result is held here now
+            self._bytes -= self._held
+            self._held = 0
+            self._fill()
+        elif len(self._buf) + self._items == self._refill_at:
+            self._fill()  # half a window handed out of one batch: more run meanwhile
+        return item
 
     def __iter__(self) -> Iterator[T]:
         _not_again(self)
@@ -1047,14 +1240,19 @@ class Results(Generic[T]):
 
         Items submitted from here on are one call each, so cancelling an
         item's future cancels only that item."""
+        if self._asource is not None:  # here, not at the first item: a chained map is read later
+            raise TypeError(_ASYNC_SOURCE)
+        return self._futures()
+
+    def _futures(self) -> Iterator[Future[T]]:
         self._chunk = None
         self._start()
         while True:
             if self._buf:
-                _, _, _, slot, j = self._buf.popleft()
+                _, _, _, slot, j = self._handout()
                 yield self._item_future(slot, j)
                 continue
-            if self._closed or not self._slots:
+            if self._drained():
                 self._end()
                 return
             slot = self._pop_ordered()
@@ -1066,14 +1264,18 @@ class Results(Generic[T]):
         passed by handle, so values move between executors, not through here."""
         return fn.map(self.futures(), ordered=ordered)
 
-    def reduce_by_key(self, combine: Any = None, *, partitions: int | None = None) -> Any:
+    def reduce_by_key(
+        self, combine: Any = None, *, partitions: int | None = None, memory: int | str | None = None
+    ) -> Any:
         """Group the (key, value) pairs each result yields by key, across all
         results, folding each key's values with `combine` (associative; without
         it, values are collected into lists). The pairs are repartitioned
-        between workers, never through here. Returns a ``Partitioned``."""
+        between workers, never through here. Returns a ``Partitioned``.
+        `memory` is what each gather may take for its partition (see
+        ``_data.reduce_by_key``)."""
         from ._data import reduce_by_key
 
-        return reduce_by_key(self, combine, partitions=partitions)
+        return reduce_by_key(self, combine, partitions=partitions, memory=memory)
 
     def write(self, sink: Any) -> Future[Any]:
         """Write each result as one partition of `sink` (an ``ext.Sink``), from
@@ -1098,11 +1300,27 @@ class Results(Generic[T]):
         close = getattr(self._source, "close", None)
         if callable(close):
             close()
+        if self._pull is not None:
+            self._pull.cancel()  # an async source stops where it waits
         for slot in self._slots.values():
             if not slot.fut.done():
                 slot.fut._rt.client.cancel(slot.fut.key, False)
         self._slots.clear()
         self._buf.clear()
+        self._pulled.clear()
+        self._pull_error = None  # closed: nothing more is raised
+        self._bytes = self._held = 0
+
+    async def aclose(self) -> None:
+        """``close()``, then wait for an async source to close: its
+        ``finally`` blocks have run when this returns."""
+        pull = self._pull
+        self.close()
+        if pull is not None:
+            await asyncio.wait([pull])
+        aclose = getattr(self._asource, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     def __enter__(self) -> Results[T]:
         return self
@@ -1110,32 +1328,68 @@ class Results(Generic[T]):
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    async def __aenter__(self) -> Results[T]:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
     def __aiter__(self) -> AsyncIterator[T]:
         _not_again(self)
-        return self
+        return self if self._asource is None else self._reading()
+
+    async def _reading(self) -> AsyncIterator[T]:
+        """``async for`` over a map of an async source: the loop owns the
+        map, so leaving it early closes the map and its source."""
+        try:
+            while True:
+                try:
+                    value = await self.__anext__()
+                except StopAsyncIteration:
+                    return
+                yield value
+        finally:
+            await self.aclose()
 
     async def __anext__(self) -> T:
         self._start()
-        if not self._buf:
-            if self._closed or not self._slots:
+        # A slot is taken only once its call has finished, with no await in
+        # between: a read cancelled while it waits leaves it to the next.
+        while True:
+            if self._asource is not None and not self._closed:
+                self._apump()
+            if self._buf:
+                break
+            if self._drained():
                 self._end()
+                if self._pull_error is not None:  # the async source's, after the items before it
+                    error, self._pull_error = self._pull_error, None
+                    raise error
                 raise StopAsyncIteration
             if self._ordered:
-                slot = self._pop_ordered()
-                try:
-                    await slot.fut
-                except Exception:
-                    pass  # _expand reports the call's error at each item
+                head = [next(iter(self._slots.values()))] if self._slots else []
+                ready = [s for s in head if s.fut.done()]
+                # Until a result's size is known, calls behind the head are watched too (see _behind_head).
+                watch = head if self._out_n else list(self._slots.values())
             else:
-                next(iter(self._slots.values())).fut._rt.client.flush()
-                while not any(s.fut.done() for s in self._slots.values()):
-                    self._waker.watch(s.fut for s in self._slots.values())
-                    await self._waker.wait(None)
-                slot = min((s for s in self._slots.values() if s.fut.done()), key=lambda s: s.first)
-                self._remove(slot)
-                self._fill()
+                watch = list(self._slots.values())
+                ready = [s for s in watch if s.fut.done()]
+            if not ready:
+                if self._ordered and not self._out_n:
+                    self._behind_head()
+                    if self._out_n:
+                        continue  # one behind the head had finished: the window grew
+                if watch:
+                    watch[0].fut._rt.client.flush()
+                # Until a call finishes, or the async source gives items to send.
+                await any_done([s.fut for s in watch], self._pull_waiters if self._pull is not None else None)
+                continue
+            slot = min(ready, key=lambda s: s.first)
+            self._remove(slot)
             self._expand(slot)
-        _, value, err, _, _ = self._buf.popleft()
+            if self._items + len(self._buf) <= self._refill_at:
+                self._fill()
+        _, value, err, _, _ = self._handout()
         if err is not None:
             raise err
         return value
@@ -1158,20 +1412,24 @@ class Stream(Results[T]):
 
     Iterate it (``for x in fn.remote(...)``, or ``async for``). The generator
     runs at most a window of items ahead of you (``max_in_flight``, default
-    64). If its worker dies, the generator runs again and the items you
-    already have are skipped, so a generator should yield the same items each
-    time (the default ``deterministic=True``). An error raised in the
+    64, and ``max_in_flight_bytes`` of them, default 256 MiB). If its worker
+    dies, the generator runs again and the items you already have are
+    skipped, so a generator should yield the same items each time (the
+    default ``deterministic=True``). An error raised in the
     generator is raised here after the items before it. ``close()`` stops it.
     """
 
-    def __init__(self, fut: Future[int], window: int) -> None:
+    def __init__(self, fut: Future[int], window: int, window_bytes: int) -> None:
         self._fut = fut
         self.key = fut.key
         self._rt = fut._rt
         self._items: dict[int, tuple[Any, ...]] = {}
         self._next = 0
         self._window = window
+        self._window_bytes = window_bytes
         self._credited = 0
+        self._taken = 0  # stored bytes of the items taken since the last credit
+        self._waiters: list[asyncio.Future[None]] = []  # async reads waiting for an item
         self._rt._streams[self.key] = self
         if not self._rt.in_executor:
             self._rt._stream_keys.add(self.key)
@@ -1183,6 +1441,34 @@ class Stream(Results[T]):
         """An item arrived (dispatcher thread; a replayed attempt repeats indices)."""
         if index >= self._next:
             self._items.setdefault(index, outcome)
+            if self._waiters:
+                for w in list(self._waiters):
+                    wake(w)
+
+    def _claim(self) -> tuple[Any, ...] | None:
+        """Take the next item if it has arrived (None: not yet). At the end,
+        raises StopIteration, or the generator's error."""
+        ended = self._fut.done()  # read first: every item arrives before the end
+        outcome = self._items.pop(self._next, None)
+        if outcome is None:
+            if not ended:
+                return None
+            count = self._fut._value_or_raise()  # the generator's error, if it raised
+            if self._next >= count:
+                self._finished = True
+                raise StopIteration
+            raise StreamInterrupted(f"the stream ended after {self._next} of {count} items")
+        self._next += 1
+        return outcome
+
+    def _deliver(self, outcome: tuple[Any, ...]) -> T:
+        # The generator pauses a window ahead of the last credit, in items or
+        # in stored bytes: credit after half of either is taken.
+        self._taken += outcome[4]
+        if self._next - self._credited >= max(1, self._window // 2) or self._taken >= self._window_bytes // 2:
+            self._credited, self._taken = self._next, 0
+            self._rt.client.stream_credit(self.key, self._next)
+        return self._rt.read_value(outcome)
 
     def __iter__(self) -> Stream[T]:
         _not_again(self)
@@ -1192,36 +1478,42 @@ class Stream(Results[T]):
         rt = self._rt
         rt.client.flush()
         with rt.cond:
-            while self._next not in self._items:
-                if self._fut.done():
-                    count = self._fut._value_or_raise()  # the generator's error, if it raised
-                    if self._next >= count:
-                        self._finished = True
-                        raise StopIteration
-                    raise StreamInterrupted(f"the stream ended after {self._next} of {count} items")
+            while (outcome := self._claim()) is None:
                 rt.cond.wait(1.0)
-            outcome = self._items.pop(self._next)
-        self._next += 1
-        if self._next - self._credited >= max(1, self._window // 2):
-            self._credited = self._next
-            rt.client.stream_credit(self.key, self._next)
-        return rt.read_value(outcome)
+        return self._deliver(outcome)
 
     def __aiter__(self) -> Stream[T]:
         _not_again(self)
         return self
 
     async def __anext__(self) -> T:
-        # StopIteration cannot cross a thread boundary into a coroutine.
-        end = object()
-        item = await asyncio.to_thread(lambda: next(self, end))
-        if item is end:
-            raise StopAsyncIteration
-        return item
+        self._rt.client.flush()
+        while True:
+            try:
+                outcome = self._claim()
+            except StopIteration:
+                raise StopAsyncIteration from None
+            if outcome is not None:
+                return self._deliver(outcome)
+            # Only the claim above takes an item, with no await before it: a
+            # read cancelled while it waits here leaves the item to the next.
+            w = asyncio.get_running_loop().create_future()
+            self._waiters.append(w)
+            end = self._fut._on_done(lambda _: wake(w))
+            try:
+                if self._next not in self._items:  # else it arrived before `w` was listed
+                    await w
+            finally:
+                self._waiters.remove(w)
+                if end is not None:
+                    self._fut._off_done(end)
 
     def close(self) -> None:
         """Stop the generator; items not taken yet are dropped."""
         self._fut.cancel()
+
+    async def aclose(self) -> None:
+        self.close()
 
     def __enter__(self) -> Stream[T]:
         return self

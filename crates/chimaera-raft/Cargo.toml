@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 chimaera-core.workspace = true
 chimaera-proto.workspace = true
+blake3.workspace = true
 openraft = { version = "=0.10.1", features = ["serde"] }
 redb = "5.0"
 tokio.workspace = true
@@ -22,4 +23,6 @@ futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+# network.rs tests run on tokio's paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 openraft = { version = "=0.10.1", features = ["serde"] }

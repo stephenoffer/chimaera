@@ -6,7 +6,14 @@ Both get the same split of this machine: 3 nodes of ``--cpus-per-node`` CPUs
 ``--cpus``). Everything crosses real sockets between node processes, but
 nodes share one machine's cores, memory and loopback network: this measures
 protocol and scheduling overhead, NOT scaling. ``node_loss`` is left out
-(it kills a node by host).
+(it kills a node by host; ``node_loss.py`` repeats node loss on localhost).
+
+Each round runs every workload once per runtime, the workloads and which
+runtime goes first in a seeded random order (``--seed``). The JSON holds the
+run's manifest (``manifest.py``) and every child's raw samples; the report
+the medians over all rounds with their 95% intervals, and the raft entries
+the peers applied per unit of work. Without ``--ray-python`` only Chimaera
+runs: a regression run against its own earlier reports.
 
     .venv/bin/python bench/evals/local_cluster.py --ray-python .venv-bench/bin/python --rounds 3
 """
@@ -16,16 +23,21 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
+import random
 import signal
-import statistics
 import subprocess
 import sys
 import time
 
+import manifest
+from multi_node import CHIMAERA_ONLY, SCALE
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-WORKLOADS = ["tasks", "cpu_scaling", "map_small", "broadcast", "actors", "nested", "shuffle"]
+WORKLOADS = [
+    "tasks", "tasks_serial", "cpu_scaling", "map_small", "broadcast", "actors", "actors_peer", "nested", "shuffle",
+    "shuffle_unfused",
+]
 
 RAY_HOLDER = """
 import sys
@@ -72,9 +84,10 @@ def run_child(python: str, runtime: str, workload: str, env: dict[str, str]) -> 
 
 def main() -> None:
     """Start both clusters, run each workload against each runtime for the
-    given rounds (alternating which goes first), then write the medians."""
+    given rounds in a seeded random order, then write the manifest, the raw
+    results and the report."""
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ray-python", required=True, help="a Python with Ray installed")
+    ap.add_argument("--ray-python", help="a Python with Ray installed (without it, only Chimaera runs)")
     ap.add_argument(
         "--chimaera-python",
         default=sys.executable,
@@ -83,74 +96,74 @@ def main() -> None:
     ap.add_argument("--nodes", type=int, default=3)
     ap.add_argument("--cpus-per-node", type=int, default=4)
     ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--seed", type=int, help="the run order's seed (default: a random one, recorded)")
     ap.add_argument("--only", default="")
     ap.add_argument("--out", default=os.path.join(HERE, "results"))
     a = ap.parse_args()
     # Stopped from outside: still run the cleanup below, so only this run's nodes go away.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     names = [w for w in WORKLOADS if not a.only or w in a.only.split(",")]
+    seed = a.seed if a.seed is not None else random.randrange(1 << 31)
+    rng = random.Random(seed)
     os.makedirs(a.out, exist_ok=True)
 
-    holder = subprocess.Popen(
-        [a.ray_python, "-c", RAY_HOLDER.format(cpus=a.cpus_per_node, nodes=a.nodes)],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    ray_address = holder.stdout.readline().strip()
+    holder = None
+    pythons = {"chimaera": a.chimaera_python}
+    if a.ray_python:
+        holder = subprocess.Popen(
+            [a.ray_python, "-c", RAY_HOLDER.format(cpus=a.cpus_per_node, nodes=a.nodes)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        ray_address = holder.stdout.readline().strip()
+        pythons["ray"] = a.ray_python
     cluster = start_chimaera(a.nodes, a.cpus_per_node)
     time.sleep(3)  # founders joined and elected
-    envs = {
-        "ray": dict(os.environ, RAY_ADDRESS=ray_address),
-        "chimaera": dict(os.environ, CHIMAERA_HOME=cluster.dir(0), PYTHONPATH=os.path.join(REPO, "python")),
-    }
-    pythons = {"ray": a.ray_python, "chimaera": a.chimaera_python}
+    binary = manifest.running_binary(cluster.dir(0))
+
+    def statuses() -> list[dict]:
+        return [manifest.status(binary, cluster.dir(i)) for i in range(a.nodes)]
+
+    durability = manifest.settled_durability(statuses)
+    envs = {"chimaera": dict(os.environ, CHIMAERA_HOME=cluster.dir(0), PYTHONPATH=os.path.join(REPO, "python"))}
+    if holder:
+        envs["ray"] = dict(os.environ, RAY_ADDRESS=ray_address)
     records = []
     try:
         for rnd in range(a.rounds):
-            order = ("ray", "chimaera") if rnd % 2 == 0 else ("chimaera", "ray")
-            for w in names:
-                for rt in order:
+            for w in rng.sample(names, len(names)):
+                for rt in rng.sample(sorted(pythons), len(pythons)):
+                    if rt == "ray" and w in CHIMAERA_ONLY:
+                        continue
+                    entries0 = manifest.raft_entries(statuses()) if rt == "chimaera" else 0
                     rec = run_child(pythons[rt], rt, w, envs[rt])
                     rec["round"] = rnd
+                    if rt == "chimaera":
+                        rec["durability"] = durability
+                        if "result" in rec:  # the commits behind the child's work, warm-up included
+                            rec["result"]["raft_entries"] = manifest.raft_entries(statuses()) - entries0
                     print(json.dumps(rec), flush=True)
                     records.append(rec)
     finally:
         cluster.close()
-        holder.stdin.close()
-        holder.wait(timeout=120)
-
-    def median(rt: str, w: str) -> dict:
-        ok = [r["result"] for r in records if r["runtime"] == rt and r["workload"] == w and "result" in r]
-        if not ok:
-            errs = [r.get("error", "")[:200] for r in records if r["runtime"] == rt and r["workload"] == w]
-            return {"error": errs[0] if errs else "no runs"}
-        keys = [k for k, v in ok[0].items() if isinstance(v, (int, float))]
-        return {k: statistics.median(r[k] for r in ok) for k in keys} | {"runs": len(ok)}
+        if holder:
+            holder.stdin.close()
+            holder.wait(timeout=120)
 
     stamp = time.strftime("%Y-%m-%d")
-    summary = {w: {rt: median(rt, w) for rt in ("ray", "chimaera")} for w in names}
-    meta = {
-        "machine": f"{platform.platform()} {os.cpu_count()} cpus",
-        "nodes": a.nodes,
-        "cpus_per_node": a.cpus_per_node,
-        "rounds": a.rounds,
-        "pythons": {rt: subprocess.run([py, "-c", "import platform; print(platform.python_version())"], capture_output=True, text=True).stdout.strip() for rt, py in pythons.items()},
-        "load_avg_after": os.getloadavg(),
-    }
+    topology = {"nodes": a.nodes, "cpus_per_node": a.cpus_per_node, "data_groups": cluster.data_groups,
+                "layout": "one machine, loopback network"}
+    order = {"seed": seed, "rounds": a.rounds, "scale": SCALE, "load_avg_after": os.getloadavg()}
+    doc = {"manifest": manifest.collect(binary, pythons, topology=topology, durability=durability, order=order),
+           "results": records}
     with open(os.path.join(a.out, f"local{a.nodes}-{stamp}.json"), "w") as f:
-        json.dump({"meta": meta, "summary": summary, "records": records}, f, indent=2)
-    rows = [
-        f"# Ray vs Chimaera, {a.nodes} nodes on one machine ({stamp})",
-        "",
+        json.dump(doc, f, indent=2)
+    report = manifest.report(doc, WORKLOADS, f"Ray vs Chimaera, {a.nodes} nodes on one machine ({stamp})", [
         "Protocol and scheduling overhead only: every node shares one machine's cores and loopback network.",
-        f"{meta['machine']}; {a.nodes} x {a.cpus_per_node} CPUs; median of {a.rounds} rounds, alternating which runtime goes first.",
-        "",
-        "| workload | Ray | Chimaera |",
-        "|---|---|---|",
-    ]
-    rows += [f"| {w} | {json.dumps(summary[w]['ray'])} | {json.dumps(summary[w]['chimaera'])} |" for w in names]
-    report = "\n".join(rows) + "\n"
+        f"{doc['manifest']['host']['platform']}, {os.cpu_count()} cpus; {a.nodes} x {a.cpus_per_node} CPUs; "
+        f"{a.rounds} rounds in a random order (seed {seed}). EVAL_SCALE {SCALE}.",
+    ])
     with open(os.path.join(a.out, f"local{a.nodes}-{stamp}.md"), "w") as f:
         f.write(report)
     print(report)

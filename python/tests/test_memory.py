@@ -14,7 +14,7 @@ import tempfile
 
 import pytest
 
-from conftest import BIN, run_script
+from conftest import BIN, REPO, run_script
 
 
 @pytest.fixture
@@ -122,6 +122,48 @@ def test_a_leaking_function_gets_a_fresh_worker(home):
         [BIN, "--dir", home, "explain", run_id, "--decisions"], capture_output=True, text=True, timeout=60
     ).stdout
     assert "leaks" in decisions and "replaced" in decisions, decisions
+
+
+def test_fast_calls_that_keep_memory_are_not_batched_past_the_leak_watch(home):
+    # The leak watch looks between batches. A 2 ms function that kept memory
+    # was batched 100 deep, so its worker grew by 100 calls' worth between two
+    # looks; on a small peer one batch outgrew the pool and every call in it
+    # failed as out of memory. Each replacement now comes within a few calls
+    # of its limit (twice the first reading plus 512 MiB).
+    import json
+    import re
+
+    r = run_script(
+        """
+        import numpy as np
+        import chimaera as ch
+
+        kept = []
+
+        @ch.remote(cpus=4)
+        def keep(i):
+            kept.append(np.ones(8 * 2**20 // 8))  # 8 MiB never released
+            return i
+
+        assert sum(ch.get([keep.remote(i) for i in range(320)], timeout=240)) == sum(range(320))
+        print(ch.runs.current_run().id)
+        """,
+        home=home,
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr
+    run_id = r.stdout.split()[-1]
+    out = subprocess.run(
+        [BIN, "--dir", home, "explain", run_id, "--decisions", "--json"], capture_output=True, text=True, timeout=60
+    ).stdout
+    grew = [
+        tuple(map(int, m.groups()))
+        for d in json.loads(out)["decisions"]
+        if d["controller"] == "leaks" and (m := re.search(r"grew from (\d+) MiB to (\d+) MiB", d["evidence"]))
+    ]
+    assert len(grew) >= 2, out
+    over = [last - (2 * first + 512) for first, last in grew]
+    assert max(over) < 128, f"MiB past the limit before each replacement: {over}"
 
 
 def test_executors_cap_thread_pools_and_write_no_core_dumps():
@@ -342,3 +384,29 @@ def test_memory_a_call_freed_goes_back_to_the_system(home):
     )
     assert r.returncode == 0, r.stderr
     assert int(r.stdout.split()[-1]) < 200, f"worker still holds {r.stdout.split()[-1]} MiB after freeing ~390 MiB"
+
+
+def test_a_value_written_past_the_memory_limit_goes_to_a_spill_directory_that_can_take_it(tmp_path):
+    # Spilled at birth (memory over its limit), in its own process: the first
+    # spill directory in turn cannot hold the run's files, so the value goes
+    # to the next, and nothing is left in the first.
+    mem, bad, good = (tmp_path / n for n in ("mem", "bad", "good"))
+    for d in (mem, bad, good):
+        d.mkdir()
+    run = "ab" * 16
+    (bad / run).write_bytes(b"")  # a file where its run directory would go
+    code = f"""
+import os
+from chimaera import _native
+_native.objects_config({str(mem)!r}, None, {f"{bad}:{good}"!r}, 1)  # over a 1-byte limit
+for i in range(2):  # round-robin: one starts at each directory
+    path = os.path.join({str(mem)!r}, {run!r}, f"{{i:032x}}")
+    _native.write_object(path, [b"x" * 5000])
+    print(os.readlink(path), open(path, "rb").read() == b"x" * 5000)
+"""
+    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "python"))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 0, r.stderr[-3000:]
+    for i, line in enumerate(r.stdout.splitlines()):
+        assert line == f"{good / run / f'{i:032x}'} True", r.stdout
+    assert os.listdir(bad) == [run] and os.path.isfile(bad / run), "no partial file in the failed directory"

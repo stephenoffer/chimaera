@@ -5,7 +5,7 @@ use crate::core::CoreMsg;
 use crate::router::Router;
 use crate::stores::{CodeStore, ObjectStore, hex};
 use chimaera_core::pb;
-use chimaera_core::shard::{Tk, read};
+use chimaera_core::shard::{Tk, read, store};
 use chimaera_core::swim::{Config as SwimConfig, State as SwimState, Swim, Update as SwimUpdate};
 use chimaera_raft::{ProposeError, RpcFuture, RpcKind, Transport};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -104,6 +104,13 @@ const REPLICA_SEARCH: usize = 8;
 const FETCH_RANGES: u64 = 8;
 /// TCP connections per peer that bulk fetches spread over (see channel_lane).
 const FETCH_LANES: usize = 4;
+/// Connections of their own for Raft: its snapshots, its messages larger
+/// than RAFT_SMALL, and the rest (heartbeats among them), so a heartbeat
+/// never queues behind other bytes on one TCP connection.
+const SNAPSHOT_LANE: usize = FETCH_LANES + 1;
+const RAFT_BULK_LANE: usize = FETCH_LANES + 2;
+const RAFT_LANE: usize = FETCH_LANES + 3;
+const RAFT_SMALL: usize = 64 << 10;
 /// Transfers this large teach the bandwidth estimate.
 const RATE_SAMPLE_MIN: u64 = 1 << 20;
 /// Objects fetched this recently are offered as locality hints.
@@ -185,6 +192,10 @@ pub struct MeshClient {
     /// SWIM membership (who is alive), driven by the liveness loop.
     pub swim: Mutex<Swim>,
     epoch: Instant,
+    /// Paces the bytes this peer sends in bulk, by traffic class (see traffic).
+    pub traffic: crate::traffic::Shaper,
+    /// Round trips of the Raft heartbeats this peer sent lately.
+    pub heartbeats: crate::traffic::Rtts,
 }
 
 /// SWIM incarnation of a member: process incarnation high, refutations low.
@@ -273,6 +284,8 @@ impl MeshClient {
             received: Mutex::new(Vec::new()),
             swim: Mutex::new(Swim::new(me_node, swim_inc(me_inc), me_node, swim_config())),
             epoch: Instant::now(),
+            traffic: crate::traffic::Shaper::from_env(),
+            heartbeats: Default::default(),
         })
     }
 
@@ -280,9 +293,10 @@ impl MeshClient {
         self.channel_lane(addr, 0)
     }
 
-    /// A connection to `addr`: lane 0 is the shared one; bulk transfers
-    /// spread over lanes 1..=FETCH_LANES, each its own TCP connection, since
-    /// one HTTP/2 connection carries all its streams on one socket.
+    /// A connection to `addr`: lane 0 carries messages, Raft's go on the Raft
+    /// lanes, and byte streams on lanes 1..=FETCH_LANES, each its own TCP
+    /// connection, since one HTTP/2 connection carries all its streams on
+    /// one socket.
     fn channel_lane(&self, addr: &str, lane: usize) -> Result<Rpc, std::io::Error> {
         let key = if lane == 0 { addr.to_string() } else { format!("{addr}#{lane}") };
         let mut chans = self.channels.lock().expect("lock");
@@ -471,6 +485,8 @@ impl MeshClient {
         let unavailable = |reason: String| ProposeError::Unavailable { group, reason };
         let mut c = self.rpc(node).map_err(|e| unavailable(e.to_string()))?;
         let req = pb::ProposeRequest { cluster: self.cluster.clone(), group, cmd: Some(cmd.clone()) };
+        // Calls and their inline arguments: never held, but counted (see traffic).
+        self.traffic.charge(prost::Message::encoded_len(&req));
         let r = tokio::time::timeout(CALL_TIMEOUT, c.propose(req))
             .await
             .map_err(|_| unavailable(format!("node {node} did not answer")))?
@@ -513,6 +529,7 @@ impl MeshClient {
 
     pub async fn dispatch(&self, node: u64, req: pb::DispatchRequest) -> std::io::Result<()> {
         let mut c = self.rpc(node)?;
+        self.traffic.charge(prost::Message::encoded_len(&req));
         tokio::time::timeout(CALL_TIMEOUT, c.dispatch(req))
             .await
             .map_err(std::io::Error::other)?
@@ -523,6 +540,7 @@ impl MeshClient {
     pub async fn push_logs(&self, node: u64, mut req: pb::PushLogsRequest) -> std::io::Result<()> {
         req.cluster = self.cluster.clone();
         let mut c = self.rpc(node)?;
+        self.traffic.charge(prost::Message::encoded_len(&req));
         tokio::time::timeout(CALL_TIMEOUT, c.push_logs(req))
             .await
             .map_err(std::io::Error::other)?
@@ -550,7 +568,16 @@ impl MeshClient {
     /// bytes from here, to its disk).
     /// Ask `node` to keep a copy of `object`. With `wait`, the answer comes
     /// once the copy is made, so an error means there is no copy.
-    pub async fn replicate(&self, node: u64, run: &[u8], object: &[u8], size: u64, wait: bool) -> std::io::Result<()> {
+    /// `traffic`: a checkpoint copy, or a recovery one (a drain's hand-off).
+    pub async fn replicate(
+        &self,
+        node: u64,
+        run: &[u8],
+        object: &[u8],
+        size: u64,
+        wait: bool,
+        traffic: pb::TrafficClass,
+    ) -> std::io::Result<()> {
         let req = pb::ReplicateRequest {
             cluster: self.cluster.clone(),
             run: run.to_vec(),
@@ -558,12 +585,26 @@ impl MeshClient {
             size,
             from_node: self.me.node_id,
             wait,
+            traffic: traffic as i32,
         };
         let mut c = self.rpc(node)?;
-        // A waited copy is one transfer: allow it 25 MB/s at worst.
-        let limit = if wait { CALL_TIMEOUT + Duration::from_secs_f64(size as f64 / 25e6) } else { CALL_TIMEOUT };
+        // A waited copy is one transfer: allow it 25 MB/s at worst or, as this
+        // peer paces the bytes (see traffic), its class's promised share split
+        // among the copies made at once (background ones and retained ones,
+        // REPLICAS_AT_ONCE of each at most; a drain's, as many).
+        let copies = 2.0 * crate::objplane::REPLICAS_AT_ONCE as f64;
+        let worst = self.traffic.promised(traffic).map_or(25e6, |r| (r / copies).min(25e6));
+        let limit = if wait { CALL_TIMEOUT + Duration::from_secs_f64(size as f64 / worst) } else { CALL_TIMEOUT };
         tokio::time::timeout(limit, c.replicate(req)).await.map_err(std::io::Error::other)?.map_err(status_err)?;
         Ok(())
+    }
+
+    /// Hold, renew or release resources on `node`'s ledger (Peer.Hold).
+    pub async fn hold(&self, node: u64, mut req: pb::HoldRequest) -> std::io::Result<pb::HoldReply> {
+        req.cluster = self.cluster.clone();
+        let mut c = self.rpc(node)?;
+        let r = tokio::time::timeout(CALL_TIMEOUT, c.hold(req)).await.map_err(std::io::Error::other)?;
+        Ok(r.map_err(status_err)?.into_inner())
     }
 
     /// What `node`'s object store holds (objplane::inventory, as JSON).
@@ -597,6 +638,11 @@ impl MeshClient {
         s.insert(object.to_vec(), Instant::now());
     }
 
+    /// Whether another peer asked for `object` in the last minute.
+    pub fn was_served(&self, object: &[u8]) -> bool {
+        self.served.lock().expect("lock").get(object).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+    }
+
     /// `object` was copied here from another peer (just before it appears
     /// under its name).
     fn note_arrived(&self, object: &[u8]) {
@@ -610,11 +656,6 @@ impl MeshClient {
     /// Whether `object` was copied here from another peer in the last minute.
     pub fn arrived(&self, object: &[u8]) -> bool {
         self.arrived.lock().expect("lock").get(object).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
-    }
-
-    /// Whether another peer asked for `object` in the last minute.
-    pub fn was_served(&self, object: &[u8]) -> bool {
-        self.served.lock().expect("lock").get(object).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
     }
 
     /// Where this peer's objects are replicated: the next live member by
@@ -636,7 +677,9 @@ impl MeshClient {
             let (mesh, node) = (self.clone(), p.member.node_id);
             let req = pb::MeshPutCode { cluster: self.cluster.clone(), digest: digest.clone(), code: code.clone() };
             tokio::spawn(async move {
-                let Ok(mut c) = mesh.rpc(node) else { return };
+                // A copy ahead of a loss, paced as one, on a byte lane (as code fetches are).
+                mesh.traffic.send(pb::TrafficClass::TrafficCheckpoint, req.code.len()).await;
+                let Ok(mut c) = mesh.rpc_lane(node, 1) else { return };
                 if let Err(e) = tokio::time::timeout(CALL_TIMEOUT, c.put_code(req)).await {
                     tracing::debug!("code copy to node {node} timed out: {e}");
                 }
@@ -769,7 +812,16 @@ impl MeshClient {
     /// rename). With its `size` known and at least PARALLEL_FETCH, it comes as
     /// FETCH_RANGES ranges over parallel streams. Every chunk is checked
     /// against its checksum, and the rate teaches the bandwidth estimate.
-    pub async fn fetch(&self, node: u64, run: &[u8], object: &[u8], size: u64, dest: &Path) -> std::io::Result<u64> {
+    /// `traffic`: the class `node` paces the bytes as.
+    pub async fn fetch(
+        &self,
+        node: u64,
+        run: &[u8],
+        object: &[u8],
+        size: u64,
+        dest: &Path,
+        traffic: pb::TrafficClass,
+    ) -> std::io::Result<u64> {
         if let Some(dir) = dest.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
@@ -783,16 +835,16 @@ impl MeshClient {
         }
         // Size unknown (a reader asked by name): learn it from a one-byte
         // range, so a large object still comes over parallel streams.
-        let size = if size == 0 { self.object_size(node, run, object).await.unwrap_or(0) } else { size };
+        let size = if size == 0 { self.object_size(node, run, object, traffic).await.unwrap_or(0) } else { size };
         let mut got = if size >= PARALLEL_FETCH {
-            self.fetch_ranges(node, run, object, size, &tmp).await
+            self.fetch_ranges(node, run, object, size, &tmp, traffic).await
         } else {
             Err(std::io::Error::other("small"))
         };
         if got.is_err() {
             // Small, or a peer that does not serve ranges: one stream.
             tokio::fs::File::create(&tmp).await?;
-            got = self.fetch_range(node, run, object, 0, 0, &tmp, 0).await;
+            got = self.fetch_range(node, run, object, (0, 0), &tmp, 1, traffic).await;
         }
         match got {
             Ok(n) => {
@@ -811,7 +863,7 @@ impl MeshClient {
 
     /// The size of an object held by `node` (from the first chunk of a
     /// one-byte range); None from a peer that does not report it.
-    async fn object_size(&self, node: u64, run: &[u8], object: &[u8]) -> Option<u64> {
+    async fn object_size(&self, node: u64, run: &[u8], object: &[u8], traffic: pb::TrafficClass) -> Option<u64> {
         let mut c = self.rpc(node).ok()?;
         let req = pb::FetchRequest {
             cluster: self.cluster.clone(),
@@ -820,20 +872,29 @@ impl MeshClient {
             code: false,
             offset: 0,
             len: 1,
+            traffic: traffic as i32,
         };
         let mut stream = c.fetch(req).await.ok()?.into_inner();
         let first = stream.message().await.ok()??;
         (first.object_size > 0).then_some(first.object_size)
     }
 
-    async fn fetch_ranges(&self, node: u64, run: &[u8], object: &[u8], size: u64, tmp: &Path) -> std::io::Result<u64> {
+    async fn fetch_ranges(
+        &self,
+        node: u64,
+        run: &[u8],
+        object: &[u8],
+        size: u64,
+        tmp: &Path,
+        traffic: pb::TrafficClass,
+    ) -> std::io::Result<u64> {
         tokio::fs::File::create(tmp).await?.set_len(size).await?;
         let parts = ranges(size, FETCH_RANGES);
         let got: u64 = futures_util::future::try_join_all(
             parts
                 .iter()
                 .enumerate()
-                .map(|(i, &(off, len))| self.fetch_range(node, run, object, off, len, tmp, 1 + i % FETCH_LANES)),
+                .map(|(i, &range)| self.fetch_range(node, run, object, range, tmp, 1 + i % FETCH_LANES, traffic)),
         )
         .await?
         .into_iter()
@@ -852,10 +913,10 @@ impl MeshClient {
         node: u64,
         run: &[u8],
         object: &[u8],
-        offset: u64,
-        len: u64,
+        (offset, len): (u64, u64),
         path: &Path,
         lane: usize,
+        traffic: pb::TrafficClass,
     ) -> std::io::Result<u64> {
         let mut c = self.rpc_lane(node, lane)?;
         let req = pb::FetchRequest {
@@ -865,6 +926,7 @@ impl MeshClient {
             code: false,
             offset,
             len,
+            traffic: traffic as i32,
         };
         let mut stream = c.fetch(req).await.map_err(status_err)?.into_inner();
         // A blocking writer checks and writes each chunk (pwrite at its offset)
@@ -1009,6 +1071,7 @@ impl MeshClient {
     /// `holders` (node ids), or from any live member when none is known.
     /// `size`: the object's bytes if known (0: unknown; it then comes over one
     /// stream). Attempts that need the same object at once share one transfer.
+    /// `traffic`: why it is read (a call's input, a shuffle's part).
     pub async fn localize(
         &self,
         store: &ObjectStore,
@@ -1016,6 +1079,7 @@ impl MeshClient {
         object: &[u8],
         size: u64,
         holders: &[u64],
+        traffic: pb::TrafficClass,
     ) -> std::io::Result<()> {
         let dest = store.path(run, object);
         if dest.exists() {
@@ -1030,7 +1094,7 @@ impl MeshClient {
         let result = if dest.exists() {
             Ok(())
         } else {
-            self.fetch_from(run, object, size, holders, &dest).await.map(|node| {
+            self.fetch_from(run, object, size, holders, &dest, traffic).await.map(|node| {
                 // Off the async workers: it reads the fetched file's header.
                 let (hints, run, dest) = (self.parts.clone(), run.to_vec(), dest.clone());
                 tokio::task::spawn_blocking(move || hints.learn(&run, &dest, node));
@@ -1061,6 +1125,7 @@ impl MeshClient {
         size: u64,
         holders: &[u64],
         dest: &Path,
+        traffic: pb::TrafficClass,
     ) -> std::io::Result<u64> {
         let mut candidates: Vec<u64> = holders.iter().copied().filter(|n| *n != self.me.node_id).collect();
         if candidates.is_empty() {
@@ -1070,19 +1135,18 @@ impl MeshClient {
         // The fastest known holder first.
         candidates.sort_by(|a, b| self.bandwidth(*b).unwrap_or(0.0).total_cmp(&self.bandwidth(*a).unwrap_or(0.0)));
         for &node in &candidates {
-            match self.fetch(node, run, object, size, dest).await {
+            match self.fetch(node, run, object, size, dest, traffic).await {
                 Ok(_) => return Ok(node),
                 Err(e) => last = e,
             }
         }
-        // Every known holder failed (gone, or freed it). Replicas live on the
-        // writer's successor (see Replicate), so try each holder's successor
-        // first, then a few other live members (membership may have moved).
-        let mut live: Vec<u64> = self.live_others().iter().map(|p| p.member.node_id).collect();
-        live.sort_unstable();
-        let succ = |h: u64| live.iter().copied().find(|&n| n > h).or_else(|| live.first().copied());
-        let mut order: Vec<u64> = candidates.iter().filter_map(|&h| succ(h)).collect();
-        order.extend(live.iter().copied());
+        // Every known holder failed (gone, or freed it). Replicas live where
+        // replicas::targets puts a writer's copies (other failure domains
+        // first), so try those of each holder first, then a few other live
+        // members (membership may have moved).
+        let mut order: Vec<u64> =
+            candidates.iter().flat_map(|&h| crate::replicas::targets(self, h, REPLICA_SEARCH)).collect();
+        order.extend(self.live_others().iter().map(|p| p.member.node_id));
         let mut tried = candidates;
         for node in order {
             if tried.contains(&node) || node == self.me.node_id {
@@ -1092,7 +1156,7 @@ impl MeshClient {
                 break;
             }
             tried.push(node);
-            if self.fetch(node, run, object, size, dest).await.is_ok() {
+            if self.fetch(node, run, object, size, dest, traffic).await.is_ok() {
                 return Ok(node);
             }
         }
@@ -1120,7 +1184,7 @@ impl MeshClient {
         }
         let mut last = std::io::Error::new(std::io::ErrorKind::NotFound, "no peer holds the code");
         for p in self.code_order(digest) {
-            let Ok(mut c) = self.rpc(p.member.node_id) else { continue };
+            let Ok(mut c) = self.rpc_lane(p.member.node_id, 1) else { continue };
             let req = pb::FetchRequest {
                 cluster: self.cluster.clone(),
                 object_id: digest.to_vec(),
@@ -1182,7 +1246,9 @@ pub struct MeshTransport(pub Arc<MeshClient>);
 
 impl Transport for MeshTransport {
     fn call(&self, target: u64, addr: &str, group: u32, kind: RpcKind, body: Vec<u8>) -> RpcFuture {
-        let client = self.0.channel(addr);
+        // Never paced, but counted against the rate (see traffic).
+        self.0.traffic.charge(body.len());
+        let client = self.0.channel_lane(addr, if body.len() > RAFT_SMALL { RAFT_BULK_LANE } else { RAFT_LANE });
         let cluster = self.0.cluster.clone();
         Box::pin(async move {
             let mut c = client?;
@@ -1192,16 +1258,27 @@ impl Transport for MeshTransport {
         })
     }
 
+    fn heartbeat(&self, _target: u64, took: Duration) {
+        self.0.heartbeats.note(took);
+    }
+
     fn send_snapshot(&self, target: u64, addr: &str, group: u32, header: Vec<u8>, file: std::fs::File) -> RpcFuture {
-        let client = self.0.channel(addr);
-        let cluster = self.0.cluster.clone();
+        let client = self.0.channel_lane(addr, SNAPSHOT_LANE);
+        let (cluster, mesh) = (self.0.cluster.clone(), self.0.clone());
         Box::pin(async move {
             use futures_util::StreamExt;
             let mut c = client?;
             let size = file.metadata()?.len();
             let first = pb::SnapshotChunk { cluster, group, header, size, data: Vec::new(), target };
-            let rest = snapshot_chunks(tokio::fs::File::from_std(file), FETCH_CHUNK)
-                .map(|data| pb::SnapshotChunk { data, ..Default::default() });
+            // A replica that fell behind catches up: recovery traffic.
+            let rest =
+                snapshot_chunks(tokio::fs::File::from_std(file), mesh.traffic.piece(FETCH_CHUNK)).then(move |data| {
+                    let mesh = mesh.clone();
+                    async move {
+                        mesh.traffic.send(pb::TrafficClass::TrafficRecovery, data.len()).await;
+                        pb::SnapshotChunk { data, ..Default::default() }
+                    }
+                });
             let r = c
                 .install_snapshot(futures_util::stream::once(async move { first }).chain(rest))
                 .await
@@ -1368,6 +1445,14 @@ impl pb::mesh_server::Mesh for MeshService {
         self.0.check(&r.cluster)?;
         let router = self.0.router()?;
         let mut reply = pb::ReadReply::default();
+        if let Some(get) = &r.store {
+            let (v, now) = (store::vshard_of(&get.tenant, &get.namespace), router.hlc());
+            match router.read(v, |kv| store::read(kv, v, get, now)) {
+                Some(s) => reply.store = Some(s),
+                None => reply.error = "group not hosted here".into(),
+            }
+            return Ok(Response::new(reply));
+        }
         // A listing asked linearizably comes from the leader, which has applied every commit.
         let list_group = if r.list_runs_group > 0 { r.list_runs_group } else { r.list_actors_group };
         if list_group > 0
@@ -1438,14 +1523,22 @@ impl pb::mesh_server::Mesh for MeshService {
             }
             let run = chimaera_core::ids::Id::from_slice(&r.run).ok().and_then(|id| read::run(kv, id));
             let actor = chimaera_core::ids::Id::from_slice(&r.actor).ok().and_then(|id| read::actor(kv, id));
-            (tasks, keys, run, actor)
+            let dead = match chimaera_core::ids::Id::from_slice(&r.run) {
+                Ok(id) if r.failed => read::dead_letters(kv, r.failed_vshard as u16, id),
+                _ => Vec::new(),
+            };
+            (tasks, keys, run, actor, dead)
         });
         match view {
-            Ok((tasks, keys, run, actor)) => {
+            Ok((tasks, keys, run, actor, dead)) => {
                 reply.tasks = tasks;
                 reply.page_keys = keys;
                 reply.run = run;
                 reply.actor = actor;
+                for (tk, d) in dead {
+                    reply.failed_keys.push(tk.pb());
+                    reply.failed.push(d);
+                }
             }
             Err(e) => reply.error = e.to_string(),
         }
@@ -1476,14 +1569,22 @@ impl pb::mesh_server::Mesh for MeshService {
         if !r.code {
             crate::ingress::restore(&self.0.objects, &r.run, &r.object_id).await; // spilled to object storage
         }
-        let chunks =
-            crate::stores::read_chunks(&path, r.offset, r.len, FETCH_CHUNK).await.map_err(|e| match e.kind() {
+        let mesh = self.0.mesh.clone();
+        let chunks = crate::stores::read_chunks(&path, r.offset, r.len, mesh.traffic.piece(FETCH_CHUNK))
+            .await
+            .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => Status::not_found(e.to_string()),
                 _ => Status::invalid_argument(e.to_string()),
             })?;
-        let stream = tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(chunks), |c| {
-            c.map(|c| pb::FetchChunk { data: c.data, total: c.total, checksum: c.checksum, object_size: c.object_size })
-                .map_err(|e| Status::internal(e.to_string()))
+        // Each chunk waits for its class's turn (see traffic).
+        let traffic = r.traffic();
+        let stream = futures_util::StreamExt::then(tokio_stream::wrappers::ReceiverStream::new(chunks), move |c| {
+            let mesh = mesh.clone();
+            async move {
+                let c = c.map_err(|e| Status::internal(e.to_string()))?;
+                mesh.traffic.send(traffic, c.data.len()).await;
+                Ok(pb::FetchChunk { data: c.data, total: c.total, checksum: c.checksum, object_size: c.object_size })
+            }
         });
         Ok(Response::new(Box::pin(stream)))
     }
@@ -1495,19 +1596,26 @@ impl pb::mesh_server::Mesh for MeshService {
         self.0.check(&r.cluster)?;
         let tasks: Vec<Tk> = r.tasks.iter().filter_map(Tk::parse).collect();
         let session = (1u64 << 62) | self.0.next_session.fetch_add(1, Ordering::Relaxed);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let reader = crate::mailbox::Reader(crate::mailbox::Mailbox::new());
         let core = self.0.core.clone();
-        core.send(CoreMsg::OpenSession { id: session, tx }).await.map_err(|_| Status::unavailable("stopping"))?;
+        core.send(CoreMsg::OpenSession { id: session, mailbox: reader.0.clone(), tenant: None })
+            .await
+            .map_err(|_| Status::unavailable("stopping"))?;
         core.send(CoreMsg::Watch { session, tasks: tasks.clone() })
             .await
             .map_err(|_| Status::unavailable("stopping"))?;
         let (out_tx, out_rx) = mpsc::channel(256);
+        let mesh = self.0.mesh.clone();
         tokio::spawn(async move {
             let mut left = tasks.len();
             while left > 0 {
-                let Some(ev) = rx.recv().await else { break };
+                let Some(ev) = reader.0.recv().await else { break };
+                if reader.0.wants_more() {
+                    let _ = core.send(CoreMsg::SessionRoom { id: session }).await;
+                }
                 if let Some(pb::session_event::Event::Outcome(o)) = ev.event {
                     left -= 1;
+                    mesh.traffic.charge(prost::Message::encoded_len(&o)); // results: never held, but counted
                     if out_tx.send(Ok(o)).await.is_err() {
                         break;
                     }
@@ -1571,6 +1679,15 @@ impl pb::mesh_server::Mesh for MeshService {
         self.0.check(&r.cluster)?;
         let _ = self.0.core.send(CoreMsg::RemoteLogs { run: r.run, lines: r.lines }).await;
         Ok(Response::new(pb::PushLogsReply {}))
+    }
+
+    async fn hold(&self, req: Request<pb::HoldRequest>) -> Result<Response<pb::HoldReply>, Status> {
+        let r = req.into_inner();
+        self.0.check(&r.cluster)?;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let gone = || Status::unavailable("peer is stopping");
+        self.0.core.send(CoreMsg::Hold { req: r, reply }).await.map_err(|_| gone())?;
+        Ok(Response::new(rx.await.map_err(|_| gone())?))
     }
 
     /// Why an actor placed here has not started (explain() on another peer asks).
@@ -1643,8 +1760,12 @@ async fn replica_into(
     if held_whole(dest, r.size).await {
         return Ok(());
     }
-    let disk = objects.spill_path(&r.run, &r.object_id);
-    mesh.fetch(r.from_node, &r.run, &r.object_id, r.size, disk.as_deref().unwrap_or(dest))
+    let disk = objects.spill_path(&r.run, &r.object_id, r.size);
+    let traffic = match r.traffic() {
+        pb::TrafficClass::TrafficRecovery => pb::TrafficClass::TrafficRecovery,
+        _ => pb::TrafficClass::TrafficCheckpoint,
+    };
+    mesh.fetch(r.from_node, &r.run, &r.object_id, r.size, disk.as_deref().unwrap_or(dest), traffic)
         .await
         .map_err(|e| format!("replica of {} from node {}: {e}", hex(&r.object_id), r.from_node))?;
     if let Some(disk) = disk {

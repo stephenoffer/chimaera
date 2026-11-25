@@ -265,3 +265,62 @@ def test_calls_queued_at_an_actor_whose_method_waits_suggest_concurrency(home):
     )
     assert r.returncode == 0, r.stderr
     assert "queued at its actor" in r.stdout and "@ch.method(concurrency=N) on fetch" in r.stdout, r.stdout
+
+
+def test_an_initial_value_is_where_learning_starts_and_modes_keep_their_promises(home):
+    r = run_script(
+        """
+        import time
+        import chimaera as ch
+
+        @ch.remote(cpus=ch.auto(2, min=0.5))
+        def wait(i):
+            time.sleep(0.2)
+            return i
+
+        first = wait.remote(-1)
+        first.result(timeout=60)
+        assert list(wait.map(range(600))) == list(range(600))
+        later = [wait.remote(0)]
+        later.append(wait.options(adaptive="observe").remote(0))
+        later.append(wait.options(adaptive="frozen").remote(0))
+        later.append(wait.options(cpus=2).remote(0))
+        for f in [first, *later]:
+            f.result(timeout=60)
+            print(f.explain()["attempts"][-1]["reservation"])
+        for f in (first, later[0], later[3]):
+            s = f.explain()["attempts"][-1]["settings"]["cpus"]
+            print("SETTING", s["source"], s["value"], s["min"])
+        """,
+        home=home,
+        timeout=300,
+    )
+    assert r.returncode == 0, r.stderr
+    first, learned, observed, frozen, pinned = r.stdout.splitlines()[:5]
+    settings = [ln.split()[1:] for ln in r.stdout.splitlines() if ln.startswith("SETTING")]
+    assert settings == [["initial", "2.0", "0.5"], ["learned", "0.5", "0.5"], ["user", "2.0", "0.0"]], settings
+    assert first.startswith("cpus 2 (your initial setting)"), first
+    # Learning moved it down (the calls mostly wait), held at min=0.5.
+    assert learned.startswith("cpus 0.5 (learned"), learned
+    assert observed.startswith('cpus 2 (not applied (adaptive="observe"): would reserve 0.5 cores'), observed
+    assert frozen.startswith("cpus 2 (your initial setting)"), frozen
+    assert pinned.startswith("cpus 2 (set by the caller)"), pinned
+
+
+def test_a_bound_that_holds_a_learned_value_is_explained(home):
+    r = run_script(
+        ALLOCATE.replace("@ch.remote", '@ch.remote(memory=ch.auto(max="64 MiB"))')
+        + """
+for i in range(3):
+    allocate.remote(i).result(timeout=60)
+f = allocate.remote(3)
+f.result(timeout=60)
+m = f.explain()["attempts"][-1]["settings"]["memory"]
+print(m["source"], int(m["value"]) >> 20, int(m["requested"]) >> 20, m["reason"])
+""",
+        home=home,
+    )
+    assert r.returncode == 0, r.stderr
+    source, value, requested, reason = r.stdout.split(maxsplit=3)
+    assert (source, value) == ("clamped", "64"), r.stdout
+    assert int(requested) > 64 and reason.startswith("held at ch.auto max"), r.stdout

@@ -75,7 +75,10 @@ stop) or `chimaera logs RUN --follow` (Ctrl-C to stop).
 
 Each peer stores its calls' output in `logs/runs/<run>.log` under its data
 directory, up to 64 MiB per run. On a cluster, output from calls on other
-peers reaches your terminal as it's printed.
+peers reaches your terminal as it's printed. A script that stops reading
+(paused, or busy for long) doesn't grow the peer's memory: the peer holds
+16 MiB for it, its results wait as ids, and output past that is skipped,
+with a line saying how many lines `chimaera logs` still has.
 
 </details>
 
@@ -100,7 +103,7 @@ assert "wall_seconds" in attempt["measures"]
 |---|---|
 | `state` | `"Pending"`, `"Ready"`, `"Running"` or `"Done"` |
 | `pending_reason` | Why a call that has not started is waiting, e.g. `waiting on 1 prerequisite(s)`; empty once it runs |
-| `attempts` | One dict per attempt: `attempt`, `end_reason` (`ok`, `user_error`, ...), `detail`, `placement` (why this peer), `reservation` (the CPUs and memory it was given, and where those numbers came from), `granted` and `measures` |
+| `attempts` | One dict per attempt: `attempt`, `end_reason` (`ok`, `user_error`, ...), `detail`, `placement` (why this peer), `reservation` (the CPUs and memory it was given, and where those numbers came from), `settings` (the same per setting: `cpus`, `memory` and `batch`, each with `value`, `requested`, `min`, `max`, `source` and `reason`; `source` is `"clamped"` when a `ch.auto` bound or the peer's size changed what was chosen, and `reason` says which), `granted` (the policy the call asked for) and `measures` |
 | `measures` | Name to `(value, scope, method)`: `wall_seconds`, `cpu_seconds`, `mean_cores`, `rss_peak_bytes`, `rss_end_bytes`, `memory_private_peak_bytes` |
 | `failures` | Messages of attempts lost to infrastructure (a worker or peer that died) |
 
@@ -226,7 +229,9 @@ assert total["nodes"] >= 1 and total["cpus"] >= 1
 
 Each node is a named tuple: `peer`, `address`, `cpus`, `memory_bytes`,
 `gpus`, `alive`, `cpu_used`, `queued`, `this_peer`, `labels`, `actors`,
-`object_bytes` and `draining`. `resources()` adds up the live ones into
+`object_bytes`, `draining` and `object_layout` (the newest layout of stored
+results it reads; a shuffle writes the newest only while every live peer
+reads it). `resources()` adds up the live ones into
 `nodes`, `cpus`, `cpus_in_use`, `memory_bytes` and `gpus`.
 
 </details>
@@ -330,10 +335,19 @@ And `chimaera doctor` on a laptop:
 ```text
 os macos aarch64 · kernel 23.5.0
 cpus 12 (usable 12.00) · memory 36.0 GiB
-numa nodes 1 · gpus 1
+cores 12 · sockets 1 · last-level caches 1 · numa nodes 1 · gpus 1
 isolated accounting: unavailable: accounting="isolated" fails preflight here; measurements are process-scoped
 fsync p50 39 µs in .../homes/observability (cluster peers pay this per commit)
+python 3.14.4 (.../.venv/bin/python) imports chimaera (.../python/chimaera/_native.abi3.so, this binary's build) and starts the peer binary .../target/release/chimaera
+unix sockets: socket, bind and connect work in .../homes/observability
+cluster: none selected; drivers here start a local peer
 ```
+
+When one of the last three checks fails, its line names the step that
+failed and the fix: an interpreter that cannot import chimaera, or whose
+`chimaera._native` is another build than the binary; a sandbox that refuses
+Unix sockets; a cluster that TCP, TLS or the token cannot reach
+([cli.md](../cli.md#chimaera-doctor)).
 
 By default `peer.log` is `~/.chimaera/local/peer.log`. Each worker
 writes `logs/executor-<n>.log` in the same directory. `CHIMAERA_LOG` sets
@@ -378,8 +392,10 @@ but still bind it where only your scraper can reach it.
 <summary>Exported metrics and Kubernetes</summary>
 
 - Gauges: calls queued and running, CPUs in use, workers, object and memory bytes, connected drivers, proposals in flight, and dispatch latency (p50 and p99).
-- Counters since startup: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a canceled call, and failed object replicas.
+- Counters since startup: proposals and proposals no leader accepted, peers declared dead, worker deaths, OOM kills, workers killed for a canceled call, and failed object replicas. Also the capacity summaries the peer answered for other cells (`chimaera_fleet_summaries_served_total`), the store requests it served (`chimaera_store_requests_total`), and the times it listed the fleet directory whole as its cell's publisher (`chimaera_fleet_directory_listings_total`).
+- On peers of a federated cell ([../federation.md](../federation.md)), what the cell's view of the fleet holds: `chimaera_fleet_cells`, `chimaera_fleet_publishing` (1 on the cell's summary publisher) and `chimaera_fleet_epoch`.
 - On cluster peers, `chimaera_groups_without_leader`, and for each group they hold, `chimaera_group_leading{group="N"}` plus, on the leader, `chimaera_group_max_lag_entries{group="N"}`.
+- On cluster peers, Raft heartbeat round trips (`chimaera_raft_heartbeat_p50_microseconds`, `..._p99_...`), the paced rate (`chimaera_mesh_rate_bytes`, see `CHIMAERA_MESH_RATE` in [../configuration.md](../configuration.md)), and per traffic class the bytes sent to other peers and the time they waited for their turn (`chimaera_mesh_sent_bytes_total{class="checkpoint"}`, `chimaera_mesh_wait_seconds_total{...}`).
 
 Any other path gets a 404.
 

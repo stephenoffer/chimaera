@@ -13,6 +13,7 @@ import collections
 import fnmatch
 import inspect
 import itertools
+import json
 import logging
 import os
 import platform
@@ -27,18 +28,20 @@ import weakref
 from typing import Any, Callable
 
 from . import _cluster, _context, _objects, _project, _serde, _values
-from ._errors import ChimaeraError, DataLost, Infeasible, QuorumLost, SerializationError, WorkflowDivergence
-from ._native import Client, blake3_digest, child_id, derive_id, socket_path, vshard_of
+from ._errors import ChimaeraError, DataLost, Infeasible, QuorumLost, SerializationError, divergence
+# VERSION: the release, as the extension module and its peer binary report it.
+from ._native import VERSION, Client, blake3_digest, child_id, derive_id, socket_path, vshard_of
 
-VERSION = "0.1.0"
 # Functions whose code digest is remembered (newest kept).
 CODE_CACHE_MAX = 1024
 # CH120: the same code sent as this many distinct functions.
 REWRAP_WARN_CALLS = 100
 CALL_FUNCTION, CALL_ACTOR_CTOR, CALL_ACTOR_METHOD, CALL_MAP_ITEM = 0, 1, 2, 3
 EFFECTS_CODE = {"none": 0, "idempotent": 1, "external": 2}
-# Items a generator call may run ahead of its consumer (unless max_in_flight says).
+# Items a generator call may run ahead of its consumer (unless max_in_flight says),
+# and their stored bytes (unless max_in_flight_bytes says).
 STREAM_WINDOW = 64
+STREAM_WINDOW_BYTES = 256 << 20
 MAX_CAPTURE_BYTES = 256 << 20
 MAX_PENDING_CALLS = 1_000_000
 WARN_CAPTURE_BYTES = 1 << 20
@@ -65,9 +68,13 @@ def _peer_binary(*, skip: str = "") -> str:
     for c in candidates:
         if c and os.path.isfile(c) and os.access(c, os.X_OK) and not (skip and _same_file(c, skip)):
             return c
+
+    def shown(c: str) -> str:
+        return c + (" (not executable: chmod +x it)" if os.path.isfile(c) and not os.access(c, os.X_OK) else "")
+
     raise ChimaeraError(
         "cannot find the `chimaera` peer binary (looked for "
-        + ", ".join(c for c in candidates if c)
+        + ", ".join(shown(c) for c in candidates if c)
         + "). A wheel built with `make wheel` includes it; in a source checkout, build it with "
         "`cargo build --release -p chimaera-peer`, or set CHIMAERA_BIN to its path."
     )
@@ -130,6 +137,9 @@ def _check_cluster_version(name: str, version: str) -> None:
 PEER_ENV = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ", "LANG")
 # A local peer's log past this size is rotated when the next peer starts.
 PEER_LOG_MAX = 16 << 20
+# How a local peer exits when another peer holds its directory (runtime.rs
+# DIR_HELD_EXIT): the program that started it waits for that one's socket.
+DIR_HELD_EXIT = 75
 
 
 def _peer_env() -> dict[str, str]:
@@ -148,7 +158,8 @@ def _ensure_local_peer(home: str) -> None:
     except OSError:
         pass
     with open(log_path, "ab") as log:
-        subprocess.Popen(
+        start = log.tell()
+        peer = subprocess.Popen(
             [_peer_binary(), "--dir", home, "peer", "start", "--idle-timeout", "600"],
             stdin=subprocess.DEVNULL,
             stdout=log,
@@ -159,9 +170,51 @@ def _ensure_local_peer(home: str) -> None:
         )
     deadline = time.monotonic() + 20
     while not os.path.exists(sock):
+        # Exiting before its socket exists is a failed start, unless the
+        # peer found another one, starting there now, holding the directory.
+        code = peer.poll()
+        if code is not None and code != DIR_HELD_EXIT:
+            raise ChimaeraError(_start_failure(log_path, start, code))
         if time.monotonic() > deadline:
-            raise ChimaeraError(f"the local peer did not start; see {os.path.join(home, 'peer.log')}")
+            raise ChimaeraError(f"the local peer did not start; see {log_path}")
         time.sleep(0.02)
+
+
+def _start_failure(log_path: str, start: int, code: int) -> str:
+    """Why a local peer exited while starting: the error it printed last
+    (`chimaera: ...`), else the end of what it wrote to `log_path` after
+    offset `start`."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(start)
+            lines = [ln for ln in f.read().decode(errors="replace").splitlines() if ln.strip()]
+    except OSError:
+        lines = []
+    errors = [ln.removeprefix("chimaera: ") for ln in lines if ln.startswith("chimaera: ")]
+    why = errors[-1] if errors else "\n".join(lines[-20:]) or "it printed nothing"
+    return f"the local peer exited while starting (status {code}): {why}\n(its log: {log_path})"
+
+
+def _check_socket_allowed(path: str) -> None:
+    """Raise, naming the call, the path and the remedy, when a sandbox, a
+    seccomp profile or the socket's permissions refuse this process the Unix
+    socket at `path`, so a live peer's socket is not taken for a dead one's."""
+    import socket
+
+    call = "socket"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            call = "connect"
+            s.connect(path)
+    except PermissionError as e:
+        raise ChimaeraError(
+            f"{call}() on the Unix socket {path}: {e.strerror} (os error {e.errno}). Unix sockets are refused "
+            "here, by a sandbox or seccomp profile that denies them or by the socket's permissions (another "
+            "user's peer): allow Unix sockets for this program, or set CHIMAERA_HOME to a directory of your own "
+            "on a local disk"
+        ) from None
+    except OSError:
+        pass  # nothing listens there: a peer that died left it
 
 
 # The call whose result this thread is loading (`Runtime.read_value`): blobs
@@ -172,11 +225,20 @@ _reading = threading.local()
 _NO_CALL = "the program stored it (ch.put, or an argument), and no call can make it again"
 
 
-def read_object(object_dir: str, run: bytes, obj: bytes, task: bytes | None = None, *, decode: bool = True) -> Any:
+def _no_call(durability: str) -> str:
+    """Why a lost value no call returned stays lost, naming the durability
+    class its ch.put chose (`durability`; "" for the default)."""
+    return f"{_NO_CALL} (it was stored with durability={durability!r})" if durability else _NO_CALL
+
+
+def read_object(
+    object_dir: str, run: bytes, obj: bytes, task: bytes | None = None, *, decode: bool = True, durability: str = ""
+) -> Any:
     """Load an object from this peer's store, asking the peer to fetch it
     first when another peer produced it. `task` is the call whose result it
     is: when every copy is lost, the peer runs that call again if it can.
-    With ``decode=False`` it is only made local (and None returned)."""
+    With ``decode=False`` it is only made local (and None returned).
+    `durability` is a ch.put value's class, named if it is lost."""
     path = _serde.object_path(object_dir, run, obj)
     if not decode and os.path.exists(path):
         return None
@@ -189,7 +251,7 @@ def read_object(object_dir: str, run: bytes, obj: bytes, task: bytes | None = No
     except FileNotFoundError as e:
         # Every peer that held it is gone (or freed it), and its call could
         # not run again (the peer's message says why).
-        why = e if task is not None else _NO_CALL
+        why = e if task is not None else _no_call(durability)
         raise DataLost(f"value {obj.hex()} of run {run.hex()} is no longer stored on any live peer: {why}") from e
     if not decode:
         return None
@@ -329,6 +391,11 @@ class Runtime:
         tenant: str | None = None,
     ) -> None:
         self.home = home or default_home()
+        # How workers' output is printed here: text, "(fn pid=N) line", or one
+        # JSON object per line for log collectors.
+        self.log_format = os.environ.get("CHIMAERA_LOG_FORMAT", "text").strip().lower() or "text"
+        if self.log_format not in ("text", "json"):
+            raise ValueError(f"CHIMAERA_LOG_FORMAT={self.log_format!r}: expected 'text' or 'json'")
         self.in_executor = os.environ.get("CHIMAERA_EXECUTOR") == "1"
         client_name = f"python-{platform.python_version()} chimaera-{VERSION}"
         target = None if self.in_executor else _cluster.resolve(cluster)
@@ -544,6 +611,7 @@ class Runtime:
             # A stale socket from a peer that died: remove it and start fresh.
             if given:
                 raise
+            _check_socket_allowed(socket)
             try:
                 os.unlink(socket)
             except FileNotFoundError:
@@ -551,18 +619,20 @@ class Runtime:
             _ensure_local_peer(self.home)
             return Client(socket, client_name)
 
-    def localize(self, run: bytes, obj: bytes, task: bytes | None = None) -> None:
+    def localize(self, run: bytes, obj: bytes, task: bytes | None = None, traffic: str = "") -> None:
         """Make an object readable at its path under ``object_dir``: the local peer
         fetches it into its store (running `task` again if it is the result of
         that call and every copy is lost); a remote client downloads it into
         its cache. Without `task`, the call whose result this thread is
-        loading (`read_value`) is named: a blob its frame links is part of it."""
+        loading (`read_value`) is named: a blob its frame links is part of it.
+        `traffic` ("shuffle"; default: a call reads it now) is the class its
+        holder paces the bytes as."""
         if task is None:
             task = getattr(_reading, "task", None)
         if self.remote:
             self.client.fetch_object(run, obj, _serde.object_path(self.object_dir, run, obj), task)
         else:
-            self.client.localize(run, obj, task)
+            self.client.localize(run, obj, task, traffic)
 
     def pack(self, key: bytes, value: Any, site: str | None = None, holds: list[Any] | None = None) -> dict[str, Any]:
         """Encode a call frame by size: inline when small, else a file for this
@@ -712,7 +782,7 @@ class Runtime:
                             if reason.startswith("infeasible"):
                                 exc: ChimaeraError = Infeasible(reason)
                             elif reason.startswith("workflow divergence"):
-                                exc = WorkflowDivergence(reason)
+                                exc = divergence(reason)
                             elif reason.startswith("quorum lost"):
                                 exc = QuorumLost(reason)
                             else:
@@ -731,9 +801,15 @@ class Runtime:
                     _, key, stream, text, pid = ev
                     out = sys.stderr if stream == "stderr" else sys.stdout
                     name = self._names.get(key)
-                    label = f"({name} pid={pid})" if name else f"(pid={pid})"
-                    for line in text.splitlines():
-                        out.write(f"{label} {line}\n")
+                    if self.log_format == "json":
+                        task = key.hex() if key else ""
+                        for line in text.splitlines():
+                            rec = {"time": time.time(), "task": task, "function": name or "", "pid": pid, "stream": stream}
+                            out.write(json.dumps({**rec, "line": line}) + "\n")
+                    else:
+                        label = f"({name} pid={pid})" if name else f"(pid={pid})"
+                        for line in text.splitlines():
+                            out.write(f"{label} {line}\n")
                     out.flush()
                 elif tag in ("actor", "error"):
                     # Sending a creation releases the GIL, so its answer can
@@ -755,10 +831,11 @@ class Runtime:
         with self.cond:
             self.cond.notify_all()
 
-    def read_value(self, outcome: tuple[Any, ...], task: bytes | None = None) -> Any:
+    def read_value(self, outcome: tuple[Any, ...], task: bytes | None = None, *, durability: str = "") -> Any:
         """Load a stored value. `task` is the call that returned it: when its
         file, or a blob its frame links, is lost with every peer that held it,
-        the peer runs that call again (see ``localize``)."""
+        the peer runs that call again (see ``localize``). `durability`: a
+        ch.put value's class, named if it is lost."""
         _, inline, run, obj, _size, _oob = outcome
         outer, _reading.task = getattr(_reading, "task", None), task
         try:
@@ -774,9 +851,10 @@ class Runtime:
                 try:
                     return _serde.loads(inline, run_dir)
                 except FileNotFoundError as e:  # a blob it links, and its call could not run again
-                    where, why = f"part of value {obj.hex()} of run {run.hex()}", e if task is not None else _NO_CALL
+                    where = f"part of value {obj.hex()} of run {run.hex()}"
+                    why = e if task is not None else _no_call(durability)
                     raise DataLost(f"{where} is no longer stored on any live peer: {why}") from e
-            return read_object(self.object_dir, run, obj, task)
+            return read_object(self.object_dir, run, obj, task, durability=durability)
         finally:
             _reading.task = outer
 

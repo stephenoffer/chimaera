@@ -4,6 +4,7 @@ processes, peers killed or paused mid-run."""
 from __future__ import annotations
 
 import collections
+import glob
 import json
 import os
 import re
@@ -43,12 +44,16 @@ class Cluster:
         clients: bool = False,
         labels: dict[int, str] | None = None,
         one_machine: bool = False,
+        env: dict[int, dict[str, str]] | None = None,
+        cpus: dict[int, int] | None = None,
     ) -> None:
         self.root = tempfile.mkdtemp(prefix="chc", dir="/tmp")
         self.labels = labels or {}  # peer index -> CHIMAERA_LABELS
         # The peers stand for separate machines unless `one_machine`: on one,
         # they take objects straight from each other's stores.
         self.one_machine = one_machine
+        self.env = env or {}  # peer index -> extra environment
+        self.cpus = cpus or {}  # peer index -> --cpus (default 4)
         self.addrs = [f"127.0.0.1:{p}" for p in free_ports(founders + spares)]
         # --client-listen addresses, for drivers that connect over TCP.
         self.client_addrs = [f"127.0.0.1:{p}" for p in free_ports(len(self.addrs))] if clients else []
@@ -107,7 +112,7 @@ class Cluster:
             pass
         log = open(os.path.join(self.root, f"p{i}.log"), "ab")
         cmd = [BIN, "--dir", self.dir(i), "peer", "start", "--listen", self.addrs[i], "--seeds", self.seeds]
-        cmd += ["--cluster", "test", "--data-groups", str(self.data_groups), "--cpus", "4"]
+        cmd += ["--cluster", "test", "--data-groups", str(self.data_groups), "--cpus", str(self.cpus.get(i, 4))]
         if self.ca is not None:
             cmd += ["--tls-ca", self.ca]  # the token comes from the CA directory too
             if token:
@@ -120,6 +125,7 @@ class Cluster:
             cmd += ["--client-listen", self.client_addrs[i]]
         machine = os.path.basename(self.root) + ("" if self.one_machine else f"-{i}")
         env = dict(os.environ, CHIMAERA_LABELS=self.labels.get(i, ""), CHIMAERA_MACHINE_ID=machine, **self.ca_env)
+        env.update(self.env.get(i, {}))
         self.procs[i] = subprocess.Popen(cmd, stdout=log, stderr=log, start_new_session=True, env=env)
 
     def wait_ready(self, peers, timeout: float = 60) -> None:
@@ -635,6 +641,71 @@ def status(c: Cluster, i: int) -> dict:
     out = subprocess.run([BIN, "--dir", c.dir(i), "status", "--json"], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
+
+
+def test_synced_peers_on_separate_machines_give_machine_durability(three):
+    s = status(three, 1)
+    assert s["durability"]["requested"] == "machine", s["durability"]
+    assert s["durability"]["effective"] == "machine", s["durability"]
+    assert s["groups"] and all(g["durability"] == "machine" for g in s["groups"]), s["groups"]
+    # A slow disk may degrade service here; no group falls short of what was asked.
+    assert not [d for d in s["durability"]["degraded"] if d.startswith("group")], s["durability"]
+
+
+def test_a_group_with_a_voter_that_does_not_sync_reports_process_durability_only():
+    # Peer 2 keeps its raft log in the page cache, and with three founders it
+    # votes in every group: it and one other voter make a majority, so a
+    # commit may be acknowledged by a voter that forgets it when its machine
+    # restarts. No group may claim to survive a machine's loss.
+    c = Cluster(3, env={2: {"CHIMAERA_RAFT_SYNC": "none"}})
+    try:
+        synced, unsynced = status(c, 0), status(c, 2)
+        assert synced["durability"]["requested"] == "machine", synced["durability"]
+        assert unsynced["durability"]["requested"] == "process", unsynced["durability"]
+        for s in (synced, unsynced):
+            assert s["durability"]["effective"] == "process", s["durability"]
+            assert s["groups"] and all(g["durability"] == "process" for g in s["groups"]), s["groups"]
+        why = [d for d in synced["durability"]["degraded"] if d.startswith("group")]
+        assert len(why) == len(synced["groups"]), synced["durability"]
+        assert all(f"{c.addrs[2]} keeps its raft log in the page cache" in d for d in why), why
+        assert unsynced["durability"]["degraded"] == [], "it asked for no more than it gets"
+    finally:
+        c.close()
+
+
+@pytest.mark.slow
+def test_a_dead_voters_seat_goes_only_to_a_peer_that_syncs():
+    # The only spare keeps its raft log in the page cache. Giving it a dead
+    # founder's seats would make every group's commits forgettable on a
+    # machine restart, so the seats wait for a peer that syncs, and the groups
+    # keep committing on the two founders left.
+    c = Cluster(3, spares=1, env={3: {"CHIMAERA_RAFT_SYNC": "none"}})
+    try:
+        c.signal(1, signal.SIGKILL)
+        deadline = time.monotonic() + 60
+        while "retiring it" not in c.log(0) + c.log(2):
+            assert time.monotonic() < deadline, "the dead founder was never declared dead"
+            time.sleep(1)
+        time.sleep(15)  # past the 10 s a dead voter waits before its seats are given away
+        assert "replacing a dead voter" not in "".join(c.log(i) for i in (0, 2, 3))
+        s = status(c, 0)
+        assert s["durability"]["effective"] == "machine", s["durability"]
+        assert s["groups"] and all(g["durability"] == "machine" for g in s["groups"]), s["groups"]
+        out = c.run(
+            0,
+            """
+import chimaera as ch
+
+@ch.remote
+def add(a, b):
+    return a + b
+
+print("SUM", sum(ch.get([add.remote(i, i) for i in range(20)], timeout=120)))
+""",
+        )
+        assert lines(out, "SUM") == [str(sum(2 * i for i in range(20)))]
+    finally:
+        c.close()
 
 
 def test_a_peer_serves_while_some_groups_have_no_quorum():
@@ -1347,7 +1418,10 @@ for a in actors:
         c.close()
 
 
-def test_values_lost_with_their_peer_are_made_again_from_their_calls():
+def test_values_lost_with_their_peer_are_made_again_from_their_calls(monkeypatch):
+    # No replicas (they are made on every platform now): running the calls
+    # again is then the only way back, so both must run again.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
     c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
     marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
     go = os.path.join(marks, "go")
@@ -1394,11 +1468,8 @@ print("TOTAL", total.options(placement=on("s2")).remote(b).result(timeout=120), 
         out, err = driver.communicate(timeout=180)
         assert f"TOTAL ({2 << 20}, {bytes(range(3))!r})" in out, out + err[-3000:]
         ran = {n: len(open(os.path.join(marks, n)).read().splitlines()) for n in ("make", "double")}
-        if sys.platform == "darwin":  # no replicas here: both calls ran again, inputs first
-            assert ran == {"make": 2, "double": 2}, ran
-            assert "running the call that made it again" in c.log(2), c.log(2)[-2000:]
-        else:  # a replica may have served it instead
-            assert set(ran.values()) <= {1, 2}, ran
+        assert ran == {"make": 2, "double": 2}, ran  # both calls ran again, inputs first
+        assert "running the call that made it again" in c.log(2), c.log(2)[-2000:]
     finally:
         c.close()
 
@@ -1582,6 +1653,324 @@ except ch.errors.DataLost as e:
         assert lost and "ch.put" in lost[0], out + err[-3000:]
     finally:
         c.close()
+
+
+LOSE_THE_WRITER = """
+import os, time
+import chimaera as ch
+
+def ran(name):
+    with open(os.path.join({marks!r}, name), "a") as f:
+        f.write("ran\\n")
+
+@ch.remote(durability={durability!r})
+def make(n):
+    ran("make")
+    return bytes(range(256)) * (n // 256)
+
+@ch.remote
+def stash(n):
+    ran("stash")
+    return ch.put(bytes(range(256)) * (n // 256), durability={put_durability!r})
+
+@ch.remote
+def noop():
+    pass
+
+PUT = {put_durability!r}
+there = ch.dist.Placement(require={{{where!r}: {value!r}}})
+# Just after the peers start, the leader placing this run's calls may not see
+# a peer `there` yet and cancels such a call as infeasible: place an uncounted
+# call there until one runs.
+deadline = time.monotonic() + 60
+while True:
+    try:
+        noop.options(placement=there).remote().result(timeout=60)
+        break
+    except ch.Infeasible:
+        if time.monotonic() > deadline:
+            raise
+        time.sleep(0.1)
+value = (make if PUT is None else stash).options(placement=there).remote(1 << 20)
+ch.wait([value], timeout=60)
+if PUT is not None:
+    value = value.result(timeout=60)  # the put's handle (small); its value stays where it was made
+print("READY", value._put[1].hex() if value._put else value._outcome[3].hex(), flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+try:
+    v = value.result(timeout=120)
+    print("READ", len(v), v[:3], flush=True)
+except ch.errors.DataLost as e:
+    print("LOST", e, flush=True)
+"""
+
+
+def _lose_the_writer(c: Cluster, driver: int, killed: list[int], **kw) -> tuple[str, str, dict[str, int], list[int]]:
+    """Make a 1 MiB value on a peer labelled `where=value` (a call's result
+    with `durability`, or a ch.put with `put_durability` made inside a call),
+    SIGKILL the `killed` peers once the driver has it, then read it. Returns
+    (the driver's output, its stderr, how often each call ran, the peers that
+    held the value's file before the kill)."""
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    go = os.path.join(marks, "go")
+    kw.setdefault("durability", "default")
+    kw.setdefault("put_durability", None)
+    proc = c.driver(driver, LOSE_THE_WRITER.format(marks=marks, go=go, **kw))
+    ready = proc.stdout.readline().split()
+    assert ready[:1] == ["READY"], proc.stderr.read()[-3000:]
+    held = [i for i in range(len(c.addrs)) if glob.glob(os.path.join(c.dir(i), "objects", "*", ready[1]))]
+    for i in killed:
+        c.signal(i, signal.SIGKILL)
+    open(go, "w").close()
+    out, err = proc.communicate(timeout=240)
+    ran = {n: len(open(os.path.join(marks, n)).read().splitlines()) for n in os.listdir(marks) if n != "go"}
+    return out, err, ran, held
+
+
+@pytest.mark.parametrize("durability", ["retained", "replayable", "ephemeral"])
+def test_a_result_outlives_its_writer_as_its_durability_says(durability):
+    # Replicas are on (the default): only the class decides what survives.
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    try:
+        out, err, ran, held = _lose_the_writer(c, 0, [1], durability=durability, where="slot", value="s1")
+        if durability == "retained":
+            assert len(held) == 2 and 1 in held, f"a copy on another peer before success: {held}"
+            assert f"READ {1 << 20} {bytes(range(3))!r}" in out and ran == {"make": 1}, (out + err[-3000:], ran)
+        elif durability == "replayable":
+            assert held == [1], f"no copy of a replayable value: {held}"
+            assert f"READ {1 << 20} {bytes(range(3))!r}" in out and ran == {"make": 2}, (out + err[-3000:], ran)
+        else:
+            assert held == [1], f"no copy of an ephemeral value: {held}"
+            lost = [ln for ln in out.splitlines() if ln.startswith("LOST")]
+            assert lost and "ephemeral" in lost[0] and ran == {"make": 1}, (out + err[-3000:], ran)
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("durability", ["retained", "ephemeral"])
+def test_a_put_outlives_its_writer_as_its_durability_says(durability):
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    try:
+        out, err, ran, held = _lose_the_writer(c, 0, [1], put_durability=durability, where="slot", value="s1")
+        if durability == "retained":
+            assert len(held) == 2 and 1 in held, f"a copy on another peer before ch.put returned: {held}"
+            assert f"READ {1 << 20} {bytes(range(3))!r}" in out, out + err[-3000:]
+        else:
+            assert held == [1], f"no copy of an ephemeral put: {held}"
+            lost = [ln for ln in out.splitlines() if ln.startswith("LOST")]
+            assert lost and "durability='ephemeral'" in lost[0], out + err[-3000:]
+    finally:
+        c.close()
+
+
+def test_a_retained_value_outlives_its_writers_rack(monkeypatch):
+    # Two copies, and two racks besides the writer's: one copy in each, so
+    # losing every peer of the writer's rack keeps the value.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "2")
+    racks = "aabbcc"
+    c = Cluster(6, labels={i: f"rack={r}" for i, r in enumerate(racks)})
+    try:
+        out, err, ran, held = _lose_the_writer(c, 2, [0, 1], durability="retained", where="rack", value="a")
+        assert len(held) == 3, f"the writer and two copies: {held}"
+        assert sorted(racks[i] for i in held) == ["a", "b", "c"], f"copies on the other racks: {held}"
+        assert f"READ {1 << 20} {bytes(range(3))!r}" in out and ran == {"make": 1}, (out + err[-3000:], ran)
+    finally:
+        c.close()
+
+
+ACTOR_DURABILITY = """
+import os, time
+import chimaera as ch
+from chimaera import _direct
+
+@ch.remote
+class Maker:
+    def big(self):
+        return bytes(range(256)) * 4096
+
+@ch.remote
+class Batcher:  # an actor that batches a method takes every call through its peer
+    @ch.method(batch=ch.Batch(max_size=2, max_wait=0.01))
+    def many(self, xs):
+        return [bytes(range(256)) * 4096 for _ in xs]
+
+here = ch.dist.Placement(require={"slot": "s0"})
+m, b = Maker.options(placement=here).remote(), Batcher.options(placement=here).remote()
+m.big.remote().result(timeout=60)
+path = _direct.socket_path(_direct.socket_dir(ch.runs.current_run()._rt), m._actor)
+deadline = time.monotonic() + 10
+while not os.path.exists(path) and time.monotonic() < deadline:
+    time.sleep(0.01)
+before = _direct._counter["direct"]
+m.big.remote().result(timeout=60)
+direct = _direct._counter["direct"] - before
+retained = m.big.options(durability="retained").remote()
+ephemeral = b.many.options(durability="ephemeral").remote(1)
+ch.wait([retained, ephemeral], timeout=60)
+after = _direct._counter["direct"] - before - direct
+print("IDS", direct, after, retained._outcome[3].hex(), ephemeral._outcome[3].hex(), flush=True)
+time.sleep(2)  # a background copy would be made by now
+"""
+
+
+def test_an_actors_results_are_kept_as_their_durability_says():
+    # The driver is on the actor's peer, so a default call goes straight to
+    # the actor's process. A retained one goes through the peer, which copies
+    # it to another peer before the call succeeds; a batched ephemeral one
+    # gets no copy.
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    try:
+        proc = c.driver(0, ACTOR_DURABILITY)
+        line = proc.stdout.readline().split()
+        assert line[:1] == ["IDS"], proc.stderr.read()[-3000:]
+        direct, after, retained, ephemeral = line[1:]
+        assert (direct, after) == ("1", "0"), "a default call went direct, the retained one did not"
+
+        def held(oid: str) -> list[int]:
+            return [i for i in range(3) if glob.glob(os.path.join(c.dir(i), "objects", "*", oid))]
+
+        assert len(held(retained)) == 2 and 0 in held(retained), f"a copy before success: {held(retained)}"
+        out, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, out + err[-3000:]
+        assert held(ephemeral) == [0], f"no copy of an ephemeral result: {held(ephemeral)}"
+    finally:
+        c.close()
+
+
+def test_holding_another_runs_value_does_not_fetch_it():
+    # Driver B, on another peer, unpickles A's handle and so holds A's value:
+    # the value stays where A stored it until B reads it.
+    c = Cluster(2)
+    try:
+        handle, go = os.path.join(c.root, "handle"), os.path.join(c.root, "go")
+        wait = f"while not os.path.exists({go!r}):\n    time.sleep(0.05)\n"
+        a = c.driver(
+            0,
+            f"import os, pickle, time\nimport chimaera as ch\n"
+            f'h = ch.put(b"x" * (8 << 20), durability="ephemeral")  # no background copy\n'
+            f"open({handle!r}, 'wb').write(pickle.dumps(h))\n"
+            f'print("PUT", h._put[1].hex(), flush=True)\n{wait}',
+        )
+        line = a.stdout.readline().split()
+        assert line[:1] == ["PUT"], a.stderr.read()[-3000:]
+        b = c.driver(
+            1,
+            f"import os, pickle, time\nimport chimaera as ch\nfrom chimaera import _leases\n"
+            f"h = pickle.loads(open({handle!r}, 'rb').read())\n"
+            f'print("HELD", len(_leases._releases), flush=True)\n{wait}'
+            f'print("READ", len(h.result(timeout=60)), flush=True)\n',
+        )
+        assert b.stdout.readline().split() == ["HELD", "1"], b.stderr.read()[-3000:]
+        held = [i for i in range(2) if glob.glob(os.path.join(c.dir(i), "objects", "*", line[1]))]
+        assert held == [0], f"unpickling fetched nothing: {held}"
+        open(go, "w").close()
+        out, err = b.communicate(timeout=120)
+        assert f"READ {8 << 20}" in out, out + err[-3000:]
+        a.communicate(timeout=60)
+    finally:
+        c.close()
+
+
+SHUFFLED = """
+import collections, operator, time
+import chimaera as ch
+from chimaera import _shuffle
+
+MAPS, PER, P = 4, 50_000, 2
+
+def on(slot):
+    return ch.dist.Placement(require={"slot": slot})
+
+@ch.remote
+def pairs(i):
+    return [((i * 7919 + j) % 120_011, 1) for j in range(PER)]
+
+@ch.remote
+def gather_counted(manifest, index):
+    # A gather's reading of its buckets, counting the parts fetched one at a
+    # time as they are read.
+    from chimaera import _serde
+    from chimaera._runtime import Runtime
+    one_at_a_time, hook = [], _serde.localize_hook
+    _serde.localize_hook = lambda *a: (one_at_a_time.append(a), hook(*a))
+    try:
+        buckets = list(_shuffle._buckets(manifest, index, P))  # each read as a gather reads them, one at a time
+    finally:
+        _serde.localize_hook = hook
+    here = Runtime.get().object_dir
+    apart = sum(_serde.part_of(_serde.object_path(here, o[2], o[3]), index, P) is not None for _, o in manifest)
+    return ch.context().node, len(one_at_a_time), apart, _shuffle._merge(operator.add, buckets)
+
+while sum(n.alive for n in ch.runs.cluster().nodes()) < 2:  # a lone peer stores no buckets apart
+    time.sleep(0.1)
+serial = collections.Counter((i * 7919 + j) % 120_011 for i in range(MAPS) for j in range(PER))
+got = pairs.options(placement=on("s0")).map(range(MAPS)).reduce_by_key(operator.add, partitions=P)
+print("REDUCE", got.to_dict() == dict(serial))
+
+inputs = [pairs.options(placement=on("s0")).remote(i) for i in range(MAPS)]
+scattered = [_shuffle._scatter.options(returns=P, placement=on("s0")).remote(f, P, operator.add) for f in inputs]
+manifest = _shuffle._manifest.remote(tuple(f.key for f in scattered))
+other = next(n.peer for n in ch.runs.cluster().nodes() if n.labels.get("slot") == "s1")
+for j in range(P):
+    node, fetched, apart, part = gather_counted.options(placement=on("s1")).remote(manifest, j).result(timeout=120)
+    want = {k: v for k, v in serial.items() if _shuffle.bucket_of(k, P) == j}
+    print("GATHER", j, node == other, fetched, apart, part == want)
+"""
+
+
+def test_a_shuffle_gathers_its_buckets_from_another_peer_several_at_a_time(monkeypatch):
+    # Scatters on p0, gathers on p1. The first gather there fetches the
+    # scatters' results and its bucket of each (stored apart), several at
+    # once. The next finds the results there but not its buckets: it must
+    # fetch those together too, not one at a time as it reads each.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")  # no copies on p1 ahead of the gathers
+    c = Cluster(2, labels={0: "slot=s0", 1: "slot=s1"})
+    try:
+        out = c.run(0, SHUFFLED)
+    finally:
+        c.close()
+    assert lines(out, "REDUCE ") == ["True"], "reduce_by_key across two peers gives the serial dict"
+    assert lines(out, "GATHER ") == [f"{j} True 0 4 True" for j in range(2)], (
+        "each gather on p1, with every scatter's bucket stored apart, fetched before it is read, and the serial dict's bucket"
+    )
+
+
+def test_a_script_on_a_one_core_peer_spreads_its_data_over_the_whole_cluster():
+    # By default a list is split, and a reduce_by_key partitioned, by the
+    # cores of every live peer (1 + 4 + 4), not only those of the script's,
+    # and the gathers run over them. Every peer says it reads sparse buckets.
+    c = Cluster(3, cpus={0: 1})
+    try:
+        out = c.run(
+            0,
+            """
+import operator, time
+import chimaera as ch
+
+@ch.remote
+def pairs(i):
+    return [(i * 40000 + j, 1) for j in range(40000)]
+
+while sum(n.alive for n in ch.runs.cluster().nodes()) < 3:
+    time.sleep(0.1)
+nodes = ch.runs.cluster().nodes()
+print("LAYOUTS", sorted(n.object_layout for n in nodes))
+print("CHUNKS", len(ch.data.partitions(list(range(18)))))
+got = pairs.map(range(16)).reduce_by_key(operator.add)
+print("PARTITIONS", len(got), sum(len(p) for p in got))
+cpus = {n.peer: n.cpus for n in nodes}
+held = [cpus[p] for loc in ch.runs.object_locations(got.futures).values() for p in loc["peers"][:1]]
+print("ON FOUR CORES", held.count(4.0), "OF", len(held))
+""",
+        )
+    finally:
+        c.close()
+    assert lines(out, "LAYOUTS ") == ["[1, 1, 1]"], "each peer's own, and the two it hears of from the others"
+    assert lines(out, "CHUNKS ") == ["9"], "18 items in chunks of 2: one per core of the cluster"
+    assert lines(out, "PARTITIONS ") == ["9 640000"], "16 inputs over the cluster's 9 cores"
+    on_four, held = map(int, lines(out, "ON FOUR CORES ")[0].split(" OF "))
+    assert held == 9 and on_four >= 6, "the gathers ran over the cluster: 8 of its 9 cores are the other peers'"
 
 
 def test_a_put_made_on_a_killed_peer_and_an_actor_result_there_are_read_from_their_replicas():

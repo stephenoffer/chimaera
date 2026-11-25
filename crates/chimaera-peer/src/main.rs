@@ -93,6 +93,20 @@ enum Cmd {
         #[command(flatten)]
         at: At,
     },
+    /// Calls of a run that failed for good (`Run.failed()`): list them, or with
+    /// --yes run them again as new calls (each leaves the list).
+    Retry {
+        /// The run (id as `chimaera runs` prints it).
+        run: String,
+        /// Only these calls (ids as listed); default all.
+        #[arg(long = "call")]
+        calls: Vec<String>,
+        /// Run them again. Without it, only list them.
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        at: At,
+    },
     /// What this peer's object store holds: in memory, on disk (spilled or
     /// replicas), per run, the largest objects, NumPy arenas and the reserve.
     Objects {
@@ -150,8 +164,16 @@ enum Cmd {
         #[command(subcommand)]
         action: ClusterCmd,
     },
-    /// Check what this host supports (cgroups, shared memory, Python).
-    Doctor,
+    /// Check what this host supports (cgroups, shared memory, Python), whether
+    /// a local peer can listen here, and whether the selected cluster answers.
+    Doctor {
+        /// The cluster to check, besides this machine: a profile in
+        /// ~/.config/chimaera/clusters.toml, or tcp://host:port. Default: the
+        /// one a driver here would use ($CHIMAERA_CLUSTER, $CHIMAERA_ADDRESS,
+        /// then the profile file's default), else none.
+        #[arg(long)]
+        cluster: Option<String>,
+    },
     /// Kubernetes manifests (`chimaera k8s render --image IMG | kubectl apply -f -`).
     K8s {
         #[command(subcommand)]
@@ -315,9 +337,16 @@ fn take_ca_from_env() -> Option<(String, String)> {
 
 fn main() -> ExitCode {
     let ca_from_env = take_ca_from_env();
-    // The peer level decides how a release is rolled out (docs/deploy.md, "Upgrading").
-    let version: &'static str =
-        format!("{} (peer level {})", env!("CARGO_PKG_VERSION"), chimaera_proto::PEER_LEVEL).leak();
+    // The peer level decides how a release is rolled out (docs/deploy.md,
+    // "Upgrading"); the wheel check (deploy/dev/wheel-check.py) parses this line.
+    let version: &'static str = format!(
+        "{} (peer level {}, wire {}, build {})",
+        env!("CARGO_PKG_VERSION"),
+        chimaera_proto::PEER_LEVEL,
+        chimaera_proto::WIRE_VERSION,
+        chimaera_proto::BUILD_ID
+    )
+    .leak();
     let cli = Cli::from_arg_matches(&Cli::command().version(version).get_matches()).unwrap_or_else(|e| e.exit());
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -332,6 +361,10 @@ fn main() -> ExitCode {
     let dir = dir_flag.clone().unwrap_or_else(runtime::default_local_dir);
     // A data directory named on the command line or in $CHIMAERA_HOME means its peer.
     let local = dir_flag.is_some() || std::env::var_os("CHIMAERA_HOME").is_some();
+    if let Some(e) = chimaera_proto::uds::pair_refused() {
+        eprintln!("chimaera: {e}"); // building the runtime would panic
+        return ExitCode::from(1);
+    }
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
     let result = rt.block_on(async move {
         match cli.cmd {
@@ -366,7 +399,14 @@ fn main() -> ExitCode {
                 let addrs = match kind {
                     ProviderKind::Local => {
                         let cfg = PeerConfig { dir, cpus, idle_timeout: idle_timeout.map(Duration::from_secs) };
-                        return runtime::run_local(cfg).await.map_err(|e| e.to_string()).map(|_| 0);
+                        return match runtime::run_local(cfg).await {
+                            Ok(()) => Ok(0),
+                            Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => {
+                                eprintln!("chimaera: {e}");
+                                Ok(runtime::DIR_HELD_EXIT)
+                            }
+                            Err(e) => Err(e.to_string()),
+                        };
                     }
                     ProviderKind::Static => {
                         let Some(listen) = listen else {
@@ -447,6 +487,7 @@ fn main() -> ExitCode {
             Cmd::Status { json, at } => status(connect(&dir, local, &at).await?, json).await,
             Cmd::Runs { limit, json, at } => runs(connect(&dir, local, &at).await?, limit, json).await,
             Cmd::Cancel { runs, pattern, yes, at } => cancel_many(connect(&dir, local, &at).await?, runs, pattern, yes).await,
+            Cmd::Retry { run, calls, yes, at } => retry(connect(&dir, local, &at).await?, &run, calls, yes).await,
             Cmd::Actors { prefix, json, at } => actors(connect(&dir, local, &at).await?, prefix, json).await,
             Cmd::Objects { json, cluster } => objects(&dir, json, cluster).await,
             Cmd::Logs { run, follow, at } => logs(connect(&dir, local, &at).await?, &run, follow).await,
@@ -496,7 +537,7 @@ fn main() -> ExitCode {
                 );
                 Ok(0)
             }
-            Cmd::Doctor => Ok(doctor(&dir)),
+            Cmd::Doctor { cluster } => Ok(doctor(&dir, cluster.as_deref()).await),
             Cmd::K8s { action: K8sCmd::Render(spec) } => {
                 print!("{}", launch::k8s::render(&spec)?);
                 let founders = spec.founders.unwrap_or(spec.replicas.min(3));
@@ -612,7 +653,7 @@ async fn logs(mut c: Client, run: &str, follow: bool) -> Result<u8, String> {
 
 async fn objects(dir: &std::path::Path, json: bool, cluster: bool) -> Result<u8, String> {
     let mut c = connect_local(dir).await?;
-    let req = pb::StatusRequest { objects: cluster };
+    let req = pb::StatusRequest { objects: cluster, ..Default::default() };
     let s = c.status(req).await.map_err(|e| e.message().to_string())?.into_inner();
     let stores: Vec<serde_json::Value> = if cluster {
         s.objects.iter().map(|j| serde_json::from_str(j).unwrap_or_default()).collect()
@@ -694,6 +735,8 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
                 "queued": s.queued,
                 "running": s.running,
                 "sessions": s.sessions,
+                "session_bytes": s.session_bytes,
+                "session_backlog": s.session_backlog,
                 "object_bytes": s.object_bytes,
                 "pending_reasons": s.pending_reasons,
                 "dispatch_p50_us": s.dispatch_p50_us,
@@ -704,6 +747,15 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
                 "memory_available": s.memory_available,
                 "automatic": s.automatic,
                 "links": s.links,
+                "mesh_rate": s.mesh_rate,
+                "traffic": s.traffic.iter().map(|t| serde_json::json!({
+                    "name": t.name,
+                    "weight": t.weight,
+                    "bytes": t.bytes,
+                    "waited_s": t.waited_s,
+                })).collect::<Vec<_>>(),
+                "heartbeat_p50_us": s.heartbeat_p50_us,
+                "heartbeat_p99_us": s.heartbeat_p99_us,
                 "nodes": s.nodes.iter().map(|n| serde_json::json!({
                     "addr": n.addr,
                     "alive": n.alive,
@@ -722,8 +774,14 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
                     "last_log": g.last_log,
                     "applied": g.applied,
                     "max_lag": g.leading.then_some(g.max_lag),
+                    "durability": g.durability,
                 })).collect::<Vec<_>>(),
                 "leaderless_groups": leaderless(&s),
+                "durability": {
+                    "requested": s.durability_requested,
+                    "effective": s.durability_effective,
+                    "degraded": s.durability_degraded,
+                },
             })
         );
     } else {
@@ -746,11 +804,38 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
             s.memory_pool >> 20,
             s.memory_available >> 20
         );
+        println!(
+            "  durability: commits survive a {} loss (asked for: {})",
+            s.durability_effective, s.durability_requested
+        );
+        for d in &s.durability_degraded {
+            println!("    degraded: {d}");
+        }
         for a in &s.automatic {
             println!("  automatic: {a}");
         }
         for l in &s.links {
             println!("  link: {l}");
+        }
+        if s.traffic.iter().any(|t| t.bytes > 0) {
+            let paced = match s.mesh_rate {
+                0 => "not paced".to_string(),
+                r => format!("paced at {:.1} MB/s", r as f64 / 1e6),
+            };
+            let classes: Vec<String> = s
+                .traffic
+                .iter()
+                .map(|t| format!("{} {:.1} MB, waited {:.1} s", t.name, t.bytes as f64 / 1e6, t.waited_s))
+                .collect();
+            println!("  sent to peers ({paced}): {}", classes.join(" · "));
+        }
+        if s.heartbeat_p99_us > 0.0 {
+            println!(
+                "  raft heartbeats: p50 {:.1} ms, p99 {:.1} ms round trip (budget {} ms)",
+                s.heartbeat_p50_us / 1e3,
+                s.heartbeat_p99_us / 1e3,
+                chimaera_peer::traffic::HEARTBEAT_BUDGET.as_millis()
+            );
         }
         for r in &s.pending_reasons {
             println!("  waiting: {r}");
@@ -783,7 +868,10 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
                     (false, addr) => format!("leader {addr}"),
                 };
                 let name = if g.group == 0 { "0 (directory)".to_string() } else { g.group.to_string() };
-                println!("    {name} · {leader} · {} voters · log {}, applied {}", g.voters, g.last_log, g.applied);
+                println!(
+                    "    {name} · {leader} · {} voters · log {}, applied {} · survives a {} loss",
+                    g.voters, g.last_log, g.applied, g.durability
+                );
             }
             let missing = leaderless(&s);
             if !missing.is_empty() {
@@ -925,6 +1013,62 @@ async fn cancel_many(mut c: Client, runs: Vec<String>, pattern: Option<String>, 
         }
     }
     if failed > 0 { Err(format!("{failed} of {} runs were not cancelled", runs.len())) } else { Ok(0) }
+}
+
+async fn retry(mut c: Client, run: &str, calls: Vec<String>, yes: bool) -> Result<u8, String> {
+    use prost::Message as _;
+    let run = parse_run(run)?;
+    let req = pb::ListTasksRequest { run: run.to_vec(), failed: true, ..Default::default() };
+    let reply = c.list_tasks(req).await.map_err(|e| e.message().to_string())?.into_inner();
+    let mut chosen = Vec::new();
+    for (key, letter) in reply.failed_keys.iter().zip(reply.failed) {
+        let id = key.task.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        if !calls.is_empty() && !calls.contains(&id) {
+            continue;
+        }
+        let spec = letter.spec.unwrap_or_default();
+        let name = pb::Policy::decode(spec.policy.as_slice()).map(|p| p.fn_name).unwrap_or_default();
+        let why = match letter.error.and_then(|o| o.value) {
+            Some(pb::outcome::Value::Err(e)) => format!("{}: {}", e.type_name, e.message.lines().next().unwrap_or("")),
+            _ => String::new(),
+        };
+        println!("{id}  {name}  {why}");
+        chosen.push((key.clone(), spec));
+    }
+    if chosen.is_empty() {
+        println!("no failed calls to retry in run {}", run.hex());
+        return Ok(if calls.is_empty() { 0 } else { 1 });
+    }
+    if !yes {
+        println!("{} failed call(s); add --yes to run them again", chosen.len());
+        return Ok(0);
+    }
+    // One session: the new calls are committed, holding their inputs, before
+    // the dead letters let go of them.
+    let salt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let mut specs = Vec::new();
+    for (i, (key, mut spec)) in chosen.iter().cloned().enumerate() {
+        let old = Id::from_slice(&key.task).map_err(|e| e.to_string())?;
+        let task = old.child(&[b"retry", &salt.to_be_bytes(), &(i as u64).to_be_bytes()]);
+        spec.key = Some(pb::TaskKey { run: key.run.clone(), task: task.to_vec() });
+        (spec.parent, spec.ran, spec.direct) = (None, None, false);
+        println!("retrying {} as {}", old.hex(), task.hex());
+        specs.push(spec);
+    }
+    let msgs = [
+        pb::ClientMsg {
+            msg: Some(pb::client_msg::Msg::Submit(pb::SubmitTasks { tasks: specs, grant_to: None })),
+            ..Default::default()
+        },
+        pb::ClientMsg {
+            msg: Some(pb::client_msg::Msg::DiscardFailed(pb::Release {
+                tasks: chosen.into_iter().map(|(k, _)| k).collect(),
+            })),
+            ..Default::default()
+        },
+    ];
+    c.session(tokio_stream::iter(msgs)).await.map_err(|e| e.message().to_string())?;
+    Ok(0)
 }
 
 async fn cancel(mut c: Client, run: &str) -> Result<u8, String> {
@@ -1122,7 +1266,8 @@ fn profiles(dir: &std::path::Path, filter: Option<&str>, json: bool) -> u8 {
     0
 }
 
-fn doctor(dir: &std::path::Path) -> u8 {
+async fn doctor(dir: &std::path::Path, cluster: Option<&str>) -> u8 {
+    use chimaera_peer::doctor;
     let shape = chimaera_peer::topology::discover();
     println!("os {} {} · kernel {}", shape.os, shape.arch, shape.kernel);
     println!(
@@ -1131,7 +1276,13 @@ fn doctor(dir: &std::path::Path) -> u8 {
         shape.usable_cores(),
         shape.memory_bytes as f64 / (1u64 << 30) as f64
     );
-    println!("numa nodes {} · gpus {}", shape.numa.len(), shape.gpus.len());
+    let (cores, sockets, llcs) = shape.cores_sockets_llcs();
+    println!(
+        "cores {cores} · sockets {sockets} · last-level caches {} · numa nodes {} · gpus {}",
+        llcs.map_or("unknown".into(), |n| n.to_string()),
+        shape.numa.len(),
+        shape.gpus.len()
+    );
     println!(
         "isolated accounting: {}",
         if shape.cgroup_delegated {
@@ -1144,6 +1295,29 @@ fn doctor(dir: &std::path::Path) -> u8 {
         // Cluster peers sync every raft commit; a call needs about three.
         Ok(us) => println!("fsync p50 {us:.0} µs in {} (cluster peers pay this per commit)", dir.display()),
         Err(e) => println!("fsync probe failed in {}: {e}", dir.display()),
+    }
+    match doctor::python().await {
+        Ok(line) | Err(line) => println!("{line}"),
+    }
+    // Beside the peer's own socket (the same directory, filesystem and sandbox
+    // rules): a name as long as peer.sock is placed as it is, and one too long
+    // for `dir` gets a name of its own in the shared fallback directory.
+    const PROBE: &str = "test.sock";
+    const _: () = assert!(PROBE.len() == runtime::CLIENT_SOCKET.len());
+    let sock = chimaera_proto::uds::socket_path(dir, PROBE);
+    match doctor::unix_socket(&sock) {
+        Ok(()) => println!("unix sockets: socket, bind and connect work in {}", sock.parent().unwrap_or(dir).display()),
+        Err(e) => println!("unix sockets: {e}"),
+    }
+    match doctor::selected(cluster) {
+        Ok(None) => println!("cluster: none selected; drivers here start a local peer"),
+        Ok(Some(t)) => {
+            println!("cluster {}:", t.name);
+            for line in doctor::reach(&t).await {
+                println!("  {line}");
+            }
+        }
+        Err(e) => println!("cluster: {e}"),
     }
     0
 }

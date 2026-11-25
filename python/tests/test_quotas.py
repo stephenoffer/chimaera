@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import tempfile
 
-from conftest import run_script
+from conftest import BIN, run_script
 
 SCRIPT = """
 import time, chimaera as ch
@@ -46,6 +48,37 @@ def test_a_capped_tenant_runs_within_its_quota_and_others_do_not_wait():
     free = run_script(SCRIPT.replace("TENANT", '"free"'), env=env, home=home)
     assert free.returncode == 0, free.stderr[-3000:]
     assert "OVERLAP True" in free.stdout, free.stdout  # no quota: the four run together
+
+
+def test_a_call_held_back_by_its_quota_says_so():
+    home = tempfile.mkdtemp(prefix="chq", dir="/tmp")
+    env = {"CHIMAERA_TENANT_QUOTAS": "capped=1", "CHIMAERA_HOME": home}
+    try:
+        r = run_script(
+            """
+            import time, chimaera as ch
+            ch.init(tenant="capped")
+
+            @ch.remote(cpus=1)
+            def hold():
+                time.sleep(3)
+
+            first, second = hold.remote(), hold.remote()
+            deadline, why = time.time() + 30, ""
+            while "quota" not in why and time.time() < deadline:
+                why = str(second.explain())
+                time.sleep(0.1)
+            print("WHY", why)
+            ch.get([first, second], timeout=60)
+            """,
+            env=env,
+            home=home,
+        )
+    finally:
+        subprocess.run([BIN, "--dir", home, "stop"], capture_output=True, timeout=60)
+        shutil.rmtree(home, ignore_errors=True)
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert "is using 1 of its 1-CPU quota on this peer" in r.stdout, r.stdout
 
 
 def test_a_malformed_quota_setting_stops_the_peer():
@@ -107,5 +140,57 @@ def test_a_cluster_share_caps_a_tenant_across_peers(monkeypatch):
         # Measured against the capped run, not a fixed time: on a 4-CPU Linux
         # container a peer's fresh workers took 2 s to start (3.7 s in all).
         assert open_peak > 2 and open_seconds < 0.8 * seconds, (open_seconds, open_peak, seconds)
+    finally:
+        cluster.close()
+
+
+NESTED_SHARE_SCRIPT = """
+import threading, time
+import numpy as np
+import chimaera as ch
+
+@ch.remote(cpus=1, placement=ch.dist.Placement(require={"role": "kids"}))
+def child(i):
+    start = time.time()
+    while time.time() - start < 0.5:
+        pass
+    return i
+
+@ch.remote(cpus=2, placement=ch.dist.Placement(require={"role": "parent"}))
+def parent():
+    stop = threading.Event()
+    def loop():
+        a = np.random.rand(300, 300)
+        while not stop.is_set():
+            a @ a
+    pool = [threading.Thread(target=loop) for _ in range(4)]
+    for t in pool:
+        t.start()
+    try:
+        return sum(child.remote(i).result(timeout=30) for i in range(6))
+    finally:
+        stop.set()
+        for t in pool:
+            t.join()
+
+print("RESULT", parent.remote().result(timeout=240))
+"""
+
+
+def test_a_busy_parents_children_run_on_another_peer_within_its_share(monkeypatch):
+    from test_cluster import Cluster
+
+    # The parent's threads keep the whole two-CPU share on one peer as it
+    # waits on its children, one at a time, on the other. There, as on the
+    # parent's peer, only those threads' CPUs are in the way: each child is
+    # let in, rather than waiting for as long as the threads run.
+    monkeypatch.setenv("CHIMAERA_TENANT_SHARES", "default=2")
+    monkeypatch.setenv("CHIMAERA_HOST_WHILE_WAITING", "0")  # every child in a process of its own
+    roles = {0: {"CHIMAERA_LABELS": "role=parent"}, 1: {"CHIMAERA_LABELS": "role=kids"}}
+    cluster = Cluster(2, cpus={0: 2, 1: 2}, env=roles)
+    try:
+        out = cluster.run(0, NESTED_SHARE_SCRIPT, timeout=280)
+        assert out.returncode == 0, out.stderr[-3000:]
+        assert "RESULT 15" in out.stdout, out.stdout
     finally:
         cluster.close()

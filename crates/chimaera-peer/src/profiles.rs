@@ -23,6 +23,14 @@ pub const MAX_BATCH: usize = 4096;
 const BATCH_TARGET_S: f64 = 0.2;
 /// Items faster than this are worth batching (A1).
 const BATCH_BELOW_S: f64 = 0.05;
+/// Most memory one batch may leave in its worker. Calls that keep memory after
+/// they return (caches, leaks) are batched no deeper than this allows, so the
+/// leak watch, which looks between batches, sees every few calls: 107 calls of
+/// a 2 ms function that each kept 20 MiB left 2 GiB in one batch, more than a
+/// small peer's pool, and the pressure kill blamed each call for all of it.
+const BATCH_KEPT_BYTES: f64 = (64u64 << 20) as f64;
+/// Memory kept per call below this is noise, not a reason to batch less.
+const KEPT_NOISE: f64 = (1u64 << 20) as f64;
 /// Local samples between CPU trials, doubled per consecutive revert.
 const TRIAL_BACKOFF: u64 = 50;
 /// A prior from older code counts as at most this many samples.
@@ -62,6 +70,8 @@ struct Entry {
     /// Bumped on each local sample, so other peers get only what changed.
     version: u64,
     batch: usize,
+    /// Memory each call leaves in its worker after returning (bytes, averaged).
+    kept: f64,
     /// CPU grant learned (grown, or adopted by a canary); 0 = none.
     cpus: f64,
     trial: Option<CpuTrial>,
@@ -83,6 +93,8 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
     User,
+    /// ch.auto(initial=...): the caller's starting value, before learning.
+    Initial,
     Default,
     Learned(String),
     /// Running a CPU trial: this attempt is the canary (true) or control.
@@ -92,9 +104,22 @@ pub enum Source {
 }
 
 impl Source {
+    /// One word for where the value came from (AttemptRecord.settings).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Source::User => "user",
+            Source::Initial => "initial",
+            Source::Default => "default",
+            Source::Learned(_) => "learned",
+            Source::Trial(_) => "trial",
+            Source::Observed(_) => "observed",
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Source::User => "set by the caller".into(),
+            Source::Initial => "your initial setting".into(),
             Source::Default => "default".into(),
             Source::Learned(e) => format!("learned: {e}"),
             Source::Trial(true) => "trial: canary".into(),
@@ -114,6 +139,8 @@ pub struct Reservation {
     pub memory_source: Source,
     /// Some(arm) when this attempt belongs to a CPU trial.
     pub arm: Option<bool>,
+    /// The function's median call time, seconds; 0 = never measured.
+    pub est_s: f64,
 }
 
 /// What the caller asked for (from the frozen policy).
@@ -122,6 +149,65 @@ pub struct Request {
     pub cpus: f64,
     pub memory: u64,
     pub adaptive: pb::policy::Adaptive,
+    /// `cpus` / `memory` is ch.auto's initial value: where learning starts,
+    /// not a value it must keep.
+    pub cpus_initial: bool,
+    pub memory_initial: bool,
+    /// ch.auto(min=, max=) on what is learned; 0 = none. Core::reserve
+    /// applies them to the grant; here they shape what observe reports.
+    pub cpus_min: f64,
+    pub cpus_max: f64,
+    pub memory_min: u64,
+    pub memory_max: u64,
+}
+
+impl Request {
+    pub fn of(p: &pb::Policy) -> Request {
+        Request {
+            cpus: p.cpus,
+            memory: p.memory,
+            adaptive: p.adaptive(),
+            cpus_initial: p.cpus_initial,
+            memory_initial: p.memory_initial,
+            cpus_min: p.cpus_min,
+            cpus_max: p.cpus_max,
+            memory_min: p.memory_min,
+            memory_max: p.memory_max,
+        }
+    }
+
+    /// `x` within `lo..hi`, where 0 is no bound.
+    fn clip<T: PartialOrd + Default + Copy>(x: T, lo: T, hi: T) -> T {
+        let zero = T::default();
+        let x = if lo > zero && x < lo { lo } else { x };
+        if hi > zero && x > hi { hi } else { x }
+    }
+
+    fn cpus_pinned(&self) -> bool {
+        self.cpus > 0.0 && !self.cpus_initial
+    }
+
+    fn memory_pinned(&self) -> bool {
+        self.memory > 0 && !self.memory_initial
+    }
+
+    /// Learned CPU applies to this call: learning is on and the caller did
+    /// not pin a value.
+    pub fn learns_cpus(&self) -> bool {
+        self.adaptive == pb::policy::Adaptive::On && !self.cpus_pinned()
+    }
+
+    /// The CPU grant when learning has nothing to say (or may not apply):
+    /// the initial value, else one core.
+    fn cpus_unlearned(&self) -> (f64, Source) {
+        if self.cpus > 0.0 { (self.cpus, Source::Initial) } else { (1.0, Source::Default) }
+    }
+
+    /// Memory when learning has nothing to say: the initial value, else
+    /// none (admission probes instead).
+    fn memory_unlearned(&self) -> (u64, Source) {
+        if self.memory > 0 { (self.memory, Source::Initial) } else { (0, Source::Default) }
+    }
 }
 
 #[derive(Default)]
@@ -194,28 +280,48 @@ impl Profiles {
         use pb::policy::Adaptive;
         let e = self.entry(key, name);
         let summary = e.stats.summary();
-        let (cpus, cpus_source, arm) = if req.cpus > 0.0 {
+        let learned = || format!("{} calls, {:.2} cores on average", summary.n, summary.cores_mean);
+        // Only calls learning applies to take part in a CPU trial: an
+        // observed or frozen call neither runs an arm nor draws one (which
+        // would shift the next call's arm).
+        let (cpus, cpus_source, arm) = if req.cpus_pinned() {
             (req.cpus, Source::User, None)
-        } else if req.adaptive == Adaptive::Frozen {
-            (1.0, Source::Default, None)
+        } else if req.adaptive != Adaptive::On {
+            let (c, source) = req.cpus_unlearned();
+            match req.adaptive {
+                // What learning would reserve, said but not applied.
+                Adaptive::Observe if e.cpus > 0.0 => {
+                    let would = Request::clip(e.cpus, req.cpus_min, req.cpus_max);
+                    (c, Source::Observed(format!("would reserve {would} cores: {}", learned())), None)
+                }
+                _ => (c, source, None),
+            }
         } else if let Some(t) = e.trial.as_mut() {
             let (c, canary) = t.assign();
             (c, Source::Trial(canary), Some(canary))
-        } else if e.cpus > 0.0 && req.adaptive == Adaptive::On {
-            (e.cpus, Source::Learned(format!("{} calls, {:.2} cores on average", summary.n, summary.cores_mean)), None)
+        } else if e.cpus > 0.0 {
+            (e.cpus, Source::Learned(learned()), None)
         } else {
-            (1.0, Source::Default, None)
+            let (c, source) = req.cpus_unlearned();
+            (c, source, None)
         };
-        let (memory, memory_source) = if req.memory > 0 {
+        let (memory, memory_source) = if req.memory_pinned() {
             (req.memory, Source::User)
         } else {
+            let unlearned = req.memory_unlearned();
             match (req.adaptive, summary.memory_for(arg_bytes)) {
-                (Adaptive::Frozen, _) | (_, None) => (0, Source::Default),
-                (Adaptive::Observe, Some(MemEstimate { evidence, .. })) => (0, Source::Observed(evidence)),
+                (Adaptive::Frozen, _) | (_, None) => unlearned,
+                (Adaptive::Observe, Some(m)) => {
+                    let would = Request::clip(m.bytes, req.memory_min, req.memory_max);
+                    (
+                        unlearned.0,
+                        Source::Observed(format!("would reserve {} MiB: {}", would.div_ceil(1 << 20), m.evidence)),
+                    )
+                }
                 (Adaptive::On, Some(m)) => (m.bytes, Source::Learned(m.evidence)),
             }
         };
-        Reservation { cpus, cpus_source, memory, memory_source, arm }
+        Reservation { cpus, cpus_source, memory, memory_source, arm, est_s: summary.wall_p50_s.max(0.0) }
     }
 
     /// The CPU grant for queued work of `key` about to start, when learning
@@ -225,7 +331,7 @@ impl Profiles {
     /// trial runs. Drawing again on every dispatch pass would turn a control
     /// that does not fit yet into a canary that does, starving the control.
     pub fn cpus_now(&mut self, key: &FnKey, req: Request, arm: Option<bool>) -> Option<(f64, Source, Option<bool>)> {
-        if req.cpus > 0.0 || req.adaptive == pb::policy::Adaptive::Frozen {
+        if !req.learns_cpus() {
             return None;
         }
         let e = self.entries.get_mut(key)?;
@@ -236,7 +342,7 @@ impl Profiles {
             let (c, canary) = t.assign();
             return Some((c, Source::Trial(canary), Some(canary)));
         }
-        (e.cpus > 0.0 && req.adaptive == pb::policy::Adaptive::On).then(|| {
+        (e.cpus > 0.0).then(|| {
             let s = e.stats.summary();
             (e.cpus, Source::Learned(format!("{} calls, {:.2} cores on average", s.n, s.cores_mean)), None)
         })
@@ -250,7 +356,18 @@ impl Profiles {
 
     /// Map items per range for `key` (A1); 1 = no batching.
     pub fn batch(&self, key: &FnKey) -> usize {
-        self.entries.get(key).map_or(1, |e| e.batch.max(1))
+        self.entries.get(key).map_or(1, |e| {
+            let cap = if e.kept >= KEPT_NOISE { (BATCH_KEPT_BYTES / e.kept) as usize } else { usize::MAX };
+            e.batch.clamp(1, cap.max(1))
+        })
+    }
+
+    /// What one call of `key` left in its worker after returning (a batch's
+    /// growth over its calls): batches of calls that keep memory stay small.
+    pub fn note_kept(&mut self, key: &FnKey, per_call: u64) {
+        if let Some(e) = self.entries.get_mut(key) {
+            e.kept = 0.5 * e.kept + 0.5 * per_call as f64;
+        }
     }
 
     /// Record a finished attempt and return the decisions it caused.
@@ -329,12 +446,12 @@ impl Profiles {
             }
         }
         let s = e.stats.summary();
-        let current = if e.cpus > 0.0 { e.cpus } else { 1.0 };
-        let learning = req.cpus <= 0.0 && req.adaptive == pb::policy::Adaptive::On;
+        let current = if e.cpus > 0.0 { e.cpus } else { req.cpus_unlearned().0 };
+        let learning = req.learns_cpus();
         // More CPU at once for a function that already uses it (A5).
         if learning
             && e.trial.is_none()
-            && let Some(c) = s.cpu_grow()
+            && let Some(c) = s.cpu_grow().map(|c| Request::clip(c, req.cpus_min, req.cpus_max))
             && c > current
         {
             out.push(decision(
@@ -352,7 +469,9 @@ impl Profiles {
         if learning
             && e.trial.is_none()
             && e.stats.total >= e.trial_after
-            && let Some(to) = s.cpu_shrink(kills_recent)
+            // Within the caller's ch.auto bounds: a canary the peer would
+            // clip runs at another grant than the trial measures.
+            && let Some(to) = s.cpu_shrink(kills_recent).map(|c| Request::clip(c, req.cpus_min, req.cpus_max))
             && to < current
         {
             e.trial = Some(CpuTrial::new(current, to, s.wall_p50_s, now_s));
@@ -371,7 +490,9 @@ impl Profiles {
             ));
         }
         // Granularity (A1): batch fast items toward BATCH_TARGET_S per range.
-        if s.n >= 3 && req.adaptive != pb::policy::Adaptive::Frozen {
+        // Learned batching applies only where learning does (Core::take_batch),
+        // so only those calls move it.
+        if s.n >= 3 && req.adaptive == pb::policy::Adaptive::On {
             let p50 = s.wall_p50_s.max(1e-6);
             let want =
                 if p50 < BATCH_BELOW_S { ((BATCH_TARGET_S / p50).ceil() as usize).clamp(1, MAX_BATCH) } else { 1 };
@@ -562,7 +683,138 @@ mod tests {
     }
 
     fn learn() -> Request {
-        Request { cpus: 0.0, memory: 0, adaptive: Adaptive::On }
+        Request { adaptive: Adaptive::On, ..Default::default() }
+    }
+
+    /// Records sleepy calls (0.02 cores over 0.2 s) until a CPU trial runs.
+    fn start_trial(p: &mut Profiles, k: &FnKey, req: Request) -> f64 {
+        let mut now = 0.0;
+        while p.entries.get(k).is_none_or(|e| e.trial.is_none()) {
+            now += 0.05;
+            p.record(k, "m.sleepy", ok(0.2, 0.02, 50 * MIB, 1.0), None, req, false, now, 0);
+        }
+        now
+    }
+
+    #[test]
+    fn an_initial_value_is_where_learning_starts_and_a_pin_never_moves() {
+        let mut p = Profiles::default();
+        let k = FnKey::new(b"sleepy", "");
+        let initial = Request { cpus: 2.0, cpus_initial: true, ..learn() };
+        let first = p.reserve(&k, "m.sleepy", MIB, initial);
+        assert_eq!((first.cpus, first.cpus_source.describe().as_str()), (2.0, "your initial setting"));
+        let mut now = 0.0;
+        for _ in 0..300 {
+            let r = p.reserve(&k, "m.sleepy", MIB, initial);
+            now += 0.05;
+            p.record(&k, "m.sleepy", ok(0.2, 0.02, 50 * MIB, r.cpus), r.arm, initial, false, now, 0);
+        }
+        let r = p.reserve(&k, "m.sleepy", MIB, initial);
+        assert!(r.cpus < 2.0 && matches!(r.cpus_source, Source::Learned(_)), "{r:?}");
+        // The same function pinned at 2 keeps 2, learned value or not.
+        let pinned = Request { cpus: 2.0, ..learn() };
+        assert_eq!(p.reserve(&k, "m.sleepy", MIB, pinned).cpus_source, Source::User);
+        assert_eq!(p.cpus_now(&k, pinned, None), None);
+        // An initial memory value is reserved until there is an estimate, then replaced.
+        let k2 = FnKey::new(b"mem", "");
+        let mem = Request { memory: 64 * MIB, memory_initial: true, ..learn() };
+        let r = p.reserve(&k2, "m.mem", MIB, mem);
+        assert_eq!((r.memory, r.memory_source), (64 * MIB, Source::Initial));
+        for _ in 0..3 {
+            p.record(&k2, "m.mem", ok(1.0, 1.0, 200 * MIB, 1.0), None, mem, false, 0.0, 0);
+        }
+        assert_eq!(p.reserve(&k2, "m.mem", MIB, mem).memory, 240 * MIB);
+    }
+
+    #[test]
+    fn observed_and_frozen_calls_leave_a_running_trial_alone() {
+        let mut p = Profiles::default();
+        let k = FnKey::new(b"sleepy", "");
+        start_trial(&mut p, &k, learn());
+        let observe = Request { adaptive: Adaptive::Observe, ..learn() };
+        let frozen = Request { adaptive: Adaptive::Frozen, ..learn() };
+        let first = p.reserve(&k, "m.sleepy", MIB, learn()).arm.expect("an On call takes an arm");
+        for req in [observe, frozen, observe] {
+            let r = p.reserve(&k, "m.sleepy", MIB, req);
+            assert_eq!((r.cpus, r.arm), (1.0, None), "{req:?} keeps the default and runs no arm");
+            assert_eq!(p.cpus_now(&k, req, None), None);
+            // Its samples still count as measurements, but feed no arm.
+            p.record(&k, "m.sleepy", ok(0.2, 0.02, 50 * MIB, 1.0), None, req, false, 1e3, 0);
+        }
+        let next = p.reserve(&k, "m.sleepy", MIB, learn()).arm.expect("trial still running");
+        assert_ne!(next, first, "the arms alternate as if the other calls had not come");
+    }
+
+    #[test]
+    fn observe_says_what_learning_would_reserve() {
+        let mut p = Profiles::default();
+        let k = FnKey::new(b"threads", "");
+        for _ in 0..3 {
+            p.record(&k, "m.f", ok(1.0, 3.5, 200 * MIB, 1.0), None, learn(), false, 0.0, 0);
+        }
+        let observe = Request { adaptive: Adaptive::Observe, ..learn() };
+        let r = p.reserve(&k, "m.f", MIB, observe);
+        assert_eq!((r.cpus, r.memory), (1.0, 0), "observe reserves what frozen would");
+        let (cpus, mem) = (r.cpus_source.describe(), r.memory_source.describe());
+        assert!(cpus.starts_with("not applied (adaptive=\"observe\"): would reserve 4 cores"), "{cpus}");
+        assert!(mem.contains("would reserve 240 MiB"), "{mem}");
+        let capped = p.reserve(&k, "m.f", MIB, Request { cpus_max: 2.0, ..observe });
+        assert!(capped.cpus_source.describe().contains("would reserve 2 cores"), "within the caller's bounds");
+        let initial = Request { cpus: 2.0, cpus_initial: true, ..observe };
+        assert_eq!(p.reserve(&k, "m.f", MIB, initial).cpus, 2.0, "observe keeps the caller's initial value");
+    }
+
+    #[test]
+    fn an_oom_in_the_canary_reverts_the_trial_at_once() {
+        let mut p = Profiles::default();
+        let k = FnKey::new(b"sleepy", "");
+        let now = start_trial(&mut p, &k, learn());
+        let canary = loop {
+            let r = p.reserve(&k, "m.sleepy", MIB, learn());
+            if r.arm == Some(true) {
+                break r;
+            }
+        };
+        let oom = Sample { peak: 500 * MIB, arg_bytes: MIB, cpus: canary.cpus, oom: true, ..Default::default() };
+        let ds = p.record(&k, "m.sleepy", oom, canary.arm, learn(), true, now + 0.01, 0);
+        assert!(ds.iter().any(|d| d.knob == "cpus" && d.outcome == "reverted"), "{ds:#?}");
+        assert_eq!(p.reserve(&k, "m.sleepy", MIB, learn()).arm, None, "no trial after the revert");
+    }
+
+    #[test]
+    fn trials_and_growth_stay_within_the_callers_bounds() {
+        let mut p = Profiles::default();
+        let k = FnKey::new(b"sleepy", "");
+        let bounded = Request { cpus_min: 0.5, ..learn() };
+        let (mut now, mut ds) = (0.0, Vec::new());
+        for _ in 0..300 {
+            let r = p.reserve(&k, "m.sleepy", MIB, bounded);
+            now += 0.05;
+            ds.extend(p.record(&k, "m.sleepy", ok(0.2, 0.02, 50 * MIB, r.cpus), r.arm, bounded, false, now, 0));
+        }
+        let cpus: Vec<f64> = ds.iter().filter(|d| d.knob == "cpus").map(|d| d.new_value.parse().unwrap()).collect();
+        assert!(!cpus.is_empty() && cpus.iter().all(|c| *c >= 0.5), "{ds:#?}");
+        assert_eq!(p.reserve(&k, "m.sleepy", MIB, bounded).cpus, 0.5);
+        let k2 = FnKey::new(b"threads", "");
+        let capped = Request { cpus_max: 2.0, ..learn() };
+        for _ in 0..3 {
+            p.record(&k2, "m.f", ok(1.0, 3.5, 0, 1.0), None, capped, false, 0.0, 0);
+        }
+        assert_eq!(p.reserve(&k2, "m.f", MIB, capped).cpus, 2.0);
+    }
+
+    #[test]
+    fn only_calls_learning_applies_to_move_batching() {
+        let mut p = Profiles::default();
+        let k = FnKey::new(b"tiny", "");
+        for adaptive in [Adaptive::Observe, Adaptive::Frozen] {
+            for _ in 0..12 {
+                p.record(&k, "m.tiny", ok(0.0001, 1.0, 0, 1.0), None, Request { adaptive, ..learn() }, false, 0.0, 0);
+            }
+            assert_eq!(p.batch(&k), 1, "{adaptive:?} calls do not batch");
+        }
+        p.record(&k, "m.tiny", ok(0.0001, 1.0, 0, 1.0), None, learn(), false, 0.0, 0);
+        assert_eq!(p.batch(&k), 2);
     }
 
     #[test]
@@ -669,6 +921,24 @@ mod tests {
             p.record(&k, "m.tiny", ok(0.0001, 1.0, 0, 1.0), None, learn(), false, 0.0, 0);
         }
         assert_eq!(p.batch(&k), 2000);
+    }
+
+    #[test]
+    fn calls_that_keep_memory_are_batched_shallowly() {
+        let mut p = Profiles::default();
+        let k = FnKey::new(b"keeps", "");
+        for _ in 0..12 {
+            p.record(&k, "m.keeps", ok(0.002, 1.0, 0, 1.0), None, learn(), false, 0.0, 0);
+        }
+        assert!(p.batch(&k) > 64, "2 ms calls batch deeply: {}", p.batch(&k));
+        for _ in 0..4 {
+            p.note_kept(&k, 20 * MIB);
+        }
+        assert!(p.batch(&k) <= 3, "20 MiB kept per call: {}", p.batch(&k));
+        for _ in 0..8 {
+            p.note_kept(&k, 0);
+        }
+        assert!(p.batch(&k) > 64, "calls that keep nothing batch as before: {}", p.batch(&k));
     }
 
     #[test]

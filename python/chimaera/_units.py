@@ -11,6 +11,8 @@ from __future__ import annotations
 import datetime as _dt
 import math
 import re
+from decimal import Decimal
+from fractions import Fraction
 
 _SIZE_UNITS = {
     "b": 1,
@@ -26,6 +28,14 @@ _SIZE_UNITS = {
 _SIZE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)\s*$")
 _DUR_UNITS = {"ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
 _DUR_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s|m|h)\s*$")
+# Sizes travel as unsigned 64-bit integers.
+MAX_BYTES = 2**64 - 1
+# Deadlines and expiries are times on the hybrid clock, which counts
+# milliseconds since 1970 in 44 bits and so ends in the year 2527 (CLOCK_END,
+# in seconds), and waits go to the OS timer, which takes about 292 years at
+# most: a duration is at most a century.
+CLOCK_END = (1 << 44) / 1000
+MAX_SECONDS = 100 * 365 * 86400.0
 
 
 def parse_bytes(value: int | str, field: str = "size") -> int:
@@ -35,29 +45,42 @@ def parse_bytes(value: int | str, field: str = "size") -> int:
     if isinstance(value, int):
         if value < 0:
             raise ValueError(f"{field}: size must not be negative, got {value}")
-        return value
-    if not isinstance(value, str):
+        total = value
+    elif isinstance(value, str):
+        m = _SIZE_RE.match(value)
+        if not m or m.group(2).lower() not in _SIZE_UNITS:
+            raise ValueError(
+                f"{field}: {value!r} is not a byte size; use a byte unit such as '512 MiB', '2 GB' or '1024 B'"
+            )
+        # Exact: a float would round '9007199254740993 B' down a byte.
+        exact = Fraction(Decimal(m.group(1))) * _SIZE_UNITS[m.group(2).lower()]
+        if exact.denominator != 1:
+            raise ValueError(f"{field}: {value!r} is not a whole number of bytes")
+        total = int(exact)
+    else:
         raise TypeError(f"{field}: expected an int of bytes or a string like '32 GiB', got {type(value).__name__}")
-    m = _SIZE_RE.match(value)
-    if not m or m.group(2).lower() not in _SIZE_UNITS:
-        raise ValueError(
-            f"{field}: {value!r} is not a byte size; use a byte unit such as '512 MiB', '2 GB' or '1024 B'"
-        )
-    number, unit = float(m.group(1)), _SIZE_UNITS[m.group(2).lower()]
-    total = number * unit
-    if total != math.floor(total):
-        raise ValueError(f"{field}: {value!r} is not a whole number of bytes")
-    return int(total)
+    if total > MAX_BYTES:
+        raise ValueError(f"{field}: {value!r} is more than 16 EiB ({MAX_BYTES} bytes), the largest size there is")
+    return total
 
 
-def parse_duration(value: float | int | str | _dt.timedelta, field: str = "duration") -> float:
-    """Return a duration in seconds."""
+def as_float(value: int | float) -> float:
+    """float(value), or an infinity for an int too large for a float."""
+    try:
+        return float(value)
+    except OverflowError:
+        return math.inf if value > 0 else -math.inf
+
+
+def parse_duration(value: float | int | str | _dt.timedelta, field: str = "duration", *, clock: bool = True) -> float:
+    """Return a duration in seconds: finite, and at most MAX_SECONDS unless
+    `clock` is False (an amount of compute time, which no clock or timer holds)."""
     if isinstance(value, bool):
         raise TypeError(f"{field}: expected a duration, got a bool")
     if isinstance(value, _dt.timedelta):
         seconds = value.total_seconds()
     elif isinstance(value, (int, float)):
-        seconds = float(value)
+        seconds = as_float(value)
     elif isinstance(value, str):
         m = _DUR_RE.match(value)
         if not m:
@@ -65,8 +88,10 @@ def parse_duration(value: float | int | str | _dt.timedelta, field: str = "durat
         seconds = float(m.group(1)) * _DUR_UNITS[m.group(2)]
     else:
         raise TypeError(f"{field}: expected a duration, got {type(value).__name__}")
-    if math.isnan(seconds) or seconds < 0:
-        raise ValueError(f"{field}: duration must be a non-negative number, got {value!r}")
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"{field}: duration must be a finite, non-negative number, got {value!r}")
+    if clock and seconds > MAX_SECONDS:
+        raise ValueError(f"{field}: {value!r} is longer than 100 years, the longest duration there is")
     return seconds
 
 

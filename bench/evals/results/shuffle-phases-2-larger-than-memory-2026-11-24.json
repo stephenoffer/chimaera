@@ -1,0 +1,218 @@
+{
+  "manifest": {
+    "source": {
+      "digest": "4c4408dc9183a83e"
+    },
+    "build": {
+      "binary": "target/debug/chimaera",
+      "profile": "dev",
+      "settings": {
+        "opt-level": 1,
+        "package": {
+          "*": {
+            "opt-level": 2
+          }
+        }
+      },
+      "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+      "rustflags": "-C debuginfo=0"
+    },
+    "versions": {
+      "python": {
+        "chimaera": "3.11.2"
+      },
+      "chimaera": "chimaera 0.1.0 (peer level 1, wire 1, build dev-f616197a08a9c7e4)"
+    },
+    "host": {
+      "platform": "Linux-6.8.0-117-generic-aarch64-with-glibc2.36",
+      "distro": "Debian GNU/Linux 12 (bookworm)",
+      "cpus": 4,
+      "image": ""
+    },
+    "topology": {
+      "nodes": 2,
+      "cpus_per_node": 1,
+      "driver_cpus": 1,
+      "layout": "one machine",
+      "machine_cpus": 4,
+      "memory_pool": "auto"
+    },
+    "shuffle": {
+      "maps": 2400,
+      "per": 200000,
+      "partitions": 256,
+      "memory": "",
+      "keys": 4000037
+    },
+    "limits": {
+      "memory_max": 1073741824,
+      "memory_peak": 1074200576,
+      "oom_kill": 0,
+      "shm_bytes": 67108864
+    }
+  },
+  "results": {
+    "uniform": [
+      {
+        "round": 0,
+        "seconds": 1220.7225,
+        "phases": {
+          "plan": {
+            "seconds": 0.11598062515258789,
+            "median_seconds": 0.11598062515258789,
+            "max_seconds": 0.11598062515258789,
+            "cpu_seconds": 0.0,
+            "bytes": 0
+          },
+          "map": {
+            "seconds": 72.26290559768677,
+            "median_seconds": 0.026189684867858887,
+            "max_seconds": 0.8216943740844727,
+            "cpu_seconds": 59.993878347000255,
+            "bytes": 0
+          },
+          "split": {
+            "seconds": 103.67623949050903,
+            "median_seconds": 0.036434292793273926,
+            "max_seconds": 0.9482600688934326,
+            "cpu_seconds": 94.64153350799995,
+            "bytes": 0,
+            "pairs": 480000000,
+            "buckets": 614400
+          },
+          "scatter_encode": {
+            "seconds": 24.18656039237976,
+            "median_seconds": 0.008130192756652832,
+            "max_seconds": 0.2559232711791992,
+            "cpu_seconds": 22.29962608200001,
+            "bytes": 3395277019
+          },
+          "fetch": {
+            "seconds": 8.09425973892212,
+            "median_seconds": 0.022008538246154785,
+            "max_seconds": 0.14076018333435059,
+            "cpu_seconds": 6.898037459999724,
+            "bytes": 0
+          },
+          "read": {
+            "seconds": 1845.864509344101,
+            "median_seconds": 6.406732439994812,
+            "max_seconds": 19.139533042907715,
+            "cpu_seconds": 691.1178512709942,
+            "bytes": 3395277019
+          },
+          "reduce": {
+            "seconds": 164.16035342216492,
+            "median_seconds": 0.6267987489700317,
+            "max_seconds": 1.1201469898223877,
+            "cpu_seconds": 152.38086876000128,
+            "bytes": 0,
+            "keys": 4000037,
+            "rss_growth_max": 0
+          },
+          "gather_encode": {
+            "seconds": 0.9977598190307617,
+            "median_seconds": 0.0022362470626831055,
+            "max_seconds": 0.032500267028808594,
+            "cpu_seconds": 0.8834875410000449,
+            "bytes": 28484674
+          },
+          "final": {
+            "seconds": 4.595150947570801,
+            "median_seconds": 4.595150947570801,
+            "max_seconds": 4.595150947570801,
+            "cpu_seconds": 0.0,
+            "bytes": 0
+          }
+        },
+        "timeline": {
+          "submit_start": {
+            "first": 0.294,
+            "median": 0.294,
+            "last": 0.294
+          },
+          "submitted": {
+            "first": 116.275,
+            "median": 116.275,
+            "last": 116.275
+          },
+          "scatter_start": {
+            "first": 21.317,
+            "median": 65254.244,
+            "last": 154583.413
+          },
+          "scatter_mapped": {
+            "first": 43.453,
+            "median": 65283.68,
+            "last": 154616.513
+          },
+          "scatter_split": {
+            "first": 64.933,
+            "median": 65324.352,
+            "last": 154674.095
+          },
+          "scatter_end": {
+            "first": 89.666,
+            "median": 65332.87,
+            "last": 154687.626
+          },
+          "manifest_start": {
+            "first": 119322.486,
+            "median": 119322.486,
+            "last": 119322.486
+          },
+          "manifest_waited": {
+            "first": 154756.991,
+            "median": 154756.991,
+            "last": 154756.991
+          },
+          "manifest_end": {
+            "first": 154759.802,
+            "median": 154759.802,
+            "last": 154759.802
+          },
+          "gather_start": {
+            "first": 154846.886,
+            "median": 745787.068,
+            "last": 1199960.222
+          },
+          "gather_fetched": {
+            "first": 154878.74,
+            "median": 745820.891,
+            "last": 1199971.87
+          },
+          "gather_merged": {
+            "first": 159259.327,
+            "median": 754412.126,
+            "last": 1204085.908
+          },
+          "gather_end": {
+            "first": 159261.449,
+            "median": 754416.995,
+            "last": 1204086.593
+          },
+          "driver_done": {
+            "first": 1204099.942,
+            "median": 1204099.942,
+            "last": 1204099.942
+          },
+          "driver_collected": {
+            "first": 1208695.093,
+            "median": 1208695.093,
+            "last": 1208695.093
+          }
+        },
+        "digest_ok": true,
+        "largest_partition": 15626,
+        "partitions": 256,
+        "cluster_cores": 2,
+        "memory": null,
+        "peers": {
+          "network_bytes": 0.0,
+          "spilled_bytes": 0.0,
+          "spill_us": 0.0
+        }
+      }
+    ]
+  }
+}

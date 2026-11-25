@@ -3,7 +3,7 @@
 Every command and flag of `chimaera`, the one binary that is both peer and
 command-line tool. Summaries and flag descriptions come from
 `chimaera --help` and `chimaera <command> --help` of
-`chimaera 0.1.0 (peer level 1)` (`chimaera --version`). Where the help is
+release 0.1.0 at peer level 1 (`chimaera --version`). Where the help is
 empty or silent, the table says what the code does.
 
 For a walkthrough, see [guides/clusters.md](guides/clusters.md) and
@@ -47,7 +47,7 @@ chimaera [OPTIONS] <COMMAND>
 |---|---|
 | `--dir <DIR>` | Data directory of the local peer (default: `$CHIMAERA_HOME` or `~/.chimaera/local`). Every command accepts it |
 | `-h, --help` | Print help |
-| `-V, --version` | Print version: the release and its peer level, e.g. `chimaera 0.1.0 (peer level 1)` |
+| `-V, --version` | Print version: the release, its peer level, wire version and build, e.g. `chimaera 0.1.0 (peer level 1, wire 1, build dev-487df68cf4ccb0f2)`. A build made by `make wheel` starts with that build's id, not `dev`, and a wheel's peer binary and `chimaera._native` report the same one |
 
 Installing the Python wheel puts `chimaera` on your `PATH`, and that
 command runs the binary installed with the package. A failing command prints
@@ -72,7 +72,9 @@ describes profiles.
 
 `objects`, `profiles`, `stop`, `doctor` and `cluster recover` always use this
 machine's data directory. `objects --cluster` is a plain switch with another
-meaning: every live peer's store.
+meaning: every live peer's store. `doctor --cluster` names the cluster it
+checks, besides this machine; without it, `doctor` checks the one a driver
+here would use (rule 3).
 
 ## Run programs
 
@@ -293,7 +295,8 @@ chimaera objects [OPTIONS]
 
 ### `chimaera doctor`
 
-Check what this host supports (cgroups, shared memory, Python).
+Check what this host supports (cgroups, shared memory, Python), whether
+a local peer can listen here, and whether the selected cluster answers.
 
 <details>
 <summary><code>chimaera doctor [OPTIONS]</code></summary>
@@ -302,9 +305,33 @@ Check what this host supports (cgroups, shared memory, Python).
 chimaera doctor [OPTIONS]
 ```
 
-No flags beyond `--dir`. It prints the OS, CPUs and memory, NUMA nodes and
-GPUs, whether isolated accounting works, and the data directory's fsync
-latency.
+| Flag | Description |
+|---|---|
+| `--cluster <CLUSTER>` | The cluster to check, besides this machine: a profile in ~/.config/chimaera/clusters.toml, or tcp://host:port. Default: the one a driver here would use ($CHIMAERA_CLUSTER, $CHIMAERA_ADDRESS, then the profile file's default), else none |
+
+It prints the OS, CPUs and memory, the physical cores, sockets and
+last-level caches those CPUs span, NUMA nodes and GPUs, whether isolated
+accounting works, and the data directory's fsync latency. Then each check
+that can fail names the step that failed and what to do:
+
+- Python: whether `$CHIMAERA_PYTHON` (else `python3`; the `chimaera`
+  command installed with the wheel passes its own interpreter) imports
+  chimaera with an extension module of this binary's build, and which peer
+  binary it would start, or that no candidate is there or executable.
+- Unix sockets: `socket()`, `bind()` and `connect()` on a socket beside the
+  peer's own (`peer.sock`). A sandbox or seccomp profile that refuses Unix
+  sockets, or a filesystem that cannot hold them, shows up here with the
+  call, the path and the remedy.
+- The cluster, chosen as a driver chooses it: for each address, TCP
+  `connect()`, then the gRPC handshake (TLS when the profile has a CA),
+  then a handshake carrying the token.
+
+A local peer that cannot make or bind its sockets exits with the same
+message, and the program that started it raises it at once instead of
+waiting out the launch timeout. A program refused `connect()` on a running
+peer's socket raises the same way and leaves that peer alone. Where even
+`socketpair()` is refused, which the async runtime needs, every `chimaera`
+command and the Python client stop at once, naming that call and the remedy.
 
 </details>
 
@@ -381,6 +408,10 @@ The code refuses:
 - `--client-port` under local and static providers; use
   `--client-listen` there.
 - A token shorter than 16 characters.
+
+A local peer (no `--listen`) that finds another peer running in its data
+directory exits with status 75, not 1: the program that started it waits for
+that peer's socket instead.
 
 Give `--dir` an absolute path. SIGTERM and SIGUSR1 drain a running peer for up
 to `CHIMAERA_DRAIN_SECONDS`; Ctrl-C stops it at once. The environment variables

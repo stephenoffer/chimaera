@@ -43,6 +43,8 @@ service Mesh {
   rpc Replicate(ReplicateRequest) returns (ReplicateReply);
   // What this peer's object store holds (`chimaera objects --cluster`).
   rpc Inventory(InventoryRequest) returns (InventoryReply);
+  // Hold resources on the target's ledger (Peer.Hold asked at another peer).
+  rpc Hold(HoldRequest) returns (HoldReply);
   // Why an actor placed on this peer has not started ("" if it is not
   // waiting): explain() on another peer asks the actor's host.
   rpc ActorWait(ActorWaitRequest) returns (ActorWaitReply);
@@ -72,6 +74,8 @@ message ReplicateRequest {
   uint64 size = 4;
   uint64 from_node = 5;  // the sender, which holds the object
   bool wait = 6;         // answer once the copy is made (an error if it failed), not at once
+  // TRAFFIC_RECOVERY for a drain's hand-off; any other: a checkpoint copy.
+  TrafficClass traffic = 7;
 }
 
 message ReplicateReply {}
@@ -100,6 +104,19 @@ message Member {
   map<string, string> labels = 8;   // for Placement(require=, prefer=)
   string host = 9;        // the machine (its boot id, or CHIMAERA_MACHINE_ID): peers with the same one share it
   string object_dir = 10; // this peer's object store, which a peer on the same machine may read directly
+  RaftSync raft_sync = 11; // how it writes its raft log: what a commit it acknowledges survives
+  // The newest layout of stored results it (and its executors) read: 1, a
+  // shuffle scatter's sparse buckets. 0: a peer too old to say, which reads
+  // only the older layouts, so no peer writes the newer while it is live.
+  uint32 object_layout = 12;
+}
+
+// How a cluster peer writes its raft log (CHIMAERA_RAFT_SYNC).
+enum RaftSync {
+  RAFT_SYNC_UNKNOWN = 0;  // a peer too old to say: counts as not syncing
+  RAFT_SYNC_OFF = 1;      // page cache only: survives the peer's process dying, not its machine
+  RAFT_SYNC_FSYNC = 2;
+  RAFT_SYNC_FULL = 3;     // fsync that also flushes the drive's cache
 }
 
 message JoinRequest {
@@ -181,6 +198,12 @@ message ReadRequest {
   // answers): a replica that stopped hearing from it checks it was not removed.
   bool membership = 10;
   uint32 membership_group = 11;
+  // `run`'s dead letters in vshard `failed_vshard`.
+  bool failed = 12;
+  uint32 failed_vshard = 13;
+  // A read of this replica's copy of a store namespace (ReadReply.store): it
+  // takes no log entry, and may lag the leader's.
+  StoreRead store = 14;
 }
 
 message ReadReply {
@@ -192,6 +215,9 @@ message ReadReply {
   repeated RunRecord runs = 6;      // list_runs_group's runs, without exec_env
   repeated ActorRecord actors = 7;  // list_actors_group's actors
   repeated uint64 members = 8;      // membership_group's voters and learners
+  repeated DeadLetter failed = 9;   // with `failed`: the dead letters
+  repeated TaskKey failed_keys = 10;
+  StoreReply store = 11;            // with `store`
 }
 
 // An attempt the leader granted to the target, with everything needed to run
@@ -233,6 +259,7 @@ message FetchRequest {
   // A byte range (parallel fetches of large objects); len 0 = to the end.
   uint64 offset = 5;
   uint64 len = 6;
+  TrafficClass traffic = 7;  // the class the sender paces these bytes as
 }
 
 message FetchChunk {
@@ -293,6 +320,11 @@ message PingReply {
   // The peer is draining (SIGTERM): it will stop. `draining` alone may also
   // mean its core has not answered yet (see the ping handler).
   bool stopping = 19;
+  // CPUs that threads of calls waiting on other calls keep using, per tenant
+  // with a share (not in tenant_cpu). They hold back no call let in one at a
+  // time while only they stand in the way, as they do here.
+  map<string, double> tenant_kept = 20;
+  Demand demand = 21;  // what more capacity would start sooner here
 }
 
 message ForgetRequest {
@@ -304,6 +336,8 @@ message ForgetRequest {
   bool run_ended = 6;           // end the run's actors hosted here
   // Records of actor calls that ended without running on their host.
   repeated TaskRecord ended = 7;
+  // With run_ended: the run's values that sessions hold (LeaseObjects), kept.
+  repeated bytes kept = 8;
 }
 
 message ForgetReply {}

@@ -41,14 +41,20 @@ pub fn default_local_dir() -> PathBuf {
     Path::new(&home).join(".chimaera").join("local")
 }
 
+/// The exit status (EX_TEMPFAIL) of a local `peer start` that finds another
+/// peer holding its data directory: the program that started it then waits
+/// for that peer's socket (python/chimaera/_runtime.py) instead of failing.
+pub const DIR_HELD_EXIT: u8 = 75;
+
 /// Hold an exclusive lock on the data directory for the process lifetime.
+/// Another peer holding it is a `ResourceBusy` error.
 pub(crate) fn lock_dir(dir: &Path) -> io::Result<std::fs::File> {
     std::fs::create_dir_all(dir)?;
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("peer.lock"))?;
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(std::fs::TryLockError::WouldBlock) => {
-            Err(io::Error::new(io::ErrorKind::AddrInUse, format!("another peer is running in {}", dir.display())))
+            Err(io::Error::new(io::ErrorKind::ResourceBusy, format!("another peer is running in {}", dir.display())))
         }
         Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
@@ -172,7 +178,8 @@ pub async fn serve(
         inline_limit: 64 * 1024,
     };
     let (exec_tx, mut exec_rx) = mpsc::channel(4096);
-    let sup = Supervisor::start(exec_socket, dir.join("logs"), welcome.clone(), exec_tx)?;
+    let numa = crate::numa::Domains::new(&shape.numa);
+    let sup = Supervisor::start(exec_socket, dir.join("logs"), welcome.clone(), exec_tx, numa)?;
 
     let isolation = if shape.cgroup_delegated {
         match crate::topology::own_cgroup_dir().map(|own| crate::accounting::Isolation::setup(&own)) {
@@ -195,6 +202,7 @@ pub async fn serve(
     profiles.hw_class = crate::profiles::hw_class(&shape);
     // A bad quota setting stops the peer rather than leaving tenants unlimited.
     crate::quotas::Quotas::from_env().map_err(io::Error::other)?;
+    crate::core::configure_cancel().map_err(io::Error::other)?;
     let core = Core::new(
         core_tx.clone(),
         router.clone(),
@@ -240,6 +248,9 @@ pub async fn serve(
         version: env!("CARGO_PKG_VERSION").into(),
         gpus: shape.gpus.iter().map(|g| g.uuid.clone()).collect(),
         direct_actor_calls: true,
+        learns_initial: true,
+        // Only cluster peers copy objects in the background (objplane::replicate_new_objects).
+        replicas: if router.is_cluster() { crate::objplane::replica_count() as u32 } else { 0 },
     };
     let shutdown = Arc::new(Notify::new());
     let ingress = Arc::new(Ingress::new(
@@ -274,7 +285,8 @@ pub async fn serve(
         });
     }
     let _ = std::fs::remove_file(&client_socket);
-    let listener = tokio::net::UnixListener::bind(&client_socket)?;
+    let listener =
+        tokio::net::UnixListener::bind(&client_socket).map_err(|e| crate::doctor::bind_error(&client_socket, e))?;
     crate::executor::restrict_to_owner(&client_socket)?;
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
     let stopping = Arc::new(Notify::new());

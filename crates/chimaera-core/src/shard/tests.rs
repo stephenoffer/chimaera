@@ -232,6 +232,65 @@ fn a_call_the_direct_path_ran_is_recorded_done_and_wakes_its_dependents() {
     assert_eq!(status(&h.submit(ran(call, &[ctor], obj(9)), Some(p)).0), Status::Duplicate);
 }
 
+fn dead(h: &Harness, run: Id) -> Vec<Tk> {
+    read::dead_letters(&h.a, V, run).into_iter().map(|(tk, _)| tk).collect()
+}
+
+#[test]
+fn a_call_that_failed_for_good_is_kept_with_its_inputs_until_discarded() {
+    let mut h = Harness::new(ShardState::new());
+    let (input, failed) = (task_id(V, 0), task_id(V, 1));
+    let p = (peer(0), 1);
+    h.submit(spec(input, &[], pb::Effects::None, 3), Some(p));
+    h.publish(input, 1, p, obj(1));
+    h.submit(spec(failed, &[input], pb::Effects::None, 3), Some(p));
+    h.publish(failed, 1, p, user_err("ValueError: bad row"));
+    let kept = read::dead_letters(&h.a, V, run_id(V));
+    assert_eq!(kept.len(), 1);
+    let (tk, letter) = &kept[0];
+    assert_eq!(*tk, failed);
+    assert_eq!(letter.spec.as_ref().unwrap().deps, vec![input.pb()], "kept as submitted, to run again");
+    assert_eq!(err_kind(&h.task(failed).unwrap()), Some(Kind::User));
+    assert_eq!(read::pins(&h.a, input), 2, "the client's pin and the dead letter's");
+    h.raw(Body::DiscardDead(pb::Release { tasks: vec![failed.pb()] }), V);
+    assert!(dead(&h, run_id(V)).is_empty());
+    assert_eq!(read::pins(&h.a, input), 1, "discarding releases the input");
+}
+
+#[test]
+fn cancelled_calls_and_calls_whose_input_failed_are_not_dead_letters() {
+    let mut h = Harness::new(ShardState::new());
+    let (root, after, cancelled) = (task_id(V, 0), task_id(V, 1), task_id(V, 2));
+    let p = (peer(0), 1);
+    h.submit(spec(root, &[], pb::Effects::None, 3), Some(p));
+    h.submit(spec(after, &[root], pb::Effects::None, 3), None);
+    h.publish(root, 1, p, user_err("boom"));
+    assert_eq!(err_kind(&h.task(after).unwrap()), Some(Kind::Causal));
+    h.submit(spec(cancelled, &[], pb::Effects::None, 3), Some(p));
+    h.cancel(cancelled);
+    assert_eq!(dead(&h, run_id(V)), vec![root], "only the root cause: retrying it reruns the rest");
+}
+
+#[test]
+fn a_run_keeps_its_newest_dead_letters_and_releases_the_inputs_of_older_ones() {
+    let mut h = Harness::new(ShardState::new());
+    let p = (peer(0), 1);
+    let input = task_id(V, 0);
+    h.submit(spec(input, &[], pb::Effects::None, 3), Some(p));
+    h.publish(input, 1, p, obj(1));
+    let n = DEAD_MAX as usize + 1;
+    for i in 1..=n {
+        let t = task_id(V, i);
+        let deps: Vec<Tk> = if i == 1 { vec![input] } else { vec![] };
+        h.submit(spec(t, &deps, pb::Effects::None, 3), Some(p));
+        h.publish(t, 1, p, user_err("e"));
+    }
+    let kept = dead(&h, run_id(V));
+    assert_eq!(kept.len(), DEAD_MAX as usize);
+    assert!(!kept.contains(&task_id(V, 1)), "the oldest went");
+    assert_eq!(read::pins(&h.a, input), 1, "and released what it held");
+}
+
 fn publish_raw(h: &mut Harness, tk: Tk, attempt: u32, p: PeerInc, o: pb::Outcome) -> Applied {
     h.raw(
         Body::Publish(pb::PublishResults {
@@ -1494,6 +1553,16 @@ fn rd(kind: pb::store_read::Kind, key: &str) -> pb::StoreRead {
 
 use pb::store_read::Kind as RK;
 use pb::store_write::Op as SO;
+
+mod store_txn;
+
+mod store_claim;
+
+mod actor_state;
+
+mod workflow;
+
+mod leases;
 
 #[test]
 fn store_versions_make_compare_and_set() {

@@ -6,11 +6,13 @@ from __future__ import annotations
 import os
 import signal
 import tempfile
+import threading
 import time
 
 import pytest
 
 import chimaera as ch
+from chimaera import _future, _remote
 
 
 @ch.remote
@@ -54,6 +56,13 @@ def evens(n):
     return (i for i in range(n) if i % 2 == 0)  # returns a generator; is not one
 
 
+@ch.remote
+def after_file(path, n):
+    while not os.path.exists(path):
+        time.sleep(0.02)
+    yield from range(n)
+
+
 def produced(path):
     try:
         with open(path) as f:
@@ -92,6 +101,49 @@ def test_the_generator_stays_a_window_ahead_of_a_slow_consumer():
     assert len(list(s)) == 998, "the rest still arrives once the consumer reads"
 
 
+@ch.remote
+def counted_blobs(n, path, size):
+    for i in range(n):
+        with open(path, "a") as f:
+            f.write(f"{i}\n")
+        yield bytes(size)
+
+
+def test_the_generator_stays_a_byte_window_ahead_of_a_slow_consumer():
+    path = os.path.join(tempfile.mkdtemp(), "produced")
+    s = counted_blobs.options(max_in_flight_bytes="16 MiB").remote(40, path, 4 << 20)
+    assert [len(next(s)) for _ in range(2)] == [4 << 20] * 2
+    time.sleep(1.0)
+    ahead = produced(path)
+    # 16 MiB is four items of 4 MiB (and a few bytes): the generator stops
+    # at the fifth past the two taken, before sending it.
+    assert ahead <= 2 + 4 + 1, f"the generator ran {ahead} items of 4 MiB ahead of a consumer that took 2"
+    assert sum(len(x) for x in s) == 38 * (4 << 20), "the rest still arrives once the consumer reads"
+
+
+def test_a_driver_that_credits_by_items_only_is_not_held_to_a_byte_window(monkeypatch):
+    # A driver from before byte credits sends no byte window and credits
+    # every max_in_flight // 2 items. A generator that waited on bytes for it
+    # stopped 256 MiB ahead, for a credit that driver never sends.
+    def deliver(self, outcome):  # that driver's Stream._deliver
+        if self._next - self._credited >= max(1, self._window // 2):
+            self._credited = self._next
+            self._rt.client.stream_credit(self.key, self._next)
+        return self._rt.read_value(outcome)
+
+    monkeypatch.setattr(_remote, "STREAM_WINDOW_BYTES", 0)  # its calls carry no byte window
+    monkeypatch.setattr(_future.Stream, "_deliver", deliver)
+    path = os.path.join(tempfile.mkdtemp(), "produced")
+    s = counted_blobs.remote(30, path, 10 << 20)  # 300 MiB, inside the 64-item window
+    sizes = []
+    reader = threading.Thread(target=lambda: sizes.extend(len(x) for x in s), daemon=True)
+    reader.start()
+    reader.join(120)
+    if reader.is_alive():
+        s.close()
+    assert sizes == [10 << 20] * 30, f"the generator stopped after {produced(path)} items of 10 MiB"
+
+
 def test_close_stops_the_generator():
     path = os.path.join(tempfile.mkdtemp(), "produced")
     s = counted.options(max_in_flight=4).remote(10_000, path)
@@ -110,6 +162,25 @@ def test_async_generators_stream_too():
     import asyncio
 
     assert asyncio.run(take()) == [0, 1, 4, 9]
+
+
+def test_a_cancelled_async_read_leaves_its_item_to_the_next_read():
+    import asyncio
+
+    path = os.path.join(tempfile.mkdtemp(), "go")
+
+    async def take():
+        s = after_file.remote(path, 3)
+        read = asyncio.ensure_future(s.__anext__())
+        await asyncio.sleep(0.3)  # waiting: the generator yields nothing until the file exists
+        read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read
+        open(path, "w").close()
+        await asyncio.sleep(1.0)  # the items arrive with no read waiting
+        return [x async for x in s]
+
+    assert asyncio.run(take()) == [0, 1, 2]
 
 
 def test_a_worker_killed_mid_stream_replays_without_duplicates():

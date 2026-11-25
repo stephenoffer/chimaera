@@ -9,12 +9,14 @@ mod local;
 mod log_store;
 mod network;
 mod recover;
+mod snapshot_file;
 mod state_machine;
+mod wal;
 
-pub use log_store::{DiskWriter, LogStore};
+pub use log_store::{DiskReport, DiskStats, DiskWriter, LogStore, MAX_COMMIT_DELAY, SLOW_COMMIT};
 pub use network::{NetworkFactory, NoTransport, RpcFuture, RpcKind, Transport, handle_rpc, handle_snapshot};
 pub use recover::force_single_voter;
-pub use state_machine::{GroupEvents, GroupRead, StateMachine};
+pub use state_machine::{GroupEvents, GroupRead, StateMachine, mark_state_machine_clean};
 
 use chimaera_core::kv::KvRead;
 use chimaera_core::pb;
@@ -69,6 +71,29 @@ pub fn raft_config() -> Arc<Config> {
         ..Default::default()
     };
     Arc::new(cfg.validate().expect("static raft config is valid"))
+}
+
+/// This boot of the machine (Linux boot id; macOS boot time), to tell a
+/// process restart, which keeps the page cache, from a machine restart.
+pub(crate) fn boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let mut len = std::mem::size_of::<libc::timeval>();
+        // SAFETY: kern.boottime fills a timeval of the given length.
+        let rc = unsafe {
+            libc::sysctlbyname(c"kern.boottime".as_ptr(), (&raw mut tv).cast(), &mut len, std::ptr::null_mut(), 0)
+        };
+        (rc == 0).then(|| format!("{}.{}", tv.tv_sec, tv.tv_usec))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 /// How hard a commit pushes data to stable storage.
@@ -142,16 +167,55 @@ impl RaftHost {
     ) -> io::Result<(RaftHost, tokio::sync::mpsc::Receiver<GroupEvents>)> {
         std::fs::create_dir_all(dir.join("snapshots"))?;
         let (log_path, sm_path) = (dir.join("raft-log.redb"), dir.join("raft-sm.redb"));
+        // A peer that syncs its log keeps its state machine's file unsynced:
+        // syncing it cost ~600 write IOs a checkpoint (redb's copy-on-write
+        // pages), most of a network volume's IOPS. After a machine restart
+        // without a clean stop it may be torn: it is rebuilt from the synced
+        // snapshot files, and the synced log replays the rest.
+        let unsynced_sm = durability != DiskDurability::Process;
+        let rebuild = unsynced_sm && !state_machine::sm_trusted(dir);
+        if rebuild {
+            tracing::warn!(
+                "{}: the machine restarted without a clean stop: rebuilding the raft state from snapshots and the log",
+                dir.display()
+            );
+            let _ = std::fs::remove_file(&sm_path);
+        }
         let mut log_db = open_db(&log_path, durability)?;
-        let mut sm_db = open_db(&sm_path, durability)?;
+        let mut sm_db = open_db(&sm_path, DiskDurability::Process)?;
         create_tables(&log_db, &sm_db)?;
+        if rebuild {
+            let groups = state_machine::rebuild_from_snapshots(&sm_db, &dir.join("snapshots"))?;
+            tracing::info!("raft state rebuilt: {groups} group(s) from snapshots");
+        }
+        if unsynced_sm {
+            state_machine::mark_sm(dir, false)?;
+        }
+        // A syncing peer writes its log through a wal (crate::wal): first what
+        // the last run left there goes into redb.
+        let wal = match durability {
+            DiskDurability::Process => None,
+            d => {
+                let (wal, replayed) =
+                    wal::Wal::recover(&log_db, &dir.join("raft-log.wal"), matches!(d, DiskDurability::Full))?;
+                if replayed > 0 {
+                    tracing::info!("raft log: {replayed} operations replayed from its write-ahead log");
+                }
+                Some(wal)
+            }
+        };
         // Purged logs and expired state leave free pages that redb reuses but
         // never gives back to the disk; return them at each start.
         compact(&mut log_db, &log_path);
         compact(&mut sm_db, &sm_path);
         state_machine::prune_snapshots(&sm_db, &dir.join("snapshots"), dir)?;
         let (log_db, sm_db) = (Arc::new(log_db), Arc::new(sm_db));
-        let writer = DiskWriter::start(log_db.clone())?;
+        // CHIMAERA_RAFT_MAX_COMMIT_DELAY_US: the most a batch is held open for company.
+        let max_hold = std::env::var("CHIMAERA_RAFT_MAX_COMMIT_DELAY_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map_or(MAX_COMMIT_DELAY, std::time::Duration::from_micros);
+        let writer = DiskWriter::start(log_db.clone(), max_hold, wal)?;
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
         let host = RaftHost {
             node_id,
@@ -174,6 +238,11 @@ impl RaftHost {
 
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// How the log's disk writer has been doing.
+    pub fn disk_stats(&self) -> Arc<DiskStats> {
+        self.writer.stats()
     }
 
     /// Start group `id`. With `bootstrap` set and no prior state, initialize it

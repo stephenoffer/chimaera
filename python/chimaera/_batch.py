@@ -12,7 +12,10 @@ first has waited ``max_wait``, calls the method once with their arguments in
 arrival order, and gives each call its element of the returned list. If the
 method raises, every call in the batch fails with that error (and retries on
 its own terms). The peer keeps up to two batches of calls in flight, so the
-next batch fills while one runs.
+next batch fills while one runs, and with ``max_bytes`` no more than that
+many bytes of their arguments at once, so a batch never holds more either.
+Every call taken into a batch gets its outcome sent, whatever happens to the
+others: each is what lets the peer send the next call.
 """
 
 from __future__ import annotations
@@ -34,15 +37,24 @@ from ._native import blake3_digest
 @dataclass(frozen=True)
 class Batch:
     """How to batch a method's calls: at most `max_size` per call of the
-    method, waiting at most `max_wait` (seconds, or "5ms") after the first."""
+    method, waiting at most `max_wait` (seconds, or "5ms") after the first.
+    `max_bytes` (an int, or "32MiB") bounds the arguments of the calls its
+    actor holds at once, the batch running and the next filling: a call that
+    would go past it waits at its peer (one larger than it goes alone)."""
 
     max_size: int = 32
     max_wait: float | str = 0.005
+    max_bytes: int | str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.max_size, bool) or not isinstance(self.max_size, int) or self.max_size < 1:
             raise ValueError(f"Batch(max_size=...) must be a positive int, got {self.max_size!r}")
         object.__setattr__(self, "max_wait", _units.parse_duration(self.max_wait, "Batch(max_wait=...)"))
+        if self.max_bytes is not None:
+            size = _units.parse_bytes(self.max_bytes, "Batch(max_bytes=...)")
+            if size < 1:
+                raise ValueError(f"Batch(max_bytes=...) must be positive, got {self.max_bytes!r}")
+            object.__setattr__(self, "max_bytes", size)
 
     @property
     def lane(self) -> int:
@@ -82,15 +94,16 @@ class Batcher:
 
         ex = self.ex
         entry = time.time_ns()
-        live: list[tuple[dict[str, Any], tuple[Any, ...], Any]] = []
-        values: list[Any] = []
+        unsent = {item[0]: (msg, item) for msg, item in calls}
 
         def finish(msg: dict[str, Any], item: tuple[Any, ...], result: Any = None, exc: BaseException | None = None) -> None:
             key, attempt = item[0], item[1]
+            if unsent.pop(key, None) is None:
+                return  # already sent
             retryable, fingerprint, state = False, b"", b""
             if exc is None:
                 try:
-                    outcome = ex.ok(key, attempt, result)
+                    outcome = ex.ok(key, attempt, result, bool(msg["policy"].get("durability")))
                     if msg.get("durable"):
                         state = _durable_state(ex.instance)
                 except BaseException as e:  # noqa: BLE001 - e.g. an unpicklable result: this call fails, not the batch
@@ -102,8 +115,28 @@ class Batcher:
                     frames = "|".join(f"{f.filename}:{f.lineno}" for f in traceback.extract_tb(exc.__traceback__))
                     fingerprint = blake3_digest(f"{outcome[2]}|{outcome[3]}|{frames}".encode())
             ex.running.pop(key, None)
-            ex.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
+            try:
+                ex.conn.send_done(key, attempt, outcome, retryable, fingerprint, entry, time.time_ns(), state)
+            except BaseException as e:  # noqa: BLE001 - this outcome would not go: send its error, go on
+                traceback.print_exc()
+                try:
+                    ex.conn.send_done(key, attempt, ex.err(e), False, b"", entry, time.time_ns(), b"")
+                except BaseException:  # noqa: BLE001 - the peer is gone: it fails or retries the calls itself
+                    traceback.print_exc()
 
+        try:
+            self._call(calls, finish)
+        finally:
+            # Whatever stopped the batch, every call it took gets an outcome.
+            stopped = RuntimeError(f"{self.method}: the batch stopped before this call's outcome was sent")
+            for msg, item in list(unsent.values()):
+                finish(msg, item, exc=stopped)
+
+    def _call(self, calls: list[tuple[dict[str, Any], tuple[Any, ...]]], finish: Any) -> None:
+        """Read the calls' arguments, call the method once, and finish each call."""
+        ex = self.ex
+        live: list[tuple[dict[str, Any], tuple[Any, ...], Any]] = []
+        values: list[Any] = []
         for msg, item in calls:
             key, attempt, args_ref, deps, item_index = item
             ctx = _context.TaskContext(

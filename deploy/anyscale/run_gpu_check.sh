@@ -19,4 +19,7 @@ export CHIMAERA_HOME=/tmp/chimaera-gpu-home
 status=0
 "$CHIMAERA_PYTHON" bench/evals/gpu_check.py "$OUT" | tee "$OUT/checks.jsonl" || status=$?
 "$CHIMAERA_BIN" --dir "$CHIMAERA_HOME" stop || true
+# The checks into the job's log as one file too: the lane that submitted the
+# job rebuilds it from its log (bench/qualification/build_manifest.py emit).
+"$CHIMAERA_PYTHON" bench/qualification/build_manifest.py emit "$OUT/checks.jsonl"
 exit "$status"

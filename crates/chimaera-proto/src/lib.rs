@@ -17,6 +17,12 @@ pub const WIRE_VERSION: u32 = 1;
 /// every peer onto the new release (docs/deploy.md, "Upgrading").
 pub const PEER_LEVEL: u32 = 1;
 
+/// Which build this is: `<release>-<schema digest>`, where the release is
+/// the id `make wheel` gives one wheel's peer binary and extension module
+/// (`dev` for other builds) and the digest covers every .proto compiled in.
+/// A wheel whose two halves disagree is refused before it is published.
+pub const BUILD_ID: &str = env!("CHIMAERA_BUILD_ID");
+
 #[allow(clippy::all, clippy::pedantic)]
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/chimaera.v1.rs"));
@@ -62,7 +68,7 @@ pub mod client {
     /// ca.pem, verifying the name every peer certificate carries) or a Unix socket path.
     pub async fn channel(address: &str, ca: Option<&str>) -> Result<Channel, String> {
         let Some(hostport) = address.strip_prefix("tcp://") else {
-            return crate::uds::connect(address.to_string()).await.map_err(|e| e.to_string());
+            return crate::uds::connect(address.to_string()).await.map_err(|e| with_causes(&e));
         };
         let scheme = if ca.is_some() { "https" } else { "http" };
         let mut ep = tonic::transport::Endpoint::from_shared(format!("{scheme}://{hostport}"))
@@ -75,7 +81,23 @@ pub mod client {
                 .domain_name("chimaera-peer");
             ep = ep.tls_config(tls).map_err(|e| e.to_string())?;
         }
-        ep.connect().await.map_err(|e| e.to_string())
+        ep.connect().await.map_err(|e| with_causes(&e))
+    }
+
+    /// `e` and the errors under it: tonic's own message is only "transport
+    /// error", and the cause (the OS error of a refused connect(), a TLS
+    /// failure) is what says what to do.
+    fn with_causes(e: &dyn std::error::Error) -> String {
+        let mut text = e.to_string();
+        let mut cause = e.source();
+        while let Some(c) = cause {
+            let more = c.to_string();
+            if !text.contains(&more) {
+                text = format!("{text}: {more}");
+            }
+            cause = c.source();
+        }
+        text
     }
 
     /// A client of the peer at `address` (as for [`channel`]) presenting `token`.
@@ -83,6 +105,16 @@ pub mod client {
         let auth = Auth::bearer(token)?;
         let ch = channel(address, ca).await?;
         Ok(crate::v1::peer_client::PeerClient::with_interceptor(ch, auth).max_decoding_message_size(256 << 20))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[tokio::test]
+        async fn a_failed_connect_names_its_os_error() {
+            let path = format!("/tmp/chimaera-no-peer-{}.sock", std::process::id());
+            let err = super::channel(&path, None).await.unwrap_err();
+            assert!(err.starts_with("transport error: ") && err.contains("(os error 2)"), "{err}");
+        }
     }
 }
 
@@ -143,6 +175,24 @@ pub mod uds {
         Ok(())
     }
 
+    /// Why this process may not make a pair of connected Unix sockets, if it
+    /// may not. tokio's I/O driver makes one (for signals) when a runtime is
+    /// built and panics without it, so the peer and the Python client check
+    /// first and report this, naming the call and the remedy, instead.
+    pub fn pair_refused() -> Option<std::io::Error> {
+        std::os::unix::net::UnixStream::pair().err().map(pair_error)
+    }
+
+    fn pair_error(e: std::io::Error) -> std::io::Error {
+        let remedy = match e.raw_os_error() {
+            Some(libc::EPERM | libc::EACCES) => {
+                ". A sandbox or seccomp profile refuses Unix sockets here: allow them for chimaera"
+            }
+            _ => "",
+        };
+        std::io::Error::new(e.kind(), format!("socketpair() of Unix sockets, which chimaera needs: {e}{remedy}"))
+    }
+
     pub async fn connect(path: impl Into<PathBuf>) -> Result<Channel, tonic::transport::Error> {
         let path = path.into();
         // The URI is ignored by the connector; it only has to parse.
@@ -172,6 +222,14 @@ pub mod uds {
             let r = prepare(&sock);
             std::fs::remove_dir_all(&dir).unwrap();
             r.unwrap();
+        }
+
+        #[test]
+        fn a_refused_socket_pair_names_the_call_and_the_remedy() {
+            assert!(pair_refused().is_none(), "socket pairs work here");
+            let msg = pair_error(std::io::Error::from_raw_os_error(libc::EPERM)).to_string();
+            assert!(msg.starts_with("socketpair() of Unix sockets, which chimaera needs: "), "{msg}");
+            assert!(msg.ends_with("allow them for chimaera"), "{msg}");
         }
 
         #[test]

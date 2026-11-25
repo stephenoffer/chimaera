@@ -46,6 +46,29 @@ pub trait Transport: Send + Sync + 'static {
     /// `file` streamed in pieces, never as one message. The reply is what
     /// [`handle_snapshot`] returns on the receiving peer.
     fn send_snapshot(&self, target: NodeId, addr: &str, group: u32, header: Vec<u8>, file: std::fs::File) -> RpcFuture;
+    /// A heartbeat (an append with no entries) to `target` ended after
+    /// `took`: how long the network, not the follower's disk, held it. One
+    /// that failed, or that openraft gave up on at its deadline, counts as at
+    /// least that deadline.
+    fn heartbeat(&self, _target: NodeId, _took: std::time::Duration) {}
+}
+
+/// Times a heartbeat however its call ends: answered, failed, or dropped by
+/// openraft at the deadline (its heartbeat worker wraps each call in a
+/// timeout), so the slowest heartbeats are not the ones left out.
+struct HeartbeatTimer {
+    transport: Arc<dyn Transport>,
+    target: NodeId,
+    sent: tokio::time::Instant,
+    deadline: std::time::Duration,
+    answered: bool,
+}
+
+impl Drop for HeartbeatTimer {
+    fn drop(&mut self) {
+        let took = self.sent.elapsed();
+        self.transport.heartbeat(self.target, if self.answered { took } else { took.max(self.deadline) });
+    }
 }
 
 pub struct NetworkFactory {
@@ -126,9 +149,19 @@ impl RaftNetworkV2<TypeConfig> for Network {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendResult<TypeConfig>, RPCError<TypeConfig>> {
+        let mut timer = rpc.entries.is_empty().then(|| HeartbeatTimer {
+            transport: self.transport.clone(),
+            target: self.target,
+            sent: tokio::time::Instant::now(),
+            deadline: option.hard_ttl(),
+            answered: false,
+        });
         let wire: AppendWire = self.rpc(RpcKind::Append, &rpc).await?;
+        if let Some(t) = &mut timer {
+            t.answered = true;
+        }
         Ok(wire.into())
     }
 
@@ -176,9 +209,19 @@ impl RaftNetworkV2<TypeConfig> for Network {
 }
 
 /// Install a snapshot that arrived as `header` plus the file at `path`. The
-/// reply is a postcard `Result<SnapshotResponse, String>`.
+/// reply is a postcard `Result<SnapshotResponse, String>`. A file that fails
+/// its checks (cut short, changed, or not the snapshot the header names) is
+/// refused here, before raft sees it: the sender tries again later, and this
+/// replica keeps the state it had.
 pub async fn handle_snapshot(group: &Group, header: &[u8], path: &std::path::Path) -> io::Result<Vec<u8>> {
     let (vote, meta): (VoteOf<TypeConfig>, SnapshotMetaOf<TypeConfig>) = dec(header)?;
+    let (id, file, m) = (group.id, path.to_path_buf(), meta.clone());
+    let checked =
+        tokio::task::spawn_blocking(move || crate::snapshot_file::verify(&file, id, &m)).await.map_err(io_err)?;
+    if let Err(e) = checked {
+        tracing::warn!(group = group.id, "refused a snapshot: {e}");
+        return enc(&Err::<SnapshotResponse<TypeConfig>, String>(e.to_string()));
+    }
     let snapshot = openraft::storage::Snapshot { meta, snapshot: std::fs::File::open(path)? };
     let r = group.raft.install_full_snapshot(vote, snapshot).await;
     enc(&r.map_err(|e| e.to_string()))
@@ -215,5 +258,64 @@ impl Transport for NoTransport {
         _file: std::fs::File,
     ) -> RpcFuture {
         Box::pin(async move { Err(io_err(format!("no transport to node {target} for group {group}"))) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Answers heartbeats after `delay`, or fails them, and keeps what was noted.
+    struct Scripted {
+        delay: Duration,
+        fail: bool,
+        noted: Mutex<Vec<Duration>>,
+    }
+
+    impl Transport for Scripted {
+        fn call(&self, _: NodeId, _: &str, _: u32, _: RpcKind, _: Vec<u8>) -> RpcFuture {
+            let (delay, fail) = (self.delay, self.fail);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                if fail {
+                    return Err(io_err("connection reset"));
+                }
+                enc(&Ok::<AppendWire, String>(AppendWire::Ok(None)))
+            })
+        }
+
+        fn send_snapshot(&self, _: NodeId, _: &str, _: u32, _: Vec<u8>, _: std::fs::File) -> RpcFuture {
+            unreachable!()
+        }
+
+        fn heartbeat(&self, _: NodeId, took: Duration) {
+            self.noted.lock().unwrap().push(took);
+        }
+    }
+
+    async fn heartbeat(delay: Duration, fail: bool, give_up: Duration) -> Vec<Duration> {
+        let t = Arc::new(Scripted { delay, fail, noted: Mutex::default() });
+        let mut net = Network { target: 2, addr: String::new(), group: 1, transport: t.clone() };
+        let rpc = AppendEntriesRequest {
+            vote: openraft::Vote::new(1, 1),
+            prev_log_id: None,
+            leader_commit: None,
+            entries: vec![],
+        };
+        let deadline = Duration::from_millis(300);
+        let _ = tokio::time::timeout(give_up, net.append_entries(rpc, RPCOption::new(deadline))).await;
+        t.noted.lock().unwrap().clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_is_timed_however_it_ends() {
+        let ms = Duration::from_millis;
+        assert_eq!(heartbeat(ms(5), false, ms(300)).await, [ms(5)], "answered");
+        // Failed fast, or dropped at the deadline as openraft's heartbeat
+        // worker does: a missed heartbeat, noted as at least the deadline.
+        assert_eq!(heartbeat(ms(1), true, ms(300)).await, [ms(300)], "failed");
+        assert_eq!(heartbeat(ms(900), false, ms(300)).await, [ms(300)], "given up");
     }
 }

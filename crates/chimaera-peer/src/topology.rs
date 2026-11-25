@@ -2,8 +2,14 @@
 //! nodes and GPUs. Inside a container or a Kubernetes pod this reports the
 //! allocation, not the host totals (a peer advertises only what it was granted).
 
+use chimaera_core::devices::SysFs;
 use chimaera_core::topology::{self as t, HostShape, NumaNode};
 use std::path::{Path, PathBuf};
+
+/// A directory holding another host's recorded `/proc/self/status` and
+/// `/sys/devices/system/{cpu,node}` files: its CPU layout replaces this
+/// host's (tests and qualification runs emulate a machine with it).
+pub const TOPOLOGY_ROOT_ENV: &str = "CHIMAERA_TOPOLOGY_ROOT";
 
 pub fn discover() -> HostShape {
     let mut shape = HostShape {
@@ -12,6 +18,9 @@ pub fn discover() -> HostShape {
         ..Default::default()
     };
     platform::fill(&mut shape);
+    if let Some(root) = std::env::var_os(TOPOLOGY_ROOT_ENV).filter(|r| !r.is_empty()) {
+        cpu_layout(&mut shape, &crate::devices::HostFs::new(Path::new(&root)));
+    }
     // Every accelerator kind (crate::devices); nvidia-smi above stays the
     // fallback where /proc/driver/nvidia is not visible.
     let found = crate::devices::shape_gpus();
@@ -30,6 +39,13 @@ pub fn discover() -> HostShape {
 
 fn read(path: impl AsRef<Path>) -> Option<String> {
     std::fs::read_to_string(path).ok()
+}
+
+/// The CPUs this process may run on, where each sits, and their NUMA nodes.
+fn cpu_layout(shape: &mut HostShape, fs: &dyn SysFs) {
+    shape.cpus = t::allowed_cpus(fs);
+    shape.cpu_topology = t::cpu_topology(fs, &shape.cpus);
+    shape.numa = t::numa_nodes(fs, &shape.cpus);
 }
 
 /// This process's cgroup v2 directory, if the unified hierarchy is mounted.
@@ -106,7 +122,6 @@ mod platform {
 
     pub fn fill(shape: &mut HostShape) {
         shape.kernel = read("/proc/sys/kernel/osrelease").unwrap_or_default().trim().to_string();
-        shape.cpus = affinity_cpus();
         let host_mem = read("/proc/meminfo").and_then(|m| t::parse_memtotal(&m)).unwrap_or(0);
         shape.memory_bytes = host_mem;
         // The tightest limit on the way up applies.
@@ -121,39 +136,8 @@ mod platform {
         if let Some(dir) = own_cgroup_dir() {
             shape.cgroup_delegated = can_delegate(&dir);
         }
-        shape.numa = numa_nodes(&shape.cpus);
+        cpu_layout(shape, &crate::devices::HostFs::new(Path::new("/")));
         shape.gpus = nvidia_gpus();
-    }
-
-    fn affinity_cpus() -> Vec<u32> {
-        // SAFETY: cpu_set_t is plain data; sched_getaffinity writes at most
-        // size_of::<cpu_set_t>() bytes into it.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-                return Vec::new();
-            }
-            (0..libc::CPU_SETSIZE as u32).filter(|&c| libc::CPU_ISSET(c as usize, &set)).collect()
-        }
-    }
-
-    fn numa_nodes(allowed: &[u32]) -> Vec<NumaNode> {
-        let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") else { return Vec::new() };
-        let mut nodes: Vec<NumaNode> = entries
-            .flatten()
-            .filter_map(|e| {
-                let id: u32 = e.file_name().to_str()?.strip_prefix("node")?.parse().ok()?;
-                let cpus: Vec<u32> = t::parse_cpulist(&read(e.path().join("cpulist"))?)
-                    .into_iter()
-                    .filter(|c| allowed.contains(c))
-                    .collect();
-                let memory_bytes = read(e.path().join("meminfo")).and_then(|m| t::parse_memtotal(&m)).unwrap_or(0);
-                Some(NumaNode { id, cpus, memory_bytes })
-            })
-            .filter(|n| !n.cpus.is_empty())
-            .collect();
-        nodes.sort_by_key(|n| n.id);
-        nodes
     }
 
     /// Delegation means we may create child groups and move processes there.
@@ -208,8 +192,20 @@ mod platform {
 
     pub fn fill(shape: &mut HostShape) {
         shape.memory_bytes = sysctl_u64("hw.memsize").unwrap_or(0);
-        let n = sysctl_u64("hw.logicalcpu").unwrap_or(1) as u32;
+        let n = sysctl_u64("hw.logicalcpu").unwrap_or(1).max(1) as u32;
         shape.cpus = (0..n).collect();
+        // A Mac sets no CPU affinity, so only the counts matter: siblings are
+        // taken as adjacent ids, and each package shares one last-level cache
+        // (its L3, or Apple silicon's system-level cache).
+        let physical = sysctl_u64("hw.physicalcpu").map_or(n, |p| (p as u32).clamp(1, n));
+        let per_package = n / sysctl_u64("hw.packages").map_or(1, |p| (p as u32).clamp(1, physical));
+        let smt = n / physical;
+        shape.cpu_topology = (0..n)
+            .map(|id| {
+                let socket = id / per_package;
+                t::LogicalCpu { id, socket, core: id - id % smt, llc: Some(socket * per_package) }
+            })
+            .collect();
         let out = std::process::Command::new("uname").arg("-r").output();
         shape.kernel = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
     }
@@ -233,6 +229,9 @@ mod tests {
         assert!(s.memory_bytes > 64 << 20, "memory {}", s.memory_bytes);
         assert!(!s.numa.is_empty());
         assert!(s.numa.iter().all(|n| !n.cpus.is_empty()));
+        assert!(s.cpu_topology.is_empty() || s.cpu_topology.iter().map(|c| c.id).eq(s.cpus.iter().copied()));
+        let (cores, sockets, _) = s.cores_sockets_llcs();
+        assert!(cores >= 1 && cores <= s.cpus.len() && sockets >= 1);
         assert!(s.usable_cores() > 0.0);
         println!("{s:#?}");
     }

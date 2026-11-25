@@ -59,6 +59,22 @@ class TaskContext:
         """True once the caller cancelled this call; check it to stop early."""
         return self._cancelled.is_set()
 
+    def describe_policy(self) -> str:
+        """Each option this call runs with and where it was set, in the words
+        ``fn.policy().describe()`` used where the call was made. Only a call
+        made with ``explain=True`` carries them."""
+        from ._errors import OptionsError
+        from ._options import describe
+
+        said = self.policy.get("explained")
+        if not said:
+            raise OptionsError(
+                "describe_policy(): this call was made without explain=True, so it carries no record of where its "
+                "options were set; make it with .options(explain=True), on its decorator or in a "
+                "`with ch.defaults(explain=True):` block"
+            )
+        return describe(said)
+
     @property
     def run_id(self) -> str:
         return self.run.hex()

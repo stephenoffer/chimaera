@@ -96,6 +96,329 @@ machines had not been tested. Both have changed since: lost results of function
 and map calls are rebuilt by running them again, and the Ray comparisons below
 ran on up to 64 separate machines.
 
+## How a comparison is recorded (from 2026-11-23)
+
+The Ray comparison rounds below predate this: one run per workload and
+runtime, in a fixed order, with medians and no raw samples. From 2026-11-23
+the harnesses (`bench/evals/multi_node.py` on clusters, `local_cluster.py` on
+one machine, `run_evals.py` on one node) write a manifest beside their numbers
+(`bench/evals/manifest.py`):
+
+- the code: a digest of the source files, plus the commit and a digest of the
+  uncommitted diff where git is present. Cluster jobs upload the tree without
+  `.git`; `python bench/evals/manifest.py` prints a checkout's digest to match.
+- the peer binary's `--version`, its cargo profile and that profile's settings,
+  rustc and RUSTFLAGS.
+- each runtime's version and its drivers' Python.
+- the machines (host, CPUs and platform of each) and the data groups.
+- the durability class the peers report in `chimaera status --json`: the
+  guarantee asked for, the weakest any group gives and each peer's raft sync.
+  It is read once every peer gives what it asks for, or after 30 s: a peer
+  reports a group as `process` until it learns the group's voters.
+
+A report is refused when its manifest lacks the version of a runtime it
+measured or the durability class of a Chimaera row. Every row keeps each timed
+sample. A cell is the median over all of them with a bootstrap 95% interval
+that resamples the runs, then the samples within each. Both runtimes stay up,
+and each trial runs every workload once per runtime, the workloads and which
+runtime goes first in a random order from a recorded seed (`EVAL_SEED` and
+`EVAL_TRIALS` on clusters, `--seed` and `--rounds` on one machine).
+
+What one unit of each throughput row is, and how Chimaera commits it:
+
+| Row | One unit | Path |
+|---|---|---|
+| `tasks` | a no-op call, made in one burst with the rest, its result read | the client coalesces calls into submissions of up to 4,096 |
+| `tasks_serial` | a no-op call made alone, its result read before the next | one submission per call: the per-call path, kept as a control. One call is in flight at a time, so the rate is the round trip, not throughput with coalescing off |
+| `map_small` | one int doubled: in a 4M-item map (Chimaera), in 200k items run one task each (Ray, naive) or in 4M items run 1,000 per task (Ray, batched by hand) | Chimaera chunks the map's items into calls |
+| `actors` | one method call on one of max(8, CPUs / 2) actors | straight to the actor's executor when it shares the driver's peer, the shard recording it after the reply; otherwise through the peer |
+| `actors_peer` | as `actors`, Chimaera only | `CHIMAERA_DIRECT=0`: every call through the peer and its shard, kept as a control |
+
+The report's last column counts the raft entries the peers' groups applied
+per unit (per run for timed rows), read from every peer's status before and
+after each run, and the share of actor calls that went direct. On three local
+peers (debug build, `EVAL_SCALE=0.01`, local) `tasks` took 0.033 raft entries
+per call and `tasks_serial` 4.0. The shuffle has two pairs: `shuffle`, each
+runtime's idiomatic program with the map run inside the split (Ray's by hand,
+Chimaera's `reduce_by_key` on a map nothing has read), and `shuffle_unfused`,
+stage for stage, with the map's outputs stored first and read by separate
+split calls. Both stop the clock with every partition in the driver, check
+the output after it, and record a digest of the output for every run: in the
+local run Ray and Chimaera gave the same digest for both.
+
+The cluster `node_loss` row now also records `recovered_s` (kill to last
+result, both runtimes) and `detected_s` (kill to the head peer's first
+suspicion of the victim, Chimaera).
+
+### Node loss, repeated (local)
+
+`bench/evals/node_loss.py` starts a fresh cluster of four peers for each
+experiment and SIGKILLs one peer other than the driver's: the one leading the
+most shard groups (`leader`) or the fewest (`follower`). It kills when every
+call has been made, when a call has started on the victim, or when half the
+calls have started, under half-second tasks, durable actors and a 16-map
+`reduce_by_key`. Every call attempt leaves a marker naming its call, its peer
+and its start time. Times are seconds after the kill: when the driver's peer
+first suspected the victim, when it retired it, when each call that had
+started on the victim started again elsewhere, when the first of their results
+reached the driver, and when the last result did.
+
+2026-11-23, laptop shared with other heavy work, debug build, 3 seeds x 2
+roles x 3 workloads x 3 kill points, 54 experiments. A `leader` victim led 3
+to 5 of the 5 groups in 22 of its 27 experiments, 1 in one, and none in 4
+(leadership had not spread from the driver's peer within 30 s); a `follower`
+led none. Pooled over workloads and kill points, p50 [p90, max], as the
+harness's report prints it (the report also gives p50 [min, max] for each
+workload, victim and kill point):
+
+| Victim | Detected | Retired | Lost calls started again | First of their results | Last result |
+|---|---:|---:|---:|---:|---:|
+| `leader` | 0.15 [0.28, 0.35] | 1.25 [1.52, 1.55] | 3.42 [4.09, 4.68], 35 calls | 3.60 [4.15, 4.59] | 4.02 [5.18, 6.05] |
+| `follower` | 0.17 [0.34, 0.64] | 1.39 [1.50, 1.55] | 1.51 [2.02, 2.60], 32 calls | 1.91 [2.22, 2.72] | 2.10 [3.90, 4.21] |
+
+Every result reached its driver exactly once in all 54. Restarting a leader's
+calls took about 2 s longer than a follower's. Detection is fast here because
+a killed peer's port refuses connections at once on loopback; a machine that
+vanishes from a real network is noticed only through missed probes, so these
+detection times are a lower bound. Repeating this across machines is
+unverified. In an earlier run of the same matrix, one durable actor call of 54
+experiments failed with `InfrastructureFailure` ("commit refused:
+VersionConflict state version moved") after the actor's peer, which led 5
+groups, was killed while the call ran. The 54 above did not reproduce it, and
+it is open.
+
+## Lanes, baselines and the release manifest (from 2026-11-24)
+
+The gates run in lanes. The quick lane (`.github/workflows/check.yml`, on
+every push to main and every pull request) is `make check` on Linux and
+macOS, and `make regress` on Linux: three local release peers run eight
+workloads (`bench/evals/regress.py`) at a pinned size, seed and number of
+rounds. The run fails when any run failed its own output check, an output
+digest differs from the baseline's, the pins or the build profile differ, or a
+median is worse than the baseline's by more than its tolerance (30%, or the
+baseline's own p10 to p90 spread, up to 90%). Timings compare only on one
+kind of machine, so each machine keeps its own baseline in
+`bench/evals/baselines`, written by `make regress-record`. None is recorded
+yet; the check workflow's `record_baseline` input records one for its runner.
+The slower lanes (`.github/workflows/integration.yml`, nightly) run
+`make linux-check linux-pytest` in the dev image, each launcher gate in
+Docker and the fleet emulator's gates (`chimaera-fleet --weak-scaling`, which
+exits 1 when one fails), and, by hand, the GPU check and the 4-node
+comparison as Anyscale jobs. Neither workflow has run on GitHub yet.
+
+Each lane has a mutation proof that it fails for the reason it should:
+
+- `test_regress.py::test_a_corrupted_result_fails_the_quick_lane` runs the
+  lane on a copy of the package whose decoder returns an int value one too
+  high. Every round of `tasks` fails its output check and the lane exits 1,
+  while the unmodified copy records a baseline that its own run passes
+  (local, debug peer). Without the lane, `local_cluster.py` exits 0 on the
+  same mutant and only its report's cells show the errors.
+- `make kind-mutant-test` gives kind-test an image whose `chimaera k8s render`
+  mounts the peers' volume at /srv/data instead of /data, which the render's
+  unit tests do not check. On 2026-11-24 (local, colima VM) kind-test passed
+  on the base image and failed on the mutant, its pods never Ready, so the
+  proof passed. Both ran inside the VM, because its port forwarding did not
+  reach kind's API server from macOS that day.
+
+A release's qualification manifest (`make qualification
+QUALIFICATION_KEY=<ssh key>`, `bench/qualification/build_manifest.py`) lists
+each claim of speed, scale and fault tolerance the README makes, each row of
+its status table and each measured section of this record, as
+`bench/qualification/claims.toml` lists them: the claim's tier, its raw
+artifacts with their sha256, the command that replays it, and why it is
+pending when it is not traced. The manifest also names the lanes that passed
+on the release's source, the gates here that are unverified or failing, and
+the limits tested (a limit whose claim is not traced says why). The build is
+refused, and `test_qualification_manifest.py` fails, when a README claim or a
+measured section here has no entry, a quoted figure changed, or an artifact's
+digest changed.
+
+Each CI job records its lane with `build_manifest.py lane` (the command, its
+outcome, the source digest, a link to the Actions run, and the log) and
+uploads the record as an artifact named `lane-*`. Before a release, collect
+each run's records with `gh run download <run-id> -p 'lane-*' -D
+dist/qualification/lanes/<run-id>`. A lane traces its claims only when its
+latest record on the release's own source passed: the same source digest
+and, since that digest leaves out the tests, `deploy/` and CI, the same
+commit with nothing uncommitted on either side. So build the manifest in a
+clean checkout of the commit the lanes ran on. The Anyscale jobs print their
+raw results (`multi_results.json`, `multi_cost.json` and `multi_report.md`,
+or the GPU check's `checks.jsonl`) into the job's log with `build_manifest.py
+emit`, and the hardware lane rebuilds them from its log as files of its
+record (never as a lane record) and fails when one it expects (`lane
+--expect`) is not there. So a cloud round's results reach the manifest
+without anyone copying them out of the cloud's storage. `make qualification
+QUALIFICATION_KEY=<key> RELEASE=<tag>` signs the manifest with `ssh-keygen -Y
+sign` and uploads it, its signature and `qualification.tar.gz` (the manifest
+and every lane record, log and rebuilt file) to that GitHub release. A reader
+unpacks the tarball in a checkout of the tag and runs `build_manifest.py
+verify --signers <allowed_signers>`, which checks the signature, re-hashes
+every artifact the manifest names, and fails on one that changed or is
+missing (unless `--allow-missing`).
+
+Today only the container memory traps are traced to raw artifacts kept in the
+repository. The earlier cloud rounds' raw results stayed in the jobs' storage,
+so their entries stay pending. A section published from a hardware lane's
+round keeps that lane's rebuilt files in `bench/evals/results` and lists them
+as its artifacts. No release key has been chosen yet.
+
+### Cost per workload
+
+From the next cluster round, `multi_node.py` records each machine's instance
+type and region (EC2 instance metadata) and writes `multi_cost.json` beside
+its report. For each workload and runtime it gives the instance-hours (the
+wall time of its runs times the machines held), the dollars, allocated
+core-hours and GPU-hours at the prices in `bench/evals/prices.json` (AWS
+on-demand list prices, dated, carried in the result), and the useful
+completions at one SLO for both runtimes. A repetition counts only within its
+workload's bound in `bench/evals/cost.py`, set about 5x worse than the slower
+runtime's 64-node median, and a failed run counts its hours and nothing else.
+`python bench/evals/cost.py multi_results.json` recomputes it from the raw
+results, with `--instances c7i.4xlarge=64` for a run that did not record its
+machines. No round has been priced yet, because the rounds below did not keep
+their raw results.
+
+## Shuffle phases (local, 2026-11-24)
+
+`bench/evals/shuffle_phases.py` runs the 3.2M-pair shuffle of the cluster
+rounds (64 maps of 50,000 `(key, 1)` pairs into 64 partitions, the map run
+inside the scatters) on three release peers on one laptop, with
+`chimaera._shuffle_phases` recording each scatter's, the manifest call's and
+each gather's own steps. Seconds add up over the calls, which run side by
+side on the machine's 12 cores; the per-call median is beside them. Bytes
+are the encoded buckets and partitions. Network is what the peers sent each
+other for the shuffle, from their own counters
+(`chimaera_mesh_sent_bytes_total{class="shuffle"}`), and spill what their
+stores moved out of memory (`chimaera_spilled_bytes_total`, with the time it
+took). The uniform keys are the benchmark's; the skewed ones are drawn from a
+Zipf distribution (exponent 1.2) over the same 100,003 keys. Each is the
+median of 3 runs after a warm-up, and every run's output matched the digest
+of the same pairs counted serially. Neither run spilled. The seconds are
+wall time, each call's own clock, not CPU time: the script records the
+calls' CPU time too since this run (see the next section).
+
+| Phase | Uniform: s | Per call | MiB | Zipf: s | Per call | MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| plan (driver) | 0.004 | | | 0.004 | | |
+| map | 0.215 | 0.003 | | 0.650 | 0.009 | |
+| split | 0.278 | 0.003 | | 0.594 | 0.004 | |
+| scatter encode | 0.145 | 0.001 | 17.6 | 0.079 | 0.000 | 3.7 |
+| fetch | 0.826 | 0.001 | | 0.172 | 0.000 | |
+| read | 0.839 | 0.007 | 17.6 | 0.416 | 0.002 | 3.7 |
+| reduce | 0.743 | 0.006 | | 0.194 | 0.001 | |
+| gather encode | 0.016 | 0.000 | 0.7 | 0.013 | 0.000 | 0.7 |
+| final (driver) | 0.088 | | | 0.076 | | |
+| network (peers) | | | 20.4 | | | 1.3 |
+| spill (peers) | 0.000 | | 0 | 0.000 | | 0 |
+| whole shuffle | 0.665 | | | 0.529 | | |
+
+The uniform run's stages, in ms after the driver's start (median run;
+first, median and last call):
+
+| Boundary | First | Median | Last |
+|---|---:|---:|---:|
+| driver submitted the shuffle | 4.4 | | |
+| scatter start | 3.5 | 84.5 | 245.4 |
+| scatter split done | 9.3 | 101.0 | 250.7 |
+| manifest start | 147.9 | | |
+| manifest saw every scatter | 259.8 | | |
+| manifest returned | 259.9 | | |
+| gather start | 272.9 | 409.5 | 540.9 |
+| gather fetched | 333.4 | 414.6 | 541.3 |
+| gather merged | 342.9 | 438.2 | 573.6 |
+| driver saw every partition done | 576.8 | | |
+| driver held every partition | 664.6 | | |
+
+The scatters take 240 ms to all start: 64 calls on 12 cores, in about five
+waves. The manifest returns 9 ms after the last split, and the first gather
+starts 13 ms after that. The gathers spread over 270 ms for the same reason
+as the scatters, and the driver holds every partition 88 ms after the last
+one is done. The skewed run is faster because its scatters fold the repeated
+keys before anything is stored, which leaves 3.7 MiB of buckets against 17.6.
+Its largest partition held 1,548 keys and the uniform one's 1,563. A recorded
+scatter or gather encodes its result twice, once to time it, and every
+recorded call writes one report, so a recorded run is slower than an
+unrecorded one. The same phases on separate machines are still to do, in a
+cloud round.
+
+## Shuffle phases, larger than memory and spilling (Linux container, 2026-11-24)
+
+Two runs of the same script in the dev image (`deploy/dev/Dockerfile`), each
+in a container held to 1 GiB (`docker run --memory 1g --memory-swap 1g`, 4
+CPUs), with two peers of one core each. The peer and `chimaera._native` were
+built there in the dev profile (opt-level 1) without debug info: the release
+profile's single-unit LTO link was killed for memory in the shared Docker VM.
+It's slower than a release build, so read the shares, not the seconds. Each
+artifact's manifest records the container's limit, its `memory.peak` (which
+counts the page cache of the objects written, so it sits at the limit), its
+OOM kills, the size of `/dev/shm` and each peer's memory pool. Both outputs
+matched the digest of the same pairs counted serially, which the driver takes
+a partition at a time and never holds whole, and neither container had an OOM
+kill.
+
+Larger than memory: 2,400 maps of 200,000 `(key, 1)` pairs, 480M in all, into
+256 partitions over 4,000,037 keys. The scatters stored 3.16 GiB of buckets,
+3.2 times the container's memory. The container's `/dev/shm` is the default
+64 MiB, so the stores kept every object on disk and spilled nothing.
+
+Spilling: 300 maps of the same pairs, 0.40 GiB of buckets, with a 2.5 GiB
+`/dev/shm` (`--shm-size 2560m`), so the stores keep objects in memory, and
+each peer's pool set to 320 MiB (`CHIMAERA_MEMORY_POOL`). The stores moved
+211 MiB of objects to disk, in 0.42 s.
+
+| Phase | Larger: s | CPU s | GiB | Spilling: s | CPU s | GiB |
+|---|---:|---:|---:|---:|---:|---:|
+| plan (driver) | 0.1 | | | 0.04 | | |
+| map | 72.3 | 60.0 | | 8.5 | 7.2 | |
+| split | 103.7 | 94.6 | | 12.1 | 11.3 | |
+| scatter encode | 24.2 | 22.3 | 3.16 | 2.7 | 2.5 | 0.40 |
+| fetch | 8.1 | 6.9 | | 0.6 | 0.5 | |
+| read | 1,845.9 | 691.1 | 3.16 | 30.6 | 17.7 | 0.40 |
+| reduce | 164.2 | 152.4 | | 12.8 | 12.4 | |
+| gather encode | 1.0 | 0.9 | 0.03 | 0.1 | 0.1 | 0.02 |
+| final (driver) | 4.6 | | | 3.0 | | |
+| network (peers) | | | 0 | | | 0 |
+| spill (peers) | 0.0 | | 0 | 0.42 | | 0.21 |
+| whole shuffle | 1,220.7 | | | 47.5 | | |
+
+Seconds add up over the calls; CPU seconds are the CPU the calls' threads
+spent. In the larger run the scatters ran from 0.02 s to 154.7 s, the
+manifest returned at 154.8 s, the gathers ran from 154.8 s to 1,204.1 s, and
+the driver held every partition at 1,208.7 s. Reading the buckets is most of
+the gathers' time, and most of the reading is waiting: each gather reads 2,400
+buckets from disk, and the container's page cache holds less than a third
+of what was stored. The peers also paused admission for memory pressure
+through the run: with the page cache of the objects they wrote, the
+container's memory stayed near its limit. With two peers, every stored object is copied to the other peer in
+the background (the default durability), so each gather found its buckets in
+its own store and the shuffle sent nothing between the peers; those copies are
+the peers' checkpoint traffic, which these counters leave out. No gather grew
+its process's private memory: each reused memory its executor had freed.
+
+The larger run's size with objects in `/dev/shm` (the spilling run's settings)
+did not pass: it was OOM-killed after 16 minutes, with the container's shared
+memory sampled near 500 MiB and its anonymous memory near 600 MiB. That case
+is open.
+
+## The partition count on a cluster (to run)
+
+Without `partitions=`, `reduce_by_key` makes one partition per input up to
+the cores of all the live peers, not only the script's, and more when inputs
+already stored would not fit a reducer's memory (docs/guides/data.md). The
+check on real hosts is still to do: start 64 peers, then on the smallest
+host, a 2-core one with `CHIMAERA_HOME` naming its peer, run
+
+    .venv/bin/python bench/evals/shuffle_phases.py --join --nodes 64 \
+        --metrics <each peer's CHIMAERA_METRICS_LISTEN, comma-separated> \
+        --maps 4096 --partitions 0 --memory 2GiB --rounds 3 --name cluster-partitions
+
+The script fails unless `reduce_by_key` chose as many partitions as the
+cluster has cores, and a gather that grows past `--memory` fails the run.
+The report gives the most any gather grew. On one machine, `--nodes 3
+--cpus 4 --driver-cpus 1 --partitions 0 --memory 64MiB --maps 16` runs the
+same check with a one-core peer for the script: 9 partitions over 9 cores.
+
 ## Ray comparison (cluster, single node)
 
 One Anyscale node, c7i.16xlarge (64 vCPU, 124 GiB, Linux 6.8 x86_64), Ray
@@ -195,6 +518,95 @@ test_an_unsynced_peer_whose_machine_rebooted_rejoins_as_a_new_member`, which
 also caught a starting peer being declared dead while its core was not yet
 answering pings, and a dead identity kept alive by a new one answering at its
 address).
+
+Since 2026-11-23 cluster peers sync every commit unless `CHIMAERA_RAFT_SYNC=none` is set, slow volumes included (commits are held open up to 2 ms to batch them), so throughput numbers measured after that change are not comparable with earlier ones, including the hosting and nested-tree numbers in `docs/ray-gotchas.md` and `bench/evals/nested_tree.py`.
+
+Holding commits open on a slow disk (laptop; the ignored test
+`measure_group_commit_hold_on_a_slow_disk` in `chimaera-raft`: 16 writers in a
+closed loop, every commit synced, each setting run at least twice). On the SSD
+alone (2026-11-24) the test writes as a syncing peer does: each batch synced
+in the raft log's write-ahead file, then put in redb unsynced. The slow disks
+(2026-11-23) are the SSD with a sleep added to every sync. Those rows run
+without the write-ahead file, every commit a synced redb transaction, because
+the test cannot slow the write-ahead file's sync; the writer holds and times
+commits the same way on both paths. A real network volume has not been
+measured yet. To measure one, run the test with `TMPDIR` set to a directory
+on the volume and `MEASURE_SYNC_US=0`, which takes the write-ahead path.
+
+| Disk | Hold | Operations/s | p99 wait | Operations per commit |
+|---|---|---:|---:|---:|
+| SSD, write-ahead file | none | 127,600–154,800 | 0.22–0.47 ms | 8.3–8.5 |
+| SSD, write-ahead file | up to 2 ms (never held) | 108,500–166,700 | 0.18–0.83 ms | 8.2–8.4 |
+| SSD, +3.5 ms per sync, synced redb | none | 1,412–1,491 | 18.4–23.3 ms | 8.0 |
+| SSD, +3.5 ms per sync, synced redb | up to 2 ms (held 1.4 ms) | 2,110–2,318 | 11.1–21.8 ms | 15.9 |
+| SSD, +5 ms per sync, synced redb | none | 1,088–1,134 | 23.5–23.8 ms | 8.0–8.1 |
+| SSD, +5 ms per sync, synced redb | up to 2 ms (held 1.9 ms) | 1,662–1,722 | 14.1–18.7 ms | 15.9 |
+
+On the SSD alone, commits take 41–61 µs at p50, so the writer never holds a
+batch and the setting changes nothing; the spread over four runs each is
+other work on the laptop (load average 90–160). Holding helps only when
+operations arrive together: a writer whose operations come one at a time has
+nothing to wait for. The EBS run below committed 1.0 operations per commit,
+so holding could not recover the cost of its syncs.
+
+## Ray comparison (cluster, 2026-11-23): the fsync default, and an A/B on one build
+
+A snapshot of the shared tree at 10:14 MST on 2026-11-23, same machines and
+method as below (30 s windows in the A/B jobs). The tree carries a durability
+change: every peer now syncs each raft commit
+(`raft sync fsync (the default)` in the peers' logs), where the evening
+round's peers measured their EBS volume (fsync p50 3.4 ms) and kept commits
+in the page cache (`raft sync none`). Ray's control plane syncs nothing.
+Rounds ran on 1, 4, 16 (out of time during Ray's passes) and 64 nodes, with A/B
+jobs on 4 and 16.
+
+With the fsync default, Chimaera fell far behind its own evening numbers:
+tasks 13,588 → 1,033/s on one node and 12,096 → 2,768/s at 64; actor calls
+13,040 → 7,104/s (one node) and timed out at 64; nested 0.937 → 9.31 s at 64.
+
+The A/B runs each setting on the same build and cluster, Chimaera's default
+first changed by one variable (median of 30 s, seconds unless marked):
+
+| 4 nodes | `RAFT_SYNC=none` | default (fsync) | `OBJECT_REPLICAS=0` | `REPLICA_DELAY_MS=1000` | Ray |
+|---|---:|---:|---:|---:|---:|
+| Actor calls (/s) | 14,209 | 2,037 | 1,910 | 1,526 | 9,434 |
+| Nested tasks | 0.209 | 2.240 | 2.330 | 2.179 | 0.295 |
+| Broadcast | 0.035 | 0.107 | 0.095 | 0.096 | 0.024 |
+| 10 calls on a 256 MiB value just made | 0.258 | 0.295 | 0.335 | 0.374 | 0.223 |
+| Shuffle, 3.2M pairs | 0.173 | 0.299 | 0.296 | 0.293 | 0.153 |
+
+| 16 nodes | `RAFT_SYNC=none` | default (fsync) | `OBJECT_REPLICAS=0` | `REPLICA_DELAY_MS=1000` | Ray |
+|---|---:|---:|---:|---:|---:|
+| Nested tasks | 0.329 | 6.412 | 4.451 | 2.934 | 0.409 |
+| Broadcast | 0.117 | 0.331 | 0.423 | 0.349 | 0.106 |
+| 10 calls on a 256 MiB value just made | 0.239 | 0.371 | 0.289 | 0.320 | 0.237 |
+| Shuffle, 3.2M pairs | 0.171 | 0.290 | 0.294 | 0.293 | 0.145 |
+
+- Syncing every commit costs 3-20x on these workloads on EBS; replicas,
+  made at once or a second later, change little against that.
+- With commits unsynced, as Ray's control plane is, Chimaera leads on actor
+  calls and nested tasks at 4 and 16 nodes, is level on calls on a value
+  just made at 16, and trails on broadcast (10% at 16) and the shuffle
+  (13% at 4, 18% at 16: it was 2.8x and 3.4x the evening before).
+- The shuffle's gain is the placement change of this round: a leader placing
+  a call no longer copies every member's view (it cost a gather 1.8 ms and
+  the 64-peer leader 63 copies per call), and gathers start about 40 ms after
+  the last scatter instead of 120 (three local peers, per-call timeline).
+- On a local disk an emulated 3.4 ms sync costs tasks only 25% (5,849 against
+  7,856/s on one peer). On EBS the cost is IO count, not sync latency.
+  - Two one-node jobs ran tasks at:
+    - 13,486/s unsynced;
+    - 1,051–1,064/s synced on the EBS-backed `/tmp`;
+    - 13,440/s synced with the raft directory on tmpfs.
+  - Synced on EBS, the raft log's commits took p50 7.0 ms and p99 97 ms, at 1.0 operations each.
+  - The volume did 1.97 M writes in 653 s, about 3,000 per second: gp3's baseline IOPS cap.
+  - Each commit costs about 21 write IOs (12.4 GB in all, about 130 KB per commit), because redb rewrites B-tree and allocator pages per transaction. At 3,000 IOPS that is about 143 commits a second.
+  - A per-file count on one local peer (20,000 tasks) split the writes: the raft log did 269 syncs and 1,729 write calls, and the state machine's database did 11 syncs and 6,645 write calls (about 600 per checkpoint). Most of the IO is the state machine's.
+  - The fix, both halves (one node, the fsync default):
+    - the raft log goes through a synced write-ahead file;
+    - the state machine's database is left unsynced, and rebuilt from snapshots and the log after an unclean machine restart.
+  - Results: tasks 13,066/s (from 1,044; Ray 6,636), nested 0.12 s (Ray 0.151), actor calls 8,095/s (Ray 9,071). The volume did 1,770 writes/s during tasks, below its cap.
+  - The raft log's write-ahead file alone changed nothing on one node (1,044/s).
 
 ## Ray comparison (cluster, 1, 4, 16 and 64 nodes, 2026-11-22, evening)
 

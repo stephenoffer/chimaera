@@ -141,18 +141,44 @@ class _NumpyHook(importlib.abc.MetaPathFinder):
         return spec
 
 
-def claim(view: memoryview, run_dir: str, prefix: bytes = b"", blob: bytes | None = None) -> tuple[bytes, int] | None:
+def claim(
+    view: memoryview, run_dir: str, prefix: bytes = b"", blob: bytes | None = None, keep_local: bool = False
+) -> tuple[bytes, int] | None:
     """Store the arena allocation holding `view` as a blob of the run, by
     hard link: (blob id, offset of `view` in it), or None (not in the arena,
     or changed since stored; the caller copies it). `prefix` starts a random
     blob id (results use their run's prefix so they outlive the run's values);
-    `blob` names it instead."""
+    `blob` names it instead. `keep_local`: see mark_local."""
     if not _state["installed"]:
         return None
     if blob is None:
         blob = prefix + os.urandom(16 - len(prefix))
-    off = _native.arena_claim(view, os.path.join(run_dir, blob.hex()))
+    path = os.path.join(run_dir, blob.hex())
+    if keep_local:
+        mark_local(path)
+    off = _native.arena_claim(view, path)
     return None if off is None else (blob, off)
+
+
+# The peer's replicas::MARKER.
+LOCAL_MARKER = ".tmp-local"
+
+
+def mark_local(path: str) -> None:
+    """Have the peer make no background copy of the object about to appear at
+    `path`, whose durability class is not the default: an empty marker beside
+    it, which the peer's replicator takes away. A peer that copies nothing in
+    the background (``replicas`` 0 in its info) is not asked."""
+    from ._runtime import Runtime
+
+    if not Runtime.get().info.get("replicas"):
+        return
+    marker = path + LOCAL_MARKER
+    try:
+        os.close(os.open(marker, os.O_CREAT | os.O_WRONLY, 0o600))
+    except FileNotFoundError:  # the run's directory comes with its first object
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.close(os.open(marker, os.O_CREAT | os.O_WRONLY, 0o600))
 
 
 def prefetch(outcome: tuple[Any, ...], object_dir: str, localize: Callable[[bytes, bytes], None]) -> None:
@@ -161,18 +187,22 @@ def prefetch(outcome: tuple[Any, ...], object_dir: str, localize: Callable[[byte
     if outcome[0] != "ok":
         return
     _, inline, run, obj, _size, _oob = outcome
-    head = inline
-    if head is None:
-        path = _serde.object_path(object_dir, run, obj)
-        if not os.path.exists(path):
-            localize(run, obj)
-        with open(path, "rb") as f:
-            first = f.read(_serde.header_size(0))
-            n = int.from_bytes(first[8:12], "little")  # n_buffers, after magic and flags
-            head = first + f.read(_serde.header_size(n) - len(first))
-    for blob in _serde.external_blobs(head):
+    blobs = _serde.external_blobs(inline) if inline is not None else linked_blobs(object_dir, run, obj, localize)
+    for blob in blobs:
         if not os.path.exists(os.path.join(_serde.run_dir(object_dir, run), blob.hex())):
             localize(run, blob)
+
+
+def linked_blobs(object_dir: str, run: bytes, obj: bytes, localize: Callable[[bytes, bytes], None]) -> list[bytes]:
+    """The blobs a stored value links, from the header of its object file
+    (made local first)."""
+    path = _serde.object_path(object_dir, run, obj)
+    if not os.path.exists(path):
+        localize(run, obj)
+    with open(path, "rb") as f:
+        first = f.read(_serde.header_size(0))
+        n = int.from_bytes(first[8:12], "little")  # n_buffers, after magic and flags
+        return _serde.external_blobs(first + f.read(_serde.header_size(n) - len(first)))
 
 
 def stats() -> dict[str, int]:

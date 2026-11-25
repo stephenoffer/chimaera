@@ -449,6 +449,7 @@ dependencies = [
 name = "chimaera-raft"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "chimaera-core",
  "chimaera-proto",
  "futures-util",

@@ -87,12 +87,16 @@ class ObjectRefGenerator:
         return self
 
     async def __anext__(self) -> ItemRef:
-        import asyncio
-
-        try:
-            return await asyncio.to_thread(self.__next__)
-        except StopIteration:
-            raise StopAsyncIteration from None
+        if self._done:
+            raise StopAsyncIteration
+        try:  # the stream's own async read: cancelled while it waits, it takes no item
+            return ItemRef(await self._results.__anext__())
+        except StopAsyncIteration:
+            self._done = True
+            raise
+        except Exception as e:  # Ray hands the error out as the next ref
+            self._done = True
+            return ItemRef(error=e)
 
     def completed(self) -> ItemRef:
         """A ref that resolves once the generator has finished."""

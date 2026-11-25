@@ -40,3 +40,5 @@ object-store-spill = ["dep:object_store", "dep:url"]
 
 [dev-dependencies]
 tempfile = "3"
+# Paused time: traffic.rs tests pacing over simulated seconds.
+tokio = { workspace = true, features = ["test-util"] }

@@ -14,16 +14,18 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Coroutine, Iterable, Iterator
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, ParamSpec, Protocol, TypeVar, Unpack, overload
 
-from . import _context, _direct, _serde, _values
+from . import _context, _direct, _leases, _serde, _values, _width, _workflow
 from ._errors import ActorDied, ChimaeraError, Infeasible, NotFound, OptionsError, SerializationError
 from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part, start_pending
 from ._native import blake3_digest, child_id, derive_id
-from ._options import Effective, Layer, Options, resolve, resolve_cached, signature_of, validate
+from ._options import U32_MAX, Effective, Layer, Options, resolve, resolve_cached, signature_of, validate
 from ._batch import Batch
+from ._mailbox import Mailbox, limits as _method_limits
 from ._pool import Pool
+from ._sources import map_source
 
 if TYPE_CHECKING:
     from ._gang import Gang, GangActor
@@ -34,6 +36,7 @@ from ._runtime import (
     CALL_MAP_ITEM,
     EFFECTS_CODE,
     STREAM_WINDOW,
+    STREAM_WINDOW_BYTES,
     Runtime,
 )
 from ._serde import Dep
@@ -104,6 +107,7 @@ def build_call(
     stream: bool = False,
     policy_extra: dict[str, Any] | None = None,
     reads: list[Any] | None = None,
+    shown: tuple[str, tuple[Any, ...], dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], bytes]:
     """Encode a call. Futures passed directly as arguments become dependency
     edges (the callee receives their values; nothing flows through here). A
@@ -151,7 +155,17 @@ def build_call(
             return PartDep(dep(x.key), x._index, x._count)
         if isinstance(x, Future):
             if x._put is not None:
-                _run, object_id, inline, size = x._put
+                run, object_id, inline, size, files = x._put[:5]
+                ctx = _context.current_task()
+                if files and run != (ctx.run if ctx is not None else rt.run):
+                    # Another run's value, held here (see _leases): the call
+                    # reads that run's files, held until its outcome (for an
+                    # actor, which may keep it, for this session).
+                    if reads is None or kind in (CALL_ACTOR_CTOR, CALL_ACTOR_METHOD):
+                        _leases.keep(x)
+                    else:
+                        reads.append(x)
+                    return _leases.Value(x._put)
                 for path in x._owned or ():
                     # Files it links (Linux arena arrays) are inputs too, even
                     # when the handle itself is inline: placed by and fetched
@@ -195,6 +209,9 @@ def build_call(
             packed["blobs"].append((object_id, size))
     ctx = _context.current_task()
     effects = eff.get("effects")
+    durability = eff.get("durability")
+    if durability not in (None, "default"):
+        _check_durability(eff, durability, kind, durable, stream)
     retry = eff.get("retry_exceptions") or ()
     spec = {
         "key": key,
@@ -219,11 +236,11 @@ def build_call(
     if stream:
         spec["stream"] = True
     if ctx is not None and ctx.workflow and not durable:
-        # What this step asks for: a replay asking for something else diverged.
-        blobs = b"".join(object_id for object_id, _ in packed["blobs"])
-        digest = spec["fn_digest"] if isinstance(spec["fn_digest"], bytes) else b""
-        spec["command_fingerprint"] = blake3_digest(
-            digest + b"\0" + method.encode() + b"\0" + (packed.get("args_inline") or b"") + blobs
+        # What this step asks for, and how to show it: a replay asking for
+        # something else diverged (`shown`: the call a ch.durable helper makes).
+        shown = shown or (spec["policy"]["fn_name"], args, kwargs)
+        spec["command_fingerprint"], spec["workflow_step"] = _workflow.step(
+            ctx._children, (target, method, frame), spec, packed, site, shown
         )
     if durable:
         # A durable actor's command: its id (default: this call) and what it
@@ -233,6 +250,19 @@ def build_call(
         blobs = b"".join(object_id for object_id, _ in packed["blobs"])
         spec["command_fingerprint"] = blake3_digest(method.encode() + b"\0" + (packed.get("args_inline") or b"") + blobs)
     return spec, key
+
+
+def _check_durability(eff: Effective, durability: str, kind: int, durable: bool, stream: bool) -> None:
+    """A durability class the call cannot have fails at submission."""
+    where = f"durability={durability!r} ({eff.sources.get('durability', '')})"
+    if durable:
+        raise OptionsError(f"{where}: a durable actor's replies are kept with its committed state")
+    if stream:
+        raise OptionsError(f"{where}: a generator's items are stored as they come, like any other object")
+    if durability == "replayable" and kind not in (CALL_FUNCTION, CALL_MAP_ITEM):
+        raise OptionsError(f"{where}: a lost result is made again by running its call, and an actor's are not")
+    if durability == "replayable" and eff.get("effects") == "external":
+        raise OptionsError(f"{where}: a lost result is made again by running its call; effects='external' runs once")
 
 
 def _unsendable(
@@ -362,7 +392,10 @@ class RemoteFunction(Generic[P, R]):
 
     def partial(self, *args: Any, **kwargs: Any) -> RemoteFunction[..., R]:
         """Bind constants once; they ship with the code, not with every call."""
-        return RemoteFunction(functools.partial(self._fn, *args, **kwargs), self._decorator, self._view)  # type: ignore[arg-type]
+        fn = functools.partial(self._fn, *args, **kwargs)
+        if getattr(self._fn, "__chimaera_workflow__", False):
+            fn.__chimaera_workflow__ = True  # type: ignore[attr-defined]  # still a durable workflow
+        return RemoteFunction(fn, self._decorator, self._view)  # type: ignore[arg-type]
 
     def policy(self) -> Effective:
         """Effective options and where each value came from."""
@@ -394,12 +427,18 @@ class RemoteFunction(Generic[P, R]):
 
             return call_within(eff.get("within"), self._fn, args, kwargs)
         if self._streams:
-            fut = submit_call(rt, self._fn, args, kwargs, kind=CALL_FUNCTION, eff=eff, site=_site(), stream=True)
-            return Stream(fut, int(eff.get("max_in_flight") or STREAM_WINDOW))
+            # The worker holds the generator to the byte window this Stream credits.
+            window_bytes = int(eff.get("max_in_flight_bytes") or STREAM_WINDOW_BYTES)
+            extra = {"max_in_flight_bytes": window_bytes}
+            fut = submit_call(
+                rt, self._fn, args, kwargs, kind=CALL_FUNCTION, eff=eff, site=_site(), stream=True, policy_extra=extra
+            )
+            return Stream(fut, int(eff.get("max_in_flight") or STREAM_WINDOW), window_bytes)
         return submit_call(rt, self._fn, args, kwargs, kind=CALL_FUNCTION, eff=eff, site=_site())
 
-    def map(self, *sources: Iterable[Any], ordered: bool = True) -> Results[R]:
-        """Apply to every item (several sources zip like builtin ``map``)."""
+    def map(self, *sources: Iterable[Any] | AsyncIterable[Any], ordered: bool = True) -> Results[R]:
+        """Apply to every item (several sources zip like builtin ``map``; an
+        async iterable among them makes a map read with ``async for``)."""
         if not sources:
             raise TypeError("map() needs at least one source")
         rt = Runtime.get()
@@ -408,16 +447,18 @@ class RemoteFunction(Generic[P, R]):
         # byte bound keeps large items few.
         window = eff.get("max_in_flight") or max(256, int(32 * rt.info["usable_cores"]))
         window_bytes = eff.get("max_in_flight_bytes") or (256 << 20)
-        source = iter(sources[0]) if len(sources) == 1 else zip(*sources)
+        source = map_source(sources)
         single = len(sources) == 1
+        ctx = _context.current_task()
+        site = _site() if ctx is not None and ctx.workflow else None  # a durable workflow's steps name their line
 
         def submit(i: int, item: Any) -> Future[R]:
             args = (item,) if single else tuple(item)
             if eff.get("cache"):  # each item is looked up and stored on its own
                 from . import _cache
 
-                return _cache.submit(rt, self, args, {}, eff, kind=CALL_MAP_ITEM, item_index=i)
-            return submit_call(rt, self._fn, args, {}, kind=CALL_MAP_ITEM, eff=eff, item_index=i)
+                return _cache.submit(rt, self, args, {}, eff, kind=CALL_MAP_ITEM, item_index=i, site=site)
+            return submit_call(rt, self._fn, args, {}, kind=CALL_MAP_ITEM, eff=eff, item_index=i, site=site)
 
         # Fast items go several to a call (what hand batching does), each
         # keeping its own value and error. Calls that may not be replayed as a
@@ -438,7 +479,9 @@ class RemoteFunction(Generic[P, R]):
 
         def submit_chunk(i: int, items: list[Any]) -> Future[Any]:
             extra = {"profile_digest": inner, "items": len(items)}
-            return submit_call(rt, runner, (items,), {}, kind=CALL_MAP_ITEM, eff=eff, item_index=i, policy_extra=extra)
+            return submit_call(
+                rt, runner, (items,), {}, kind=CALL_MAP_ITEM, eff=eff, item_index=i, policy_extra=extra, site=site
+            )
 
         return Results(
             submit,
@@ -448,6 +491,7 @@ class RemoteFunction(Generic[P, R]):
             window_bytes=window_bytes,
             chunk=submit_chunk if chunkable else None,
             parallel=int(rt.info["usable_cores"]),
+            at_once=_width.function_calls(rt, eff),
             grow_window=eff.get("max_in_flight") is None,
             # reduce_by_key may run the function in its scatter (Results.claim).
             origin=None if rt.in_executor else (self._fn, eff, single),
@@ -547,7 +591,14 @@ class ActorClass(Generic[C]):
         return GangActor(self, args, kwargs)
 
 
-def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Actor[Any]:
+def _create_actor(
+    rt: Runtime,
+    cls: type[Any],
+    eff: Effective,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    policy_extra: dict[str, Any] | None = None,
+) -> Actor[Any]:
     name = eff.get("name")
     tenant = rt.tenant
     ctx = _context.current_task()
@@ -557,18 +608,29 @@ def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, 
     # The peer checks the id is derived: from tenant and name, or from the run and this nonce.
     nonce = b"" if name else os.urandom(16)
     actor = _keyed_actor_id(tenant, name) if name else child_id(run, [b"actor", nonce])
-    lanes = sum(_lane_limits(cls).values())
-    if lanes:
+    limits = _lane_limits(cls)
+    concurrency = eff.get("concurrency")
+    if limits:
         # Concurrency groups and per-method lanes run beside the default lane,
-        # so the peer may send that many more calls at once.
-        own = eff.get("concurrency")
-        own = own if isinstance(own, int) else 1
-        eff = Effective({**eff.values, "concurrency": own + lanes}, {**eff.sources, "concurrency": "concurrency groups"})
+        # so the peer may send that many more calls at once. Only the peer's
+        # policy carries the total: the handle, its methods and the call's
+        # explanation keep the options as they were set.
+        own = concurrency if isinstance(concurrency, int) else 1
+        concurrency = own + sum(limits.values())
+        if concurrency > U32_MAX:  # the policy carries it as an unsigned 32-bit count
+            lanes = ", ".join(f"{k.removeprefix('method:')}={n}" for k, n in limits.items())
+            raise OptionsError(
+                f"concurrency={own} ({eff.sources.get('concurrency', 'default')}) plus the concurrency groups and "
+                f"@ch.method lanes beside it ({lanes}) is {concurrency}, more than {U32_MAX}, the most there is"
+            )
+        policy_extra = {**(policy_extra or {}), "concurrency": concurrency}
     durable = eff.get("state") is not None
-    if durable and eff.get("concurrency") not in (None, 1):
+    if durable and concurrency not in (None, 1):
         raise OptionsError("a durable actor (state=ch.durable.State()) runs one call at a time; drop `concurrency`")
     ctor_key = run + child_id(run, [actor, b"ctor"])
-    spec, _ = build_call(rt, cls, args, kwargs, kind=CALL_ACTOR_CTOR, eff=eff, actor=actor, key=ctor_key)
+    spec, _ = build_call(
+        rt, cls, args, kwargs, kind=CALL_ACTOR_CTOR, eff=eff, actor=actor, key=ctor_key, policy_extra=policy_extra
+    )
     seq = rt.client.create_actor(
         actor,
         spec,
@@ -580,13 +642,19 @@ def _create_actor(rt: Runtime, cls: type[Any], eff: Effective, args: tuple[Any, 
         bool(eff.get("detach")),
         durable,
         nonce,
+        state_schema=eff.get("state").version if durable else 0,
+        methods=_method_limits(cls),
     )
     ev = rt.wait_actor(seq)
     if ev[0] == "error":
         msg = ev[2]
         raise Infeasible(msg) if msg.startswith("infeasible") else ChimaeraError(msg)
-    rt.client.watch([ctor_key])
-    return Actor(rt, actor, ctor_key, cls, eff)
+    # ("actor", seq, status, state, generation, constructor key, durable): a
+    # named actor that exists already was built by its record's constructor,
+    # not this one (which was never submitted), and is durable if its record is.
+    if ev[5] == ctor_key:
+        rt.client.watch([ctor_key])
+    return Actor(rt, actor, ev[5], cls, eff, durable=ev[6])
 
 
 # Attributes of an Actor handle itself; an actor method with one of these names is unreachable.
@@ -636,9 +704,9 @@ def actor(name: str) -> Actor[Any]:
     rec = rt.client.get_actor(actor_id)
     if rec is None or rec[0] == "Dead":
         raise NotFound(f"no live actor named {name!r}")
-    _state, ctor, class_digest = rec
+    _state, ctor, class_digest, durable = rec
     eff = resolve((), Layer({}, f"ch.actor({name!r})", "decorator"))
-    return Actor(rt, actor_id, ctor, _load_class(rt, class_digest), eff, class_digest)
+    return Actor(rt, actor_id, ctor, _load_class(rt, class_digest), eff, class_digest, durable=durable)
 
 
 def _load_class(rt: Runtime, digest: bytes) -> type[Any] | None:
@@ -656,7 +724,15 @@ class Actor(Generic[C]):
     """A handle to a remote actor. Calls through one handle run in submission order."""
 
     def __init__(
-        self, rt: Runtime, actor: bytes, ctor_key: bytes, cls: type[C] | None, eff: Effective, digest: bytes = b""
+        self,
+        rt: Runtime,
+        actor: bytes,
+        ctor_key: bytes,
+        cls: type[C] | None,
+        eff: Effective,
+        digest: bytes = b"",
+        *,
+        durable: bool = False,
     ) -> None:
         self._rt = rt
         self._actor = actor
@@ -664,6 +740,9 @@ class Actor(Generic[C]):
         self._cls = cls  # None for an actor found by key: methods are called by name
         self._digest = digest
         self._eff = eff
+        # Its record's: a durable actor's calls carry their command ids,
+        # whichever class or lookup this handle came from.
+        self._durable = durable
         self._handle = int.from_bytes(os.urandom(8), "little") >> 1
         self._seq = itertools.count()
         # The key of this handle's last call: each call names it (`prev`), so a
@@ -730,7 +809,7 @@ class Actor(Generic[C]):
             raise error
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (_rebuild_actor, (self._actor, self._ctor, self._cls, self._digest))
+        return (_rebuild_actor, (self._actor, self._ctor, self._cls, self._digest, self._durable))
 
 
 # CH121: actors of one class made at one call site that ended after at most
@@ -767,9 +846,11 @@ def _actor_ended(key: tuple[str, str], calls: list[int], made: float) -> None:
         )
 
 
-def _rebuild_actor(actor: bytes, ctor: bytes, cls: type[Any] | None, digest: bytes = b"") -> Actor[Any]:
+def _rebuild_actor(
+    actor: bytes, ctor: bytes, cls: type[Any] | None, digest: bytes = b"", durable: bool = False
+) -> Actor[Any]:
     rt = Runtime.get()
-    return Actor(rt, actor, ctor, cls, resolve((), Layer({}, "handle", "decorator")), digest)
+    return Actor(rt, actor, ctor, cls, resolve((), Layer({}, "handle", "decorator")), digest, durable=durable)
 
 
 class RemoteMethod(Generic[P, R]):
@@ -796,12 +877,14 @@ class RemoteMethod(Generic[P, R]):
         layer = validate(opts, kind="view", target="function", source=source)
         return RemoteMethod(self._actor, self._name, self._fn, (layer, *self._view))
 
-    def _policy(self) -> Effective:
-        """The actor's settings, then the method's ``@ch.method``, then scopes and views."""
+    def policy(self) -> Effective:
+        """Effective options and where each value came from: this view's
+        ``.options``, then the method's ``@ch.method``, the actor's options,
+        then ``with ch.defaults`` blocks."""
         a = self._actor
         declared = {k: v for k, v in (getattr(self._fn, "__chimaera_method__", None) or {}).items() if k != "group"}
         layers = self._view + ((Layer(declared, f"@ch.method on {self._name}", "view"),) if declared else ())
-        eff = resolve_cached(self, layers, Layer(a._eff.values, "actor", "decorator"))
+        eff = resolve_cached(self, layers, Layer(a._eff.values, "actor", "decorator", sources=a._eff.sources))
         if eff.get("cache"):
             raise OptionsError(
                 f"cache= is for functions: an actor method's result depends on its actor's state ({eff.sources['cache']})"
@@ -821,19 +904,19 @@ class RemoteMethod(Generic[P, R]):
             args,
             kwargs,
             kind=CALL_ACTOR_METHOD,
-            eff=self._policy(),
+            eff=self.policy(),
             actor=a._actor,
             handle=a._handle,
             ordered=a,
             method=self._name,
             extra_deps=(a._ctor,),
             site=_site(),
-            durable=a._eff.get("state") is not None,
+            durable=a._durable,
         )
 
-    def map(self, source: Iterable[Any], *, ordered: bool = True) -> Results[Any]:
+    def map(self, source: Iterable[Any] | AsyncIterable[Any], *, ordered: bool = True) -> Results[Any]:
         a = self._actor
-        eff = self._policy()
+        eff = self.policy()
         window = eff.get("max_in_flight") or 64
 
         def submit(i: int, item: Any) -> Future[Any]:
@@ -853,7 +936,9 @@ class RemoteMethod(Generic[P, R]):
                 item_index=i,
             )
 
-        return Results(submit, iter(source), ordered=ordered, window=window)
+        # Until a result's size is known, one item per call of this method the actor runs at once.
+        parallel = _width.lane(a._cls, self._fn, a._eff)
+        return Results(submit, map_source((source,)), ordered=ordered, window=window, parallel=parallel)
 
 
 class _Decorator(Protocol):
@@ -893,6 +978,8 @@ def _decorator_layer(obj: Any, options: dict[str, Any], target: str, name: str) 
 
 def _wrap(obj: Any, options: dict[str, Any]) -> Any:
     name = getattr(obj, "__qualname__", repr(obj))
+    if ("version" in options or "compatible" in options) and options.get("workflow") != "durable":
+        raise TypeError(f"version= and compatible= apply to durable workflows (workflow='durable'), not to {name}")
     if inspect.isclass(obj):
         layer = _decorator_layer(obj, options, "actor", name)
         shadowed = sorted(n for n in _HANDLE_NAMES if callable(getattr(obj, n, None)))
@@ -910,27 +997,38 @@ def _wrap(obj: Any, options: dict[str, Any]) -> Any:
                 raise TypeError(f"{name}.{attr} uses group {group!r}, but @ch.remote(groups=...) declares {known}")
         if groups:
             obj.__chimaera_groups__ = dict(groups)  # read by the executor to size each lane
+        if "state" in layer.values:
+            obj.__chimaera_state__ = layer.values["state"]  # read by the executor: its version and migration
         return ActorClass(obj, layer)
     if "groups" in options:
         raise TypeError(f"groups= applies to actor classes, not to {name}")
     if callable(obj):
-        if options.get("workflow") == "durable":
+        durable = options.get("workflow") == "durable"
+        if durable:
             if not inspect.iscoroutinefunction(obj):
                 raise TypeError(f"workflow='durable' needs an async def function; {name} is not")
-            # Read by the executor; replays need retries beyond the usual three.
+            options = {"max_attempts": 100, **options}  # replays need retries beyond the usual three
+        layer = _decorator_layer(obj, options, "function", name)
+        if durable:
+            # Read by the executor, and pickled with the function: a replay
+            # knows the version its history was written by.
             obj.__chimaera_workflow__ = True
-            options = {"max_attempts": 100, **options}
-        return RemoteFunction(obj, _decorator_layer(obj, options, "function", name))
+            obj.__chimaera_workflow_version__ = (layer.values.get("version", 1), layer.values.get("compatible", ()))
+        return RemoteFunction(obj, layer)
     raise TypeError(f"@ch.remote applies to functions and classes, not {type(obj).__name__}")
 
 
-def method(*, group: str | None = None, batch: Batch | None = None, **options: Any) -> Callable[[Callable[P, R]], Callable[P, R]]:
+def method(
+    *, group: str | None = None, batch: Batch | None = None, mailbox: Mailbox | None = None, **options: Any
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
     """Per-method settings on an actor class.
 
     ``group="io"`` runs the method in that concurrency group (declared with
     ``@ch.remote(groups={"io": 8})``), beside the actor's other calls.
     ``concurrency=N`` gives the method its own lane of N overlapping calls.
     ``batch=ch.Batch(...)`` calls it once per list of calls (see ``ch.Batch``).
+    ``mailbox=ch.Mailbox(max_calls=N, ...)`` bounds the method's calls at the
+    actor, turning away or holding back the rest (see ``ch.Mailbox``).
     Other options (``returns``, ``max_attempts``, ``deadline``...) apply to
     every call of the method. Calls start in the order they were made.
     """
@@ -943,6 +1041,10 @@ def method(*, group: str | None = None, batch: Batch | None = None, **options: A
         raise TypeError(f"@ch.method(batch=...) takes ch.Batch(max_size=, max_wait=), got {batch!r}")
     if batch is not None and (group is not None or "concurrency" in layer.values):
         raise TypeError("@ch.method(batch=...) runs in its own lane, sized by the batch: drop group= and concurrency=")
+    if mailbox is not None and not isinstance(mailbox, Mailbox):
+        raise TypeError(f"@ch.method(mailbox=...) takes ch.Mailbox(max_calls=, on_full=), got {mailbox!r}")
+    if mailbox is not None and batch is not None:
+        raise TypeError("@ch.method(batch=...) bounds its own queue (two batches, max_bytes): drop mailbox=")
 
     def deco(fn: Callable[P, R]) -> Callable[P, R]:
         settings = dict(layer.values)
@@ -950,6 +1052,8 @@ def method(*, group: str | None = None, batch: Batch | None = None, **options: A
             settings["group"] = group
         if batch is not None:
             settings["batch"] = batch
+        if mailbox is not None:
+            settings["mailbox"] = mailbox
         fn.__chimaera_method__ = settings  # type: ignore[attr-defined]
         return fn
 

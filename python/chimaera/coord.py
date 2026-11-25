@@ -6,16 +6,18 @@
 - ``Store``: replicated keys with compare-and-set, counters, leases (locks), barriers and watches.
 """
 
-from ._coord import Claim, Queue, Subscription, Topic, WorkQueue
+from ._coord import Claim, Gap, Queue, Subscription, Topic, WorkQueue
 from ._errors import Closed, LeaseLost, VersionConflict
-from ._store import Lease, Store, Watch
+from ._store import Lease, Scan, Store, Watch
 
 __all__ = [
     "Claim",
     "Closed",
+    "Gap",
     "Lease",
     "LeaseLost",
     "Queue",
+    "Scan",
     "Store",
     "Subscription",
     "Topic",

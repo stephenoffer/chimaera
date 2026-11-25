@@ -178,6 +178,57 @@ declare and decoration fails with a `TypeError` listing the declared groups.
 
 </details>
 
+## Bound a busy method's calls
+
+A flood of calls to one method can fill the actor and hold up the rest.
+`@ch.method(mailbox=ch.Mailbox(max_calls=N))` lets the actor hold at most N of
+that method's calls at once and turns the others away, so a health check stays
+quick under load.
+
+```python run
+@ch.remote(groups={"admin": 1})
+class Renderer:
+    @ch.method(concurrency=2, mailbox=ch.Mailbox(max_calls=4, on_full="reject"))
+    def render(self, seconds: float) -> str:
+        time.sleep(seconds)
+        return "rendered"
+
+    @ch.method(group="admin")
+    def health(self) -> str:
+        return "ok"
+
+renderer = Renderer.remote()
+renderer.health.remote().result()                       # the actor is up
+flood = [renderer.render.remote(0.2) for _ in range(50)]
+assert renderer.health.remote().result(timeout=5) == "ok"    # not stuck behind the flood
+turned_away = [f for f in flood if isinstance(f.exception(), ch.errors.Overloaded)]
+assert len(turned_away) >= 40                            # it held at most 4 at a time
+```
+
+<details>
+<summary>Waiting for room, and what counts</summary>
+
+`max_calls` counts the method's calls the actor's process holds: running, or
+waiting there for a thread. Those calls don't count against the actor's
+`concurrency`, so its other methods keep their room.
+
+A call past the limit waits at its peer for one of them to finish, for up to
+`max_wait` (default 30 s, or a string such as `"2s"`), then raises
+`ch.errors.Overloaded`. With `on_full="reject"` it raises at once. An actor
+with groups or `concurrency` promises no order, so there a waiting call
+doesn't hold back the calls made after it through the same handle. An actor
+that runs one call at a time keeps each handle's calls in order, so there it
+does. Its calls from different handles take turns by how long they've been
+ready to run, and a waiting call counts as ready only once it has room. So a
+call from another handle, such as a health check through `ch.actor(name)`,
+waits behind at most `max_calls` of the method's calls, however many more of
+them are waiting.
+
+`mailbox=` can't be combined with `batch=`, which bounds its own queue (see
+`max_bytes` below).
+
+</details>
+
 ## Set options for a method or one call
 
 Put options on the class, on a method (`@ch.method(...)`), or on one view of
@@ -205,7 +256,7 @@ assert isinstance(late.exception(), ch.DeadlineExceeded) and late.cancelled()
 | Where | Applies to | Options you'd set there |
 |---|---|---|
 | `@ch.remote(...)` on the class, or `Class.options(...)` | the actor and all its calls | `cpus`, `memory`, `gpus`, `concurrency`, `name`, `detach`, `restart`, `max_restarts`; `groups` and `state` on the decorator only |
-| `@ch.method(...)` | every call of that method | `group`, `concurrency`, `batch`, `returns`, `deadline`, `max_attempts`, `retry_exceptions` |
+| `@ch.method(...)` | every call of that method | `group`, `concurrency`, `batch`, `mailbox`, `returns`, `deadline`, `max_attempts`, `retry_exceptions` |
 | `handle.method.options(...)` | calls through that view | `deadline`, `returns`, `max_attempts`, `priority`, a stricter `effects`, `command_id` |
 
 <details>
@@ -523,6 +574,10 @@ returned list.
 - A batched method gets a separate lane, so it can run while other methods do.
   The peer keeps at most two batches going, so the next fills while one runs.
   `async def` works too.
+- `max_bytes=` (an int, or a string such as `"32MiB"`) also bounds the
+  argument bytes of the calls the actor holds, the batch running and the one
+  filling, so mixed small and large calls never pile up past it. A call that
+  would go over waits at its peer; one larger than `max_bytes` goes alone.
 - `batch=` goes in `@ch.method(...)` (on `@ch.remote` it raises
   `ch.OptionsError`) and can't be combined with `group=` or `concurrency=`.
 
@@ -566,7 +621,7 @@ assert acct.deposit.remote(0).result() == 7       # resumed from the last commit
 ```
 
 <details>
-<summary>Commits and the 1 MiB cap</summary>
+<summary>Commits and the 128 MiB cap</summary>
 
 - After each method returns, the instance's attributes (or what `__getstate__`
   returns) are pickled and committed before the reply goes out. A call that
@@ -576,14 +631,71 @@ assert acct.deposit.remote(0).result() == 7       # resumed from the last commit
   arguments raises `ch.errors.CommandConflict`. Without one, the call's own id
   is used, so a call cut off by a crash is retried on the restarted instance
   without being applied twice. Command ids are kept for 7 days.
-- Pickled state is capped at 1 MiB. Growing it past that fails the call with
-  `ch.errors.RemoteError` ("durable state exceeds the 1 MiB inline limit") and
-  leaves the committed state as it was. Keep large data elsewhere and store
-  its key.
+- Pickled state up to 1 MiB is committed whole. Larger state is cut into
+  chunks by content, and a commit writes only the chunks that changed, then
+  swaps in the new list in one step: a crash part way through leaves the
+  previous commit whole. State is capped at 128 MiB. Growing it past that
+  fails the call with `ch.errors.RemoteError` ("durable state of N MiB exceeds
+  the 128 MiB limit") and leaves the committed state as it was. Keep larger
+  data elsewhere and store its key.
 - A durable actor runs calls one by one, so setting `concurrency` raises
   `ch.OptionsError`.
 - It restarts after a crash whatever `restart=` says, up to `max_restarts`
   (default 3).
+
+</details>
+
+### Change a durable actor's class
+
+State outlives the code that wrote it. Give the new class
+`ch.durable.State(version=2, migrate=fn)` and create the named actor with it:
+the actor keeps its state and its stored replies, and from then on runs the
+new class, rebuilt from the last commit through `migrate(state, version)`.
+
+```python run
+@ch.remote(state=ch.durable.State())
+class Profile:
+    def __init__(self):
+        self.name = ""
+
+    def rename(self, name: str) -> str:
+        self.name = name
+        return name
+
+def split_name(state: dict, version: int) -> dict:
+    first, _, last = state["name"].partition(" ")      # version 1 kept one string
+    return {"first": first, "last": last}
+
+@ch.remote(state=ch.durable.State(version=2, migrate=split_name))
+class ProfileV2:
+    def rename(self, name: str) -> str:
+        self.first, _, self.last = name.partition(" ")
+        return name
+
+    def last_name(self) -> str:
+        return self.last
+
+old = Profile.options(name="docs/profile").remote()
+assert old.rename.options(command_id="r-1").remote("Ada Lovelace").result() == "Ada Lovelace"
+new = ProfileV2.options(name="docs/profile").remote()     # same name, newer version
+assert new.last_name.remote().result() == "Lovelace"
+retried = new.rename.options(command_id="r-1").remote("Ada Lovelace")
+assert retried.result() == "Ada Lovelace"                 # answered from r-1's stored reply
+```
+
+<details>
+<summary>Versions and migrations</summary>
+
+- Each commit stores its class's `version` (default 1). Creating the named
+  actor with a class of a higher version binds the actor to that class; one
+  of an equal or lower version gets the actor as it is, so old code still
+  running elsewhere can't undo an upgrade.
+- `migrate(state, version)` gets what the older class's `__getstate__`
+  returned and the version that wrote it, and returns what the new class's
+  `__setstate__` (or its attributes) takes. Without `migrate` the state is
+  used as is.
+- If `migrate` raises, the actor's calls raise that error and the committed
+  state stays as it was, ready for a fixed class of a still higher version.
 
 </details>
 

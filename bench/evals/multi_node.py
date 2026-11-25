@@ -6,17 +6,31 @@ Chimaera wheel and starts a peer, all peers founding one cluster. The driver
 then runs each workload against Chimaera (through the head node's peer) and
 against Ray (through the node's Ray cluster), each in a fresh process.
 
+Runs are paired: both runtimes stay up, and each trial runs every workload
+once per runtime, the workloads and which runtime goes first in a seeded
+random order (EVAL_SEED, else a random seed; the manifest records it).
+EVAL_TRIALS repeats the trial (the promotion gate asks for 7, with a smaller
+EVAL_MIN_SECONDS to fit the job). node_loss runs last, once per runtime.
+multi_results.json holds the run's manifest (bench/evals/manifest.py) and
+every run's raw samples; multi_report.md the medians and their intervals.
+
     python bench/evals/multi_node.py --dist /tmp/chimaera-dist --out results/
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
+import hashlib
 import json
 import os
+import random
 import subprocess
 import sys
 import time
+
+import cost
+import manifest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 7100
@@ -29,14 +43,42 @@ def n(x: int) -> int:
     return max(1, int(x * SCALE))
 
 # Each workload is run by `multi_node.py --workload NAME --runtime ray|chimaera`.
-WORKLOADS = ["tasks", "cpu_scaling", "map_small", "broadcast", "naive_big_arg", "follow_input", "actors", "nested", "shuffle", "node_loss"]
+WORKLOADS = [
+    "tasks", "tasks_serial", "cpu_scaling", "map_small", "broadcast", "naive_big_arg", "follow_input", "actors",
+    "actors_peer", "nested", "shuffle", "shuffle_unfused", "node_loss",
+]
+# The exact unit of work behind each row's number, its sizes at EVAL_SCALE 1
+# (the reports state the scale they ran at).
+UNITS = {
+    "tasks": "calls/s: one call of a no-op function, made in one burst with the others, its result read",
+    "tasks_serial": "calls/s with one call in flight: one call of a no-op function made alone, its result read "
+    "before the next call",
+    "cpu_scaling": "busy CPU-seconds / (CPUs x wall seconds) for 4 x CPUs calls of 0.5 s of CPU",
+    "map_small": "items/s: one int doubled (Chimaera: a 4M-item map; Ray naive: 200k items, one task each; "
+    "Ray hand_batched: 4M items, 1,000 per task)",
+    "broadcast": "seconds: 2 x CPUs calls each reading one 512 MiB put value",
+    "naive_big_arg": "seconds: 2 x CPUs calls each passed the same 32 MiB array",
+    "follow_input": "seconds: 10 calls on a 256 MiB value just made",
+    "actors": "calls/s: one method call (an increment) on max(8, CPUs / 2) actors, results read",
+    "actors_peer": "calls/s: as actors, with direct actor calls off (CHIMAERA_DIRECT=0)",
+    "nested": "seconds: 4 x CPUs calls each making and reading 8 child calls",
+    "shuffle": "seconds: 3.2M (key, 1) pairs summed into 64 partitions, all in the driver; "
+    "the map runs inside the split (Ray: by hand, Chimaera: Results.reduce_by_key)",
+    "shuffle_unfused": "seconds: as shuffle, with the map's outputs stored first and read by separate split calls",
+    "node_loss": "seconds: 4 x CPUs one-second calls all returned while one worker node's runtime is SIGKILLed",
+}
+# Regression controls for Chimaera alone, and the environment their child runs in.
+CHIMAERA_ONLY = {"actors_peer"}
+CONTROL_ENV = {"actors_peer": {"CHIMAERA_DIRECT": "0"}}
 
 
 # ---- launching Chimaera peers on every node (runs under Ray) -------------------
 
 
-def launch_peers(dist: str, peer_env: dict[str, str] | None = None) -> tuple[list[str], str]:
-    """Start one Chimaera peer per alive Ray node; return (addresses, head address).
+def launch_peers(dist: str, peer_env: dict[str, str] | None = None) -> tuple[list[str], str, list[str], int, dict]:
+    """Start one Chimaera peer per alive Ray node; return (addresses, head
+    address, each machine's description, data groups, the machines' instance
+    types and region, which bench/evals/cost.py prices).
 
     Each peer runs under a detached actor that stays alive with it: Ray reaps
     the child processes of a finished task's worker, so a peer started from a
@@ -55,6 +97,7 @@ def launch_peers(dist: str, peer_env: dict[str, str] | None = None) -> tuple[lis
     class PeerHost:
         def __init__(self, files: dict[str, bytes], seeds: str, groups: int, peer_env: dict[str, str]) -> None:
             import glob
+            import platform
             import socket
 
             here = "/tmp/chimaera-dist"
@@ -75,13 +118,36 @@ def launch_peers(dist: str, peer_env: dict[str, str] | None = None) -> tuple[lis
                  "--token-file", os.path.join(here, "token")],
                 stdout=log, stderr=log, start_new_session=True, env=env,
             )
-            self.desc = f"{ip} ({socket.gethostname()}, {cpus} cpus)"
+            self.bin = os.path.join(here, "chimaera")
+            self.desc = f"{ip} ({socket.gethostname()}, {cpus} cpus, {platform.platform()})"
 
         def describe(self) -> str:
             return self.desc
 
+        def instance(self) -> tuple[str, str]:
+            """This machine's EC2 instance type and region (IMDSv2), or ("", "") off EC2."""
+            import urllib.request
+
+            url = "http://169.254.169.254/latest/"
+            try:
+                ttl = {"X-aws-ec2-metadata-token-ttl-seconds": "60"}
+                token = urllib.request.urlopen(urllib.request.Request(url + "api/token", method="PUT", headers=ttl),
+                                               timeout=2).read().decode()
+                ask = [urllib.request.Request(url + f"meta-data/{k}", headers={"X-aws-ec2-metadata-token": token})
+                       for k in ("instance-type", "placement/region")]
+                kind, region = (urllib.request.urlopen(r, timeout=2).read().decode() for r in ask)
+                return kind, region
+            except OSError:
+                return "", ""
+
         def alive(self) -> bool:
             return self.proc.poll() is None
+
+        def status(self) -> dict:
+            """The peer's `chimaera status --json`, or {} when it does not answer."""
+            p = subprocess.run([self.bin, "--dir", PEER_DIR, "status", "--json"], capture_output=True, text=True,
+                               timeout=30, check=False)
+            return json.loads(p.stdout) if p.returncode == 0 else {}
 
         def log_tail(self) -> str:
             return open("/tmp/chimaera-peer.log", errors="replace").read()[-3000:]
@@ -129,9 +195,13 @@ def launch_peers(dist: str, peer_env: dict[str, str] | None = None) -> tuple[lis
         ).remote(files, seeds, groups, peer_env or {})
         for n in nodes
     ]
-    print("peers:", ray.get([h.describe.remote() for h in hosts]), flush=True)
+    machines = ray.get([h.describe.remote() for h in hosts])
+    print("peers:", machines, flush=True)
+    found = ray.get([h.instance.remote() for h in hosts])
+    priced = {"instances": dict(collections.Counter(t for t, _ in found if t)),
+              "region": ",".join(sorted({r for _, r in found if r}))}
     ray.shutdown()
-    return [f"{ip}:{PORT}" for ip in ips], head_ip
+    return [f"{ip}:{PORT}" for ip in ips], head_ip, machines, groups, priced
 
 
 def peer_hosts():
@@ -162,6 +232,20 @@ def peer_settings() -> list[str]:
         return ray.get([h.settings.remote() for h in peer_hosts()], timeout=30)
     except Exception as e:  # noqa: BLE001
         return [f"(unavailable: {e})"]
+    finally:
+        ray.shutdown()
+
+
+def peer_status() -> list[dict]:
+    """Every peer's status: the durability class it reports and the raft
+    entries its groups applied."""
+    import ray
+
+    ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
+    try:
+        return ray.get([h.status.remote() for h in peer_hosts()], timeout=60)
+    except Exception:  # noqa: BLE001
+        return []
     finally:
         ray.shutdown()
 
@@ -240,13 +324,13 @@ METRICS = ("tasks_per_s", "calls_per_s", "naive_items_per_s", "efficiency", "sec
 
 
 def repeat_workload(rt: str, name: str) -> dict:
-    if name == "node_loss":  # takes a node down: once only
-        return run_workload(rt, name)
-    run_workload(rt, name)  # warm-up: executors start, code and values ship
+    once = name == "node_loss"  # takes a node down: once only
+    runs = [] if once else [run_workload(rt, name)]  # warm-up: executors start, code and values ship
     reps: list[dict] = []
     t0 = time.perf_counter()
-    while len(reps) < MIN_REPS or time.perf_counter() - t0 < MIN_SECONDS:
+    while not reps or not once and (len(reps) < MIN_REPS or time.perf_counter() - t0 < MIN_SECONDS):
         reps.append(run_workload(rt, name))
+    runs += reps
     key = next(k for k in METRICS if k in reps[0])
     xs = sorted(r[key] for r in reps)
 
@@ -255,7 +339,17 @@ def repeat_workload(rt: str, name: str) -> dict:
 
     out = dict(reps[-1])
     out[key] = xs[len(xs) // 2]
-    out.update({"metric": key, "reps": len(xs), "p10": q(0.1), "p90": q(0.9)})
+    out.update({"metric": key, "reps": len(xs), "p10": q(0.1), "p90": q(0.9), "samples": [r[key] for r in reps],
+                "unit": UNITS[name], "executions": len(runs)})
+    # Totals over every run, the warm-up's too: the peers' commit count over
+    # the whole child is divided by them.
+    for k in ("ops", "direct_calls"):
+        if k in out:
+            out[k] = sum(r[k] for r in runs)
+    digests = collections.Counter(r["digest"] for r in reps if "digest" in r)
+    if digests:  # each timed run's output digest, and how many runs saw it
+        del out["digest"]
+        out["digests"] = dict(digests)
     return out
 
 
@@ -285,14 +379,19 @@ def run_workload(rt: str, name: str) -> dict:
     cpus = total_cpus(rt)
     t0 = time.perf_counter()
 
-    if name == "tasks":
+    if name in ("tasks", "tasks_serial"):
         noop = remote(lambda x: x)
-        k = n(200_000)
-        t0 = time.perf_counter()
-        out = get([noop.remote(i) for i in range(k)])
+        if name == "tasks":  # one burst: Chimaera's client coalesces the calls into few submissions
+            k = n(200_000)
+            t0 = time.perf_counter()
+            out = get([noop.remote(i) for i in range(k)])
+        else:  # one call at a time: each is a submission of its own (the per-call path)
+            k = n(2_000)
+            t0 = time.perf_counter()
+            out = [get(noop.remote(i)) for i in range(k)]
         assert out[-1] == k - 1
         dt = time.perf_counter() - t0
-        return {"tasks_per_s": round(k / dt), "cpus": cpus}
+        return {"tasks_per_s": round(k / dt), "cpus": cpus, "ops": k}
 
     if name == "cpu_scaling":
         burn = remote(busy)
@@ -322,7 +421,7 @@ def run_workload(rt: str, name: str) -> dict:
         s = sum(double.map(range(k)))
         dt = time.perf_counter() - t0
         assert s == k * (k - 1)
-        return {"naive_items_per_s": round(k / dt)}
+        return {"naive_items_per_s": round(k / dt), "ops": k}
 
     if name == "broadcast":
         import numpy as np
@@ -377,7 +476,7 @@ def run_workload(rt: str, name: str) -> dict:
         most = collections.Counter(h for _, h in out).most_common(1)[0][1]
         return {"seconds": round(dt, 3), "calls_on_one_host": most, "calls": len(out)}
 
-    if name == "actors":
+    if name in ("actors", "actors_peer"):
         class Counter:
             def __init__(self):
                 self.n = 0
@@ -394,15 +493,21 @@ def run_workload(rt: str, name: str) -> dict:
         actors = [A.remote() for _ in range(k)]
         hosts = get([a.host.remote() for a in actors])
         calls = n(2000)
+        if rt == "chimaera":
+            from chimaera import _direct  # counts the calls this process sent straight to an actor
+
+            direct = _direct._counter["direct"]
         t0 = time.perf_counter()
         futs = [a.inc.remote(1) for a in actors for _ in range(calls)]
         out = get(futs)
         dt = time.perf_counter() - t0
         assert max(out) == calls
+        res = {"calls_per_s": round(k * calls / dt), "actors": k, "hosts": len(set(hosts)), "ops": k * calls}
         if rt == "chimaera":  # its actors live until closed or the run ends; reps repeat
+            res["direct_calls"] = _direct._counter["direct"] - direct
             for a in actors:
                 a.close()
-        return {"calls_per_s": round(k * calls / dt), "actors": k, "hosts": len(set(hosts))}
+        return res
 
     if name == "nested":
         child = remote(lambda x: x)
@@ -423,18 +528,22 @@ def run_workload(rt: str, name: str) -> dict:
         assert out[0] == 28
         return {"seconds": round(dt, 3), "parents": 4 * cpus}
 
-    if name == "shuffle":
+    if name in ("shuffle", "shuffle_unfused"):
         # 64 map outputs of 50k (key, value) pairs each, summed into 64 partitions.
+        # "shuffle" is each runtime's idiomatic program, with the map run inside
+        # the split; "shuffle_unfused" the stage-for-stage control, with the
+        # map's outputs stored first and read by separate split calls.
         maps, per, parts = 64, n(50_000), 64
+        fused = name == "shuffle"
 
         def produce(i):
             return [((i * 7919 + j) % 100_003, 1) for j in range(per)]
 
         if rt == "ray":
 
-            def split(i):
+            def split(src):
                 out = [dict() for _ in range(parts)]
-                for k, v in produce(i):
+                for k, v in produce(src) if fused else src:
                     d = out[hash(k) % parts]
                     d[k] = d.get(k, 0) + v
                 return out
@@ -448,36 +557,63 @@ def run_workload(rt: str, name: str) -> dict:
 
             split_r = remote(num_returns=parts)(split)
             merge_r = remote(merge)
+            gen_r = remote(produce)
             t0 = time.perf_counter()
-            mapped = [split_r.remote(i) for i in range(maps)]
+            mapped = [split_r.remote(i if fused else gen_r.remote(i)) for i in range(maps)]
             reduced = get([merge_r.remote(*[m[p] for m in mapped]) for p in range(parts)])
             dt = time.perf_counter() - t0
-            total = sum(sum(d.values()) for d in reduced)
         else:
             import operator
 
+            from chimaera._data import reduce_by_key  # over stored results, as Results.reduce_by_key on a read map
+
             gen = remote(produce)
             t0 = time.perf_counter()
-            # Stop the clock where Ray's does: every partition in the driver.
-            reduced = list(gen.map(range(maps)).reduce_by_key(operator.add, partitions=parts))
+            if fused:
+                # Stop the clock where Ray's does: every partition in the driver.
+                reduced = list(gen.map(range(maps)).reduce_by_key(operator.add, partitions=parts))
+            else:
+                reduced = list(reduce_by_key([gen.remote(i) for i in range(maps)], operator.add, partitions=parts))
             dt = time.perf_counter() - t0
-            total = sum(sum(d.values()) for d in reduced)
-        assert total == maps * per, total
-        return {"seconds": round(dt, 3), "pairs": maps * per}
+        # Every key's total, against one dict filled serially after the clock
+        # stopped, and each key in one partition only.
+        serial = {}
+        for i in range(maps):
+            for k, v in produce(i):
+                serial[k] = serial.get(k, 0) + v
+        merged = {k: v for d in reduced for k, v in d.items()}
+        assert sum(len(d) for d in reduced) == len(serial), "a key is in two partitions"
+        assert merged == serial, "the partitions differ from the serial result"
+        # The output's digest: one value for every runtime and variant that got it right.
+        digest = hashlib.sha256(repr(sorted(merged.items())).encode()).hexdigest()[:16]
+        return {"seconds": round(dt, 3), "pairs": maps * per, "digest": digest}
 
     if name == "node_loss":
         # Kill the runtime on one worker node while 4 × cpus 1-second tasks
         # run; every task must still return exactly once.
         burn = remote(busy)
         k = 4 * cpus
+        if rt == "chimaera":
+            import chimaera as ch
+
+            peer_at = {n.address.rsplit(":", 1)[0]: n.peer for n in ch.runs.cluster().nodes()}
         t0 = time.perf_counter()
         futs = [burn.remote(1.0) for _ in range(k)]
         time.sleep(2.0)
+        killed = time.time()
         victim = kill_one_worker_node(rt)
         out = get(futs, timeout=900) if rt == "chimaera" else get(futs)
         dt = time.perf_counter() - t0
         assert len(out) == k
-        return {"seconds": round(dt, 3), "tasks": k, "killed": victim}
+        # recovered_s: from the kill to the last result. detected_s: to the
+        # head peer's first suspicion of the victim (Chimaera's member events).
+        res = {"seconds": round(dt, 3), "tasks": k, "killed": victim, "recovered_s": round(time.time() - killed, 3)}
+        if rt == "chimaera" and victim in peer_at:
+            seen = [e.at for e in ch.runs.cluster().events(["member"], start="earliest", follow=False)
+                    if e.node == peer_at[victim] and e.at >= killed and e.message.startswith(("suspect", "dead"))]
+            if seen:
+                res["detected_s"] = round(min(seen) - killed, 3)
+        return res
 
     raise ValueError(name)
 
@@ -519,6 +655,7 @@ def main() -> None:
     ap.add_argument("--only", default="")
     a = ap.parse_args()
     if a.workload:  # child process: run one workload, print one JSON line
+        os.environ.update(CONTROL_ENV.get(a.workload, {}))  # before chimaera is imported
         res = repeat_workload(a.runtime, a.workload)
         print(json.dumps({"runtime": a.runtime, "workload": a.workload, "result": res}), flush=True)
         return
@@ -526,60 +663,106 @@ def main() -> None:
     from chimaera._native import socket_path
 
     names = [w for w in WORKLOADS if not a.only or w in a.only.split(",")]
+    seed = int(os.environ.get("EVAL_SEED") or random.randrange(1 << 31))
+    trials = int(os.environ.get("EVAL_TRIALS", "1"))
+    rng = random.Random(seed)
     # Extra Chimaera passes with other peer settings, before the main one:
     # EVAL_CHIMAERA_VARIANTS="CHIMAERA_RAFT_SYNC=none" (";" between variants,
     # "," between variables), each running EVAL_VARIANT_WORKLOADS.
     variants = [dict(kv.split("=", 1) for kv in v.split(",")) for v in os.environ.get("EVAL_CHIMAERA_VARIANTS", "").split(";") if v]
     subset = [w for w in os.environ.get("EVAL_VARIANT_WORKLOADS", "tasks,actors").split(",") if w in names]
-    passes = [("chimaera", v, subset) for v in variants] + [("chimaera", {}, names), ("ray", {}, names)]
     results = []
-    peers, head = [], ""
-    for rt, peer_env, workloads in passes:
+    cluster: dict = {}
+
+    def launch(peer_env: dict[str, str]) -> dict:
+        """Start the peers; the durability class they report."""
+        peers, head, machines, groups, priced = launch_peers(a.dist, peer_env)
+        cluster.update(nodes=len(peers), peers=peers, head=head, machines=machines, data_groups=groups, **priced)
+        deadline = time.time() + 120
+        while not os.path.exists(socket_path(PEER_DIR, "peer.sock")):
+            assert time.time() < deadline, peer_logs()
+            time.sleep(0.5)
+        time.sleep(5)  # every founder joined and elected
+        print("peer settings:", peer_settings(), flush=True)
+        durability = manifest.settled_durability(peer_status)
+        print("durability:", durability, flush=True)
+        return durability
+
+    def stop() -> None:
+        try:
+            stop_peers(wipe=True)
+        except Exception as e:  # noqa: BLE001
+            print("stopping peers:", e)
+
+    def child(rt: str, w: str, durability: dict, **extra) -> None:
+        env = dict(os.environ, CHIMAERA_HOME=PEER_DIR, RAY_ADDRESS="auto")
+        counted = rt == "chimaera" and w != "node_loss"
+        cpu0 = peer_cpu() if counted else []
+        entries0 = manifest.raft_entries(peer_status()) if counted else 0
+        t0 = time.time()
+        try:
+            p = subprocess.run([sys.executable, __file__, "--workload", w, "--runtime", rt], capture_output=True,
+                               text=True, timeout=1200, env=env)
+            lines = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
+            rec = json.loads(lines[-1]) if p.returncode == 0 and lines else {
+                "runtime": rt, "workload": w, "error": (p.stderr or p.stdout)[-1500:]}
+        except subprocess.TimeoutExpired:
+            rec = {"runtime": rt, "workload": w, "error": "timed out"}
+        rec["wall_s"] = round(time.time() - t0, 1)
+        rec.update(extra)
         if rt == "chimaera":
-            peers, head = launch_peers(a.dist, peer_env)
-            deadline = time.time() + 120
-            while not os.path.exists(socket_path(PEER_DIR, "peer.sock")):
-                assert time.time() < deadline, peer_logs()
-                time.sleep(0.5)
-            time.sleep(5)  # every founder joined and elected
-            print("peer settings:", peer_settings(), flush=True)
-        # node_loss last for each runtime: it takes a node's runtime down.
-        for w in workloads:
-            env = dict(os.environ, CHIMAERA_HOME=PEER_DIR, RAY_ADDRESS="auto")
-            cpu0 = peer_cpu() if rt == "chimaera" and w != "node_loss" else []
-            t0 = time.time()
-            try:
-                p = subprocess.run([sys.executable, __file__, "--workload", w, "--runtime", rt], capture_output=True,
-                                   text=True, timeout=1200, env=env)
-                lines = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
-                rec = json.loads(lines[-1]) if p.returncode == 0 and lines else {
-                    "runtime": rt, "workload": w, "error": (p.stderr or p.stdout)[-1500:]}
-            except subprocess.TimeoutExpired:
-                rec = {"runtime": rt, "workload": w, "error": "timed out"}
-            rec["wall_s"] = round(time.time() - t0, 1)
-            if peer_env:
-                rec["variant"] = peer_env
-            cpu1 = peer_cpu() if cpu0 else []
-            if cpu0 and len(cpu1) == len(cpu0):
-                # Cores each peer process kept busy over the workload: one
-                # near 1.0 or more while others idle points at a serial bottleneck.
-                rec["peer_cores"] = sorted((round((b - a) / max(rec["wall_s"], 0.1), 2) for a, b in zip(cpu0, cpu1)), reverse=True)
-            if "error" in rec and rt == "chimaera":
-                rec["peer_logs"] = peer_logs()[-4000:]
-            print(json.dumps(rec), flush=True)
-            results.append(rec)
-        if rt == "chimaera":
-            try:
-                stop_peers(wipe=True)
-            except Exception as e:  # noqa: BLE001
-                print("stopping peers:", e)
+            rec["durability"] = durability
+        cpu1 = peer_cpu() if cpu0 else []
+        if cpu0 and len(cpu1) == len(cpu0):
+            # Cores each peer process kept busy over the workload: one
+            # near 1.0 or more while others idle points at a serial bottleneck.
+            rec["peer_cores"] = sorted((round((b - a) / max(rec["wall_s"], 0.1), 2) for a, b in zip(cpu0, cpu1)), reverse=True)
+        if counted and "result" in rec:  # the commits behind the child's work, warm-up included
+            rec["result"]["raft_entries"] = manifest.raft_entries(peer_status()) - entries0
+        if "error" in rec and rt == "chimaera":
+            rec["peer_logs"] = peer_logs()[-4000:]
+        print(json.dumps(rec), flush=True)
+        results.append(rec)
+
+    for v in variants:
+        durability = launch(v)
+        for w in subset:
+            child("chimaera", w, durability, variant=v)
+        stop()
+    durability = launch({})
+    paired = [w for w in names if w != "node_loss"]
+    for trial in range(trials):
+        for w in rng.sample(paired, len(paired)):
+            for rt in rng.sample(["ray", "chimaera"], 2):
+                if rt == "chimaera" or w not in CHIMAERA_ONLY:
+                    child(rt, w, durability, trial=trial)
+    # node_loss last: it takes a node's runtime down. Chimaera's first: Ray,
+    # its launcher, stops the peers afterwards.
+    if "node_loss" in names:
+        child("chimaera", "node_loss", durability)
+    stop()
+    if "node_loss" in names:
+        child("ray", "node_loss", durability)
+    order = {"seed": seed, "trials": trials, "min_seconds": MIN_SECONDS, "scale": SCALE, "variants": variants}
+    meta = manifest.collect(os.path.join(a.dist, "chimaera"), {"ray": sys.executable, "chimaera": sys.executable},
+                            topology=cluster, durability=durability, order=order)
+    doc = {"manifest": meta, "results": results}
     with open(os.path.join(a.out, "multi_results.json"), "w") as f:
-        json.dump({"peers": peers, "head": head, "results": results}, f, indent=2)
-    rows = ["| Workload | Ray | Chimaera |", "|---|---|---|"]
-    for w in names:
-        cell = {r["runtime"]: json.dumps(r.get("result", {"error": r.get("error", "")[:120]})) for r in results if r["workload"] == w and "variant" not in r}
-        rows.append(f"| {w} | {cell.get('ray', '')} | {cell.get('chimaera', '')} |")
-    report = f"# Ray vs Chimaera, {len(peers)} nodes\n\n" + "\n".join(rows) + "\n"
+        json.dump(doc, f, indent=2)
+    report = manifest.report(doc, WORKLOADS, f"Ray vs Chimaera, {cluster['nodes']} nodes", [
+        f"Machines: {'; '.join(cluster['machines'])}. {cluster['data_groups']} data groups.",
+        f"{trials} paired trial(s) in a random order (seed {seed}), each run timed for at least {MIN_SECONDS:.0f} s "
+        f"after a warm-up; node_loss once per runtime, last. EVAL_SCALE {SCALE}.",
+    ])
+    try:  # what each workload cost, from the machines' instance types (bench/evals/cost.py)
+        with open(os.path.join(HERE, "prices.json")) as f:
+            spend = cost.costs(doc, json.load(f))
+    except ValueError as e:
+        print("costs:", e, flush=True)
+    else:
+        with open(os.path.join(a.out, "multi_cost.json"), "w") as f:
+            json.dump(spend, f, indent=2)
+        report += "\n## Cost per workload\n\n" + cost.report(spend)
     with open(os.path.join(a.out, "multi_report.md"), "w") as f:
         f.write(report)
     print("===== report =====\n" + report)

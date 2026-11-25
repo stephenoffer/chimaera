@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
+import dataclasses
+import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 from ._errors import from_outcome
+from ._native import child_id
 from ._runtime import Runtime
+
+
+@dataclasses.dataclass(frozen=True)
+class FailedCall:
+    """A call that failed for good (``Run.failed()``): its id, its function
+    and the error it raised."""
+
+    id: str
+    function: str
+    error: BaseException
+    _key: bytes = dataclasses.field(repr=False, compare=False)
+    _spec: bytes = dataclasses.field(repr=False, compare=False)
 
 
 class Run:
@@ -105,6 +120,63 @@ class Run:
             if deadline is not None and time.monotonic() > deadline:
                 raise TimeoutError(f"run {self.id} still has work: {counts}")
             time.sleep(poll)
+
+    def failed(self) -> list[FailedCall]:
+        """Calls that failed for good and were neither retried nor discarded,
+        oldest first: errors they raised, and crashes, memory kills or lost
+        inputs that used up their attempts. A call that never ran because its
+        input failed is not listed (retrying that input runs it again), nor is
+        a cancelled one, an actor's or a generator's. A run keeps its newest
+        1,000, while it is active, and each holds the inputs it read until it is
+        retried or discarded."""
+        return [
+            FailedCall(key[16:].hex(), name, from_outcome(err, key[16:].hex()), key, spec)
+            for key, name, err, spec in self._rt.client.failed(self._run)
+        ]
+
+    def retry_failed(self, calls: Iterable[FailedCall | str] | None = None) -> list[Any]:
+        """Run failed calls again, as new calls of the same function with the
+        same arguments, and return their futures in order. ``calls`` are some
+        of ``failed()`` (or their ids); by default all of them. A call retried
+        leaves ``failed()``; if it fails again, it is listed again."""
+        from ._future import Future
+
+        chosen = self._choose(calls)
+        futures = []
+        for c in chosen:
+            key = c._key[:16] + child_id(c._key[16:], [b"retry", os.urandom(8)])
+            f: Future[Any] = Future(self._rt, key)
+            self._rt._futures[key] = f  # its outcome arrives on this session, as a call's does
+            self._rt.client.resubmit(c._spec, key)
+            futures.append(f)
+        self._discard(chosen)
+        return futures
+
+    def discard_failed(self, calls: Iterable[FailedCall | str] | None = None) -> int:
+        """Forget failed calls (by default all), releasing the inputs they held.
+        Returns how many."""
+        chosen = self._choose(calls)
+        self._discard(chosen)
+        return len(chosen)
+
+    def _discard(self, chosen: list[FailedCall]) -> None:
+        """Forget `chosen` (after any resubmission sent before: the same session
+        delivers it first, so a retry holds the inputs before the letter lets go),
+        and return once ``failed()`` no longer lists them."""
+        self._rt.client.discard_failed([c._key for c in chosen])
+        ids, deadline = {c.id for c in chosen}, time.monotonic() + 10
+        while ids & {c.id for c in self.failed()} and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def _choose(self, calls: Iterable[FailedCall | str] | None) -> list[FailedCall]:
+        current = {c.id: c for c in self.failed()}
+        if calls is None:
+            return list(current.values())
+        ids = [c if isinstance(c, str) else c.id for c in calls]
+        gone = [i for i in ids if i not in current]
+        if gone:
+            raise ValueError(f"not among this run's failed calls (retried or discarded already?): {', '.join(gone)}")
+        return [current[i] for i in ids]
 
     def outcomes(self) -> Iterator[tuple[str, Any, BaseException | None]]:
         """(task_id, value, error) for every finished task, in task-id order."""

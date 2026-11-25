@@ -1,0 +1,938 @@
+{
+  "manifest": {
+    "source": {
+      "digest": "3da8f2f2475055e0",
+      "commit": "fb96652a746eb7d86b3b425545c97eb3ce4e5263",
+      "diff": "fb723ad838b0c535"
+    },
+    "build": {
+      "binary": "target/release/chimaera",
+      "profile": "release",
+      "settings": {
+        "lto": "thin",
+        "codegen-units": 1,
+        "debug": 1
+      },
+      "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+      "rustflags": ""
+    },
+    "versions": {
+      "python": {
+        "chimaera": "3.14.4"
+      },
+      "chimaera": "chimaera 0.1.0 (peer level 1, wire 1, build dev-f616197a08a9c7e4)"
+    },
+    "host": {
+      "platform": "macOS-14.5-arm64-arm-64bit-Mach-O",
+      "distro": "",
+      "cpus": 12,
+      "image": ""
+    },
+    "topology": {
+      "nodes": 3,
+      "cpus_per_node": 4,
+      "layout": "one machine",
+      "machine_cpus": 12
+    },
+    "shuffle": {
+      "maps": 64,
+      "per": 50000,
+      "partitions": 64,
+      "keys": 100003
+    }
+  },
+  "results": {
+    "uniform": [
+      {
+        "round": 0,
+        "seconds": 0.633,
+        "phases": {
+          "plan": {
+            "seconds": 0.0045320987701416016,
+            "median_seconds": 0.0045320987701416016,
+            "max_seconds": 0.0045320987701416016,
+            "bytes": 0
+          },
+          "map": {
+            "seconds": 0.2577342987060547,
+            "median_seconds": 0.0025320053100585938,
+            "max_seconds": 0.015336990356445312,
+            "bytes": 0
+          },
+          "split": {
+            "seconds": 0.42607641220092773,
+            "median_seconds": 0.0034769773483276367,
+            "max_seconds": 0.07049012184143066,
+            "bytes": 0,
+            "pairs": 3200000,
+            "buckets": 4096
+          },
+          "scatter_encode": {
+            "seconds": 0.167036771774292,
+            "median_seconds": 0.0012339353561401367,
+            "max_seconds": 0.031844139099121094,
+            "bytes": 18496024
+          },
+          "fetch": {
+            "seconds": 0.8617608547210693,
+            "median_seconds": 0.0005420446395874023,
+            "max_seconds": 0.08640098571777344,
+            "bytes": 0
+          },
+          "read": {
+            "seconds": 0.647456169128418,
+            "median_seconds": 0.006337642669677734,
+            "max_seconds": 0.06678938865661621,
+            "bytes": 18496024
+          },
+          "reduce": {
+            "seconds": 0.539417028427124,
+            "median_seconds": 0.005060434341430664,
+            "max_seconds": 0.07922720909118652,
+            "bytes": 0,
+            "keys": 100003,
+            "rss_growth_max": 688128
+          },
+          "gather_encode": {
+            "seconds": 0.0056476593017578125,
+            "median_seconds": 6.198883056640625e-05,
+            "max_seconds": 0.0007069110870361328,
+            "bytes": 707701
+          },
+          "final": {
+            "seconds": 0.07724809646606445,
+            "median_seconds": 0.07724809646606445,
+            "max_seconds": 0.07724809646606445,
+            "bytes": 0
+          }
+        },
+        "timeline": {
+          "submit_start": {
+            "first": 0.136,
+            "median": 0.136,
+            "last": 0.136
+          },
+          "submitted": {
+            "first": 4.668,
+            "median": 4.668,
+            "last": 4.668
+          },
+          "scatter_start": {
+            "first": 3.456,
+            "median": 84.476,
+            "last": 245.44
+          },
+          "scatter_mapped": {
+            "first": 5.767,
+            "median": 87.69,
+            "last": 247.817
+          },
+          "scatter_split": {
+            "first": 9.09,
+            "median": 101.008,
+            "last": 250.67
+          },
+          "scatter_end": {
+            "first": 10.222,
+            "median": 102.009,
+            "last": 251.719
+          },
+          "manifest_start": {
+            "first": 139.292,
+            "median": 139.292,
+            "last": 139.292
+          },
+          "manifest_waited": {
+            "first": 259.848,
+            "median": 259.848,
+            "last": 259.848
+          },
+          "manifest_end": {
+            "first": 259.875,
+            "median": 259.875,
+            "last": 259.875
+          },
+          "gather_start": {
+            "first": 272.9,
+            "median": 409.507,
+            "last": 540.948
+          },
+          "gather_fetched": {
+            "first": 333.417,
+            "median": 414.592,
+            "last": 541.326
+          },
+          "gather_merged": {
+            "first": 342.94,
+            "median": 438.207,
+            "last": 553.132
+          },
+          "gather_end": {
+            "first": 343.01,
+            "median": 438.309,
+            "last": 553.201
+          },
+          "driver_done": {
+            "first": 555.711,
+            "median": 555.711,
+            "last": 555.711
+          },
+          "driver_collected": {
+            "first": 632.959,
+            "median": 632.959,
+            "last": 632.959
+          }
+        },
+        "digest_ok": true,
+        "largest_partition": 1563,
+        "peers": {
+          "network_bytes": 21389062.0,
+          "spilled_bytes": 0.0,
+          "spill_us": 0.0
+        }
+      },
+      {
+        "round": 1,
+        "seconds": 0.6646,
+        "phases": {
+          "plan": {
+            "seconds": 0.00411224365234375,
+            "median_seconds": 0.00411224365234375,
+            "max_seconds": 0.00411224365234375,
+            "bytes": 0
+          },
+          "map": {
+            "seconds": 0.2145400047302246,
+            "median_seconds": 0.00242459774017334,
+            "max_seconds": 0.010577201843261719,
+            "bytes": 0
+          },
+          "split": {
+            "seconds": 0.2784886360168457,
+            "median_seconds": 0.003298044204711914,
+            "max_seconds": 0.041311025619506836,
+            "bytes": 0,
+            "pairs": 3200000,
+            "buckets": 4096
+          },
+          "scatter_encode": {
+            "seconds": 0.12049126625061035,
+            "median_seconds": 0.0010983943939208984,
+            "max_seconds": 0.0101318359375,
+            "bytes": 18496024
+          },
+          "fetch": {
+            "seconds": 0.6205446720123291,
+            "median_seconds": 0.000596165657043457,
+            "max_seconds": 0.04897904396057129,
+            "bytes": 0
+          },
+          "read": {
+            "seconds": 0.8390040397644043,
+            "median_seconds": 0.007456183433532715,
+            "max_seconds": 0.07505345344543457,
+            "bytes": 18496024
+          },
+          "reduce": {
+            "seconds": 0.7425999641418457,
+            "median_seconds": 0.0063669681549072266,
+            "max_seconds": 0.06614875793457031,
+            "bytes": 0,
+            "keys": 100003,
+            "rss_growth_max": 147456
+          },
+          "gather_encode": {
+            "seconds": 0.07445502281188965,
+            "median_seconds": 6.592273712158203e-05,
+            "max_seconds": 0.06879305839538574,
+            "bytes": 707701
+          },
+          "final": {
+            "seconds": 0.0877530574798584,
+            "median_seconds": 0.0877530574798584,
+            "max_seconds": 0.0877530574798584,
+            "bytes": 0
+          }
+        },
+        "timeline": {
+          "submit_start": {
+            "first": 0.274,
+            "median": 0.274,
+            "last": 0.274
+          },
+          "submitted": {
+            "first": 4.386,
+            "median": 4.386,
+            "last": 4.386
+          },
+          "scatter_start": {
+            "first": 3.185,
+            "median": 84.327,
+            "last": 230.027
+          },
+          "scatter_mapped": {
+            "first": 5.895,
+            "median": 88.416,
+            "last": 232.098
+          },
+          "scatter_split": {
+            "first": 9.318,
+            "median": 91.855,
+            "last": 235.644
+          },
+          "scatter_end": {
+            "first": 11.941,
+            "median": 93.637,
+            "last": 236.683
+          },
+          "manifest_start": {
+            "first": 147.93,
+            "median": 147.93,
+            "last": 147.93
+          },
+          "manifest_waited": {
+            "first": 243.909,
+            "median": 243.909,
+            "last": 243.909
+          },
+          "manifest_end": {
+            "first": 243.951,
+            "median": 243.951,
+            "last": 243.951
+          },
+          "gather_start": {
+            "first": 251.376,
+            "median": 371.334,
+            "last": 539.623
+          },
+          "gather_fetched": {
+            "first": 300.256,
+            "median": 373.601,
+            "last": 540.536
+          },
+          "gather_merged": {
+            "first": 317.609,
+            "median": 410.004,
+            "last": 573.648
+          },
+          "gather_end": {
+            "first": 317.677,
+            "median": 410.073,
+            "last": 573.724
+          },
+          "driver_done": {
+            "first": 576.809,
+            "median": 576.809,
+            "last": 576.809
+          },
+          "driver_collected": {
+            "first": 664.562,
+            "median": 664.562,
+            "last": 664.562
+          }
+        },
+        "digest_ok": true,
+        "largest_partition": 1563,
+        "peers": {
+          "network_bytes": 21226983.0,
+          "spilled_bytes": 0.0,
+          "spill_us": 0.0
+        }
+      },
+      {
+        "round": 2,
+        "seconds": 0.7431,
+        "phases": {
+          "plan": {
+            "seconds": 0.003509044647216797,
+            "median_seconds": 0.003509044647216797,
+            "max_seconds": 0.003509044647216797,
+            "bytes": 0
+          },
+          "map": {
+            "seconds": 0.1981062889099121,
+            "median_seconds": 0.0026940107345581055,
+            "max_seconds": 0.008665084838867188,
+            "bytes": 0
+          },
+          "split": {
+            "seconds": 0.2730591297149658,
+            "median_seconds": 0.0037189722061157227,
+            "max_seconds": 0.014332056045532227,
+            "bytes": 0,
+            "pairs": 3200000,
+            "buckets": 4096
+          },
+          "scatter_encode": {
+            "seconds": 0.14518046379089355,
+            "median_seconds": 0.0015780925750732422,
+            "max_seconds": 0.02665400505065918,
+            "bytes": 18496024
+          },
+          "fetch": {
+            "seconds": 0.8260989189147949,
+            "median_seconds": 0.0005306005477905273,
+            "max_seconds": 0.0888519287109375,
+            "bytes": 0
+          },
+          "read": {
+            "seconds": 0.9784326553344727,
+            "median_seconds": 0.007128477096557617,
+            "max_seconds": 0.07204651832580566,
+            "bytes": 18496024
+          },
+          "reduce": {
+            "seconds": 0.9003398418426514,
+            "median_seconds": 0.0067901611328125,
+            "max_seconds": 0.06676816940307617,
+            "bytes": 0,
+            "keys": 100003,
+            "rss_growth_max": 32768
+          },
+          "gather_encode": {
+            "seconds": 0.016222000122070312,
+            "median_seconds": 6.711483001708984e-05,
+            "max_seconds": 0.01004791259765625,
+            "bytes": 707701
+          },
+          "final": {
+            "seconds": 0.09407901763916016,
+            "median_seconds": 0.09407901763916016,
+            "max_seconds": 0.09407901763916016,
+            "bytes": 0
+          }
+        },
+        "timeline": {
+          "submit_start": {
+            "first": 0.213,
+            "median": 0.213,
+            "last": 0.213
+          },
+          "submitted": {
+            "first": 3.722,
+            "median": 3.722,
+            "last": 3.722
+          },
+          "scatter_start": {
+            "first": 59.645,
+            "median": 129.32,
+            "last": 300.552
+          },
+          "scatter_mapped": {
+            "first": 62.009,
+            "median": 132.487,
+            "last": 302.596
+          },
+          "scatter_split": {
+            "first": 65.869,
+            "median": 138.492,
+            "last": 305.207
+          },
+          "scatter_end": {
+            "first": 69.494,
+            "median": 140.458,
+            "last": 306.224
+          },
+          "manifest_start": {
+            "first": 199.298,
+            "median": 199.298,
+            "last": 199.298
+          },
+          "manifest_waited": {
+            "first": 311.821,
+            "median": 311.821,
+            "last": 311.821
+          },
+          "manifest_end": {
+            "first": 311.838,
+            "median": 311.838,
+            "last": 311.838
+          },
+          "gather_start": {
+            "first": 320.638,
+            "median": 470.967,
+            "last": 625.598
+          },
+          "gather_fetched": {
+            "first": 381.879,
+            "median": 471.241,
+            "last": 626.26
+          },
+          "gather_merged": {
+            "first": 393.738,
+            "median": 513.478,
+            "last": 645.592
+          },
+          "gather_end": {
+            "first": 393.813,
+            "median": 513.543,
+            "last": 645.676
+          },
+          "driver_done": {
+            "first": 648.96,
+            "median": 648.96,
+            "last": 648.96
+          },
+          "driver_collected": {
+            "first": 743.039,
+            "median": 743.039,
+            "last": 743.039
+          }
+        },
+        "digest_ok": true,
+        "largest_partition": 1563,
+        "peers": {
+          "network_bytes": 24087061.0,
+          "spilled_bytes": 0.0,
+          "spill_us": 0.0
+        }
+      }
+    ],
+    "zipf": [
+      {
+        "round": 0,
+        "seconds": 0.5705,
+        "phases": {
+          "plan": {
+            "seconds": 0.004094123840332031,
+            "median_seconds": 0.004094123840332031,
+            "max_seconds": 0.004094123840332031,
+            "bytes": 0
+          },
+          "map": {
+            "seconds": 0.649573564529419,
+            "median_seconds": 0.008754491806030273,
+            "max_seconds": 0.03224611282348633,
+            "bytes": 0
+          },
+          "split": {
+            "seconds": 0.33883142471313477,
+            "median_seconds": 0.004164457321166992,
+            "max_seconds": 0.028312206268310547,
+            "bytes": 0,
+            "pairs": 3200000,
+            "buckets": 4096
+          },
+          "scatter_encode": {
+            "seconds": 0.0786888599395752,
+            "median_seconds": 0.00034546852111816406,
+            "max_seconds": 0.02521228790283203,
+            "bytes": 3912224
+          },
+          "fetch": {
+            "seconds": 0.1718921661376953,
+            "median_seconds": 9.703636169433594e-05,
+            "max_seconds": 0.02122211456298828,
+            "bytes": 0
+          },
+          "read": {
+            "seconds": 0.4156770706176758,
+            "median_seconds": 0.0019192695617675781,
+            "max_seconds": 0.06973624229431152,
+            "bytes": 3912224
+          },
+          "reduce": {
+            "seconds": 0.21742606163024902,
+            "median_seconds": 0.0013480186462402344,
+            "max_seconds": 0.03917050361633301,
+            "bytes": 0,
+            "keys": 98311,
+            "rss_growth_max": 81920
+          },
+          "gather_encode": {
+            "seconds": 0.03245043754577637,
+            "median_seconds": 6.0558319091796875e-05,
+            "max_seconds": 0.026760339736938477,
+            "bytes": 699244
+          },
+          "final": {
+            "seconds": 0.07622599601745605,
+            "median_seconds": 0.07622599601745605,
+            "max_seconds": 0.07622599601745605,
+            "bytes": 0
+          }
+        },
+        "timeline": {
+          "submit_start": {
+            "first": 0.192,
+            "median": 0.192,
+            "last": 0.192
+          },
+          "submitted": {
+            "first": 4.286,
+            "median": 4.286,
+            "last": 4.286
+          },
+          "scatter_start": {
+            "first": 3.921,
+            "median": 97.811,
+            "last": 321.815
+          },
+          "scatter_mapped": {
+            "first": 11.146,
+            "median": 109.174,
+            "last": 330.157
+          },
+          "scatter_split": {
+            "first": 14.311,
+            "median": 113.019,
+            "last": 334.35
+          },
+          "scatter_end": {
+            "first": 14.647,
+            "median": 117.948,
+            "last": 334.858
+          },
+          "manifest_start": {
+            "first": 183.885,
+            "median": 183.885,
+            "last": 183.885
+          },
+          "manifest_waited": {
+            "first": 339.682,
+            "median": 339.682,
+            "last": 339.682
+          },
+          "manifest_end": {
+            "first": 339.699,
+            "median": 339.699,
+            "last": 339.699
+          },
+          "gather_start": {
+            "first": 355.147,
+            "median": 421.809,
+            "last": 483.685
+          },
+          "gather_fetched": {
+            "first": 366.649,
+            "median": 421.886,
+            "last": 483.784
+          },
+          "gather_merged": {
+            "first": 375.527,
+            "median": 436.918,
+            "last": 491.585
+          },
+          "gather_end": {
+            "first": 375.708,
+            "median": 436.978,
+            "last": 491.71
+          },
+          "driver_done": {
+            "first": 494.201,
+            "median": 494.201,
+            "last": 494.201
+          },
+          "driver_collected": {
+            "first": 570.427,
+            "median": 570.427,
+            "last": 570.427
+          }
+        },
+        "digest_ok": true,
+        "largest_partition": 1548,
+        "peers": {
+          "network_bytes": 1382337.0,
+          "spilled_bytes": 0.0,
+          "spill_us": 0.0
+        }
+      },
+      {
+        "round": 1,
+        "seconds": 0.4633,
+        "phases": {
+          "plan": {
+            "seconds": 0.004746913909912109,
+            "median_seconds": 0.004746913909912109,
+            "max_seconds": 0.004746913909912109,
+            "bytes": 0
+          },
+          "map": {
+            "seconds": 0.6500942707061768,
+            "median_seconds": 0.008173942565917969,
+            "max_seconds": 0.06687808036804199,
+            "bytes": 0
+          },
+          "split": {
+            "seconds": 0.675936222076416,
+            "median_seconds": 0.0034499168395996094,
+            "max_seconds": 0.0654900074005127,
+            "bytes": 0,
+            "pairs": 3200000,
+            "buckets": 4096
+          },
+          "scatter_encode": {
+            "seconds": 0.06198406219482422,
+            "median_seconds": 0.00032198429107666016,
+            "max_seconds": 0.023280858993530273,
+            "bytes": 3912224
+          },
+          "fetch": {
+            "seconds": 0.11426019668579102,
+            "median_seconds": 9.989738464355469e-05,
+            "max_seconds": 0.01330113410949707,
+            "bytes": 0
+          },
+          "read": {
+            "seconds": 0.20638418197631836,
+            "median_seconds": 0.0023404359817504883,
+            "max_seconds": 0.010096073150634766,
+            "bytes": 3912224
+          },
+          "reduce": {
+            "seconds": 0.11870527267456055,
+            "median_seconds": 0.00144195556640625,
+            "max_seconds": 0.005407571792602539,
+            "bytes": 0,
+            "keys": 98311,
+            "rss_growth_max": 81920
+          },
+          "gather_encode": {
+            "seconds": 0.006201267242431641,
+            "median_seconds": 5.888938903808594e-05,
+            "max_seconds": 0.0004558563232421875,
+            "bytes": 699244
+          },
+          "final": {
+            "seconds": 0.07252717018127441,
+            "median_seconds": 0.07252717018127441,
+            "max_seconds": 0.07252717018127441,
+            "bytes": 0
+          }
+        },
+        "timeline": {
+          "submit_start": {
+            "first": 0.096,
+            "median": 0.096,
+            "last": 0.096
+          },
+          "submitted": {
+            "first": 4.843,
+            "median": 4.843,
+            "last": 4.843
+          },
+          "scatter_start": {
+            "first": 3.083,
+            "median": 87.447,
+            "last": 236.0
+          },
+          "scatter_mapped": {
+            "first": 9.757,
+            "median": 96.323,
+            "last": 242.172
+          },
+          "scatter_split": {
+            "first": 12.537,
+            "median": 100.309,
+            "last": 244.934
+          },
+          "scatter_end": {
+            "first": 12.861,
+            "median": 100.728,
+            "last": 245.264
+          },
+          "manifest_start": {
+            "first": 196.189,
+            "median": 196.189,
+            "last": 196.189
+          },
+          "manifest_waited": {
+            "first": 249.952,
+            "median": 249.952,
+            "last": 249.952
+          },
+          "manifest_end": {
+            "first": 249.969,
+            "median": 249.969,
+            "last": 249.969
+          },
+          "gather_start": {
+            "first": 266.523,
+            "median": 327.252,
+            "last": 378.875
+          },
+          "gather_fetched": {
+            "first": 273.376,
+            "median": 327.337,
+            "last": 379.055
+          },
+          "gather_merged": {
+            "first": 276.618,
+            "median": 334.082,
+            "last": 387.305
+          },
+          "gather_end": {
+            "first": 276.689,
+            "median": 334.139,
+            "last": 387.371
+          },
+          "driver_done": {
+            "first": 390.696,
+            "median": 390.696,
+            "last": 390.696
+          },
+          "driver_collected": {
+            "first": 463.223,
+            "median": 463.223,
+            "last": 463.223
+          }
+        },
+        "digest_ok": true,
+        "largest_partition": 1548,
+        "peers": {
+          "network_bytes": 1250536.0,
+          "spilled_bytes": 0.0,
+          "spill_us": 0.0
+        }
+      },
+      {
+        "round": 2,
+        "seconds": 0.529,
+        "phases": {
+          "plan": {
+            "seconds": 0.0033452510833740234,
+            "median_seconds": 0.0033452510833740234,
+            "max_seconds": 0.0033452510833740234,
+            "bytes": 0
+          },
+          "map": {
+            "seconds": 0.6818802356719971,
+            "median_seconds": 0.008543610572814941,
+            "max_seconds": 0.04694986343383789,
+            "bytes": 0
+          },
+          "split": {
+            "seconds": 0.5935735702514648,
+            "median_seconds": 0.0037310123443603516,
+            "max_seconds": 0.050692081451416016,
+            "bytes": 0,
+            "pairs": 3200000,
+            "buckets": 4096
+          },
+          "scatter_encode": {
+            "seconds": 0.1149899959564209,
+            "median_seconds": 0.00034999847412109375,
+            "max_seconds": 0.06497502326965332,
+            "bytes": 3912224
+          },
+          "fetch": {
+            "seconds": 0.27642297744750977,
+            "median_seconds": 0.00011146068572998047,
+            "max_seconds": 0.03513693809509277,
+            "bytes": 0
+          },
+          "read": {
+            "seconds": 0.4314277172088623,
+            "median_seconds": 0.0020437240600585938,
+            "max_seconds": 0.07606267929077148,
+            "bytes": 3912224
+          },
+          "reduce": {
+            "seconds": 0.193617582321167,
+            "median_seconds": 0.0014671087265014648,
+            "max_seconds": 0.030818700790405273,
+            "bytes": 0,
+            "keys": 98311,
+            "rss_growth_max": 81920
+          },
+          "gather_encode": {
+            "seconds": 0.012950658798217773,
+            "median_seconds": 7.128715515136719e-05,
+            "max_seconds": 0.0046100616455078125,
+            "bytes": 699244
+          },
+          "final": {
+            "seconds": 0.08061695098876953,
+            "median_seconds": 0.08061695098876953,
+            "max_seconds": 0.08061695098876953,
+            "bytes": 0
+          }
+        },
+        "timeline": {
+          "submit_start": {
+            "first": 0.094,
+            "median": 0.094,
+            "last": 0.094
+          },
+          "submitted": {
+            "first": 3.439,
+            "median": 3.439,
+            "last": 3.439
+          },
+          "scatter_start": {
+            "first": 2.095,
+            "median": 85.471,
+            "last": 267.698
+          },
+          "scatter_mapped": {
+            "first": 8.841,
+            "median": 94.621,
+            "last": 274.47
+          },
+          "scatter_split": {
+            "first": 11.542,
+            "median": 116.497,
+            "last": 277.449
+          },
+          "scatter_end": {
+            "first": 11.84,
+            "median": 119.897,
+            "last": 277.807
+          },
+          "manifest_start": {
+            "first": 176.404,
+            "median": 176.404,
+            "last": 176.404
+          },
+          "manifest_waited": {
+            "first": 283.025,
+            "median": 283.025,
+            "last": 283.025
+          },
+          "manifest_end": {
+            "first": 283.046,
+            "median": 283.046,
+            "last": 283.046
+          },
+          "gather_start": {
+            "first": 299.56,
+            "median": 368.193,
+            "last": 439.338
+          },
+          "gather_fetched": {
+            "first": 317.731,
+            "median": 368.277,
+            "last": 439.418
+          },
+          "gather_merged": {
+            "first": 324.519,
+            "median": 380.968,
+            "last": 445.101
+          },
+          "gather_end": {
+            "first": 324.585,
+            "median": 381.128,
+            "last": 445.204
+          },
+          "driver_done": {
+            "first": 448.357,
+            "median": 448.357,
+            "last": 448.357
+          },
+          "driver_collected": {
+            "first": 528.974,
+            "median": 528.974,
+            "last": 528.974
+          }
+        },
+        "digest_ok": true,
+        "largest_partition": 1548,
+        "peers": {
+          "network_bytes": 1776818.0,
+          "spilled_bytes": 0.0,
+          "spill_us": 0.0
+        }
+      }
+    ]
+  }
+}

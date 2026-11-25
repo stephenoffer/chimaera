@@ -18,6 +18,7 @@ and workflows), ``chimaera.errors`` (every error), ``chimaera.typing``
 """
 
 from ._batch import Batch
+from ._mailbox import Mailbox
 from ._context import context
 from ._errors import (
     ActorDied,
@@ -33,6 +34,7 @@ from ._errors import (
     SerializationError,
 )
 from ._future import Future, Results, as_completed, get, handles, put, wait
+from ._group import TaskGroup
 from ._options import auto, defaults
 from ._remote import Executor, actor, gather, method, remote
 from ._run import Run as _Run, current_run as _current_run
@@ -101,12 +103,14 @@ __all__ = [
     "Future",
     "Infeasible",
     "InfrastructureFailure",
+    "Mailbox",
     "NotFound",
     "OptionsError",
     "OutOfMemory",
     "OutcomeUnknown",
     "Results",
     "SerializationError",
+    "TaskGroup",
     "actor",
     "as_completed",
     "auto",

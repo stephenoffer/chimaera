@@ -16,7 +16,7 @@ use std::time::Duration;
 /// mount a 64 MiB /dev/shm.
 pub const MIN_SHM_BYTES: u64 = 2 << 30;
 
-fn free_bytes(p: &Path) -> Option<u64> {
+pub(crate) fn free_bytes(p: &Path) -> Option<u64> {
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: statvfs fills `st` for a NUL-terminated path.
@@ -479,15 +479,16 @@ fn is_object_name(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Replicate every object this peer stores to its ring successor (see the
-/// Replicate RPC), so a lost peer loses no data: a consumer whose holder is
-/// gone finds the copy on another live member. Objects are seen through
-/// inotify as they appear in the store: renamed into place from a writer's
-/// `.tmp` name, or hard-linked from a NumPy arena. Copies fetched from other
-/// peers (`.part` names) and spills are not replicated again; where there
-/// is no inotify (macOS) the store is listed instead (see poll). The copy lags
-/// the write by one transfer. `CHIMAERA_OBJECT_REPLICAS=N` keeps N copies on
-/// the next N peers (default 1); 0 turns this off.
+/// Replicate every object this peer stores to other peers (see the
+/// Replicate RPC and replicas::targets), so a lost peer loses no data: a
+/// consumer whose holder is gone finds the copy on another live member.
+/// Objects are seen through inotify as they appear in the store: renamed
+/// into place from a writer's `.tmp` name, or hard-linked from a NumPy arena.
+/// Copies fetched from other peers (`.part` names), spills and objects their
+/// writer marked (a durability class other than the default) are not
+/// replicated. The copy lags the write by one transfer.
+/// `CHIMAERA_OBJECT_REPLICAS=N` keeps N copies, in other failure domains
+/// first (default 1); 0 turns this off.
 pub fn replicate_new_objects(
     objects: PathBuf,
     mesh: std::sync::Arc<crate::mesh::MeshClient>,
@@ -529,6 +530,9 @@ fn poll(
             }
             for e in std::fs::read_dir(run.path()).into_iter().flatten().flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
+                if crate::replicas::note_marker(&run.path(), &name) {
+                    continue; // its object gets no copy here (see replicas)
+                }
                 // A symlink is a spilled object or a replica of another peer's.
                 if !is_object_name(&name) || e.file_type().map_or(true, |t| t.is_symlink()) {
                     continue;
@@ -624,6 +628,9 @@ fn watch(
                 continue;
             }
             let Some(run_dir) = runs.get(&ev.wd) else { continue };
+            if ev.mask & libc::IN_CREATE != 0 && crate::replicas::note_marker(run_dir, &name) {
+                continue; // its object gets no copy here (see replicas)
+            }
             if ev.mask & libc::IN_MOVED_FROM != 0 {
                 if moved.len() > 4096 {
                     moved.clear(); // unpaired cookies (moves out of the directory)
@@ -643,16 +650,20 @@ fn watch(
     }
 }
 
-/// Copy `<run_dir>/<name>` to this peer's successor after replica_delay(),
-/// unless another peer fetched it meanwhile (that copy suffices) or it was
-/// freed. The grace keeps a replica from competing with a reader on another
-/// peer for this peer's bandwidth.
+/// Copy `<run_dir>/<name>` to the peers that hold this peer's copies
+/// (replicas::targets) after replica_delay(), unless its writer marked it to
+/// have none (another durability class), another peer fetched it meanwhile
+/// (that copy suffices) or it was freed. The grace keeps a replica from
+/// competing with a reader on another peer for this peer's bandwidth.
 fn replicate_one(
     run_dir: &Path,
     name: &str,
     mesh: &std::sync::Arc<crate::mesh::MeshClient>,
     rt: &tokio::runtime::Handle,
 ) {
+    if crate::replicas::kept_local(run_dir, name) {
+        return;
+    }
     let path = run_dir.join(name);
     let (Some(run), Some(object)) =
         (run_dir.file_name().and_then(|r| decode_hex(&r.to_string_lossy())), decode_hex(name))
@@ -660,7 +671,7 @@ fn replicate_one(
         return;
     };
     let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else { return };
-    let nodes = mesh.successors(replica_count());
+    let nodes = crate::replicas::targets(mesh, mesh.me.node_id, replica_count());
     if nodes.is_empty() {
         return;
     }
@@ -675,7 +686,8 @@ fn replicate_one(
         // A peer that fetched it already holds one copy.
         let want = nodes.len() - usize::from(mesh.was_served(&object));
         for &node in &nodes[..want] {
-            if let Err(e) = mesh.replicate(node, &run, &object, size, true).await {
+            let checkpoint = chimaera_core::pb::TrafficClass::TrafficCheckpoint;
+            if let Err(e) = mesh.replicate(node, &run, &object, size, true, checkpoint).await {
                 crate::counters::REPLICATION_FAILURES.add(1);
                 tracing::warn!("no replica of {} on node {node}: {e}", path.display());
             }
@@ -684,20 +696,20 @@ fn replicate_one(
 }
 
 /// Copies of each object on other peers (`CHIMAERA_OBJECT_REPLICAS`, default
-/// 1; 0 turns replicas off), on the next peers round the ring.
-fn replica_count() -> usize {
+/// 1; 0 turns background replicas off), in other failure domains first.
+pub(crate) fn replica_count() -> usize {
     std::env::var("CHIMAERA_OBJECT_REPLICAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
 }
 
 /// Replicas being copied at once, from one peer.
-const REPLICAS_AT_ONCE: usize = 8;
+pub(crate) const REPLICAS_AT_ONCE: usize = 8;
 
 fn replica_turns() -> &'static tokio::sync::Semaphore {
     static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     TURNS.get_or_init(|| tokio::sync::Semaphore::new(REPLICAS_AT_ONCE))
 }
 
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(s: &str) -> Option<Vec<u8>> {
     s.len()
         .is_multiple_of(2)
         .then(|| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect())
@@ -705,9 +717,10 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Before this peer leaves (a drain): give every object it holds a copy on
-/// its ring successor, the next live peer that is not draining, which is
-/// where readers look once a holder is gone. Each copy is waited for, eight
-/// at a time, until `deadline`. A successor that already has an object
+/// the first peer that holds its copies (replicas::targets: other failure
+/// domains first, among live peers that are not draining), which is where
+/// readers look once a holder is gone. Each copy is waited for, eight
+/// at a time, until `deadline`. A peer that already has an object
 /// answers at once. Returns (objects with a copy there, objects left behind).
 pub async fn hand_off(
     objects: &crate::stores::ObjectStore,
@@ -716,7 +729,7 @@ pub async fn hand_off(
 ) -> (u64, u64) {
     let held = held_objects(objects.dir());
     let total = held.len() as u64;
-    let Some(node) = mesh.successor() else {
+    let Some(&node) = crate::replicas::targets(mesh, mesh.me.node_id, 1).first() else {
         if total > 0 {
             tracing::warn!("drain: no live peer to hand {total} objects to; they leave with this peer");
         }
@@ -729,7 +742,8 @@ pub async fn hand_off(
         copies.spawn(async move {
             let _turn = turns.acquire_owned().await.ok()?;
             let left = deadline.checked_duration_since(std::time::Instant::now())?;
-            tokio::time::timeout(left, mesh.replicate(node, &run, &object, size, true)).await.ok()?.ok()
+            let recovery = chimaera_core::pb::TrafficClass::TrafficRecovery;
+            tokio::time::timeout(left, mesh.replicate(node, &run, &object, size, true, recovery)).await.ok()?.ok()
         });
     }
     let mut copied = 0;

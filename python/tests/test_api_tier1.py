@@ -320,6 +320,29 @@ def test_topic_delivers_to_every_subscriber_from_its_start():
     assert list(early) == [2, 3, 4] and early.skipped == 2  # read nothing before the log trimmed
 
 
+def test_a_cursor_resumes_where_it_acked_and_names_the_exact_gap():
+    topic = ch.coord.Topic(retain=3)
+    sub = topic.subscribe("earliest", cursor="reader")
+    topic.publish("first").result()
+    assert next(sub) == "first"
+    sub.ack().result()
+    sub.close()  # the reader goes away
+    for i in range(10):  # offsets 1 to 10: the topic keeps 8, 9 and 10
+        topic.publish(i).result()
+    again = topic.subscribe("latest", cursor="reader")  # start counts only the first time
+    assert again.offset == 1
+    assert [next(again) for _ in range(3)] == [7, 8, 9]
+    assert again.gaps == [ch.coord.Gap(first_missed=1, first_available=8)] and again.skipped == 7
+    again.ack(99).result()  # past the end: up to the end
+    topic.publish("next").result()
+    assert next(topic.subscribe(cursor="reader")) == "next"
+    fresh = topic.subscribe("latest", cursor="other")
+    topic.publish("last").result()
+    assert next(fresh) == "last" and not fresh.gaps
+    with pytest.raises(ValueError, match="cursor"):
+        topic.subscribe().ack()
+
+
 def test_latest_starts_at_subscribe_not_at_the_first_read():
     topic = ch.coord.Topic()
     topic.publish("before").result()
