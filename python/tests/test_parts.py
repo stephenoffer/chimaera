@@ -98,7 +98,10 @@ def stored(c: Cluster, i: int) -> dict[str, bytes]:
     return out
 
 
-def test_a_consumer_at_scale_fetches_only_its_value_and_parts_go_with_their_result():
+def test_a_consumer_at_scale_fetches_only_its_value_and_parts_go_with_their_result(monkeypatch):
+    # What each peer fetched, so no replicas: those copy every part to the
+    # next peer as soon as it is written (see test_cluster for replicas).
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
     c = Cluster(3)  # three peers, a consumer on each: parts pay (see worth_splitting)
     looked, broken, done = (os.path.join(c.root, n) for n in ("looked", "broken", "done"))
     driver = DRIVER.replace("LOOKED", repr(looked)).replace("BROKEN", repr(broken)).replace("DONE", repr(done))
