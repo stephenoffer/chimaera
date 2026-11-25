@@ -34,7 +34,6 @@ mod actor_limits;
 mod actor_state;
 mod demand;
 mod holds;
-mod native;
 mod shortlist;
 
 type Kind = pb::error_record::Kind;
@@ -975,10 +974,6 @@ pub struct Core {
     code: CodeStore,
     capacity: f64,
     cpu_used: f64,
-    /// Executors where calls wait, and the CPU their threads still use (native).
-    native: HashMap<u32, native::Native>,
-    /// What was last let in over those threads' CPU, and when a call last started (native).
-    letting: native::Letting,
     queue: crate::keyed_queue::KeyedQueue<Work, Tk>,
     /// Items still running per task, so a finished call heard of (most ran
     /// elsewhere, or already finished here) costs a lookup, not a scan.
@@ -1247,8 +1242,6 @@ impl Core {
             outstanding: HashMap::new(),
             finished_at: HashMap::new(),
             in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            native: HashMap::new(),
-            letting: native::Letting::default(),
         }
     }
 
@@ -1594,7 +1587,6 @@ impl Core {
                     memory_available: self.available.unwrap_or(0),
                     object_bytes: self.object_bytes,
                     tenant_cpu: self.quotas.usage(),
-                    tenant_kept: self.quotas.kept(),
                     demand: Some(self.demand()),
                     ..Default::default()
                 });
@@ -3151,21 +3143,15 @@ impl Core {
     }
 
     /// Per tenant, the CPUs the other live peers last reported holding.
-    /// Per tenant, the CPUs its calls hold on the other peers, and what the
-    /// threads of its waiting calls keep there (native).
-    fn tenants_elsewhere(&self) -> HashMap<String, (f64, f64)> {
-        let mut out: HashMap<String, (f64, f64)> = HashMap::new();
+    fn tenants_elsewhere(&self) -> HashMap<String, f64> {
+        let mut out = HashMap::new();
         let me = self.router.identity.peer.0.to_vec();
         for v in self.router.mesh.as_ref().map(|m| m.members()).unwrap_or_default() {
             if v.dead || v.member.peer == me {
                 continue;
             }
-            let Some(load) = v.load else { continue };
-            for (tenant, cpus) in load.tenant_cpu {
-                out.entry(tenant).or_default().0 += cpus;
-            }
-            for (tenant, kept) in load.tenant_kept {
-                out.entry(tenant).or_default().1 += kept;
+            for (tenant, cpus) in v.load.map(|l| l.tenant_cpu).unwrap_or_default() {
+                *out.entry(tenant).or_insert(0.0) += cpus;
             }
         }
         out
@@ -3206,7 +3192,7 @@ impl Core {
     /// fits, until the head has waited HEAD_WAIT).
     fn dispatch(&mut self) {
         let mut i = 0;
-        let mut elsewhere: Option<HashMap<String, (f64, f64)>> = None; // tenants' CPUs on other peers, read once
+        let mut elsewhere: Option<HashMap<String, f64>> = None; // tenants' CPUs on other peers, read once
         while i < self.queue.len() && i <= BACKFILL {
             self.refresh_cpus(i);
             // A gang rank or a bundle's host runs on the slot held for it
@@ -3251,9 +3237,7 @@ impl Core {
                 );
                 continue;
             }
-            // Let in over what waiting calls' threads keep, if only that is in the way (native).
-            let mut lent = slot.is_none() && self.cpu_used + cpus > self.capacity + 1e-9;
-            if lent && !self.native_in_the_way(cpus, waited) {
+            if slot.is_none() && self.cpu_used + cpus > self.capacity + 1e-9 {
                 if self.delegate(i, cpus) {
                     continue; // it runs in another cell; look at the next
                 }
@@ -3262,13 +3246,12 @@ impl Core {
             if self.quotas.enabled() {
                 let tenant = self.tenant_of(self.queue[i].tk.run);
                 let others = if self.quotas.has_share(&tenant) {
-                    elsewhere.get_or_insert_with(|| self.tenants_elsewhere()).get(&tenant).copied().unwrap_or_default()
+                    elsewhere.get_or_insert_with(|| self.tenants_elsewhere()).get(&tenant).copied().unwrap_or(0.0)
                 } else {
-                    (0.0, 0.0)
+                    0.0
                 };
-                match self.quotas.admit(&tenant, cpus, others, || self.native_free(waited)) {
+                match self.quotas.admit(&tenant, cpus, others) {
                     crate::quotas::Admit::Yes => {}
-                    crate::quotas::Admit::Lent => lent = true,
                     crate::quotas::Admit::Wait(_) => {
                         i += 1; // other tenants' work may go ahead
                         continue;
@@ -3302,7 +3285,6 @@ impl Core {
                     continue;
                 }
                 let w = self.queue.remove(i).expect("index in range");
-                self.native_started(w.tk, lent);
                 self.start_isolated(w);
                 continue;
             }
@@ -3347,7 +3329,6 @@ impl Core {
                 let _ = self.take_slot(run, t); // found above in this pass: its CPUs and devices are the call's now
             }
             self.devices.hold(exec, &key);
-            self.native_started(batch[0].tk, lent);
             self.start(exec, batch);
         }
     }
@@ -3572,12 +3553,11 @@ impl Core {
             let by_holds =
                 if held > 0.0 { format!(", {held:.2} of it held for gangs and reservations") } else { String::new() };
             return format!(
-                "needs {} CPU ({}); {:.2} of {:.2} in use{by_actors}{by_holds}{}",
+                "needs {} CPU ({}); {:.2} of {:.2} in use{by_actors}{by_holds}",
                 w.cpus,
                 w.reservation(),
                 self.cpu_used,
-                self.capacity,
-                self.native_note()
+                self.capacity
             );
         }
         if let Some(why) = self.devices.wait_reason(w.policy.gpus, &w.policy.device).filter(|_| !leased) {
@@ -3587,6 +3567,20 @@ impl Core {
             .or_else(|| self.memory_wait(w))
             .or_else(|| self.pids_note.clone())
             .unwrap_or_else(|| "waiting for an executor to start".into())
+    }
+
+    /// The tenant quota or share that keeps `w` waiting here, if one does.
+    fn quota_note(&self, w: &Work) -> Option<String> {
+        let tenant = self.quotas.tenant_of(w.tk.run)?;
+        let others = if self.quotas.has_share(tenant) {
+            self.tenants_elsewhere().get(tenant).copied().unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        match self.quotas.admit(tenant, w.cpus, others) {
+            crate::quotas::Admit::Wait(why) => Some(why),
+            _ => None,
+        }
     }
 
     fn consume_start(&self, w: Work) {
@@ -4066,14 +4060,12 @@ impl Core {
                     r.blocked = msg.blocked;
                     let head = r.items.first().map(|w| (w.tk.run, w.tk.task));
                     // A task waiting on other futures lends out its CPU so the
-                    // work it waits for can run (it keeps its memory charge),
-                    // less what its threads go on using (native).
+                    // work it waits for can run (it keeps its memory charge).
                     if msg.blocked {
                         self.cpu_used -= r.cpus;
                     } else {
                         self.cpu_used += r.cpus;
                     }
-                    self.native_restart(exec);
                     if let Some(call) = head {
                         if msg.blocked {
                             self.quotas.pause(call);
@@ -4383,9 +4375,6 @@ impl Core {
             unlearned = std::mem::take(&mut r.unlearned);
             if !r.blocked {
                 self.cpu_used -= r.cpus;
-            }
-            if self.native.contains_key(&exec) {
-                self.native_restart(exec);
             }
             if let Some(w) = r.items.first() {
                 self.quotas.give((w.tk.run, w.tk.task));
@@ -4888,7 +4877,6 @@ impl Core {
         let info = self.execs.remove(&exec);
         self.actor_waits.retain(|(e, _), _| *e != exec);
         self.sup.forget(exec);
-        self.native_restart(exec); // gone from execs: nothing more is watched
         self.devices.release(exec);
         if let Some(e) = &info {
             self.cpu_used -= e.held_cpus;
@@ -5211,8 +5199,7 @@ impl Core {
         let holds = &self.actor_holds;
         let held =
             |peer: &[u8]| holds.iter().filter(|(_, p, ..)| p.as_slice() == peer).map(|(_, _, c, _)| c).sum::<f64>();
-        // Cores that waiting calls' threads use are free to the actor they may wait for (native).
-        let free_here = self.capacity - self.cpu_used + self.native_yielding(Duration::MAX) - held(&me.peer);
+        let free_here = self.capacity - self.cpu_used - held(&me.peer);
         let Some(mesh) = self.router.mesh.clone() else {
             return if self.capacity + 1e-9 < cpus {
                 ActorPlacement::Infeasible
@@ -5281,7 +5268,6 @@ impl Core {
 
     fn hold_actor_cpus(&mut self, actor: Id, peer: &pb::PeerInc, cpus: f64) {
         if cpus > 0.0 {
-            self.native_placed(actor, &peer.peer, cpus);
             self.actor_holds.push((actor, peer.peer.clone(), cpus, Instant::now()));
         }
     }
@@ -6041,7 +6027,6 @@ impl Core {
         self.expire_holds();
         self.spill();
         self.charge_budgets();
-        self.native_sample();
         // Actors that waited for CPUs: try again (each re-reads its record).
         for actor in std::mem::take(&mut self.actors_waiting) {
             self.on_actor_changed(actor);

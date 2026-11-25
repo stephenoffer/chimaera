@@ -99,13 +99,6 @@ between calls that run one after another in a worker, and a lock held across
 `CHIMAERA_HOST_WHILE_WAITING=0` on the peers to give each waiting call a
 process of its own.
 
-Threads the call started that keep running through the wait, such as a BLAS
-pool, keep the CPU they use: the peer measures them and grants only the rest.
-When only those threads stand in the way of the calls it waits for, the calls
-still start, one at a time beside them: the next once the one before ends,
-waits, or sits idle for a quarter of a second. If other calls are running on
-the peer too, a call first waits up to two seconds for one of them to end.
-
 </details>
 
 ## Cancel a call

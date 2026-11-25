@@ -180,10 +180,10 @@ print("RESULT", parent.remote().result(timeout=240))
 def test_a_busy_parents_children_run_on_another_peer_within_its_share(monkeypatch):
     from test_cluster import Cluster
 
-    # The parent's threads keep the whole two-CPU share on one peer as it
-    # waits on its children, one at a time, on the other. There, as on the
-    # parent's peer, only those threads' CPUs are in the way: each child is
-    # let in, rather than waiting for as long as the threads run.
+    # The parent holds the tenant's whole two-CPU share on one peer, and its
+    # threads keep running as it waits on its children, one at a time, on the
+    # other. Waiting, it lends its share there too: each child starts, rather
+    # than waiting for as long as the threads run.
     monkeypatch.setenv("CHIMAERA_TENANT_SHARES", "default=2")
     monkeypatch.setenv("CHIMAERA_HOST_WHILE_WAITING", "0")  # every child in a process of its own
     roles = {0: {"CHIMAERA_LABELS": "role=parent"}, 1: {"CHIMAERA_LABELS": "role=kids"}}

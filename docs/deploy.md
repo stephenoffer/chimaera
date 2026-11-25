@@ -339,7 +339,7 @@ Start peers with `CHIMAERA_TENANT_QUOTAS="team-a=8,team-b=2"`
 to cap each tenant's CPUs on that peer:
 - **At the cap:** while a tenant's running calls hold its quota, its other calls wait, and other tenants' work goes ahead.
 - **Over the cap:** a call that asks for more than the whole quota fails as infeasible, naming the quota.
-- **Waiting calls:** a call waiting on its own calls lends its share, as it lends its CPU, so nested work never deadlocks a quota. Threads it started that keep running through the wait, such as a BLAS pool, keep the share they use. When only what those threads keep stands in the way, calls still start, one at a time on each peer, under a quota or a cluster share.
+- **Waiting calls:** a call waiting on its own calls lends its share, as it lends its CPU, so nested work never deadlocks a quota.
 - **No quota:** tenants without a quota are not limited.
 - **Bad setting:** a malformed setting stops the peer.
 

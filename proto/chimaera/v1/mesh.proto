@@ -320,9 +320,10 @@ message PingReply {
   // The peer is draining (SIGTERM): it will stop. `draining` alone may also
   // mean its core has not answered yet (see the ping handler).
   bool stopping = 19;
-  // CPUs that threads of calls waiting on other calls keep using, per tenant
-  // with a share (not in tenant_cpu). They hold back no call let in one at a
-  // time while only they stand in the way, as they do here.
+  // Unused: peers from this version on neither set nor read it, and an older
+  // peer's value is ignored. It carried CPUs that threads of waiting calls
+  // kept, per tenant; that change was taken back. Keep the field and never
+  // reuse number 20.
   map<string, double> tenant_kept = 20;
   Demand demand = 21;  // what more capacity would start sooner here
 }
