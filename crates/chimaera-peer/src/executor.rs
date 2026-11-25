@@ -208,6 +208,8 @@ impl Supervisor {
             // Pools that ignore OMP_NUM_THREADS.
             "POLARS_MAX_THREADS",
             "NUMBA_NUM_THREADS",
+            // joblib's process pool: a nested Parallel(n_jobs=-1) starts one per CPU it counts.
+            "LOKY_MAX_CPU_COUNT",
         ] {
             if !env.env.contains_key(var) {
                 cmd.env(var, &t);

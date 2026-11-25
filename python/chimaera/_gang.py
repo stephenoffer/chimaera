@@ -191,6 +191,21 @@ class Group:
             out[name] = axis
         return out
 
+    def table(self) -> list[dict[str, Any]]:
+        """This group's ranks as this generation started them, in order: each
+        rank's ``rank`` in the gang, ``node`` (its peer), ``local_rank``,
+        ``devices`` (the ids of the devices it was granted) and ``visible``
+        (their indexes as its process numbers them, so ``0`` for a rank with
+        one GPU). One read of the gang's store."""
+        from ._store import Store
+
+        rows = {v["rank"]: v for _, v in Store(f"gang/{self._root}").scan(f"{self.generation}/host/")}
+        seen: dict[str, int] = {}
+        for r in sorted(rows):  # as LOCAL_RANK: its place among the ranks on its peer
+            rows[r]["local_rank"] = seen.get(rows[r]["node"], 0)
+            seen[rows[r]["node"]] = rows[r]["local_rank"] + 1
+        return [rows[r] for r in self.ranks]
+
     @property
     def backend(self) -> str:
         """The ``torch.distributed`` backend of this rank's devices (``gloo`` on CPU)."""
@@ -483,13 +498,13 @@ def _fits(opts: dict[str, Any]) -> int:
     """How many ranks of this shape the live peers can hold (CPUs, and GPUs if the ranks need them)."""
     from ._cluster import cluster
 
-    cpus, gpus = opts.get("cpus") or 1.0, opts.get("gpus") or 0.0
+    cpus, gpus = opts.get("cpus") or 1.0, _ledger.devices(float(opts.get("gpus") or 0.0))
     cpus = (cpus.initial or 1.0) if isinstance(cpus, Auto) else float(cpus)
     total = 0
     for n in cluster().nodes():
-        if n.alive:
+        if n.alive and not n.draining:  # as _ledger.plan: a draining peer takes no rank
             fit = math.floor(n.cpus / cpus + 1e-9)
-            total += min(fit, math.floor(len(n.gpus) / float(gpus) + 1e-9)) if gpus else fit
+            total += min(fit, len(n.gpus) // gpus) if gpus else fit
     return total
 
 
@@ -623,6 +638,7 @@ def _rendezvous(gang: str, generation: int, rank: int, world: int, collective: f
     holds it until its code starts (`_hand_off`). A record the members
     create waits `collective` seconds in each collective."""
     from . import _context
+    from ._devices import devices
     from ._store import Store
 
     store = Store(f"gang/{gang}")
@@ -648,7 +664,12 @@ def _rendezvous(gang: str, generation: int, rank: int, world: int, collective: f
         sock.bind(("", 0))
         _listeners[(gang, generation)] = sock
         _publish(store, generation, _host_addr(), sock.getsockname()[1], serving=False)
-    store.put(f"{generation}/node/{rank}", node, ttl=TTL)
+    store.put(f"{generation}/node/{rank}", node, ttl=TTL)  # the supervisor's: where a lost rank ran
+    # This rank's row of the rank table (`Group.table`), under its peer, so a
+    # rank reads only its own peer's rows: one read however large the gang.
+    granted = devices()
+    row = {"rank": rank, "node": node, "devices": [d["id"] for d in granted], "visible": [d["index"] for d in granted]}
+    store.put(f"{generation}/host/{node}/{rank:06d}", row, ttl=TTL)
     timeout = record["timeout"]
     try:
         store.barrier(f"{generation}/start", world).wait(timeout)
@@ -657,13 +678,13 @@ def _rendezvous(gang: str, generation: int, rank: int, world: int, collective: f
         raise InfrastructureFailure(
             f"gang rendezvous: rank(s) {_names(missing)} did not arrive within {timeout:g} s"
         ) from None
-    nodes = [store.get(f"{generation}/node/{r}") for r in range(world)]
+    here = [v["rank"] for _, v in store.scan(f"{generation}/host/{node}/")]  # in rank order
     addr, port = store.get(f"{generation}/record")["endpoint"][:2]
     env = {
         "RANK": str(rank),
         "WORLD_SIZE": str(world),
-        "LOCAL_RANK": str(sum(1 for r in range(rank) if nodes[r] == node)),
-        "LOCAL_WORLD_SIZE": str(nodes.count(node)),
+        "LOCAL_RANK": str(here.index(rank)),
+        "LOCAL_WORLD_SIZE": str(len(here)),
         "MASTER_ADDR": addr,
         "MASTER_PORT": str(port),
         "CHIMAERA_GANG": gang,

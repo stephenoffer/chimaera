@@ -10,17 +10,19 @@ Importing this module registers the ``"chimaera"`` backend::
 
 Each batch of a ``Parallel`` loop is one Chimaera call, and joblib sizes
 batches by how long they take, so many small tasks share a call. ``n_jobs``
-sets how many batches are in flight at once (default and ``-1``: this
-machine's CPU count); Chimaera places them on whichever peers have room. If a
-task raises, joblib raises that error and the batches still running are
-cancelled.
+sets how many batches run at once (default and ``-1``: the CPUs of every live
+peer, ``-2`` one fewer, and so on); the rest wait here, and Chimaera places
+each on whichever peer has room. If a task raises, joblib raises that error
+and the batches still running are cancelled.
 """
 
 from __future__ import annotations
 
-import os
+import concurrent.futures
+import functools
 import queue
 import threading
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -50,11 +52,15 @@ class ChimaeraBackend(AutoBatchingMixin, ParallelBackendBase):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._pending: set[ch.Future[Any]] = set()
+        # Batches past n_jobs wait here, unsent: joblib dispatches up to
+        # pre_dispatch (2 * n_jobs) of them, and a roomy cluster would run all.
+        self._waiting: deque[tuple[Callable[[], list[Any]], Callable[[Any], Any] | None]] = deque()
+        self._running = 0  # batches sent and not yet settled
         self._lock = threading.Lock()
         # joblib dispatches its next batch from the completion callback. A
         # future's callbacks run on the thread that delivers outcomes, which
         # must never wait on a submission, so they run on this thread instead.
-        self._callbacks: queue.SimpleQueue[tuple[Callable[[Any], Any], ch.Future[Any]] | None] | None = None
+        self._callbacks: queue.SimpleQueue[tuple[Callable[[Any], Any], Any] | None] | None = None
 
     def effective_n_jobs(self, n_jobs: int | None) -> int:
         if n_jobs == 0:
@@ -62,7 +68,8 @@ class ChimaeraBackend(AutoBatchingMixin, ParallelBackendBase):
         if n_jobs is None:
             return 1
         if n_jobs < 0:
-            return max((os.cpu_count() or 1) + 1 + n_jobs, 1)
+            cpus = sum(n.cpus for n in ch.runs.cluster().nodes() if n.alive and not n.draining)
+            return max(int(cpus) + 1 + n_jobs, 1)
         return n_jobs
 
     def configure(self, n_jobs: int = 1, parallel: Any = None, **kwargs: Any) -> int:
@@ -70,35 +77,66 @@ class ChimaeraBackend(AutoBatchingMixin, ParallelBackendBase):
         if self._callbacks is None:
             self._callbacks = queue.SimpleQueue()
             threading.Thread(target=self._deliver, args=(self._callbacks,), name="joblib-callbacks", daemon=True).start()
-        return self.effective_n_jobs(n_jobs)
+        self._n_jobs = self.effective_n_jobs(n_jobs)
+        return self._n_jobs
 
-    def _deliver(self, callbacks: queue.SimpleQueue[tuple[Callable[[Any], Any], ch.Future[Any]] | None]) -> None:
+    def _deliver(self, callbacks: queue.SimpleQueue[tuple[Callable[[Any], Any], Any] | None]) -> None:
         while (item := callbacks.get()) is not None:
             callback, future = item
             callback(future)
 
-    def submit(self, func: Callable[[], list[Any]], callback: Callable[[Any], Any] | None = None) -> ch.Future[Any]:
-        future = _run_batch.remote(func)
+    def submit(
+        self, func: Callable[[], list[Any]], callback: Callable[[Any], Any] | None = None
+    ) -> ch.Future[Any] | None:
+        """Send the batch, or keep it until one of the n_jobs running settles.
+        joblib reads results only through `callback` (supports_retrieve_callback),
+        so a kept batch returns None."""
+        with self._lock:
+            if self._running >= self._n_jobs:
+                self._waiting.append((func, callback))
+                return None
+            self._running += 1
+        return self._send(func, callback)
+
+    def _send(self, func: Callable[[], list[Any]], callback: Callable[[Any], Any] | None) -> Any:
+        callbacks = self._callbacks
+        assert callbacks is not None, "configure() runs before submit()"
+        settled = functools.partial(self._settled, callback)
+        try:
+            future = _run_batch.remote(func)
+        except Exception as e:  # noqa: BLE001 - joblib hears of it as of a batch that failed
+            # Raised on the callback thread, which sends the next batches too,
+            # it would end that thread, and Parallel would wait forever.
+            failed: concurrent.futures.Future[Any] = concurrent.futures.Future()
+            failed.set_exception(e)
+            callbacks.put((settled, failed))
+            return failed
         with self._lock:
             self._pending.add(future)
-        future.add_done_callback(self._settled)
-        if callback is not None:
-            callbacks = self._callbacks
-            assert callbacks is not None, "configure() runs before submit()"
-            future.add_done_callback(lambda f: callbacks.put((callback, f)))
+        future.add_done_callback(lambda f: callbacks.put((settled, f)))
         return future
 
-    def _settled(self, future: ch.Future[Any]) -> None:
+    def _settled(self, callback: Callable[[Any], Any] | None, future: Any) -> None:
+        """A batch settled (on the callback thread): its slot goes to the next
+        waiting batch, then joblib hears of it."""
         with self._lock:
             self._pending.discard(future)
+            following = self._waiting.popleft() if self._waiting else None
+            if following is None:
+                self._running -= 1
+        if following is not None:
+            self._send(*following)
+        if callback is not None:
+            callback(future)
 
-    def retrieve_result_callback(self, future: ch.Future[Any]) -> list[Any]:
+    def retrieve_result_callback(self, future: Any) -> list[Any]:  # a ch.Future, or one _send failed
         return future.result()
 
     def abort_everything(self, ensure_ready: bool = True) -> None:
-        """Cancel the batches still running."""
+        """Cancel the batches still running, and drop those waiting."""
         with self._lock:
             pending, self._pending = self._pending, set()
+            self._waiting.clear()
         for future in pending:
             future.cancel()
 

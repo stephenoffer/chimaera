@@ -76,7 +76,10 @@ assert envs[0]["MASTER_ADDR"] == envs[1]["MASTER_ADDR"]
 
 In Python, `ch.context().gang` gives you this as a `Group`: `rank`, `size`,
 `local_rank`, `local_size`, `generation`, `id` and `master` (an
-`(addr, port)` pair). Outside a gang it's `None`.
+`(addr, port)` pair). Outside a gang it's `None`. `table()` lists every
+rank of the generation: its `rank`, `node`, `local_rank`, `devices` (the
+ids of the GPUs it was granted) and `visible` (their indexes as its process
+numbers them, so a rank with one GPU sees index 0).
 
 If later calls reuse a worker, it gets its old environment back, so plain
 calls never see a stale `RANK`.
@@ -264,7 +267,10 @@ Lose a peer and an elastic gang comes back smaller instead of waiting for a
 replacement. `gang.decisions` tells you why each generation got its size;
 `gang.size` and `gang.generation` tell you how it ran.
 
-The count goes by the peers' CPUs, plus GPUs when ranks ask for them. It
+The count goes by the peers' CPUs, plus GPUs when ranks ask for them. A
+fractional `gpus=0.5` counts as the whole device each rank gets, so eight
+GPUs hold eight such ranks. The count doesn't look at `device=` yet: on a
+cluster of mixed GPUs, give `max` no larger than the matching devices. It
 counts capacity, not what's free right now. If you give `initial`, the first
 generation starts there. `min` defaults to 1. `max` is required unless you
 give `initial`, which then doubles as the max.

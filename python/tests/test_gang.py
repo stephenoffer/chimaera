@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 
@@ -687,6 +688,121 @@ for device in ("rocm", "cuda:A100"):  # the peer reports eight devices, all of t
     assert re.search(head.format("cuda:A100") + r"needs 2 cuda:A100 device\(s\); this peer has 0", out), out
 
 
+def test_a_gang_sizing_itself_counts_a_fractional_gpu_as_the_whole_device_it_gets():
+    out = on_a_fresh_peer(
+        """
+import json, os
+import chimaera as ch
+
+@ch.remote(gpus=0.5, cpus=0.25)
+def device():
+    return json.loads(os.environ["CHIMAERA_DEVICES"])[0]["id"]
+
+gang = device.options(ranks=ch.auto(max=16)).gang()  # eight devices: eight ranks, not sixteen half ones
+ids = gang.result(timeout=240)
+print("RANKS", len(ids), "DISTINCT", len(set(ids)))
+print("DECISION", gang.decisions[0])
+""",
+        env={"CHIMAERA_DEVICE_ROOT": FIXTURE_GPUS},
+    )
+    assert "RANKS 8 DISTINCT 8" in out, out
+    assert "DECISION generation 1: 8 ranks: the live peers hold 8 of this shape" in out, out
+
+
+def test_each_rank_sees_its_own_device_as_index_0_and_the_rank_table_names_it():
+    out = on_a_fresh_peer(
+        """
+import json, os
+import chimaera as ch
+
+@ch.remote(gpus=1, cpus=0.25)
+def where():
+    g = ch.context().gang
+    mine = json.loads(os.environ["CHIMAERA_DEVICES"])
+    return g.rank, g.local_rank, g.local_size, [d["index"] for d in mine], [d["id"] for d in mine], g.table()
+
+rows = where.options(ranks=2).gang().result(timeout=240)
+print("LOCAL", [r[1:3] for r in rows], "VISIBLE", [r[3] for r in rows], "DISTINCT", len({r[4][0] for r in rows}))
+print("TABLES AGREE", rows[0][5] == rows[1][5])
+table = [(t["rank"], t["local_rank"], t["visible"], t["devices"]) for t in rows[0][5]]
+print("TABLE MATCHES", table == [(r[0], r[1], r[3], r[4]) for r in rows])
+""",
+        env={"CHIMAERA_DEVICE_ROOT": FIXTURE_GPUS},
+    )
+    assert "LOCAL [(0, 2), (1, 2)] VISIBLE [[0], [0]] DISTINCT 2" in out, out
+    assert "TABLES AGREE True" in out, out
+    assert "TABLE MATCHES True" in out, out
+
+
+def test_a_rank_reads_the_store_as_often_however_large_its_gang(monkeypatch):
+    """The rendezvous costs each rank a fixed number of reads: at 1,024 ranks,
+    reading every rank's peer from every rank was a million reads."""
+    from chimaera import _context, _gang, _store
+    from chimaera._errors import VersionConflict
+
+    data: dict[str, tuple[object, int]] = {}
+    barriers: dict[str, threading.Barrier] = {}
+    lock, here = threading.Lock(), threading.local()
+
+    class CountingStore:
+        def __init__(self, namespace: str) -> None:
+            self.ns = namespace
+
+        def _read(self) -> None:
+            here.reads += 1
+
+        def get(self, key, default=None):
+            self._read()
+            return data.get(f"{self.ns}/{key}", (default, 0))[0]
+
+        def get_versioned(self, key, default=None):
+            self._read()
+            return data.get(f"{self.ns}/{key}", (default, 0))
+
+        def put(self, key, value, *, if_version=None, ttl=None, fence=None):
+            with lock:
+                version = data.get(f"{self.ns}/{key}", (None, 0))[1]
+                if if_version is not None and if_version != version:
+                    raise VersionConflict(key, version)
+                data[f"{self.ns}/{key}"] = (value, version + 1)
+
+        def scan(self, prefix=""):
+            self._read()
+            full = f"{self.ns}/{prefix}"
+            with lock:
+                return sorted((k[len(self.ns) + 1 :], v) for k, (v, _) in data.items() if k.startswith(full))
+
+        def barrier(self, key, parties):
+            with lock:
+                b = barriers.setdefault(f"{self.ns}/{key}", threading.Barrier(parties))
+            return types.SimpleNamespace(wait=b.wait)
+
+    monkeypatch.setattr(_store, "Store", CountingStore)
+    monkeypatch.setattr(_context, "context", lambda: types.SimpleNamespace(node=here.node))
+    reads_by_world = {}
+    for world in (2, 4, 8, 16):
+        gang = f"count-{world}"
+        _gang._record(CountingStore(f"gang/{gang}"), 1, [None] * world, timeout=30)
+        envs, reads = [None] * world, [0] * world
+
+        def rank(r: int) -> None:
+            here.node, here.reads = f"peer{r % 2}", 0  # two peers, alternating
+            envs[r] = _gang._rendezvous(gang, 1, r, world)
+            reads[r] = here.reads
+
+        threads = [threading.Thread(target=rank, args=(r,)) for r in range(world)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        _gang._hand_off(gang, 1)
+        assert [(e["LOCAL_RANK"], e["LOCAL_WORLD_SIZE"]) for e in envs] == [
+            (str(r // 2), str(world // 2)) for r in range(world)
+        ]
+        reads_by_world[world] = max(reads)
+    assert len(set(reads_by_world.values())) == 1, reads_by_world
+
+
 def test_a_gang_the_roomiest_peer_refuses_is_admitted_where_devices_are_free():
     from test_cluster import Cluster
 
@@ -973,3 +1089,47 @@ def test_a_rank_stuck_or_refused_setting_up_torch_reforms_the_gang_within_its_co
     gang = torch_set_up_fails_once.options(ranks=3, collective_timeout=3, rendezvous_timeout=150).gang(how)
     assert gang.result(timeout=120) == [2, 2, 2]
     assert time.monotonic() - start < 60, "given up at the collective_timeout, not the rendezvous_timeout"
+
+
+def _ddp_fit(torch, model, x, y, steps):
+    """`steps` of SGD on the mean squared error of `model` over x, y."""
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(steps):
+        opt.zero_grad()
+        torch.nn.functional.mse_loss(model(x), y).backward()
+        opt.step()
+
+
+def _ddp_data(torch):
+    gen = torch.Generator().manual_seed(1)
+    x = torch.randn(8, 3, generator=gen, dtype=torch.float64)
+    return x, x @ torch.tensor([[1.0], [-2.0], [0.5]], dtype=torch.float64) + 0.3
+
+
+@ch.remote(cpus=0.5)
+def ddp_rank(steps):
+    import torch
+    from torch.nn.parallel import DistributedDataParallel
+
+    g = ch.context().gang
+    dist = g.torch()
+    torch.manual_seed(0)
+    model = torch.nn.Linear(3, 1).double()
+    x, y = _ddp_data(torch)
+    half = slice(g.rank * 4, (g.rank + 1) * 4)  # each rank its half of the batch; DDP averages the gradients
+    _ddp_fit(torch, DistributedDataParallel(model), x[half], y[half], steps)
+    total = torch.tensor([float(g.rank + 1)], dtype=torch.float64)
+    dist.all_reduce(total)
+    return ch.dist.device(), g.backend, total.item(), [v for p in model.parameters() for v in p.detach().flatten().tolist()]
+
+
+def test_a_ddp_model_on_two_gloo_ranks_trains_as_it_does_in_one_process():
+    torch = pytest.importorskip("torch")
+    ranks = ddp_rank.options(ranks=2).gang(20).result(timeout=240)
+    torch.manual_seed(0)
+    model = torch.nn.Linear(3, 1).double()
+    _ddp_fit(torch, model, *_ddp_data(torch), 20)  # the whole batch, in this process
+    alone = [v for p in model.parameters() for v in p.detach().flatten().tolist()]
+    assert [r[:3] for r in ranks] == [("cpu", "gloo", 3.0)] * 2, ranks
+    assert ranks[0][3] == ranks[1][3], "the ranks' weights diverged"
+    assert max(abs(a - b) for a, b in zip(ranks[0][3], alone, strict=True)) < 1e-9, (ranks[0][3], alone)

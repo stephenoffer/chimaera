@@ -93,9 +93,14 @@ assert squares == [i * i for i in range(100)]
 
 Each batch joblib dispatches becomes one Chimaera call, placed on whichever
 peers have room. joblib sizes its batches by how long they take, so lots of
-small tasks end up sharing a call. `n_jobs` is the number of batches in flight.
-By default, and with `-1`, that's the CPU count of the machine your script
-runs on.
+small tasks end up sharing a call. `n_jobs` is the number of batches running
+at once, and the rest wait in your script. By default, and with `-1`, that's
+the CPU count of every live peer in the cluster (`-2` is one fewer, and so
+on), not just the machine your script runs on.
+
+scikit-learn's `n_jobs` searches, such as `GridSearchCV`, run this way
+inside `parallel_config(backend="chimaera")`, and a seeded search scores
+each fold the same as joblib's default backend.
 
 If a task raises, `Parallel` raises that error, and the batches still running
 get canceled. `return_as="generator"` works too.
