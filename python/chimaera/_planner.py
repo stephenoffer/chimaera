@@ -485,14 +485,25 @@ class Forecast:
     become usable, for the startup estimate. It does no IO: `samples` is what
     a provisioner keeps in its store to start from after a restart."""
 
-    def __init__(self, target: Target, startup_s: float = 60.0, samples: Sequence[float] = (), window_s: float = 300.0):
+    def __init__(
+        self,
+        target: Target,
+        startup_s: float = 60.0,
+        samples: Sequence[float] = (),
+        window_s: float = 300.0,
+        shape: tuple[float, int] | None = None,
+    ):
+        """`shape`: (cpus, memory bytes) of a peer the pool adds, when known;
+        else learned from the first peer it adds that joins."""
         self.target = target
+        self.given = shape
         self.startup = Startup(tuple(samples)[-KEEP_SAMPLES:], startup_s)
         self.window_s = window_s
         self.history: deque[tuple[float, Sequence[Any]]] = deque()
         self.asked: list[float] = []  # when each peer not usable yet was asked for, oldest first
         self.usable: int | None = None
-        self.shape: tuple[float, int] | None = None  # (cpus, memory) of a pool peer
+        self.seen: set[str] | None = None  # usable peers at the last look
+        self.shape: tuple[float, int] | None = None  # (cpus, memory) of a peer this pool added
 
     @property
     def samples(self) -> tuple[float, ...]:
@@ -507,23 +518,32 @@ class Forecast:
         usable = [n for n in nodes if _usable(n) and not getattr(n, "starting", False)]
         if self.usable is not None and len(usable) > self.usable:
             # Peers that became usable end the oldest waits.
-            for _ in range(min(len(usable) - self.usable, len(self.asked))):
+            came = min(len(usable) - self.usable, len(self.asked))
+            for _ in range(came):
                 took = now - self.asked.pop(0)
                 self.startup = Startup((self.startup.samples + (took,))[-KEEP_SAMPLES:], self.startup.default_s)
-        self.usable = len(usable)
+            new = [n for n in usable if self.seen is not None and n.peer not in self.seen]
+            if came and new:
+                self.shape = (float(new[-1].cpus), int(new[-1].memory_bytes))
+        self.usable, self.seen = len(usable), {n.peer for n in usable}
         # As many waits as peers missing: a shrink drops the newest; peers
         # asked for before this provisioner looked count from now.
         missing = max(0, replicas - len(usable))
         del self.asked[missing:]
         self.asked += [now] * (missing - len(self.asked))
-        if usable:
-            self.shape = (max(float(n.cpus) for n in usable), max(int(n.memory_bytes) for n in usable))
+        # A new peer is as large as one this pool added; until one has joined,
+        # as the smallest peer there is: assuming more would buy peers for
+        # calls that only a larger peer (one it did not add) can run.
+        shape = self.given or self.shape
+        if shape is None and usable:
+            small = min(usable, key=lambda n: (float(n.cpus), int(n.memory_bytes)))
+            shape = (float(small.cpus), int(small.memory_bytes))
         self.history.append((now, nodes))
         while self.history and self.history[0][0] < now - self.window_s:
             self.history.popleft()
-        if self.shape is None:
+        if shape is None:
             return Plan(replicas, "hold", "hold: no usable peer yet to size new ones by", 0.0, 0.0, None, None, None,
                         30.0, {})
         pending = tuple(self.startup.remaining(now - t) for t in self.asked)
-        pool = Pool(self.shape[0], self.shape[1], replicas, pool_min, pool_max, pending)
+        pool = Pool(shape[0], shape[1], replicas, pool_min, pool_max, pending)
         return plan(nodes, pool, self.target, self.startup.seconds(), arrival_rate(list(self.history)))

@@ -254,6 +254,16 @@ class ClusterView:
         start = _units.start_position(start)
         return EventStream(kinds or [], None if start == "latest" else 0 if start == "earliest" else start, follow)
 
+    def capacity(self) -> list[dict[str, Any]]:
+        """The latest plan for each pool a forecast provisioner manages
+        (``python -m chimaera.provisioner --planner forecast``): its pool,
+        replicas, want, action, reason and, when its target cannot be met,
+        `missed` and `binding`. Plans hold no function names. Empty when no
+        such provisioner runs in this tenant (they are kept in its store)."""
+        from ._store import Store
+
+        return [plan for _, plan in Store("chimaera/capacity").scan("plan:")]
+
     def resources(self) -> dict[str, float]:
         """Capacity of the live nodes, and how much CPU they report in use."""
         live = [n for n in self.nodes() if n.alive]

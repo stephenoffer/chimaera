@@ -260,9 +260,23 @@ class Future(Generic[T]):
         return tuple(_Part(self, i, n) for i in range(n))
 
     def explain(self) -> dict[str, Any]:
-        """What happened to this call: state, waiting reason, attempts and measurements."""
+        """What happened to this call: state, waiting reason, attempts and
+        measurements; while it is not done, also each managed pool's latest
+        plan (``capacity``, when a forecast provisioner runs)."""
+        from ._cluster import ClusterView
+        from ._errors import ChimaeraError
+
         self._rt.client.flush()
-        return self._rt.client.explain(self.key)
+        d = self._rt.client.explain(self.key)
+        if d.get("state") != "Done":
+            # Read from the store: a store that cannot answer (no quorum) is
+            # said here, not raised, since that is when explain() is wanted.
+            try:
+                if plans := ClusterView().capacity():
+                    d["capacity"] = plans
+            except ChimaeraError as e:
+                d["capacity_error"] = str(e)
+        return d
 
     def __await__(self) -> Generator[Any, None, T]:
         if not self.done():

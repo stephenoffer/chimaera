@@ -223,3 +223,21 @@ def test_a_forecast_counts_peers_asked_for_and_learns_how_long_they_take():
     # A shrink by hand drops the newest wait, and a restarted provisioner counts unknown waits from now.
     g = Forecast(Target(start_s=60), startup_s=60)
     assert g.look(nodes, 3, 1, 16, now=5.0).inputs["pending"] == [60.0]
+
+
+def test_new_peers_are_sized_by_the_pool_not_by_a_larger_peer_it_did_not_add():
+    # A 16-CPU peer the pool did not add, a 4-CPU one it did, and calls of 12 CPUs only the first fits.
+    big = node(0, cpus=16.0, shapes=[calls(30, 20.0, cpus=12.0)])
+    f = Forecast(Target(start_s=60), startup_s=60)
+    p = f.look([big, node(1, cpus=4.0)], 2, 1, 16, now=0.0)
+    assert (p.want, p.action) == (2, "hold"), "a new peer is assumed no larger than the smallest there is"
+    # With only the large peer to go by, it must be told the pool's peers have 8 CPUs.
+    told = Forecast(Target(start_s=60), startup_s=60, shape=(8.0, 32 * GiB))
+    p = told.look([big], 1, 1, 16, now=0.0)
+    assert p.want == 1 and p.action == "hold", p.reason
+    # Once a peer it added has joined, new ones are sized like that one.
+    g = Forecast(Target(start_s=60), startup_s=60)
+    small = [node(0, cpus=4.0), node(1, cpus=4.0)]
+    g.look(small, 3, 1, 16, now=0.0)
+    g.look(small + [node(2, cpus=8.0)], 3, 1, 16, now=30.0)
+    assert g.shape == (8.0, 32 * GiB)

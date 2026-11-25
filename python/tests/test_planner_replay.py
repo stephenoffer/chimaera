@@ -49,8 +49,9 @@ def test_restraint_and_burst_savings_hold_on_every_seed():
 @pytest.mark.slow
 @pytest.mark.xfail(
     strict=True,
-    reason="seed 6: three of the first new peers take 109-147 s to start, and until three startups are seen the "
-    "planner assumes --startup-estimate (60 s), so it buys too few for persistent load (p99 74 s vs 60 s)",
+    reason="seed 6: persistent-load completion p99 is 76 s against the queue rule's 60 s; the queue rule buys "
+    "the pool max (16 peers) and some of them start fast. The cause is not established: raising the startup "
+    "estimate to the longest wait of a peer still starting did not change it",
 )
 def test_persistent_load_p99_holds_on_every_seed():
     failed = [seed for seed, gates in _sweep(range(1, 11)).items() if not gates[2]["pass"]]
