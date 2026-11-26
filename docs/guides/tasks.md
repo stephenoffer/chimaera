@@ -326,9 +326,11 @@ future as it finishes.
 <summary>The four wait helpers</summary>
 
 One catch: `ch.get` on a list holds every value in your script's memory at
-once, and warns (CH117) past a quarter of the machine's memory. For big lists,
-consume results with `ch.as_completed` or `fn.map`, or reduce them inside
-calls.
+once, and warns (CH117) past a quarter of the machine's memory, or past half of
+what your container's memory limit has left. It warns before reading results
+whose size it already knows, counts `ch.put` values, and counts a value listed
+twice once. For big lists, consume results with `ch.as_completed` or `fn.map`,
+or reduce them inside calls.
 
 | Helper | Returns | Notes |
 |---|---|---|

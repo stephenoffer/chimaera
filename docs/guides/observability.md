@@ -443,7 +443,7 @@ assert any(str(w.message).startswith("CH101") for w in caught)
 | CH113 | error (`ChimaeraError`) | A process forked from one using Chimaera tried to submit, wait or fetch | Use `multiprocessing.get_context("spawn")` or `"forkserver"`, or make the work a call |
 | CH115 | error, in the call | The call's function would not load, and the worker runs a different Python version than your script | Run the script with the workers' Python version, or put the function in an importable module |
 | CH116 | warning | The cluster runs a different Chimaera version than your script | Install the cluster's version locally, or upgrade the cluster |
-| CH117 | warning | One `ch.get` has read results totalling more than a quarter of this machine's memory | Consume results as they finish, or reduce them inside calls |
+| CH117 | warning | One `ch.get` holds results totalling more than a quarter of this machine's memory, or more than half of what this process's cgroup memory limit has left | Consume results as they finish, or reduce them inside calls |
 | CH118 | warning | A list, dict, set or tuple shared with calls pickles to 8 MiB or more; every reader unpickles its own copy | Use a NumPy array or an Arrow table, which readers map instead |
 | CH119 | note on the error | A call that asked for no GPU hit a CUDA error on a machine that has GPUs | `@ch.remote(gpus=1)` or `fn.options(gpus=1)` |
 | CH120 | warning | The same code was wrapped as a new remote function 100 times (for example `ch.remote(lambda ...)` in a loop) | Define the remote function once, outside the loop |

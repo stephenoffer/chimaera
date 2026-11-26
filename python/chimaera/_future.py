@@ -763,12 +763,18 @@ def wait(
 
 
 def _values_of(futures: list[Future[T]], timeout: float | None) -> list[T]:
-    """Every future's value, in order (``ch.get`` of a list)."""
+    """Every future's value, in order (``ch.get`` of a list). Warns (CH117)
+    once the values it holds would outgrow what this process can hold,
+    before reading any whose size is known by then."""
     deadline = None if timeout is None else time.monotonic() + timeout
     out = []
-    held = 0
+    gathered = _Gathered(len(futures))
+    for f in futures:
+        if f.done():
+            gathered.add(f)  # finished already: its stored size is known before it is read
     for f in futures:
         left = None if deadline is None else max(0.0, deadline - time.monotonic())
+        gathered.add(f)  # finished by now: counted before it is read
         try:
             out.append(f.result(left))
         except TimeoutError:
@@ -777,41 +783,100 @@ def _values_of(futures: list[Future[T]], timeout: float | None) -> list[T]:
             for g in futures:
                 g._seen = True  # asked for together: the error raised answers for the rest
             raise
-        if f._put is None and f._outcome is not None and f._outcome[0] == "ok":
-            # A Linux arena array's stored size is only the frame that links
-            # it, but it pins its pages while held here: count its bytes.
-            nbytes = getattr(out[-1], "nbytes", 0)
-            held += max(f._outcome[4], nbytes if isinstance(nbytes, int) else 0)
-            _note_gathered(held, len(out), len(futures))
+        # A Linux arena array's stored size is only the frame that links it,
+        # but it pins its pages while held here: count its bytes.
+        nbytes = getattr(out[-1], "nbytes", 0)
+        gathered.add(f, nbytes if isinstance(nbytes, int) else 0)
     return out
 
 
-# CH117: results one ch.get has read past this many stored bytes (None: a
-# quarter of this machine's memory).
+# CH117: the values one ch.get holds past this many stored bytes (None: a
+# quarter of this machine's memory, or half of what this process's cgroup has
+# left when the ch.get starts, if that is less).
 GATHER_WARN_BYTES: int | None = None
 _gather_warned = False
+PROC_CGROUP, CGROUP_ROOT = "/proc/self/cgroup", "/sys/fs/cgroup"  # cgroup v2; tests point them elsewhere
 
 
-def _note_gathered(held: int, done: int, total: int) -> None:
-    """A driver that gathers everything holds everything: warn once before a
-    ch.get's results outgrow this machine (Ray's head node runs out of memory
-    on the same program, with no message)."""
-    global _gather_warned
-    limit = GATHER_WARN_BYTES
-    if limit is None:
+def _cgroup_room() -> tuple[int, int] | None:
+    """(memory.max, bytes left under it) of the cgroup on this process's
+    cgroup v2 path, it or one above it, with the least room now (its limit
+    less its current charge). None where none sets a limit (macOS, cgroup
+    v1, an unlimited container)."""
+    try:
+        with open(PROC_CGROUP) as f:
+            group = next(line[3:].strip() for line in f if line.startswith("0::"))
+    except (OSError, StopIteration):
+        return None
+    least: tuple[int, int] | None = None
+    while True:
+        d = os.path.join(CGROUP_ROOT, group.lstrip("/"))
         try:
-            limit = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 4
-        except (ValueError, OSError):
+            with open(os.path.join(d, "memory.max")) as f:
+                limit = int(f.read())  # "max": no limit here, a ValueError
+            with open(os.path.join(d, "memory.current")) as f:
+                room = max(0, limit - int(f.read()))
+            if least is None or room < least[1]:
+                least = (limit, room)
+        except (OSError, ValueError):
+            pass
+        if group in ("", "/"):
+            return least
+        group = os.path.dirname(group)
+
+
+def _gather_limit() -> tuple[int, str] | None:
+    """The stored bytes one ch.get may hold before CH117, and what that is."""
+    if GATHER_WARN_BYTES is not None:
+        return GATHER_WARN_BYTES, f"{GATHER_WARN_BYTES >> 20} MiB"
+    try:
+        limit = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 4, "a quarter of this machine's memory")
+    except (ValueError, OSError):
+        limit = None
+    room = _cgroup_room()
+    if room is not None and (limit is None or room[1] // 2 < limit[0]):
+        why = f"half of the {room[1] >> 20} MiB left under this process's {room[0] >> 20} MiB cgroup limit"
+        limit = (room[1] // 2, why)
+    return limit
+
+
+class _Gathered:
+    """The stored bytes of the values one ch.get holds: each stored value
+    once, however many of its futures are listed, ch.put values too. Warns
+    once (CH117) when they pass `_gather_limit` (a driver that gathers
+    everything holds everything: Ray's head node runs out of memory on the
+    same program, with no message)."""
+
+    def __init__(self, total: int) -> None:
+        self.total, self.held = total, 0
+        self.sizes: dict[tuple[bytes, bytes], int] = {}
+        self.limit = None if _gather_warned else _gather_limit()
+
+    def add(self, f: Future[Any], nbytes: int = 0) -> None:
+        """Count `f`'s value, if it has finished, at least `nbytes` large."""
+        o = f._outcome
+        if self.limit is None or o is None or o[0] != "ok":
             return
-    if _gather_warned or held <= limit:
-        return
-    _gather_warned = True
-    warnings.warn(
-        f"CH117: ch.get has read {done} of {total} results, {held >> 20} MiB stored, past a quarter of this "
-        "machine's memory, and holds them all at once. Consume results as they finish (ch.as_completed, or "
-        "fn.map(items)) or reduce them inside calls.",
-        stacklevel=3,
-    )
+        key, size = (o[2], o[3]), max(o[4], nbytes)
+        before = self.sizes.get(key, 0)
+        if size <= before:
+            return
+        self.sizes[key] = size
+        self.held += size - before
+        self._note()
+
+    def _note(self) -> None:
+        global _gather_warned
+        assert self.limit is not None
+        if _gather_warned or self.held <= self.limit[0]:
+            return
+        _gather_warned = True
+        warnings.warn(
+            f"CH117: one ch.get of {self.total} results holds {self.held >> 20} MiB of them stored, past "
+            f"{self.limit[1]}, all at once. Consume results as they finish (ch.as_completed, or fn.map(items)) "
+            "or reduce them inside calls.",
+            stacklevel=4,
+        )
 
 
 class as_completed(Generic[T]):  # noqa: N801 -- mirrors concurrent.futures.as_completed
