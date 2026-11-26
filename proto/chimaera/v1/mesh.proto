@@ -61,6 +61,7 @@ message ActorWaitReply {
 
 message InventoryRequest {
   string cluster = 1;
+  uint32 largest = 2;  // how many of its largest objects to list (objplane::listed)
 }
 
 message InventoryReply {

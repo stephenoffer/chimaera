@@ -365,7 +365,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | `object_spilling_threshold`, `max_io_workers` | `CHIMAERA_SPILL_THRESHOLD`, `CHIMAERA_SPILL_THREADS` |
 | restore: a copy back into the store | a mapping of the disk file: no copy |
 | `ObjectStoreFullError` after the fallback allocator fills | no store-full error: memory, then disk; a full disk is an `OSError` naming it |
-| `ray memory`, `ray.util.state.list_objects`, `ray summary objects` | `ch.runs.objects()`, and `chimaera objects --cluster` from the CLI: every live peer's store, with what is in memory and on disk, per run, and its ten largest objects |
+| `ray memory`, `ray.util.state.list_objects` (up to 10,000), `ray summary objects` | `ch.runs.objects(largest=N)`, and `chimaera objects --cluster --largest N` from the CLI: every live peer's store, with what is in memory and on disk, per run, and its N largest objects (up to 10,000), each with its size and where it is. Ray's rows also give each object's reference type, call site and process |
 | store metrics in the dashboard | Prometheus `object_bytes`, `memory_used_bytes`, `replication_failures_total` |
 | chunked pull between nodes | parallel ranges over four connections, every chunk checked with blake3 (Ray checks nothing) |
 | lineage reconstruction of task outputs | both: replicas on another peer (another failure domain first), for task outputs *and* `put` values, with a durability class per value (above). When every copy of a call's result is lost, the call runs again on the reader's peer, under the same attempt, so it writes the same object and blob ids. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again, and not one declared `deterministic=False`, which could return other bytes under the old id; the chain is rebuilt depth first, three levels at most. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
@@ -379,7 +379,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | task results up to 100 KiB returned to the caller inline (`max_direct_call_object_size`); a `ray.put` value always in the store | a result up to 64 KiB and a `put` value up to 4 KiB travel in the handle |
 | Ray Direct Transport: GPU tensors between actors over NCCL or NIXL | a `put` CUDA tensor: on one machine over CUDA IPC, across machines GPU to GPU with `CHIMAERA_CUDA_NET` (NCCL over EFA measured; NIXL did not complete there, bench/objects/RESULTS.md); `durability="ephemeral"` keeps no host copy |
 
-Not matched yet: a list of every object with its own row, as Ray's `list_objects` gives (`ch.runs.objects()` gives each store's totals, per run, and its ten largest), and `ObjectRef.call_site()` with `RAY_record_ref_creation_sites` set (it is always empty). `ObjectRef.owner_address()` has no counterpart: no process owns a value.
+Not matched yet: `ObjectRef.call_site()` with `RAY_record_ref_creation_sites` set (it is always empty). `ObjectRef.owner_address()` has no counterpart: no process owns a value.
 `ray.experimental.get_object_locations` is `ch.runs.object_locations`: the
 peer each value is stored at, with its size. Copies made in the background
 are not listed, as no peer keeps a record of where every copy is, and Ray

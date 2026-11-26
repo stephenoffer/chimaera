@@ -115,6 +115,9 @@ enum Cmd {
         /// Every live peer's store, not only this one's.
         #[arg(long)]
         cluster: bool,
+        /// How many of each store's largest objects to list (at most 10,000).
+        #[arg(long, default_value_t = 10)]
+        largest: u32,
     },
     /// What a run's calls printed on this peer, kept after the driver has gone.
     Logs {
@@ -513,7 +516,7 @@ fn main() -> ExitCode {
             Cmd::Cancel { runs, pattern, yes, at } => cancel_many(connect(&dir, local, &at).await?, runs, pattern, yes).await,
             Cmd::Retry { run, calls, yes, at } => retry(connect(&dir, local, &at).await?, &run, calls, yes).await,
             Cmd::Actors { prefix, json, at } => actors(connect(&dir, local, &at).await?, prefix, json).await,
-            Cmd::Objects { json, cluster } => objects(&dir, json, cluster).await,
+            Cmd::Objects { json, cluster, largest } => objects(&dir, json, cluster, largest).await,
             Cmd::Logs { run, follow, at } => logs(connect(&dir, local, &at).await?, &run, follow).await,
             Cmd::Inspect { run, json, at } => inspect(connect(&dir, local, &at).await?, &run, json).await,
             Cmd::Explain { run, task, decisions, json, at } => {
@@ -700,15 +703,18 @@ async fn logs(mut c: Client, run: &str, follow: bool) -> Result<u8, String> {
     }
 }
 
-async fn objects(dir: &std::path::Path, json: bool, cluster: bool) -> Result<u8, String> {
+async fn objects(dir: &std::path::Path, json: bool, cluster: bool, largest: u32) -> Result<u8, String> {
     let mut c = connect_local(dir).await?;
-    let req = pb::StatusRequest { objects: cluster, ..Default::default() };
+    let req = pb::StatusRequest { objects: cluster, largest, ..Default::default() };
     let s = c.status(req).await.map_err(|e| e.message().to_string())?.into_inner();
     let stores: Vec<serde_json::Value> = if cluster {
         s.objects.iter().map(|j| serde_json::from_str(j).unwrap_or_default()).collect()
     } else {
         let object_dir = s.peer.map(|p| p.object_dir).unwrap_or_default();
-        vec![chimaera_peer::objplane::inventory(std::path::Path::new(&object_dir))]
+        vec![chimaera_peer::objplane::inventory(
+            std::path::Path::new(&object_dir),
+            chimaera_peer::objplane::listed(largest),
+        )]
     };
     if json {
         let out =

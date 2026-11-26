@@ -1169,10 +1169,12 @@ impl Client {
     }
 
     /// What every live peer's object store holds, the connected peer's first:
-    /// one objplane inventory each, as JSON (`chimaera objects --cluster --json`).
-    fn objects(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+    /// one objplane inventory each, as JSON (`chimaera objects --cluster --json`),
+    /// with `largest` of its largest objects (0: ten).
+    #[pyo3(signature = (largest = 0))]
+    fn objects(&self, py: Python<'_>, largest: u32) -> PyResult<Vec<String>> {
         let mut peer = self.peer.clone();
-        let req = pb::StatusRequest { objects: true, ..Default::default() };
+        let req = pb::StatusRequest { objects: true, largest, ..Default::default() };
         let r = py.detach(|| runtime().block_on(async move { peer.status(req).await })).map_err(rpc_err)?.into_inner();
         Ok(r.objects)
     }

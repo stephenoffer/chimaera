@@ -651,9 +651,9 @@ impl MeshClient {
     }
 
     /// What `node`'s object store holds (objplane::inventory, as JSON).
-    pub async fn inventory(&self, node: u64) -> std::io::Result<String> {
+    pub async fn inventory(&self, node: u64, largest: u32) -> std::io::Result<String> {
         let mut c = self.rpc(node)?;
-        let req = pb::InventoryRequest { cluster: self.cluster.clone() };
+        let req = pb::InventoryRequest { cluster: self.cluster.clone(), largest };
         let r = tokio::time::timeout(CALL_TIMEOUT, c.inventory(req))
             .await
             .map_err(std::io::Error::other)?
@@ -1762,9 +1762,11 @@ impl pb::mesh_server::Mesh for MeshService {
     }
 
     async fn inventory(&self, req: Request<pb::InventoryRequest>) -> Result<Response<pb::InventoryReply>, Status> {
-        self.0.check(&req.into_inner().cluster)?;
+        let req = req.into_inner();
+        self.0.check(&req.cluster)?;
         let dir = self.0.objects.dir().to_path_buf();
-        let json = tokio::task::spawn_blocking(move || crate::objplane::inventory(&dir).to_string())
+        let keep = crate::objplane::listed(req.largest);
+        let json = tokio::task::spawn_blocking(move || crate::objplane::inventory(&dir, keep).to_string())
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(pb::InventoryReply { json }))

@@ -54,14 +54,19 @@ def _put_files_here(f: Future[Any]) -> tuple[list[str], int, bool] | None:
     return [rt.client.info["peer"].hex()], (len(inline) if inline is not None else 0) + stored, False
 
 
-def objects() -> list[dict[str, Any]]:
+def objects(largest: int = 10) -> list[dict[str, Any]]:
     """What every live peer's object store holds, as ``chimaera objects
     --cluster --json`` shows it: one dict per peer, the connected peer's
     first (its ``addr`` is ``"this peer"``). Each gives the objects and bytes
     ``in_memory`` and ``on_disk`` (spilled, or copies of other peers' values),
-    the same per run (``runs``), the ``largest`` ten with where each is, the
-    arenas of live processes and the pre-zeroed reserve. A peer that could
-    not answer has an ``error`` instead."""
+    the same per run (``runs``), its `largest` largest objects (at most
+    10,000), each with its run and object id, size and whether it is in
+    memory or on disk, the arenas of live processes and the pre-zeroed
+    reserve. A peer that could not answer has an ``error`` instead. It lists
+    every tenant's runs, so a driver bound to a tenant gets a RuntimeError:
+    it takes the cluster token."""
     from ._runtime import Runtime
 
-    return [json.loads(s) for s in Runtime.get().client.objects()]
+    if largest < 1:
+        raise ValueError(f"largest must be at least 1, not {largest}")
+    return [json.loads(s) for s in Runtime.get().client.objects(min(largest, 10_000))]

@@ -87,11 +87,17 @@ pub fn spill_dirs(dir: &Path, peer_hex: &str) -> Vec<PathBuf> {
     if listed.is_empty() { vec![dir.join("spill")] } else { listed }
 }
 
+/// How many of a store's largest objects an inventory lists when asked for
+/// `n`: ten for 0, and never more than 10,000 (Ray's `list_objects` cap).
+pub fn listed(n: u32) -> usize {
+    if n == 0 { 10 } else { (n as usize).min(10_000) }
+}
+
 /// What a peer's object store holds, from its directory (what `ray memory`
 /// reports for Ray's store): objects in memory and on disk (spilled, or
-/// replicas of other peers' objects), per run and the largest; the NumPy
-/// arenas of live processes; the pre-zeroed reserve.
-pub fn inventory(objects: &Path) -> serde_json::Value {
+/// replicas of other peers' objects), per run and the `keep` largest; the
+/// NumPy arenas of live processes; the pre-zeroed reserve.
+pub fn inventory(objects: &Path, keep: usize) -> serde_json::Value {
     let (mut mem, mut disk) = ((0u64, 0u64), (0u64, 0u64));
     let mut runs = Vec::new();
     let mut largest: Vec<(u64, String, &'static str)> = Vec::new();
@@ -122,7 +128,7 @@ pub fn inventory(objects: &Path) -> serde_json::Value {
         runs.push(serde_json::json!({"run": name, "objects": n, "memory_bytes": rm, "disk_bytes": rd}));
     }
     largest.sort_by(|a, b| b.0.cmp(&a.0));
-    largest.truncate(10);
+    largest.truncate(keep);
     let arenas: Vec<serde_json::Value> = std::fs::read_dir(objects.join(".arena"))
         .into_iter()
         .flatten()
@@ -849,11 +855,13 @@ mod tests {
         std::fs::write(disk.path().join(&b), vec![0u8; 5000]).unwrap();
         std::os::unix::fs::symlink(disk.path().join(&b), mem.path().join(&run).join(&b)).unwrap();
         std::fs::write(mem.path().join(&run).join(format!("{a}.tmp1-2")), b"partial").unwrap();
-        let inv = inventory(mem.path());
+        let inv = inventory(mem.path(), listed(0));
         assert_eq!(inv["in_memory"]["bytes"], 3000);
         assert_eq!(inv["on_disk"]["bytes"], 5000);
         assert_eq!(inv["runs"][0]["objects"], 2, "the temporary is not an object");
         assert_eq!(inv["largest"][0]["where"], "disk");
+        assert_eq!(inventory(mem.path(), 1)["largest"].as_array().map(Vec::len), Some(1), "as many as asked");
+        assert_eq!((listed(0), listed(3), listed(u32::MAX)), (10, 3, 10_000));
     }
 
     #[test]

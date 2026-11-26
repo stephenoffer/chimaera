@@ -266,8 +266,8 @@ def test_a_program_lists_every_peers_object_store_as_the_cli_does(zoned):
     out = zoned.run(
         0,
         WHERE
-        + """
-import json
+        + f"""
+import json, subprocess
 import numpy as np
 
 x = ch.put(np.ones(4 << 20))  # 32 MiB, stored on p0
@@ -277,6 +277,13 @@ print("STORES", json.dumps([[s.get("error"), s["addr"], s["object_dir"]] for s i
 here = stores[0]
 print("RUN", json.dumps([r["objects"] for r in here["runs"] if r["run"] == run]))
 print("LARGEST", json.dumps([o["bytes"] for o in here["largest"] if o["object"].startswith(run + "/")]))
+xs = [ch.put(np.full(1024, i)) for i in range(15)]  # 8 KiB each: stored, not held in the handle
+mine = lambda listed: sum(o["object"].startswith(run + "/") for o in listed)
+print("TEN", len(ch.runs.objects()[0]["largest"]))
+print("ALL", mine(ch.runs.objects(largest=10_000)[0]["largest"]))
+cli = subprocess.run([{BIN!r}, "--dir", {zoned.dir(0)!r}, "objects", "--json", "--largest", "10000"],
+                     capture_output=True, text=True, timeout=60)
+print("CLI", mine(json.loads(cli.stdout)["largest"]))
 """,
     )
     stores = json.loads(lines(out, "STORES")[0])
@@ -284,6 +291,8 @@ print("LARGEST", json.dumps([o["bytes"] for o in here["largest"] if o["object"].
     assert stores[0][1] == "this peer" and len({s[2] for s in stores}) == 3, "each peer's own store, this one first"
     assert json.loads(lines(out, "RUN")[0])[0] >= 1, out.stdout
     assert max(json.loads(lines(out, "LARGEST")[0])) >= 32 << 20, "the put is among this store's largest"
+    assert int(lines(out, "TEN")[0]) == 10, "ten by default"
+    assert int(lines(out, "ALL")[0]) >= 16 and int(lines(out, "CLI")[0]) >= 16, "every one of the run's 16 when asked"
 
 
 def test_a_peer_on_the_same_machine_takes_an_object_from_the_holders_store(monkeypatch):

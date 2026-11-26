@@ -97,9 +97,11 @@ impl Ingress {
     /// What every live peer's object store holds, this one's first: each
     /// objplane::inventory as JSON, with the peer's address (or the error
     /// that peer gave).
-    async fn inventories(&self) -> Vec<String> {
+    async fn inventories(&self, largest: u32) -> Vec<String> {
         let dir = self.objects.dir().to_path_buf();
-        let mut own = tokio::task::spawn_blocking(move || crate::objplane::inventory(&dir)).await.unwrap_or_default();
+        let keep = crate::objplane::listed(largest);
+        let mut own =
+            tokio::task::spawn_blocking(move || crate::objplane::inventory(&dir, keep)).await.unwrap_or_default();
         own["addr"] = serde_json::json!("this peer");
         let mut out = vec![own.to_string()];
         let Some(mesh) = &self.router.mesh else { return out };
@@ -107,7 +109,7 @@ impl Ingress {
         for p in mesh.members().into_iter().filter(|p| !p.dead && p.member.node_id != mesh.me.node_id) {
             let mesh = mesh.clone();
             asks.spawn(async move {
-                let got = mesh.inventory(p.member.node_id).await;
+                let got = mesh.inventory(p.member.node_id, largest).await;
                 let mut v = match got {
                     Ok(json) => serde_json::from_str(&json).unwrap_or_default(),
                     Err(e) => serde_json::json!({ "error": e.to_string() }),
@@ -869,6 +871,7 @@ impl pb::peer_server::Peer for Service {
     }
 
     async fn status(&self, req: Request<pb::StatusRequest>) -> Result<Response<pb::StatusReply>, Status> {
+        let largest = req.get_ref().largest; // with `objects`: how many of each store's objects to list
         let caller = Caller::of(&req);
         let pb::StatusRequest { objects: want_objects, fleet, .. } = req.into_inner();
         if want_objects && caller != Caller::Admin {
@@ -885,7 +888,7 @@ impl pb::peer_server::Peer for Service {
             return Ok(Response::new(crate::fleet::answer(s)));
         }
         if want_objects {
-            s.objects = self.0.inventories().await;
+            s.objects = self.0.inventories(largest).await;
         }
         Ok(Response::new(s))
     }

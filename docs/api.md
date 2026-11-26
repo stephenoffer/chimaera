@@ -641,16 +641,21 @@ where = ch.runs.object_locations([value])[value]
 assert where["peers"] and where["size"] >= 1 << 20
 ```
 
-`ch.runs.objects()` is what every live peer's object store holds, as
-`chimaera objects --cluster` prints it (Ray's `ray memory`): one dict per
-peer, the connected peer's first, with the objects and bytes in memory and
-on disk, the same per run, and its ten largest objects. **Runs today:**
+`ch.runs.objects(largest=10)` is what every live peer's object store holds,
+as `chimaera objects --cluster` prints it (Ray's `ray memory` and
+`list_objects`): one dict per peer, the connected peer's first, with the
+objects and bytes in memory and on disk, the same per run, and its `largest`
+largest objects (up to 10,000), each with its run and object id, size, and
+whether it is in memory or on disk. It lists every tenant's runs, so a driver
+bound to a tenant gets a `RuntimeError`: it takes the cluster token.
+**Runs today:**
 
 ```python run
-stores = ch.runs.objects()
+stores = ch.runs.objects(largest=100)
 here = stores[0]
 assert here["addr"] == "this peer" and here["in_memory"]["bytes"] >= 1 << 20
 assert any(r["run"] == ch.runs.current_run().id for r in here["runs"])
+assert all(o["where"] in ("memory", "disk") for o in here["largest"])
 ```
 
 `ch.runs.cluster().events(kinds, start=)` streams what the cluster does: members
