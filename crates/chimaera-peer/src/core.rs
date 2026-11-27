@@ -667,6 +667,12 @@ fn give_back_taken<E>(reply: &Result<pb::ShardReply, E>) -> bool {
     }
 }
 
+/// Whether `rec` shows that this peer's instance of its actor, of
+/// `generation`, was replaced: a later instance is alive on another peer.
+fn replaced_elsewhere(rec: &pb::ActorRecord, generation: u64, me: &pb::PeerInc) -> bool {
+    rec.state() == pb::actor_record::State::Alive && rec.generation > generation && rec.host.as_ref() != Some(me)
+}
+
 impl Work {
     fn new(tk: Tk, attempt: u32, spec: pb::TaskSpec, policy: pb::Policy, deps: Vec<pb::Outcome>) -> Work {
         let cpus = if policy.cpus > 0.0 { policy.cpus } else { 1.0 };
@@ -1523,6 +1529,7 @@ impl Core {
                 }
                 if ev.reloaded {
                     self.recheck_watches(ev.group);
+                    self.recheck_instances(ev.group);
                 }
                 self.dispatch();
             }
@@ -1858,6 +1865,10 @@ impl Core {
                 if leader {
                     self.on_actor_changed(actor);
                 }
+                // An instance this peer runs may have been placed again
+                // elsewhere, or closed, while the peer was out of reach:
+                // every replica checks, as no leader tells its old host.
+                self.recheck_instance(actor);
                 // Calls parked until the actor had a host can be placed now.
                 if let Some(parked) = self.waiting_actor.remove(&actor) {
                     for tk in parked {
@@ -4185,6 +4196,7 @@ impl Core {
         } else {
             head.cpus
         };
+        let actor = Id::from_slice(&head.spec.actor).ok().and_then(|a| self.actors.get(&a));
         let msg = pb::Execute {
             kind: head.spec.kind,
             fn_digest: head.spec.fn_digest.clone(),
@@ -4206,7 +4218,9 @@ impl Core {
             retry_exception_types: head.spec.retry_exception_types.clone(),
             // A durable actor's constructor and methods return its state too.
             durable: matches!(head.kind(), pb::CallKind::CallActorMethod | pb::CallKind::CallActorCtor)
-                && Id::from_slice(&head.spec.actor).ok().and_then(|a| self.actors.get(&a)).is_some_and(|h| h.durable),
+                && actor.is_some_and(|h| h.durable),
+            // The instance its executor serves direct calls for (python/chimaera/_direct.py).
+            actor_generation: actor.map_or(0, |h| h.generation),
         };
         let pid = self.execs.get(&exec).map_or(0, |e| e.pid);
         let alone = !self.running.iter().any(|r| r.exec == exec);
@@ -5797,6 +5811,8 @@ impl Core {
                     } else {
                         self.start_actor(actor, run, &spec);
                     }
+                } else if !mine {
+                    self.end_replaced_instance(actor, &rec);
                 }
             }
             pb::actor_record::State::Dead => {
@@ -6069,6 +6085,82 @@ impl Core {
         host.done_seqs.clear();
         host.known_handles.clear();
         host.resolving.clear();
+        for w in calls {
+            self.give_back_actor_call(w);
+        }
+    }
+
+    /// If this peer runs an instance of `actor`, end it when its record here
+    /// shows it is no longer the actor's: the actor is dead, or runs again
+    /// on another peer. The record's leader tells a host so, but not one out
+    /// of reach then, and a copy that catches up from a snapshot raises no
+    /// events for what it skipped.
+    fn recheck_instance(&mut self, actor: Id) {
+        if self.actors.get(&actor).is_none_or(|h| h.exec.is_none()) {
+            return;
+        }
+        let Some(rec) = self.router.read(actor.vshard(), |kv| read::actor(kv, actor)).flatten() else { return };
+        if rec.state() == pb::actor_record::State::Dead {
+            self.on_actor_record(rec, None);
+        } else {
+            self.end_replaced_instance(actor, &rec);
+        }
+    }
+
+    /// This peer's copy of `group` was replaced by a snapshot: recheck the
+    /// instances it runs of that group's actors.
+    fn recheck_instances(&mut self, group: u32) {
+        let router = &self.router;
+        let hosted: Vec<Id> = self
+            .actors
+            .iter()
+            .filter(|(a, h)| h.exec.is_some() && router.group_of(a.vshard()) == group)
+            .map(|(a, _)| *a)
+            .collect();
+        for actor in hosted {
+            self.recheck_instance(actor);
+        }
+    }
+
+    /// `rec` names a later instance of `actor` on another peer while this
+    /// peer still runs an earlier one: the actor was placed again while this
+    /// peer was out of reach (declared dead, or cut off), and its process
+    /// here lived on. That instance ends now, as a moved one does. Its
+    /// process stops, so no call begins on it, direct calls waiting at its
+    /// executor included (their callers send them through the peer, to the
+    /// new instance), and calls waiting for it here go back to the shard.
+    fn end_replaced_instance(&mut self, actor: Id, rec: &pb::ActorRecord) {
+        let me = self.router.identity.pb();
+        let Some(host) = self.actors.get_mut(&actor) else { return };
+        if !replaced_elsewhere(rec, host.generation, &me) {
+            return;
+        }
+        // Taken first, so its exit is not reported as a crash (actor_exec_lost).
+        let Some(exec) = host.exec.take() else { return };
+        let generation = host.generation;
+        host.constructed = false;
+        host.moving = false;
+        host.moved = true;
+        host.inflight.clear();
+        let mut calls: Vec<Work> = std::mem::take(&mut host.mailbox).into_values().collect();
+        calls.extend(host.ctor.take().filter(|w| w.publish));
+        host.next_seq.clear();
+        host.done_seqs.clear();
+        host.known_handles.clear();
+        host.resolving.clear();
+        self.sup.kill(exec);
+        tracing::warn!(
+            "actor {}: instance {generation} ended here, as instance {} runs elsewhere",
+            actor.hex(),
+            rec.generation
+        );
+        self.record(pb::ClusterEvent {
+            kind: "actor".into(),
+            actor: actor.to_vec(),
+            node: me.peer,
+            message: format!("instance {generation} ended here: instance {} runs on another peer", rec.generation),
+            ..Default::default()
+        });
         for w in calls {
             self.give_back_actor_call(w);
         }
@@ -6952,5 +7044,21 @@ mod tests {
         assert!(replay_refusal(&call(CallActorMethod, pure, true)).is_some());
         let no_policy = pb::TaskSpec { policy: vec![], ..call(CallFunction, pure, true) };
         assert!(replay_refusal(&no_policy).is_some(), "a call recorded without a policy is not assumed deterministic");
+    }
+
+    #[test]
+    fn an_instance_is_replaced_only_by_a_later_one_alive_on_another_peer() {
+        use pb::actor_record::State::{Alive, Dead, Restarting};
+        let (me, other) = (pb::PeerInc { peer: vec![1; 16], inc: 3 }, pb::PeerInc { peer: vec![2; 16], inc: 1 });
+        let rec = |state, generation, host: Option<&pb::PeerInc>| {
+            let mut r = pb::ActorRecord { generation, host: host.cloned(), ..Default::default() };
+            r.set_state(state);
+            r
+        };
+        assert!(replaced_elsewhere(&rec(Alive, 3, Some(&other)), 2, &me));
+        assert!(!replaced_elsewhere(&rec(Alive, 2, Some(&other)), 2, &me), "no later instance: a lagging copy");
+        assert!(!replaced_elsewhere(&rec(Alive, 3, Some(&me)), 2, &me), "placed here again: it starts here");
+        assert!(!replaced_elsewhere(&rec(Restarting, 2, None), 2, &me), "no instance anywhere yet");
+        assert!(!replaced_elsewhere(&rec(Dead, 3, None), 2, &me), "a death ends it as the actor's");
     }
 }

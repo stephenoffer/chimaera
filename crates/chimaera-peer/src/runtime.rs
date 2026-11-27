@@ -149,6 +149,8 @@ pub async fn run_local(cfg: PeerConfig) -> io::Result<()> {
             .await
             .map_err(io::Error::other)?;
     }
+    // No other peer can place this one's actors: its executors' lease holds for ever.
+    let _ = crate::direct::lease::start(&cfg.dir, crate::direct::lease::FOREVER);
     serve(node, router, raft_events, cfg.idle_timeout, None).await
 }
 

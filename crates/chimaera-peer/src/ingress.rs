@@ -564,7 +564,7 @@ impl pb::peer_server::Peer for Service {
                         let mut ran = crate::direct::attempts(&s, &this.router.identity.pb());
                         // A direct call's record: its caller has the outcome, so the
                         // session is not sent it again (one event and one read a call).
-                        let recorded: BTreeSet<Tk> = ran.iter().map(|r| r.tk).collect();
+                        let recorded = crate::direct::recorded(&s);
                         let acks = this.submit(s).await;
                         let accepted: Vec<Tk> = acks
                             .acks

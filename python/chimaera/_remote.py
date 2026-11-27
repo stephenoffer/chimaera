@@ -22,6 +22,7 @@ from ._errors import TRANSIENT_ERRORS, ActorDied, ChimaeraError, Infeasible, Not
 from ._future import Future, Handles, ItemFailed, PartDep, Results, Stream, _Chunk, _Part, start_pending
 from ._native import blake3_digest, child_id, derive_id
 from ._options import (
+    DEFAULTS,
     U32_MAX,
     Effective,
     Layer,
@@ -449,7 +450,7 @@ class RemoteFunction(Generic[P, R]):
         if eff.get("within") is not None:
             from ._reserve import call_within
 
-            return call_within(eff.get("within"), self._fn, args, kwargs)
+            return call_within(eff.get("within"), self._fn, args, kwargs, eff)
         if self._streams:
             # The worker holds the generator to the byte window this Stream credits.
             window_bytes = int(eff.get("max_in_flight_bytes") or STREAM_WINDOW_BYTES)
@@ -609,7 +610,7 @@ class ActorClass(Generic[C]):
         if eff.get("within") is not None:
             from ._reserve import HostedActor
 
-            return HostedActor(eff.get("within"), self._cls, args, kwargs)  # type: ignore[return-value]
+            return HostedActor(eff.get("within"), self._cls, args, kwargs, eff)  # type: ignore[return-value]
         actor = _create_actor(Runtime.get(), self._cls, eff, args, kwargs)
         if eff.get("name") is None:  # by name, each handle may be the same actor
             _watch_churn(actor, self._cls, _site())
@@ -848,7 +849,21 @@ class Actor(Generic[C]):
             raise error
 
     def __reduce__(self) -> tuple[Any, ...]:
-        return (_rebuild_actor, (self._actor, self._ctor, self._cls, self._digest, self._durable))
+        # With whether its actor's calls may run again (REPLAY_OPTIONS, where
+        # set): a call through it elsewhere skips its peer only when one made
+        # here may (_direct.eligible). Its other options stay behind, as
+        # before: a budget, for one, would clash with the budget of the call
+        # it is passed to. As state, which an older version that unpickles it
+        # keeps as an unused attribute.
+        eff = self._eff
+        own = {k: (eff.values[k], eff.sources[k]) for k in REPLAY_OPTIONS if eff.sources[k] != "default"}
+        args = (self._actor, self._ctor, self._cls, self._digest, self._durable)
+        return (_rebuild_actor, args, {"_replay": own}) if own else (_rebuild_actor, args)
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        own = state.get("_replay") or {}
+        values, sources = {k: v for k, (v, _) in own.items()}, {k: s for k, (_, s) in own.items()}
+        self._eff = resolve((), Layer(values, "handle", "decorator", sources=sources))
 
 
 # CH121: actors of one class made at one call site that ended after at most
@@ -892,6 +907,40 @@ def _rebuild_actor(
     return Actor(rt, actor, ctor, cls, resolve((), Layer({}, "handle", "decorator")), digest, durable=durable)
 
 
+# The options that say whether a call may run again. One that may not never
+# goes straight to its actor's executor (_direct.eligible), so they go with a
+# handle passed to another call, and with a call one of Chimaera's own actors
+# makes for a user's code (`with_replay`).
+REPLAY_OPTIONS = ("effects", "deterministic")
+
+
+def _declared(fn: Any, name: str) -> tuple[Layer, ...]:
+    """Method `name`'s ``@ch.method`` options (`fn` is the method), as the
+    layer under a call's view."""
+    declared = {k: v for k, v in (getattr(fn, "__chimaera_method__", None) or {}).items() if k != "group"}
+    return (Layer(declared, f"@ch.method on {name}", "view"),) if declared else ()
+
+
+def method_options(cls: type[Any], name: str, actor: Effective) -> Effective:
+    """The options of a call of `cls`'s method `name`, in an actor made with
+    `actor`, through no view: as ``RemoteMethod.policy`` resolves them."""
+    layer = Layer(actor.values, "actor", "decorator", sources=actor.sources)
+    return resolve(_declared(getattr(cls, name, None), name), layer)
+
+
+def with_replay(method: RemoteMethod[..., Any], eff: Effective) -> RemoteMethod[..., Any]:
+    """`method`, of one of Chimaera's own actors (a bundle's host, a gang
+    rank's), which runs a user's function or method whose options are `eff`,
+    with that code's effects and determinism where they are not the defaults.
+    The host's own options say each of its calls may run again, so without
+    them one that may not could go straight to the host's executor."""
+    keys = [k for k in REPLAY_OPTIONS if eff.values[k] != DEFAULTS[k]]
+    if not keys:
+        return method
+    layer = Layer({k: eff.values[k] for k in keys}, "", "view", sources={k: eff.sources[k] for k in keys})
+    return RemoteMethod(method._actor, method._name, method._fn, (layer, *method._view))
+
+
 class RemoteMethod(Generic[P, R]):
     def __init__(self, actor: Actor[Any], name: str, fn: Callable[..., Any] | None, view: tuple[Layer, ...] = ()) -> None:
         self._actor = actor
@@ -921,8 +970,7 @@ class RemoteMethod(Generic[P, R]):
         ``.options``, then the method's ``@ch.method``, the actor's options,
         then ``with ch.defaults`` blocks."""
         a = self._actor
-        declared = {k: v for k, v in (getattr(self._fn, "__chimaera_method__", None) or {}).items() if k != "group"}
-        layers = self._view + ((Layer(declared, f"@ch.method on {self._name}", "view"),) if declared else ())
+        layers = self._view + _declared(self._fn, self._name)
         eff = resolve_cached(self, layers, Layer(a._eff.values, "actor", "decorator", sources=a._eff.sources))
         if eff.get("cache"):
             raise OptionsError(

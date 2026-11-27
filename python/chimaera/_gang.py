@@ -90,8 +90,8 @@ from . import _ledger
 from ._errors import InfrastructureFailure, VersionConflict
 from ._future import Future
 from ._native import blake3_digest, child_id
-from ._options import Auto, Placement, _pos_float
-from ._remote import Actor, remote
+from ._options import Auto, Effective, Placement, _pos_float
+from ._remote import Actor, method_options, remote, with_replay
 
 R = TypeVar("R")
 
@@ -1042,28 +1042,29 @@ def _collect(*values: Any) -> list[Any]:
 
 
 class _RankMethod:
-    def __init__(self, hosts: list[Any], name: str) -> None:
-        self._hosts, self._name = hosts, name
+    def __init__(self, hosts: list[Any], name: str, eff: Effective) -> None:
+        self._hosts, self._name, self._eff = hosts, name, eff
 
     def remote(self, *args: Any, **kwargs: Any) -> Future[list[Any]]:
         """Call the method on every rank; one future of the results, in rank order."""
-        return _collect.remote(*(h.call.remote(self._name, args, kwargs) for h in self._hosts))
+        calls = (with_replay(h.call, self._eff).remote(self._name, args, kwargs) for h in self._hosts)
+        return _collect.remote(*calls)
 
 
 class _Rank:
     """One rank of an actor gang: ``g[i].method.remote(...)`` calls only it."""
 
-    def __init__(self, host: Any) -> None:
-        self._host = host
+    def __init__(self, host: Any, options: Any) -> None:
+        self._host, self._options = host, options
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
-        host = self._host
+        host, eff = self._host, self._options(name)
 
         class _One:
             def remote(self, *args: Any, **kwargs: Any) -> Future[Any]:
-                return host.call.remote(name, args, kwargs)
+                return with_replay(host.call, eff).remote(name, args, kwargs)
 
         return _One()
 
@@ -1097,6 +1098,10 @@ class GangActor:
         self._collective_timeout = float(eff.get("collective_timeout") or COLLECTIVE_S)
         self._hosts: list[Any] = []
         self._holds: _ledger.Holds | None = None
+        # A rank's call of a method runs as one that may not run again when
+        # the method, with the class's options, may not (`with_replay`).
+        self._eff = eff
+        self._method_options: dict[str, Effective] = {}
         self._want = _wanted(eff.get("ranks"))
         self.decisions: list[str] = []
         self._build(self._sized(first=True))
@@ -1137,12 +1142,19 @@ class GangActor:
         return len(self._hosts)
 
     def __getitem__(self, rank: int) -> _Rank:
-        return _Rank(self._hosts[rank])
+        return _Rank(self._hosts[rank], self._options)
 
     def __getattr__(self, name: str) -> _RankMethod:
         if name.startswith("_") or name not in self._methods:
             raise AttributeError(f"{self._cls.__name__} has no method {name!r}")
-        return _RankMethod(self._hosts, name)
+        return _RankMethod(self._hosts, name, self._options(name))
+
+    def _options(self, name: str) -> Effective:
+        """Method `name`'s options, as a handle's call resolves them, once."""
+        eff = self._method_options.get(name)
+        if eff is None:
+            eff = self._method_options[name] = method_options(self._cls, name, self._eff)
+        return eff
 
     def restart(self) -> None:
         """Build every rank again as the next generation (an elastic gang sizes it

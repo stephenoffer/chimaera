@@ -71,6 +71,11 @@ message Ran {
   uint64 exit_unix_ns = 3;
   uint64 cpu_ns = 4;      // the executor process's CPU time during the call
   uint32 executor = 5;
+  // The generation of the actor's instance that ran it (ActorRecord.generation;
+  // 0 = not known, as from an older peer, or settled by its caller unseen),
+  // which its attempt names. Its caller already has the outcome, so the shard
+  // keeps it whatever the actor's generation is when the record lands.
+  uint64 actor_generation = 6;
 }
 
 message Attempt {

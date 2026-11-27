@@ -46,6 +46,9 @@ message Execute {
   repeated string retry_exception_types = 9;
   // A durable actor's call: return the instance's state with the result.
   bool durable = 10;
+  // An actor's call: the generation of the instance it is for (ActorRecord.
+  // generation). The executor serves direct calls for that instance alone.
+  uint64 actor_generation = 11;
 }
 
 message ExecDone {

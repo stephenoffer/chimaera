@@ -346,6 +346,11 @@ class Executor:
         # the error and its traceback, raised by every call until one loads.
         self.restore_error: tuple[BaseException, Any] | None = None
         self.terminating = False  # on_terminate ran: the peer is closing this worker
+        # The generation of the actor instance this worker holds (from its
+        # constructor's Execute), whose direct calls it serves; RETIRED once
+        # that instance is no longer current (_direct.Reply.begin).
+        self.generation = 0
+        self.retired = False  # for good: see retire()
         self.stdout: _Stdout | None = None  # set by main()
         self.running: dict[bytes, _context.TaskContext] = {}
         self.inbox: queue.SimpleQueue[tuple[Any, ...] | None] = queue.SimpleQueue()
@@ -633,8 +638,17 @@ class Executor:
             actor=msg["actor"],
         )
 
+    def retire(self) -> None:
+        """No direct call begins here again (``_direct.Reply.begin``): the
+        flag first, so a constructor setting its generation meanwhile ends
+        retired too."""
+        self.retired = True
+        self.generation = _direct.RETIRED
+
     def run_one(self, msg: dict[str, Any], item: tuple[Any, ...]) -> None:
         key, _, args_ref, deps, _ = item
+        if "direct" in msg and not msg["direct"].begin(key):
+            return  # its connection broke, or its instance is no longer current: it never runs here (Reply.begin)
         ctx = self.task_context(msg, item)
         self.running[key] = ctx
         token = _context.set_task(ctx)
@@ -681,6 +695,8 @@ class Executor:
         thread held per awaiting call meant thousands of threads for an I/O
         actor given concurrency in the thousands."""
         key, _, args_ref, deps, _ = item
+        if "direct" in msg and not msg["direct"].begin(key):
+            return  # its connection broke, or its instance is no longer current: it never runs here (Reply.begin)
         ctx = self.task_context(msg, item)
         self.running[key] = ctx
         token = _context.set_task(ctx)
@@ -689,6 +705,8 @@ class Executor:
         try:
             if self.exited:
                 raise ActorDied("the actor ended itself with ch.context().exit_actor()")
+            if self.instance is None and self.terminating:  # it began as its actor's close did
+                raise ActorDied("the actor was closed as this call began")
             args, kwargs = self.call_args(args_ref, deps)
             coro = getattr(self.instance, msg["method"])(*args, **kwargs)
         except BaseException as exc:
@@ -798,11 +816,20 @@ class Executor:
             _leases.own_run = getattr(_context.current_task(), "run", None)  # holds what other runs pass it
             cls = self.load(msg["fn_digest"])
             self.actor_concurrency = int(msg["policy"].get("concurrency") or 1)
+            # Its generation, then the peer's lease epoch, before the instance
+            # is built: retired meanwhile (its peer went, or the lease lapsed
+            # and came back in a new epoch), it serves no direct calls.
+            self.generation = msg.get("actor_generation", 0)
+            if self.retired:  # set before the generation, so either order ends retired
+                self.generation = _direct.RETIRED
+            epoch = _direct.lease_epoch(self)
             self.instance = cls(*args, **kwargs)
-            _direct.listen(self, msg)  # callers on this machine may now call it directly
+            _direct.listen(self, msg, epoch)  # callers on this machine may now call it directly
             return None
         if kind == CALL_ACTOR_METHOD:
             if self.instance is None:
+                if self.terminating:  # a direct call that began as its actor's close did (on_terminate)
+                    raise ActorDied("the actor was closed as this call began")
                 if self.restore_error is not None:
                     exc, tb = self.restore_error
                     raise exc.with_traceback(tb)
@@ -1032,6 +1059,7 @@ class Executor:
         while True:
             m = self.conn.recv()
             if m is None or m[0] == "shutdown":
+                self.retire()  # its instance ends here: no direct call begins after
                 self.inbox.put(None)
                 if m is None:
                     # The peer is gone (killed, crashed): nothing this process
@@ -1314,9 +1342,12 @@ def main() -> None:
         # The peer is closing this worker (its actor was closed, or its run
         # ended): exit as a program does, so the actor's __del__ and atexit
         # handlers run (Ray's kill skips both). The peer stops it outright if
-        # this takes longer than its grace period.
+        # this takes longer than its grace period. First, so no direct call
+        # begins after (a concurrent actor's lanes run what they hold as the
+        # process exits): their callers send them through the peer.
+        ex.retire()
+        ex.terminating = True  # before the instance goes: a call that began meanwhile raises ActorDied
         ex.instance = None
-        ex.terminating = True
         gc.collect()
         raise SystemExit(0)
 

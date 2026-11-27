@@ -46,9 +46,14 @@ TRANSIENT_ERRORS = (
 
 
 class OutcomeUnknown(ChimaeraError):
-    """A call with external effects may or may not have taken effect. From a
-    durable workflow's activity (``ch.durable.record(activity, ...)``), ``key``
-    is the activity's key: ask the other system what it did under that key."""
+    """A call with external effects may or may not have taken effect. So may
+    an actor call sent straight to its actor's executor whose connection broke
+    before the outcome came back, when that executor, though alive, cannot
+    send it back: the call began and its outcome was lost, or the executor did
+    not answer (an actor method may change the actor's state, so it is not run
+    again). From a durable workflow's activity
+    (``ch.durable.record(activity, ...)``), ``key`` is the activity's key: ask
+    the other system what it did under that key."""
 
     key: str | None = None
 

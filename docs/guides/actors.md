@@ -406,6 +406,28 @@ A call that was running when the process died is never replayed; it raises
 
 Good news: actors moved off a drained peer restart without using up a restart.
 
+If an actor's peer stops answering long enough to be declared dead, the actor
+restarts on another peer, and once the first peer is back it stops the
+instance it still ran there. Programs on that machine that call the actor
+directly ([`CHIMAERA_DIRECT`](../configuration.md)) stop reaching the old
+instance once its peer has gone 3 seconds without hearing from most of the
+cluster, sooner than the 6 it takes to declare a peer dead: from then on its
+worker begins no call that skips the peer, and those calls go through the
+peer instead. That covers a peer that was paused or cut off from most of the
+cluster.
+
+One network split isn't covered. If the old peer still hears most of the
+cluster, but most of the peers that keep the actor's record (its group, three
+peers) are on the other side, the group places the actor again, while callers
+on the old peer's machine keep reaching the old instance until the split
+heals. Their calls get answers from an instance that is being replaced,
+working from its state as of the split; callers elsewhere reach the new
+instance. Once the split heals, the old peer learns of the new instance and
+stops the old one. Stored state can't diverge: an actor with durable state
+takes no direct calls, and its group refuses commits from an instance it has
+replaced. Set `CHIMAERA_DIRECT=0` if callers must never reach a replaced
+instance.
+
 `ch.ActorDied` (an `InfrastructureFailure`) means the call won't run: the actor
 was closed, ended itself or with its run, died with `restart="never"` or ran
 out of restarts, or died while this call was running. The other errors are in

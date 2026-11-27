@@ -19,6 +19,7 @@
 //! another member later.
 
 use crate::core::CoreMsg;
+use crate::direct::lease;
 use crate::mesh::{CheckToken, GroupStarter, MeshClient, MeshServer, MeshService, MeshTransport};
 use crate::router::Router;
 use crate::runtime::{self, Node};
@@ -498,7 +499,11 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     );
 
     let planned: BTreeMap<u32, usize> = (0..=plan.data_groups).map(|g| (g, voters_in(&plan, g).len())).collect();
-    tokio::spawn(liveness(router.clone(), mesh.clone(), node.core_tx.clone(), planned, cfg.dir.join(MEMBERS_FILE)));
+    // Before any executor starts. No other peer can have declared this
+    // incarnation dead yet: it holds until the probes renew it.
+    let lease = lease::start(&cfg.dir, lease::clock_ms() + lease::LEASE_MS);
+    let members_file = cfg.dir.join(MEMBERS_FILE);
+    tokio::spawn(liveness(router.clone(), mesh.clone(), node.core_tx.clone(), planned, members_file, lease));
     tokio::spawn(crate::restore::retire_restored(router.clone(), cfg.dir.clone()));
     tokio::spawn(crate::loads::poll(mesh.clone()));
     let clients = cfg.client_listen.map(|addr| runtime::ClientListen {
@@ -552,7 +557,9 @@ async fn liveness(
     core: mpsc::Sender<CoreMsg>,
     planned: BTreeMap<u32, usize>,
     members_file: PathBuf,
+    mut lease: Option<lease::Lease>,
 ) {
+    let mut hearing = lease::Hearing::default();
     let mut dead_since: BTreeMap<u64, Instant> = BTreeMap::new();
     // Members whose port has refused every probe since then: their process is
     // gone, so they are declared dead after REFUSED_FOR, not after suspicion.
@@ -565,7 +572,12 @@ async fn liveness(
     loop {
         tick.tick().await;
         let now = mesh.now_ms();
-        let targets = mesh.swim.lock().expect("lock").next_probes(now, PROBE_FANOUT);
+        let (targets, alone) = {
+            let mut swim = mesh.swim.lock().expect("lock");
+            (swim.next_probes(now, PROBE_FANOUT), swim.is_empty())
+        };
+        let begun = lease::clock_ms();
+        let probed = targets.len();
         let probes = targets.into_iter().map(|target| {
             let mesh = mesh.clone();
             async move {
@@ -595,6 +607,14 @@ async fn liveness(
             }
         });
         let results = futures_util::future::join_all(probes).await;
+        // Executors begin direct calls only while this peer hears most of
+        // the cluster (direct/lease.rs).
+        let reached = results.iter().filter(|r| r.1).count();
+        if let Some(lease) = lease.as_mut()
+            && hearing.batch(begun, reached, probed, alone)
+        {
+            lease.renew(begun + lease::LEASE_MS);
+        }
         let changes = {
             let now = mesh.now_ms();
             let mut swim = mesh.swim.lock().expect("lock");

@@ -308,7 +308,7 @@ except ch.Infeasible as e:
 | `ch.InfrastructureFailure`, `ch.errors.WorkerCrashed` | Workers kept dying until the attempts ran out. |
 | `ch.OutOfMemory` | Over `memory_limit`; carries the peak and the limit. |
 | `ch.errors.OutOfDisk` | A value could not be stored: the disk holding objects is full. An `OSError` with `errno.ENOSPC`; the message names the directory and its free space. |
-| `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died. |
+| `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died, or an actor call sent straight to its worker ([`CHIMAERA_DIRECT`](configuration.md)) lost its connection, and the worker, still alive, can't send back what became of it. |
 | `ch.Infeasible` | Nothing can ever run this request; the message names the constraint. |
 | `ch.Cancelled`, `ch.DeadlineExceeded` | The call was stopped. |
 | `ch.ActorDied` | The actor's process ended. |

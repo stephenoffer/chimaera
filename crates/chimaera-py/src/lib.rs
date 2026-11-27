@@ -470,9 +470,10 @@ struct CallSpec {
     #[pyo3(item, default)]
     prev: Option<Vec<u8>>,
     /// A call the direct path already ran: (outcome as an executor reports
-    /// it, entry ns, exit ns, executor CPU ns, executor id). Recorded as done.
+    /// it, entry ns, exit ns, executor CPU ns, executor id, generation of the
+    /// actor instance that ran it or 0). Recorded as done.
     #[pyo3(item, default)]
-    ran: Option<(Py<PyTuple>, u64, u64, u64, u32)>,
+    ran: Option<(Py<PyTuple>, u64, u64, u64, u32, u64)>,
     /// Sent straight to its actor's executor: the peer notes it in flight.
     #[pyo3(item, default)]
     direct: bool,
@@ -523,13 +524,14 @@ impl CallSpec {
             prev: self.prev.map(|p| task_key(&p)).transpose()?,
             ran: self
                 .ran
-                .map(|(outcome, entry_unix_ns, exit_unix_ns, cpu_ns, executor)| {
+                .map(|(outcome, entry_unix_ns, exit_unix_ns, cpu_ns, executor, actor_generation)| {
                     Ok::<_, PyErr>(pb::Ran {
                         outcome: Some(outcome_from(outcome.bind(py))?),
                         entry_unix_ns,
                         exit_unix_ns,
                         cpu_ns,
                         executor,
+                        actor_generation,
                     })
                 })
                 .transpose()?,
@@ -1987,6 +1989,7 @@ impl ExecConn {
                 d.set_item("policy", policy_py(py, &x.policy.unwrap_or_default())?)?;
                 d.set_item("retry_exception_types", x.retry_exception_types)?;
                 d.set_item("durable", x.durable)?;
+                d.set_item("actor_generation", x.actor_generation)?;
                 let items = PyList::empty(py);
                 for it in &x.items {
                     let deps = PyList::empty(py);

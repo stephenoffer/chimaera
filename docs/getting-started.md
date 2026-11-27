@@ -163,7 +163,7 @@ except ValueError as e:                  # your exception, with the remote trace
 |---|---|
 | Your own exception | Your code raised it. It ran once, unless you listed it in `retry_exceptions`. |
 | `ch.InfrastructureFailure` | Workers kept dying; all three attempts were used. |
-| `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died. |
+| `ch.OutcomeUnknown` | An `effects="external"` call may have run before its worker died, or an actor call sent straight to its worker ([`CHIMAERA_DIRECT`](configuration.md)) lost its connection, and the worker, still alive, can't send back what became of it. |
 | `ch.Infeasible` | No machine could ever run this request; the message says why. |
 | `ch.Cancelled`, `ch.DeadlineExceeded` | The call was stopped. |
 | `TimeoutError` | Your wait ended; the call is still running. |

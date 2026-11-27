@@ -10,13 +10,21 @@
 //!   module turns the executor's timings into the attempt `explain()` shows
 //!   and the sample the profiles learn from, as `record_attempt` and `learn`
 //!   do for calls the peer ran itself.
+//! - A call whose connection broke before its outcome came back, and that may
+//!   have begun, is never run again: its caller records it with `ran` set to
+//!   `ActorDied` or `OutcomeUnknown` and no timings (python/chimaera/_direct.py,
+//!   `Conn._settle`). That record files no attempt: nothing saw it run.
+//! - The peer leases its executors the right to begin direct calls, only
+//!   while it hears most of its cluster (`lease`).
+
+pub mod lease;
 
 use crate::profiles::FnKey;
 use chimaera_core::ids::Id;
 use chimaera_core::pb;
 use chimaera_core::shard::Tk;
 use prost::Message;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// Calls noted in flight at most; more are not tracked (explain() then says
 /// "unknown task" for them until their record lands).
@@ -114,6 +122,12 @@ pub struct Ran {
     pub out_bytes: u64,
 }
 
+/// The calls in `s` recorded with their outcome, which their caller has:
+/// the session is not sent it again (one event and one read a call).
+pub fn recorded(s: &pb::SubmitTasks) -> BTreeSet<Tk> {
+    s.tasks.iter().filter(|t| t.ran.is_some()).filter_map(|t| t.key.as_ref().and_then(Tk::parse)).collect()
+}
+
 /// The calls in `s` that the direct path ran.
 pub fn attempts(s: &pb::SubmitTasks, peer: &pb::PeerInc) -> Vec<Ran> {
     s.tasks
@@ -133,7 +147,7 @@ pub fn attempts(s: &pb::SubmitTasks, peer: &pb::PeerInc) -> Vec<Ran> {
 }
 
 fn attempt(spec: &pb::TaskSpec, peer: &pb::PeerInc) -> Option<pb::AttemptRecord> {
-    let ran = spec.ran.as_ref()?;
+    let ran = spec.ran.as_ref().filter(|r| r.entry_unix_ns != 0)?; // 0: settled by its caller, not seen to run
     let wall_s = ran.exit_unix_ns.saturating_sub(ran.entry_unix_ns) as f64 / 1e9;
     let cpu_s = ran.cpu_ns as f64 / 1e9;
     let m = |value: f64, scope: &str, method: &str| pb::Measure {
@@ -165,7 +179,10 @@ fn attempt(spec: &pb::TaskSpec, peer: &pb::PeerInc) -> Option<pb::AttemptRecord>
         granted: pb::Policy::decode(spec.policy.as_slice()).ok(),
         measures,
         end_reason: end_reason.into(),
-        placement_reason: "direct: the caller sent it to the actor's executor on this machine".into(),
+        placement_reason: match ran.actor_generation {
+            0 => "direct: the caller sent it to the actor's executor on this machine".into(),
+            g => format!("direct: the caller sent it to the actor's executor on this machine (instance {g})"),
+        },
         ..Default::default()
     })
 }
@@ -186,6 +203,7 @@ mod tests {
             exit_unix_ns: 3_001_000,
             cpu_ns: 1_500_000,
             executor: 7,
+            actor_generation: 1,
         };
         let s = pb::SubmitTasks {
             tasks: vec![
@@ -198,8 +216,24 @@ mod tests {
         assert_eq!(got.len(), 1, "a call the peer will run gets its attempt from the peer");
         let rec = &got[0].attempt;
         assert_eq!((rec.fn_name.as_str(), rec.executor, rec.end_reason.as_str()), ("add", 7, "ok"));
+        assert!(rec.placement_reason.ends_with("(instance 1)"), "{}", rec.placement_reason);
         assert!((rec.measures["wall_seconds"].value - 0.003).abs() < 1e-9);
         assert!((rec.measures["mean_cores"].value - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_call_its_caller_settled_without_seeing_it_run_files_no_attempt() {
+        let run = Id::derive(0, 3, &[b"run"]);
+        let tk = Tk { run, task: run.child(&[b"1"]) };
+        let died = pb::ErrorRecord { kind: pb::error_record::Kind::ActorDied as i32, ..Default::default() };
+        let outcome = pb::Outcome { value: Some(pb::outcome::Value::Err(died)), ..Default::default() };
+        let ran = pb::Ran { outcome: Some(outcome), ..Default::default() };
+        let s = pb::SubmitTasks {
+            tasks: vec![pb::TaskSpec { key: Some(tk.pb()), ran: Some(ran), ..Default::default() }],
+            grant_to: None,
+        };
+        assert!(attempts(&s, &pb::PeerInc::default()).is_empty(), "no timings: nothing saw it run");
+        assert_eq!(recorded(&s), BTreeSet::from([tk]), "its caller has the outcome: no event for it");
     }
 
     #[test]

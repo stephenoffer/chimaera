@@ -86,7 +86,7 @@ a wait's built-in `TimeoutError`.
 | `ch.OutOfMemory` | killed for memory on its first try and both retries, or the retry can't fit the peer | message: peak and limit in bytes |
 | `ch.ActorDied` | the actor's process died, or it was closed ([actors.md](actors.md)) | the reason |
 | `ch.errors.DataLost` | a value is on no live peer and its call can't run again | why it can't be remade |
-| `ch.OutcomeUnknown` | an `effects="external"` call was lost after it started | the attempt and the cause |
+| `ch.OutcomeUnknown` | an `effects="external"` call was lost after it started, or an actor call sent straight to its worker ([`CHIMAERA_DIRECT`](../configuration.md)) lost its connection, and the worker, still alive, can't send back what became of it | the attempt and the cause, or what the caller knows |
 | `ch.Cancelled` | you, its caller, its run or your script's exit canceled it | who canceled it |
 | `ch.DeadlineExceeded` | its deadline passed | |
 | `ch.Infeasible` | no peer can ever run the request | the constraint |

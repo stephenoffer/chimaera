@@ -695,6 +695,8 @@ impl ShardState {
                 spec.deps.clear();
                 rec.attempts.push(pb::Attempt { attempt: 1, peer: grant_to.map(peer_pb), ..Default::default() });
                 rec.next_attempt = 2;
+                // Its caller already has this outcome, whichever instance ran it
+                // (Ran.actor_generation): the record keeps it.
                 let mut outcome = ran.outcome.unwrap_or_default();
                 outcome.attempt = 1;
                 outcome.peer = grant_to.map(peer_pb);

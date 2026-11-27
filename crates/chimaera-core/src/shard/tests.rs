@@ -232,6 +232,45 @@ fn a_call_the_direct_path_ran_is_recorded_done_and_wakes_its_dependents() {
     assert_eq!(status(&h.submit(ran(call, &[ctor], obj(9)), Some(p)).0), Status::Duplicate);
 }
 
+#[test]
+fn a_direct_record_keeps_the_outcome_its_caller_has_whichever_instance_ran_it() {
+    // Its caller resolved the call from the executor's reply before it sent
+    // the record. A record that lands after its actor was restarted keeps
+    // that outcome too: one stored as ActorDied gave the call one outcome at
+    // its caller and another at its dependents.
+    let mut h = Harness::new(ShardState::new());
+    let actor = run_id(V).child(&[b"actor"]);
+    let p = (peer(0), 1);
+    let place = |h: &mut Harness, generation: u64| {
+        let place = pb::ActorPlace { actor: actor.to_vec(), expected_generation: generation, host: Some(peer_pb(p)) };
+        h.raw(Body::ActorPlace(place), V);
+    };
+    let restart = pb::actor_spec::Restart::Fresh as i32;
+    let spec = pb::ActorSpec { actor: actor.to_vec(), restart, max_restarts: 3, ..Default::default() };
+    h.raw(Body::ActorCreate(pb::ActorCreate { spec: Some(spec) }), V);
+    place(&mut h, 0);
+    let mut next = 0;
+    let mut record = |h: &mut Harness, generation: u64| {
+        next += 1;
+        let tk = task_id(V, next);
+        let mut s = ran(tk, &[], obj(7));
+        s.actor = actor.to_vec();
+        s.kind = pb::CallKind::CallActorMethod as i32;
+        s.ran.as_mut().unwrap().actor_generation = generation;
+        assert_eq!(status(&h.submit(s, Some(p)).0), Status::Accepted);
+        let rec = h.task(tk).unwrap();
+        assert_eq!(rec.state(), TState::Done);
+        rec.outcome.unwrap().value
+    };
+    assert_eq!(record(&mut h, 1), obj(7).value, "its instance is current");
+    let died = pb::ActorDied { actor: actor.to_vec(), generation: 1, reason: None, terminal: false, moved: false };
+    h.raw(Body::ActorDied(died), V);
+    place(&mut h, 1);
+    assert_eq!(record(&mut h, 1), obj(7).value, "it ran on instance 1, and its record landed after instance 2 began");
+    assert_eq!(record(&mut h, 2), obj(7).value);
+    assert_eq!(record(&mut h, 0), obj(7).value, "no instance named (an older peer)");
+}
+
 fn dead(h: &Harness, run: Id) -> Vec<Tk> {
     read::dead_letters(&h.a, V, run).into_iter().map(|(tk, _)| tk).collect()
 }

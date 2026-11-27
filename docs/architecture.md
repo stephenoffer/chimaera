@@ -171,6 +171,9 @@ floor the real path builds on, not Chimaera's.
   inputs land. Local actor calls: 118–196 µs against Ray's 224–452 µs on this laptop, 212 µs against 426 µs on a
   32-core Linux machine ([results](../bench/proto/local-group/DIRECT-RESULTS.md)). Calls made inside tasks and
   actors go direct too, except an actor's calls to itself and methods with a mailbox limit, which the peer keeps.
+  A call that can't safely run again (its options resolve to `effects="external"` or `deterministic=False`, also for
+  actors placed `within=` a reservation and gang ranks) never goes direct: it would run before the peer records it,
+  so a retry of its caller could run it twice.
 
 The journal reuses the shard state machine that exists today (`crates/chimaera-core/src/shard`). The transitions,
 fencing and exactly-one-winner rules are the same; only the replication changes. Raft groups apply commands from a

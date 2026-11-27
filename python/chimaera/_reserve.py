@@ -35,8 +35,8 @@ from typing import Any
 from . import _ledger
 from ._errors import Infeasible
 from ._future import Future
-from ._options import Placement
-from ._remote import remote
+from ._options import Effective, Placement
+from ._remote import method_options, remote, with_replay
 
 STRATEGIES = ("pack", "spread", "strict_pack", "strict_spread")
 
@@ -257,31 +257,41 @@ def reserve(bundles: list[dict[str, Any]], *, strategy: str = "pack", timeout: f
 # ---- placing calls and actors within a bundle ------------------------------------
 
 
-def call_within(bundle: Bundle, fn: Any, args: tuple, kwargs: dict) -> Future[Any]:
-    return bundle._host().call.remote(fn, args, kwargs)
+def call_within(bundle: Bundle, fn: Any, args: tuple, kwargs: dict, eff: Effective) -> Future[Any]:
+    """`fn`, whose options are `eff`, run in the bundle's host: as a call that
+    may not run again if `fn` may not (``with_replay``)."""
+    return with_replay(bundle._host().call, eff).remote(fn, args, kwargs)
 
 
 class _HostedMethod:
     def __init__(self, actor: HostedActor, name: str) -> None:
         self._actor, self._name = actor, name
+        # The host's invoke, as a call that may not run again if this method,
+        # with its actor's options, may not (`with_replay`).
+        self._invoke = with_replay(actor._host.invoke, method_options(actor._cls, name, actor._eff))
 
     def remote(self, *args: Any, **kwargs: Any) -> Future[Any]:
-        return self._actor._host.invoke.remote(self._actor._oid_future, self._name, args, kwargs)
+        return self._invoke.remote(self._actor._oid_future, self._name, args, kwargs)
 
 
 class HostedActor:
     """An actor created ``within=`` a bundle: it lives in the bundle's host."""
 
-    def __init__(self, bundle: Bundle, cls: type, args: tuple, kwargs: dict) -> None:
-        self._bundle, self._cls = bundle, cls
+    def __init__(self, bundle: Bundle, cls: type, args: tuple, kwargs: dict, eff: Effective) -> None:
+        self._bundle, self._cls, self._eff = bundle, cls, eff
         self._host = bundle._host()
-        self._oid_future = self._host.new.remote(cls, args, kwargs)
+        # Its constructor, as one that may not run again if the class's options say so.
+        self._oid_future = with_replay(self._host.new, eff).remote(cls, args, kwargs)
+        self._methods: dict[str, _HostedMethod] = {}  # one per name, so its options resolve once
         self.id = f"{os.urandom(4).hex()}@bundle{bundle.index}"
 
     def __getattr__(self, name: str) -> _HostedMethod:
         if name.startswith("_") or not callable(getattr(self._cls, name, None)):
             raise AttributeError(f"{self._cls.__name__} has no method {name!r}")
-        return _HostedMethod(self, name)
+        method = self._methods.get(name)
+        if method is None:
+            method = self._methods[name] = _HostedMethod(self, name)
+        return method
 
     def close(self) -> None:
         self._host.drop.remote(self._oid_future)
