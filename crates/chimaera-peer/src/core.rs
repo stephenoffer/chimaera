@@ -35,6 +35,7 @@ mod actor_state;
 mod demand;
 mod holds;
 mod inputs;
+pub mod rebuild_lease;
 mod recovery;
 mod shortlist;
 
@@ -336,6 +337,17 @@ pub enum CoreMsg {
         work: Box<Work>,
         outcome: Option<pb::Outcome>,
     },
+    /// What taking the lease on a lost value's call found (rebuild_lease).
+    RebuildClaimed {
+        producer: Tk,
+        plan: Box<Plan>,
+        depth: u32,
+        claim: rebuild_lease::Claim,
+    },
+    /// A lost value that another peer made again is in this store now.
+    RebuildFetched {
+        producer: Tk,
+    },
     /// A retained result's copies are made (`error` None: publish `entry`,
     /// which names them), or could not be (see replicas).
     Retained {
@@ -455,8 +467,10 @@ pub struct Work {
     /// an ordinary attempt). See core/recovery.rs.
     rebuilds: u32,
     depth: u32,
-    /// A call run again to remake a lost value: the value it published.
+    /// A call run again to remake a lost value: the value it published, and
+    /// the fencing token of its lease (core/rebuild_lease.rs; 0: none).
     expect: Option<pb::ObjectRef>,
+    lease: u64,
     /// How its stored inputs reached this peer (core/inputs.rs).
     inputs: Vec<pb::InputRead>,
     /// When it reached this peer (unix ns), read once like every other
@@ -681,6 +695,7 @@ impl Work {
             rebuilds: 0,
             depth: 0,
             expect: None,
+            lease: 0,
             inputs: Vec::new(),
             ready_ns: now_ns(),
             queued_ns: 0,
@@ -1161,6 +1176,9 @@ pub struct Core {
     rebuild_budget: recovery::Budget,
     /// Peers large inputs are on their way to (core/shortlist.rs).
     fanout: shortlist::Fanout,
+    /// The leases this peer holds on lost values' calls it runs again,
+    /// renewed until it records the outcome (core/rebuild_lease.rs).
+    leases: HashMap<Tk, tokio::task::AbortHandle>,
     /// Tasks watched through another peer's replica.
     remote_watched: HashSet<Tk>,
     /// Hosts of actors whose records live in groups not hosted here.
@@ -1323,6 +1341,7 @@ impl Core {
             rebuild_readers: HashMap::new(),
             rebuild_budget: recovery::Budget::default(),
             fanout: shortlist::Fanout::default(),
+            leases: HashMap::new(),
             remote_watched: HashSet::new(),
             actor_hosts: HashMap::new(),
             waiting_actor: HashMap::new(),
@@ -1567,6 +1586,14 @@ impl Core {
                 self.rebuilt(&work, outcome.as_ref());
                 self.dispatch();
             }
+            CoreMsg::RebuildClaimed { producer, plan, depth, claim } => {
+                self.rebuild_claimed(producer, *plan, depth, claim);
+                self.dispatch();
+            }
+            CoreMsg::RebuildFetched { producer } => {
+                self.rebuild_done(producer);
+                self.dispatch();
+            }
             CoreMsg::Rebuild { consumer, producer, plan } => {
                 self.localizing.remove(&(consumer.tk, consumer.attempt));
                 let mut consumer = *consumer;
@@ -1586,7 +1613,7 @@ impl Core {
                                 depth,
                                 "an input was lost with every peer that held it: running the call that made it again"
                             );
-                            self.start_rebuild(producer, *plan, depth);
+                            self.claim_rebuild(producer, *plan, depth);
                         }
                     }
                 }
@@ -1605,7 +1632,7 @@ impl Core {
                                 task = %producer.task.hex(),
                                 "a result a program reads was lost with every peer that held it: running its call again"
                             );
-                            self.start_rebuild(producer, *plan, 1);
+                            self.claim_rebuild(producer, *plan, 1);
                         }
                     }
                 }
@@ -2681,10 +2708,16 @@ impl Core {
             self.fail_attempt(w, pb::record_failure::Kind::Infra, why);
             return;
         }
-        for reader in self.rebuild_readers.remove(&w.tk).unwrap_or_default() {
+        self.rebuild_failed(w.tk, why);
+    }
+
+    /// Running `producer` again failed: the readers and attempts waiting for
+    /// the value it was to remake fail with it.
+    fn rebuild_failed(&mut self, producer: Tk, why: &str) {
+        for reader in self.rebuild_readers.remove(&producer).unwrap_or_default() {
             let _ = reader.send(Err(why.to_string()));
         }
-        if let Some(waiting) = self.rebuilding.remove(&w.tk) {
+        if let Some(waiting) = self.rebuilding.remove(&producer) {
             let why = format!("an input was lost with its peer, and running the call that made it again failed: {why}");
             for c in waiting {
                 self.give_up(&c, &why);
@@ -2692,16 +2725,83 @@ impl Core {
         }
     }
 
+    /// The value `producer` remakes is in this store: the readers and
+    /// attempts waiting for it go on.
+    fn rebuild_done(&mut self, producer: Tk) {
+        for reader in self.rebuild_readers.remove(&producer).unwrap_or_default() {
+            let _ = reader.send(Ok(()));
+        }
+        for c in self.rebuilding.remove(&producer).unwrap_or_default() {
+            self.admit(c);
+        }
+    }
+
+    /// Remake a lost value: take the lease on its call, so one peer of the
+    /// cell runs it and the others fetch from there (core/rebuild_lease.rs).
+    /// Its readers wait meanwhile, in rebuilding and rebuild_readers.
+    fn claim_rebuild(&mut self, producer: Tk, plan: Plan, depth: u32) {
+        let (router, tx) = (self.router.clone(), self.me_tx.clone());
+        tokio::spawn(async move {
+            let claim = rebuild_lease::claim(&router, producer, plan.attempt).await;
+            let _ = tx.send(CoreMsg::RebuildClaimed { producer, plan: Box::new(plan), depth, claim }).await;
+        });
+    }
+
+    fn rebuild_claimed(&mut self, producer: Tk, plan: Plan, depth: u32, claim: rebuild_lease::Claim) {
+        use rebuild_lease::Claim;
+        let me = self.router.node_id();
+        match claim {
+            Claim::Won(token) => {
+                if token > 0 {
+                    let renewing = rebuild_lease::keep(self.router.clone(), producer, plan.attempt, token);
+                    self.leases.insert(producer, renewing);
+                }
+                self.start_rebuild(producer, plan, depth, token);
+            }
+            Claim::Made(node) if node == me => self.start_rebuild(producer, plan, depth, 0), // made here, since lost
+            Claim::Failed(why) => {
+                self.rebuild_failed(producer, &format!("running it again on another peer failed: {why}"))
+            }
+            Claim::Made(_) | Claim::Elsewhere => {
+                let Some(mesh) = self.router.mesh.clone() else { return self.start_rebuild(producer, plan, depth, 0) };
+                let (router, tx, objects) = (self.router.clone(), self.me_tx.clone(), self.objects.clone());
+                tokio::spawn(async move {
+                    let claim = match claim {
+                        Claim::Elsewhere => rebuild_lease::wait(&router, producer, plan.attempt).await,
+                        made => made,
+                    };
+                    let msg = match claim {
+                        Claim::Made(node) if node != router.node_id() => {
+                            match rebuild_lease::fetch(&mesh, &objects, &plan.made, node).await {
+                                Ok(()) => CoreMsg::RebuildFetched { producer },
+                                // Its maker is gone too: run it here.
+                                Err(_) => CoreMsg::RebuildClaimed {
+                                    producer,
+                                    plan: Box::new(plan),
+                                    depth,
+                                    claim: Claim::Won(0),
+                                },
+                            }
+                        }
+                        claim => CoreMsg::RebuildClaimed { producer, plan: Box::new(plan), depth, claim },
+                    };
+                    let _ = tx.send(msg).await;
+                });
+            }
+        }
+    }
+
     /// Run `producer` again here to remake a lost value: its outcome is
     /// committed, so this run only rewrites the value under the same id (the
     /// same attempt) and has nothing to start or publish.
-    fn start_rebuild(&mut self, producer: Tk, plan: Plan, depth: u32) {
+    fn start_rebuild(&mut self, producer: Tk, plan: Plan, depth: u32, lease: u64) {
         let policy = pb::Policy::decode(plan.spec.policy.as_slice()).unwrap_or_default();
         let mut work = Work::new(producer, plan.attempt, plan.spec, policy, plan.deps);
         work.publish = false;
         work.start_consumed = true;
         work.depth = depth;
         work.expect = Some(plan.made);
+        work.lease = lease;
         self.reserve(&mut work, 0, 0.0, 0);
         self.admit(work);
     }
@@ -2709,26 +2809,30 @@ impl Core {
     /// A call run again to remake a lost value finished: the attempts waiting
     /// for that value go on (it is in this peer's store now), or fail with it.
     fn rebuilt(&mut self, w: &Work, outcome: Option<&pb::Outcome>) {
-        match outcome.and_then(|o| o.value.as_ref()) {
-            Some(pb::outcome::Value::Ok(remade)) => {
-                if let Some(why) = recovery::divergence(w.expect.as_ref(), remade) {
+        let made = match outcome.and_then(|o| o.value.as_ref()) {
+            Some(pb::outcome::Value::Ok(remade)) => match recovery::divergence(w.expect.as_ref(), remade) {
+                Some(why) => {
                     // Other bytes under the old ids: never read as the value.
                     for o in with_blobs(remade) {
                         let _ = std::fs::remove_file(self.objects.path(&o.run, &o.object_id));
                     }
                     tracing::warn!(task = %w.tk.task.hex(), "{why}");
-                    self.give_up(w, &why);
-                    return;
+                    Err(why)
                 }
-                for reader in self.rebuild_readers.remove(&w.tk).unwrap_or_default() {
-                    let _ = reader.send(Ok(()));
-                }
-                for c in self.rebuilding.remove(&w.tk).unwrap_or_default() {
-                    self.admit(c);
-                }
-            }
-            Some(pb::outcome::Value::Err(e)) => self.give_up(w, &format!("it raised {}: {}", e.type_name, e.message)),
-            None => self.give_up(w, "it produced no value"),
+                None => Ok(()),
+            },
+            Some(pb::outcome::Value::Err(e)) => Err(format!("it raised {}: {}", e.type_name, e.message)),
+            None => Err("it produced no value".to_string()),
+        };
+        // The other peers waiting on this run hear how it went (rebuild_lease).
+        if let Some(renewing) = self.leases.remove(&w.tk) {
+            renewing.abort();
+        }
+        let router = self.router.clone();
+        tokio::spawn(rebuild_lease::publish(router, w.tk, w.attempt, w.lease, made.clone()));
+        match made {
+            Ok(()) => self.rebuild_done(w.tk),
+            Err(why) => self.give_up(w, &why),
         }
     }
 

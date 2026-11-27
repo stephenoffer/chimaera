@@ -1715,6 +1715,28 @@ except ch.errors.DataLost as e:
         c.close()
 
 
+# Just after a cluster starts, the leader placing a run's calls may not see a
+# labelled peer yet, and cancels a call pinned there as infeasible: a driver
+# pins nothing it counts until a call has reached each slot it uses.
+SLOTS_READY = """
+def slots_ready(*slots):
+    @ch.remote
+    def here():
+        return None
+
+    deadline = time.monotonic() + 60
+    for slot in slots:
+        while True:
+            try:
+                here.options(placement=ch.dist.Placement(require={"slot": slot})).remote().result(timeout=60)
+                break
+            except ch.Infeasible:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.1)
+"""
+
+
 def test_a_lost_result_of_a_nondeterministic_function_is_never_made_again(monkeypatch):
     # Running it again could return other bytes under the old id, so neither
     # a call reading the result as its input nor a program reading it runs
@@ -1732,6 +1754,8 @@ import chimaera as ch
 
 def on(slot):
     return ch.dist.Placement(require={{"slot": slot}})
+{SLOTS_READY}
+slots_ready("s1", "s2")
 
 @ch.remote(deterministic=False)
 def noise(n):
@@ -1789,6 +1813,8 @@ import chimaera as ch
 
 def on(slot):
     return ch.dist.Placement(require={{"slot": slot}})
+{SLOTS_READY}
+slots_ready("s1", "s2")
 
 @ch.remote
 def grows(name):
@@ -1830,6 +1856,60 @@ except ch.errors.DataLost as e:
         c.close()
 
 
+def test_readers_of_a_lost_value_on_three_peers_have_its_call_run_once(monkeypatch):
+    # Calls on p2 and p3 and the driver on p0 read the value at once, after
+    # its only holder died: one peer takes the lease on its call and runs it
+    # again, and the others fetch the value from there.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
+    c = Cluster(4, labels={i: f"slot=s{i}" for i in range(4)})
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    go = os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+import chimaera as ch
+
+def on(slot):
+    return ch.dist.Placement(require={{"slot": slot}})
+{SLOTS_READY}
+slots_ready("s1", "s2", "s3")
+
+@ch.remote
+def make(n):
+    path = os.path.join({marks!r}, "make")
+    with open(path, "a") as f:
+        f.write("ran\\n")
+    if len(open(path).read().splitlines()) > 1:
+        time.sleep(3)  # run again: slow enough that every reader finds it lost meanwhile
+    return bytes(range(256)) * (n // 256)
+
+@ch.remote
+def size(b):
+    return len(b)
+
+a = make.options(placement=on("s1")).remote(1 << 20)
+ch.wait([a], timeout=60)  # finished, not read: only on s1
+print("READY", flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+calls = [size.options(placement=on(s)).remote(a) for s in ("s2", "s3")]
+print("READ", len(a.result(timeout=120)), flush=True)
+print("SIZES", ch.get(calls, timeout=120), flush=True)
+""",
+        )
+        assert driver.stdout.readline().strip() == "READY", driver.stderr.read()[-2000:]
+        c.signal(1, signal.SIGKILL)  # the only peer holding the value
+        open(go, "w").close()
+        out, err = driver.communicate(timeout=240)
+        assert f"READ {1 << 20}" in out and f"SIZES [{1 << 20}, {1 << 20}]" in out, out + err[-3000:]
+        ran = len(open(os.path.join(marks, "make")).read().splitlines())
+        assert ran == 2, f"make ran {ran} times: once, then once more for every reader"
+    finally:
+        c.close()
+
+
 def test_a_long_chain_and_a_wide_gather_lost_with_their_peer_are_made_again(monkeypatch):
     # Forty calls, each reading the one before, and a call reading six values,
     # all lost with the one peer that held them: every lost call runs again,
@@ -1847,6 +1927,8 @@ import chimaera as ch
 
 def on(slot):
     return ch.dist.Placement(require={{"slot": slot}})
+{SLOTS_READY}
+slots_ready("s1", "s2")
 
 def mark(name):
     with open(os.path.join({marks!r}, name), "a") as f:
