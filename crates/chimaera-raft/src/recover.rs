@@ -9,7 +9,7 @@
 
 use crate::log_store::{LOG, LOG_META, dec, enc, io_err};
 use crate::state_machine::{SM_META, apply_batch, write_group_snapshot};
-use crate::{BasicNode, DiskDurability, NodeId, TypeConfig, open_db};
+use crate::{BasicNode, DEFAULT_CACHE_BYTES, DiskDurability, NodeId, TypeConfig, open_db};
 use chimaera_core::shard::ShardState;
 use openraft::type_config::alias::{EntryOf, LogIdOf, StoredMembershipOf};
 use redb::{ReadableDatabase, ReadableTable};
@@ -21,8 +21,8 @@ use std::path::Path;
 /// `dir` (the peer must be stopped). Returns the log index the group resumes
 /// from.
 pub fn force_single_voter(dir: &Path, group: u32, me: NodeId) -> io::Result<u64> {
-    let log_db = open_db(&dir.join("raft-log.redb"), DiskDurability::Os)?;
-    let sm_db = open_db(&dir.join("raft-sm.redb"), DiskDurability::Os)?;
+    let log_db = open_db(&dir.join("raft-log.redb"), DiskDurability::Os, DEFAULT_CACHE_BYTES)?;
+    let sm_db = open_db(&dir.join("raft-sm.redb"), DiskDurability::Os, DEFAULT_CACHE_BYTES)?;
 
     // Every committed entry this replica holds, applied.
     let (reached, entries) = {

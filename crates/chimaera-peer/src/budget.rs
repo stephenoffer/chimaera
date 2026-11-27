@@ -22,6 +22,10 @@ pub struct Budget {
     pub usable: u64,
     /// Kept back for the agent itself.
     pub reserve: u64,
+    /// Pages each of the agent's two raft databases may cache, within the
+    /// reserve. redb's default, 1 GiB each, would let the two hold four times
+    /// a small machine's whole reserve.
+    pub raft_cache: u64,
     /// Executor charges plus (if `objects_in_pool`) object bytes fit here.
     pub pool: u64,
     /// Objects live in tmpfs, so their bytes are memory.
@@ -30,10 +34,11 @@ pub struct Budget {
 
 impl Budget {
     /// Reserve 10% for the agent, at least 512 MiB and at most 10 GiB, but
-    /// never more than half of what there is.
+    /// never more than half of what there is; a quarter of it, at most 1 GiB,
+    /// for each raft database's cache.
     pub fn plan(usable: u64, objects_in_pool: bool) -> Budget {
         let reserve = (usable / 10).clamp(512 * MIB, 10 * GIB).min(usable / 2);
-        Budget { usable, reserve, pool: usable - reserve, objects_in_pool }
+        Budget { usable, reserve, raft_cache: (reserve / 4).min(GIB), pool: usable - reserve, objects_in_pool }
     }
 
     /// A test or operator override of the pool size.
@@ -43,10 +48,11 @@ impl Budget {
 
     pub fn describe(&self) -> String {
         format!(
-            "memory pool {} MiB = usable {} MiB - agent reserve {} MiB; objects {}",
+            "memory pool {} MiB = usable {} MiB - agent reserve {} MiB (raft cache {} MiB per database); objects {}",
             self.pool / MIB,
             self.usable / MIB,
             self.reserve / MIB,
+            self.raft_cache / MIB,
             if self.objects_in_pool { "share the pool (tmpfs)" } else { "on disk, outside the pool" }
         )
     }
@@ -326,6 +332,7 @@ mod tests {
         assert_eq!((tiny.reserve, tiny.pool), (512 * MIB, 512 * MIB));
         let micro = Budget::plan(512 * MIB, false);
         assert_eq!(micro.reserve, 256 * MIB, "never more than half");
+        assert_eq!((tiny.raft_cache, micro.raft_cache), (128 * MIB, 64 * MIB), "the raft caches fit the reserve");
     }
 
     #[test]
@@ -334,6 +341,7 @@ mod tests {
         assert_eq!(mac.reserve, 36 * GIB / 10);
         let big = Budget::plan(1024 * GIB, true);
         assert_eq!((big.reserve, big.pool), (10 * GIB, 1014 * GIB));
+        assert_eq!((mac.raft_cache, big.raft_cache), (36 * GIB / 40, GIB), "redb's own 1 GiB at most");
         assert_eq!(big.with_pool(GIB).pool, GIB);
         assert!(mac.describe().contains("on disk"));
     }

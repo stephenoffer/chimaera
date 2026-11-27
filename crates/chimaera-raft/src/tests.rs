@@ -255,6 +255,35 @@ async fn measure_single_voter_propose_latency() {
     println!("concurrent: {n} proposals in {el:?} = {:.0}/s", n as f64 / el.as_secs_f64());
 }
 
+#[test]
+fn a_database_caches_at_most_its_cache_size() {
+    // The peer sizes its databases' caches from its memory reserve. Without
+    // that size reaching redb, each would cache up to 1 GiB.
+    use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+    const T: TableDefinition<u64, &[u8]> = TableDefinition::new("t");
+    let dir = tempfile::tempdir().unwrap();
+    let cap = 1 << 20;
+    let db = open_db(&dir.path().join("c.redb"), DiskDurability::Process, cap).unwrap();
+    let value = [7u8; 4096];
+    for chunk in 0..16u64 {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(T).unwrap();
+            for i in 0..256 {
+                table.insert(chunk * 256 + i, value.as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+    let txn = db.begin_read().unwrap();
+    let table = txn.open_table(T).unwrap();
+    for i in 0..4096 {
+        assert!(table.get(i).unwrap().is_some());
+    }
+    let used = db.cache_stats().used_bytes();
+    assert!(used > 0 && used <= cap, "16 MiB written and read back; the cache holds {used} bytes");
+}
+
 /// Reads racing the disk writer must never see a gap: an entry being
 /// flushed is either still in the unflushed tail or already on disk.
 /// (A gap made openraft's replication assert and stall the group.)
@@ -264,8 +293,8 @@ async fn reads_racing_flushes_never_see_a_gap() {
     use openraft::testing::blank_ent;
     use std::sync::atomic::{AtomicU64, Ordering};
     let dir = tempfile::tempdir().unwrap();
-    let log_db = Arc::new(open_db(&dir.path().join("log.redb"), DiskDurability::Process).unwrap());
-    let sm_db = Arc::new(open_db(&dir.path().join("sm.redb"), DiskDurability::Process).unwrap());
+    let log_db = Arc::new(open_db(&dir.path().join("log.redb"), DiskDurability::Process, DEFAULT_CACHE_BYTES).unwrap());
+    let sm_db = Arc::new(open_db(&dir.path().join("sm.redb"), DiskDurability::Process, DEFAULT_CACHE_BYTES).unwrap());
     create_tables(&log_db, &sm_db).unwrap();
     let writer = DiskWriter::start(log_db.clone(), MAX_COMMIT_DELAY, None).unwrap();
     let mut log = LogStore::new(3, log_db, writer);

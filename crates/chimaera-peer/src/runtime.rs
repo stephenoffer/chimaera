@@ -123,8 +123,14 @@ impl Node {
 pub async fn run_local(cfg: PeerConfig) -> io::Result<()> {
     let (node, _lock) = Node::open(&cfg.dir, cfg.cpus)?;
     let identity = node.identity;
-    let (host, raft_events) =
-        RaftHost::open(&cfg.dir.join("raft"), identity.node_id(), Arc::new(NoTransport), DiskDurability::Process)?;
+    let cache = crate::budget::Budget::plan(node.shape.memory_bytes, false).raft_cache as usize;
+    let (host, raft_events) = RaftHost::open_with_cache(
+        &cfg.dir.join("raft"),
+        identity.node_id(),
+        Arc::new(NoTransport),
+        DiskDurability::Process,
+        cache,
+    )?;
     let members: BTreeMap<_, _> = [(identity.node_id(), BasicNode::new("local"))].into();
     let group = host.start_group(0, members, true).await?;
     wait_leader(&group).await?;

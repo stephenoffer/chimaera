@@ -4,7 +4,7 @@
 
 use crate::log_store::{LOG, LOG_META, dec, io_err};
 use crate::state_machine::{self, SM_META, apply_batch};
-use crate::{DiskDurability, TypeConfig, create_tables, open_db, wal};
+use crate::{DEFAULT_CACHE_BYTES, DiskDurability, TypeConfig, create_tables, open_db, wal};
 use chimaera_core::shard::ShardState;
 use openraft::type_config::alias::{EntryOf, LogIdOf};
 use redb::{Database, ReadableDatabase, ReadableTable};
@@ -18,6 +18,7 @@ use std::path::Path;
 pub(crate) fn recover_files(
     dir: &Path,
     durability: DiskDurability,
+    cache_bytes: usize,
 ) -> io::Result<(Database, Database, Option<wal::Wal>)> {
     std::fs::create_dir_all(dir.join("snapshots"))?;
     let (log_path, sm_path) = (dir.join("raft-log.redb"), dir.join("raft-sm.redb"));
@@ -35,8 +36,8 @@ pub(crate) fn recover_files(
         );
         let _ = std::fs::remove_file(&sm_path);
     }
-    let log_db = open_db(&log_path, durability)?;
-    let sm_db = open_db(&sm_path, DiskDurability::Process)?;
+    let log_db = open_db(&log_path, durability, cache_bytes)?;
+    let sm_db = open_db(&sm_path, DiskDurability::Process, cache_bytes)?;
     create_tables(&log_db, &sm_db)?;
     if rebuild {
         let groups = state_machine::rebuild_from_snapshots(&sm_db, &dir.join("snapshots"))?;
@@ -72,7 +73,7 @@ pub fn settle_files(dir: &Path) -> io::Result<()> {
     // peer that syncs its log (DiskDurability Full or Os).
     let synced = dir.join("raft-log.wal").exists() || state_machine::has_marker(dir);
     let (_log_db, _sm_db, wal) =
-        recover_files(dir, if synced { DiskDurability::Full } else { DiskDurability::Process })?;
+        recover_files(dir, if synced { DiskDurability::Full } else { DiskDurability::Process }, DEFAULT_CACHE_BYTES)?;
     drop(wal);
     drop((_log_db, _sm_db));
     if synced { state_machine::mark_state_machine_clean(dir) } else { Ok(()) }

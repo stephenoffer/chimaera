@@ -115,11 +115,16 @@ pub enum DiskDurability {
     Process,
 }
 
-fn open_db(path: &Path, durability: DiskDurability) -> io::Result<Database> {
+/// redb's own page cache size, for a database with no tighter budget.
+const DEFAULT_CACHE_BYTES: usize = 1 << 30;
+
+fn open_db(path: &Path, durability: DiskDurability, cache_bytes: usize) -> io::Result<Database> {
+    let mut builder = Database::builder();
+    builder.set_cache_size(cache_bytes);
     let db = match durability {
-        DiskDurability::Full => Database::create(path),
-        DiskDurability::Os => Database::builder().create_with_backend(backend::OsSyncBackend::open(path, true)?),
-        DiskDurability::Process => Database::builder().create_with_backend(backend::OsSyncBackend::open(path, false)?),
+        DiskDurability::Full => builder.create(path),
+        DiskDurability::Os => builder.create_with_backend(backend::OsSyncBackend::open(path, true)?),
+        DiskDurability::Process => builder.create_with_backend(backend::OsSyncBackend::open(path, false)?),
     };
     db.map_err(log_store::io_err)
 }
@@ -165,16 +170,27 @@ pub struct RaftHost {
 }
 
 impl RaftHost {
-    /// Open (or create) the databases under `dir`. Events from every group's
-    /// applies arrive on the returned receiver.
+    /// Open (or create) the databases under `dir`, with redb's default page
+    /// cache. Events from every group's applies arrive on the returned receiver.
     pub fn open(
         dir: &Path,
         node_id: NodeId,
         transport: Arc<dyn Transport>,
         durability: DiskDurability,
     ) -> io::Result<(RaftHost, tokio::sync::mpsc::Receiver<GroupEvents>)> {
+        Self::open_with_cache(dir, node_id, transport, durability, DEFAULT_CACHE_BYTES)
+    }
+
+    /// [`RaftHost::open`], each database caching at most `cache_bytes` of pages.
+    pub fn open_with_cache(
+        dir: &Path,
+        node_id: NodeId,
+        transport: Arc<dyn Transport>,
+        durability: DiskDurability,
+        cache_bytes: usize,
+    ) -> io::Result<(RaftHost, tokio::sync::mpsc::Receiver<GroupEvents>)> {
         let (log_path, sm_path) = (dir.join("raft-log.redb"), dir.join("raft-sm.redb"));
-        let (mut log_db, mut sm_db, wal) = settle::recover_files(dir, durability)?;
+        let (mut log_db, mut sm_db, wal) = settle::recover_files(dir, durability, cache_bytes)?;
         // Purged logs and expired state leave free pages that redb reuses but
         // never gives back to the disk; return them at each start.
         compact(&mut log_db, &log_path);

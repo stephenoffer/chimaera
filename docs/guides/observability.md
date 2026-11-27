@@ -273,7 +273,7 @@ chimaera status
 ```text
 peer 0000000024e6 (incarnation 1) · 0.00/12.00 CPU in use · 16 executors (0 busy) · 0 queued · 0 running · 3 sessions · 0 object bytes
   memory: 392 of 33177 MiB pool in use, 9447 MiB available on the host
-  automatic: memory pool 33177 MiB = usable 36864 MiB - agent reserve 3686 MiB; objects on disk, outside the pool
+  automatic: memory pool 33177 MiB = usable 36864 MiB - agent reserve 3686 MiB (raft cache 921 MiB per database); objects on disk, outside the pool
   automatic: cpu capacity 12.00
   automatic: no task limit (cgroup pids.max)
   automatic: 23 learned function profile(s), saved in .../profiles.pb

@@ -26,3 +26,5 @@ tempfile = "3"
 # network.rs tests run on tokio's paused clock.
 tokio = { workspace = true, features = ["test-util"] }
 openraft = { version = "=0.10.1", features = ["serde"] }
+# A test reads how many bytes a database's page cache holds.
+redb = { version = "5.0", features = ["cache_metrics"] }

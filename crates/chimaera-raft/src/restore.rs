@@ -15,7 +15,7 @@ use crate::settle::{apply_committed, recover_files, settle_files};
 use crate::state_machine::{
     SM, SM_META, mark_state_machine_clean, prefix, rebuild_from_snapshots, snapshot_path, write_group_snapshot,
 };
-use crate::{BasicNode, DiskDurability, NodeId, TypeConfig, snapshot_file};
+use crate::{BasicNode, DEFAULT_CACHE_BYTES, DiskDurability, NodeId, TypeConfig, snapshot_file};
 use chimaera_core::shard::keys;
 use openraft::type_config::alias::{StoredMembershipOf, VoteOf};
 use redb::{ReadableDatabase, ReadableTable};
@@ -46,7 +46,7 @@ pub struct Restored {
 /// at everything it holds as committed, and copy each file into `out`.
 pub fn backup(dir: &Path, out: &Path) -> io::Result<Vec<Backed>> {
     settle_files(dir)?;
-    let (log_db, sm_db, _) = recover_files(dir, DiskDurability::Process)?;
+    let (log_db, sm_db, _) = recover_files(dir, DiskDurability::Process, DEFAULT_CACHE_BYTES)?;
     let snapshots = dir.join("snapshots");
     std::fs::create_dir_all(out)?;
     let mut backed = Vec::new();
@@ -115,7 +115,7 @@ pub fn restore(dir: &Path, backed: &[Backed], me: NodeId, addr: &str) -> io::Res
     for (group, (meta, file)) in &checked {
         std::fs::copy(file, snapshot_path(&snapshots, *group, meta))?;
     }
-    let (log_db, sm_db, _) = recover_files(dir, DiskDurability::Full)?;
+    let (log_db, sm_db, _) = recover_files(dir, DiskDurability::Full, DEFAULT_CACHE_BYTES)?;
     let restored = rebuild_from_snapshots(&sm_db, &snapshots)?;
     if restored != checked.len() {
         return Err(io_err(format!("{restored} of {} snapshots loaded", checked.len())));

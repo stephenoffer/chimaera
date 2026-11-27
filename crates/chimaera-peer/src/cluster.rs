@@ -436,8 +436,14 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
     }
     *plan_slot.write().expect("lock") = Some(plan.clone());
 
-    let (host, raft_events) =
-        RaftHost::open(&cfg.dir.join("raft"), me.node_id, Arc::new(MeshTransport(mesh.clone())), durability)?;
+    let cache = crate::budget::Budget::plan(node.shape.memory_bytes, false).raft_cache as usize;
+    let (host, raft_events) = RaftHost::open_with_cache(
+        &cfg.dir.join("raft"),
+        me.node_id,
+        Arc::new(MeshTransport(mesh.clone())),
+        durability,
+        cache,
+    )?;
     crate::durability::watch(host.disk_stats());
     let router = Arc::new(Router::cluster(node.identity, plan.data_groups, mesh.clone()));
     let _ = server.router.set(router.clone());
