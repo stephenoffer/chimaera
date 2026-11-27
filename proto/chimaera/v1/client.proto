@@ -347,6 +347,22 @@ message AttemptRecord {
   uint64 queued_unix_ns = 19;
   // The same, setting by setting (settings.rs): cpus, memory and batch.
   repeated Setting settings = 18;
+  // How the attempt's stored inputs reached its peer, the largest first (at
+  // most INPUT_READS of them; measures input_bytes_* count them all).
+  repeated InputRead inputs = 20;
+}
+
+// One stored input of an attempt, as its peer made it present.
+message InputRead {
+  bytes object_id = 1;
+  uint64 bytes = 2;
+  // here (already in this peer's store) | linked (from a peer's store on this
+  // machine: no network) | fetched (over the network) | rebuilt (lost with
+  // every holder: its call ran again)
+  string how = 3;
+  string source = 4;     // the peer it came from (its address); "" for here
+  double seconds = 5;    // time to make it present; 0 for here
+  string detail = 6;
 }
 
 // One setting an attempt ran with. `value` was granted; `requested` is what

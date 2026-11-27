@@ -1784,6 +1784,19 @@ impl Client {
                 m.set_item(name, (meas.value, meas.scope.as_str(), meas.method.as_str()))?;
             }
             ad.set_item("measures", m)?;
+            // How its stored inputs reached its peer, the largest first.
+            let inputs = PyList::empty(py);
+            for r in &a.inputs {
+                let one = PyDict::new(py);
+                one.set_item("object", r.object_id.iter().map(|b| format!("{b:02x}")).collect::<String>())?;
+                one.set_item("bytes", r.bytes)?;
+                one.set_item("how", &r.how)?;
+                one.set_item("source", (!r.source.is_empty()).then_some(r.source.as_str()))?;
+                one.set_item("seconds", (r.how != "here" && r.how != "rebuilt").then_some(r.seconds))?;
+                one.set_item("detail", &r.detail)?;
+                inputs.append(one)?;
+            }
+            ad.set_item("inputs", inputs)?;
             attempts.append(ad)?;
         }
         d.set_item("attempts", attempts)?;

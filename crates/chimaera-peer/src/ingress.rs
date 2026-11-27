@@ -836,6 +836,9 @@ impl pb::peer_server::Peer for Service {
             .await
             .map_err(|_| Status::unavailable("peer is stopping"))?;
         let mut out = rx.await.map_err(|_| Status::unavailable("peer is stopping"))?;
+        if let Some(task) = &req.task {
+            crate::attempts::gather(&self.0.router, task, &mut out).await; // attempts other peers ran
+        }
         // A call to an actor placed on another peer waits on what that peer
         // knows (the actor may not have started there): ask it.
         if let Some(note) = self.0.actor_wait_elsewhere(&out).await {
@@ -903,6 +906,21 @@ impl pb::peer_server::Peer for Service {
         let Some(mesh) = &self.0.router.mesh else {
             return Err(Status::not_found("object not in this peer's store"));
         };
+        // A call's result: its record names the files a reader needs, with
+        // their sizes and holders, so they come at once (no size probe, and
+        // not one by one as the reader decodes). Paced reads (a shuffle's
+        // read-ahead) keep their own class on the path below.
+        if let Some(producer) = r.task.as_ref().and_then(Tk::parse)
+            && r.traffic() == pb::TrafficClass::TrafficForeground
+            && let Some(files) = crate::core::stored_files(&self.0.router, mesh, producer, &r.object_id).await
+        {
+            for f in &files {
+                restore(&self.0.objects, &f.run, &f.object_id).await; // spilled to object storage
+            }
+            if crate::core::fetch_inputs(mesh, &self.0.objects, files).await.is_ok() {
+                return Ok(Response::new(pb::LocalizeReply {}));
+            }
+        }
         let Err(e) = mesh.localize(&self.0.objects, &r.run, &r.object_id, 0, &[], r.traffic()).await else {
             return Ok(Response::new(pb::LocalizeReply {}));
         };
@@ -911,11 +929,11 @@ impl pb::peer_server::Peer for Service {
         let Some(producer) = r.task.as_ref().and_then(Tk::parse) else {
             return Err(Status::not_found(format!("object not found on any live peer: {e}")));
         };
-        let (attempt, spec, deps) = crate::core::producer_plan(&self.0.router, mesh, producer, &r.object_id)
+        let plan = crate::core::producer_plan(&self.0.router, mesh, producer, &r.object_id)
             .await
             .map_err(|why| Status::not_found(format!("every copy is lost, and it cannot be made again: {why}")))?;
         let (reply, rx) = oneshot::channel();
-        let msg = CoreMsg::RebuildRead { producer, attempt, spec: Box::new(spec), deps, reply };
+        let msg = CoreMsg::RebuildRead { producer, plan: Box::new(plan), reply };
         self.0.core.send(msg).await.map_err(|_| Status::unavailable("peer is stopping"))?;
         match rx.await {
             // Remade here; a large value may have gone straight to a spill store.
@@ -942,9 +960,13 @@ impl pb::peer_server::Peer for Service {
             ));
         };
         let copies = crate::objplane::replica_count().max(1);
-        crate::replicas::retain(mesh, &self.0.objects, &r.run, &r.object_ids, copies)
-            .await
-            .map_err(|why| Status::aborted(format!("durability='retained': no copy was made: {why}")))?;
+        crate::replicas::retain(mesh, &self.0.objects, &r.run, &r.object_ids, copies).await.map_err(|e| {
+            let why = format!("durability='retained': no copy was made: {e}");
+            match e {
+                crate::replicas::NotRetained::Infeasible(_) => Status::failed_precondition(why),
+                crate::replicas::NotRetained::Failed(_) => Status::aborted(why),
+            }
+        })?;
         Ok(Response::new(pb::RetainReply {}))
     }
 
@@ -1005,25 +1027,38 @@ impl pb::peer_server::Peer for Service {
         if size > self.0.info.memory_bytes.max(1 << 30) {
             return Err(Status::resource_exhausted(format!("blob of {size} bytes is larger than this peer's memory")));
         }
-        let mut data = first.data;
-        data.reserve(size.saturating_sub(data.len() as u64) as usize);
-        while let Some(c) = chunks.next().await {
-            data.extend_from_slice(&c?.data);
-            if data.len() as u64 > size {
-                return Err(Status::invalid_argument(format!("upload is longer than the declared {size} bytes")));
-            }
-        }
-        if data.len() as u64 != size {
-            return Err(Status::invalid_argument(format!("upload ended at {} of {size} bytes", data.len())));
-        }
         if keep_local {
             crate::replicas::keep_local(&blob_id); // no background copy (see replicas)
         }
+        // Written as it comes (stores::put_blob_from): a few chunks at a time
+        // in memory here, however large the blob.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
         let objects = self.0.objects.clone();
-        tokio::task::spawn_blocking(move || objects.put_blob(&run, &blob_id, &data))
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let writer = tokio::task::spawn_blocking(move || objects.put_blob_from(&run, &blob_id, size, rx));
+        let (mut got, mut failed) = (first.data.len() as u64, None);
+        let mut open = tx.send(first.data).await.is_ok();
+        while open && let Some(c) = chunks.next().await {
+            match c {
+                Ok(c) if got + c.data.len() as u64 > size => {
+                    failed = Some(Status::invalid_argument(format!("upload is longer than the declared {size} bytes")));
+                    break;
+                }
+                Ok(c) => {
+                    got += c.data.len() as u64;
+                    open = tx.send(c.data).await.is_ok();
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        drop(tx);
+        let stored = writer.await.map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        stored.map_err(|e| Status::invalid_argument(e.to_string()))?;
         Ok(Response::new(pb::PutBlobReply {}))
     }
 

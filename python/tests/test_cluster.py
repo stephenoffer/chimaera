@@ -1772,6 +1772,128 @@ except ch.errors.DataLost as e:
         c.close()
 
 
+def test_a_function_that_makes_another_value_when_run_again_is_not_read_as_the_lost_one(monkeypatch):
+    # Declared deterministic (the default), but its second run returns twice
+    # the bytes: neither a call reading the lost value nor the program gets
+    # those bytes under the old id; both fail, saying the value changed.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    go = os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+import chimaera as ch
+
+def on(slot):
+    return ch.dist.Placement(require={{"slot": slot}})
+
+@ch.remote
+def grows(name):
+    path = os.path.join({marks!r}, name)
+    with open(path, "a") as f:
+        f.write("ran\\n")
+    runs = len(open(path).read().splitlines())
+    return bytes(runs << 20)  # 1 MiB the first time, 2 MiB after
+
+@ch.remote
+def size(b):
+    return len(b)
+
+as_input = grows.options(placement=on("s1")).remote("as_input")
+as_read = grows.options(placement=on("s1")).remote("as_read")
+ch.wait([as_input, as_read], timeout=60)  # finished, not read: both values are only on s1
+print("READY", flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+try:
+    print("SIZE", size.options(placement=on("s2")).remote(as_input).result(timeout=120), flush=True)
+except ch.errors.ChimaeraError as e:
+    print("INPUT_LOST", type(e).__name__, e, flush=True)
+try:
+    print("READ", len(as_read.result(timeout=120)), flush=True)
+except ch.errors.DataLost as e:
+    print("READ_LOST", e, flush=True)
+""",
+        )
+        assert driver.stdout.readline().strip() == "READY", driver.stderr.read()[-2000:]
+        c.signal(1, signal.SIGKILL)  # the only peer holding either value
+        open(go, "w").close()
+        out, err = driver.communicate(timeout=240)
+        for tag in ("INPUT_LOST", "READ_LOST"):
+            lost = [ln for ln in out.splitlines() if ln.startswith(tag)]
+            assert lost and "made another value" in lost[0], tag + "\n" + out + err[-3000:]
+        assert "SIZE" not in out and "READ " not in out, out
+    finally:
+        c.close()
+
+
+def test_a_long_chain_and_a_wide_gather_lost_with_their_peer_are_made_again(monkeypatch):
+    # Forty calls, each reading the one before, and a call reading six values,
+    # all lost with the one peer that held them: every lost call runs again,
+    # once, the chain from its first call, which reads nothing lost.
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
+    c = Cluster(3, labels={i: f"slot=s{i}" for i in range(3)})
+    marks = tempfile.mkdtemp(prefix="chl", dir="/tmp")
+    go = os.path.join(marks, "go")
+    try:
+        driver = c.driver(
+            0,
+            f"""
+import os, time
+import chimaera as ch
+
+def on(slot):
+    return ch.dist.Placement(require={{"slot": slot}})
+
+def mark(name):
+    with open(os.path.join({marks!r}, name), "a") as f:
+        f.write("ran\\n")
+
+@ch.remote
+def step(prev, i):
+    mark(f"step{{i}}")
+    return (prev or bytes(1 << 20))[: 1 << 20][:-1] + bytes([i])
+
+@ch.remote
+def part(i):
+    mark(f"part{{i}}")
+    return bytes([i]) * (1 << 20)
+
+@ch.remote
+def tail(b):
+    return b[-1]
+
+@ch.remote
+def total(*parts):
+    return sum(p[0] for p in parts)
+
+x = None
+for i in range(40):
+    x = step.options(placement=on("s1")).remote(x, i)
+parts = [part.options(placement=on("s1")).remote(i) for i in range(6)]
+ch.wait([x, *parts], timeout=120)  # finished, not read: all of it is only on s1
+print("READY", flush=True)
+while not os.path.exists({go!r}):
+    time.sleep(0.05)
+print("TAIL", tail.options(placement=on("s2")).remote(x).result(timeout=180), flush=True)
+print("TOTAL", total.options(placement=on("s2")).remote(*parts).result(timeout=180), flush=True)
+""",
+        )
+        assert driver.stdout.readline().strip() == "READY", driver.stderr.read()[-2000:]
+        c.signal(1, signal.SIGKILL)  # the only peer holding any of it
+        open(go, "w").close()
+        out, err = driver.communicate(timeout=280)
+        assert "TAIL 39" in out and f"TOTAL {sum(range(6))}" in out, out + err[-3000:]
+        ran = {n: len(open(os.path.join(marks, n)).read().splitlines()) for n in os.listdir(marks) if n != "go"}
+        twice = {f"step{i}" for i in range(40)} | {f"part{i}" for i in range(6)}
+        assert ran == dict.fromkeys(twice, 2), {n: k for n, k in sorted(ran.items()) if k != 2} or ran
+    finally:
+        c.close()
+
+
 # A driver's `files(v)`: the ids of the files a finished value is stored in.
 # Its object file, or, for a frame held inline, the files that frame names:
 # with the Linux arena a large buffer is linked under an id of its own, and
@@ -1899,6 +2021,38 @@ def test_a_put_outlives_its_writer_as_its_durability_says(durability):
             assert held == [1], f"no copy of an ephemeral put: {held}"
             lost = [ln for ln in out.splitlines() if ln.startswith("LOST")]
             assert lost and "durability='ephemeral'" in lost[0], out + err[-3000:]
+    finally:
+        c.close()
+
+
+def test_a_copy_on_the_same_machine_does_not_make_a_value_retained():
+    # Two peers on one machine: a copy on the other is lost with the machine,
+    # so neither a put nor a call result counts as retained.
+    c = Cluster(2, one_machine=True)
+    try:
+        out = c.run(
+            0,
+            """
+import chimaera as ch
+
+@ch.remote
+def big():
+    return b"x" * (1 << 20)
+
+try:
+    ch.put(b"x" * (1 << 20), durability="retained")
+except ch.Infeasible as e:
+    print("PUT", e, flush=True)
+try:
+    big.options(durability="retained", max_attempts=1).remote().result(timeout=120)
+except ch.errors.ChimaeraError as e:
+    print("CALL", type(e).__name__, e, flush=True)
+print("EPHEMERAL", len(ch.put(b"x" * (1 << 20), durability="ephemeral").result()))
+""",
+        )
+        assert "on this machine" in lines(out, "PUT ")[0], out.stdout + out.stderr[-2000:]
+        assert "on this machine" in lines(out, "CALL ")[0], out.stdout + out.stderr[-2000:]
+        assert lines(out, "EPHEMERAL ") == [str(1 << 20)]
     finally:
         c.close()
 

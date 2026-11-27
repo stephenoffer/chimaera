@@ -273,6 +273,10 @@ SPREAD_RATE = float(os.environ.get("CHIMAERA_SPREAD_RATE", "2000"))
 
 DEFAULT_PASSTHROUGH = ("LANG", "LC_ALL", "LC_CTYPE", "TZ", "PYTHONHASHSEED")
 
+# Buffers of one value a driver asks its peer for at once (Runtime._localize_together).
+_TOGETHER = 8
+_together: Any = None
+
 
 def run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """The environment variables a new run ships to its executors."""
@@ -833,6 +837,21 @@ class Runtime:
         with self.cond:
             self.cond.notify_all()
 
+    def _localize_together(self, run: bytes, objs: list[bytes], task: bytes | None) -> None:
+        """Make several objects local at once: the peer fetches them in
+        parallel. One that cannot be made local is left to its reader, which
+        asks for it again and says why."""
+        global _together
+        if _together is None:
+            import concurrent.futures
+
+            _together = concurrent.futures.ThreadPoolExecutor(_TOGETHER, thread_name_prefix="chimaera-fetch")
+        for f in [_together.submit(self.localize, run, o, task) for o in objs]:
+            try:
+                f.result()
+            except OSError:  # FileNotFoundError (lost), or the peer did not answer
+                pass
+
     def read_value(self, outcome: tuple[Any, ...], task: bytes | None = None, *, durability: str = "") -> Any:
         """Load a stored value. `task` is the call that returned it: when its
         file, or a blob its frame links, is lost with every peer that held it,
@@ -850,6 +869,11 @@ class Runtime:
                 fast = _serde._plain_bytes(inline, -1, run_dir)
                 if fast is not None:
                     return fast
+                # Decoding reads every buffer the frame links: ask for the
+                # missing ones at once, not one by one as decoding reaches each.
+                blobs = [b for b in _serde.external_blobs(inline) if not os.path.exists(os.path.join(run_dir, b.hex()))]
+                if len(blobs) > 1:
+                    self._localize_together(run, blobs, task)
                 try:
                     return _serde.loads(inline, run_dir)
                 except FileNotFoundError as e:  # a blob it links, and its call could not run again

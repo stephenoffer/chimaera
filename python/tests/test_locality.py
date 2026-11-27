@@ -82,6 +82,42 @@ print("RAN", " ".join(ran))
     assert ran.count("p0") >= 4, f"calls on a 64 MiB input should run where it is (p0): {ran}"
 
 
+def test_explain_says_how_each_input_reached_the_peer_that_ran_the_call(monkeypatch):
+    # One call runs on p1, which fetches the value; p0, which the driver asks,
+    # gathers p1's record of that attempt. The other runs where the value is.
+    # No background copies: one reaching p1 first would make the value "here".
+    monkeypatch.setenv("CHIMAERA_OBJECT_REPLICAS", "0")
+    c = Cluster(3, labels={0: "zone=a", 1: "zone=b", 2: "zone=c"})
+    try:
+        out = c.run(
+            0,
+        """
+import numpy as np
+import chimaera as ch
+
+@ch.remote
+def total(a):
+    return float(a.sum())
+
+x = ch.put(np.ones(1 << 20))  # 8 MiB, stored on p0
+for name, zone in (("THERE", "b"), ("HERE", "a")):
+    f = total.options(placement=ch.dist.Placement(require={"zone": zone})).remote(x)
+    assert f.result(timeout=60) == float(1 << 20)
+    a = f.explain()["attempts"][-1]
+    hows = sorted({i["how"] for i in a["inputs"]})
+    big = [i for i in a["inputs"] if i["bytes"] >= 8 << 20]
+    print(name, hows, len(big), [i["source"] is not None for i in big], flush=True)
+    print(name + "_SAID", a["placement"], flush=True)
+""",
+        )
+    finally:
+        c.close()
+    assert lines(out, "THERE ") == ["['fetched'] 1 [True]"], out.stdout + out.stderr[-2000:]
+    assert "fetched over the network" in lines(out, "THERE_SAID ")[0]
+    assert lines(out, "HERE ") == ["['here'] 1 [False]"], out.stdout + out.stderr[-2000:]
+    assert "already here" in lines(out, "HERE_SAID ")[0]
+
+
 def test_quick_readers_of_a_put_value_stay_where_it_is():
     # A put value is stored on the driver's peer, which names itself as its
     # holder when the calls are submitted; without that, the leaders placing
@@ -215,6 +251,29 @@ print("PEERS", len(set(ran)))
     # it has cores to spare (as in test_accounting), not under other load.
     if os.getloadavg()[0] < (os.cpu_count() or 1) * 0.75:
         assert free < 0.8 * pinned, f"spreading should beat staying on the holder: {free:.2f}s vs {pinned:.2f}s"
+
+
+def test_a_burst_of_short_readers_of_a_new_large_value_stays_where_it_is(zoned):
+    # Nothing has measured `peek` yet: placement takes it to be short, so
+    # moving 128 MiB costs far more than queueing behind the holders (the
+    # writer and its background copy), and no other peer pulls the value.
+    out = zoned.run(
+        0,
+        WHERE
+        + """
+import numpy as np
+
+@ch.remote
+def peek(a):
+    time.sleep(0.005)
+    return peer_name()
+
+v = ch.put(np.ones(16 * 2**20))  # 128 MiB
+ran = ch.get([peek.remote(v) for _ in range(48)], timeout=120)
+print("PEERS", len(set(ran)))
+""",
+    )
+    assert int(lines(out, "PEERS")[0]) <= 2, out.stdout + out.stderr[-2000:]
 
 
 def test_a_released_put_value_is_deleted_on_the_peers_that_fetched_it(zoned):

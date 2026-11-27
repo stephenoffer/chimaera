@@ -96,6 +96,14 @@ const MAX_MESSAGE: usize = 256 << 20;
 /// others fetch it from them on first use.
 const CODE_COPIES: usize = 3;
 const FETCH_CHUNK: usize = 4 << 20;
+/// Received chunks waiting for their writer, across every fetch this peer
+/// makes at once: STAGED_PIECES of STAGE_PIECE (256 MiB). A disk, or a tmpfs
+/// under memory pressure, that writes slower than the network brings them
+/// then holds the network back rather than piling chunks up in memory; a
+/// fetch dropped part way gives its share back with its queued chunks.
+static STAGED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(STAGED_PIECES);
+const STAGE_PIECE: usize = 64 << 10;
+const STAGED_PIECES: usize = 4096;
 /// Objects this large come over several streams at once (the guides measured
 /// 8-10x from multiple connections on large transfers).
 const PARALLEL_FETCH: u64 = 1 << 20;
@@ -216,6 +224,27 @@ fn swim_state(s: SwimState) -> u32 {
 static FETCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// `size` bytes in `n` contiguous ranges (offset, len).
+/// How an object became present in this peer's store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// It was here already, or another fetch of it brought it meanwhile.
+    Here,
+    /// Taken from the store of `node`, a peer on this machine: no network.
+    Linked { node: u64, bytes: u64 },
+    /// Fetched from `node` over the network.
+    Fetched { node: u64, bytes: u64 },
+}
+
+impl Arrival {
+    /// The peer it came from; None when it was here.
+    pub fn node(self) -> Option<u64> {
+        match self {
+            Arrival::Here => None,
+            Arrival::Linked { node, .. } | Arrival::Fetched { node, .. } => Some(node),
+        }
+    }
+}
+
 fn ranges(size: u64, n: u64) -> Vec<(u64, u64)> {
     let step = size.div_ceil(n.max(1)).max(1);
     (0..size).step_by(step as usize).map(|off| (off, step.min(size - off))).collect()
@@ -672,6 +701,17 @@ impl MeshClient {
         Ok(r.into_inner().reason)
     }
 
+    /// The attempts of `task` that `node` ran, as it recorded them.
+    pub async fn attempts(&self, node: u64, task: pb::TaskKey) -> std::io::Result<Vec<pb::AttemptRecord>> {
+        let mut c = self.rpc(node)?;
+        let req = pb::AttemptsRequest { cluster: self.cluster.clone(), task: Some(task) };
+        let r = tokio::time::timeout(CALL_TIMEOUT, c.attempts(req))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(status_err)?;
+        Ok(r.into_inner().attempts)
+    }
+
     /// Another peer asked for `object` (it will hold a copy).
     pub fn note_served(&self, object: &[u8]) {
         let mut s = self.served.lock().expect("lock");
@@ -864,7 +904,7 @@ impl MeshClient {
         size: u64,
         dest: &Path,
         traffic: pb::TrafficClass,
-    ) -> std::io::Result<u64> {
+    ) -> std::io::Result<Arrival> {
         if let Some(dir) = dest.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
@@ -874,7 +914,7 @@ impl MeshClient {
         if let Some(n) = self.same_machine_copy(node, run, object, size, dest).await {
             self.note_linked(node, n);
             self.note_recent(object);
-            return Ok(n);
+            return Ok(Arrival::Linked { node, bytes: n });
         }
         // Size unknown (a reader asked by name): learn it from a one-byte
         // range, so a large object still comes over parallel streams.
@@ -895,7 +935,7 @@ impl MeshClient {
                 tokio::fs::rename(&tmp, dest).await?;
                 self.note_transfer(node, n, started.elapsed());
                 self.note_recent(object);
-                Ok(n)
+                Ok(Arrival::Fetched { node, bytes: n })
             }
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
@@ -967,13 +1007,14 @@ impl MeshClient {
         // A blocking writer checks and writes each chunk (pwrite at its offset)
         // while the next one arrives: hashing and disk work stay off the async
         // workers and overlap the network.
-        let (wtx, mut wrx) = tokio::sync::mpsc::channel::<(Vec<u8>, Vec<u8>)>(4);
+        type Staged = tokio::sync::SemaphorePermit<'static>;
+        let (wtx, mut wrx) = tokio::sync::mpsc::channel::<(Vec<u8>, Vec<u8>, Staged)>(4);
         let target = path.to_path_buf();
         let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
             use std::os::unix::fs::FileExt;
             let f = std::fs::OpenOptions::new().write(true).open(&target)?;
             let mut got = 0u64;
-            while let Some((data, checksum)) = wrx.blocking_recv() {
+            while let Some((data, checksum, _staged)) = wrx.blocking_recv() {
                 if !checksum.is_empty() && blake3::hash(&data).as_bytes()[..16] != checksum[..] {
                     return Err(std::io::Error::other(format!(
                         "corrupt chunk at byte {} from node {node}",
@@ -992,7 +1033,9 @@ impl MeshClient {
             match stream.message().await {
                 Ok(Some(chunk)) => {
                     total.get_or_insert(chunk.total);
-                    if wtx.send((chunk.data, chunk.checksum)).await.is_err() {
+                    let pieces = chunk.data.len().div_ceil(STAGE_PIECE).clamp(1, STAGED_PIECES) as u32;
+                    let Ok(staged) = STAGED.acquire_many(pieces).await else { break };
+                    if wtx.send((chunk.data, chunk.checksum, staged)).await.is_err() {
                         break; // the writer stopped: its error says why
                     }
                 }
@@ -1135,10 +1178,10 @@ impl MeshClient {
         size: u64,
         holders: &[u64],
         traffic: pb::TrafficClass,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Arrival> {
         let dest = store.path(run, object);
         if dest.exists() {
-            return Ok(());
+            return Ok(Arrival::Here);
         }
         // A part of a result of several values is asked for by id alone: it is
         // where that result came from (see parts).
@@ -1147,12 +1190,14 @@ impl MeshClient {
         let gate = self.gate(&dest);
         let held = gate.lock().await;
         let result = if dest.exists() {
-            Ok(())
+            Ok(Arrival::Here)
         } else {
-            self.fetch_from(run, object, size, holders, &dest, traffic).await.map(|node| {
-                // Off the async workers: it reads the fetched file's header.
-                let (hints, run, dest) = (self.parts.clone(), run.to_vec(), dest.clone());
-                tokio::task::spawn_blocking(move || hints.learn(&run, &dest, node));
+            self.fetch_from(run, object, size, holders, &dest, traffic).await.inspect(|got| {
+                if let Some(node) = got.node() {
+                    // Off the async workers: it reads the fetched file's header.
+                    let (hints, run, dest) = (self.parts.clone(), run.to_vec(), dest.clone());
+                    tokio::task::spawn_blocking(move || hints.learn(&run, &dest, node));
+                }
             })
         };
         drop(held);
@@ -1181,7 +1226,7 @@ impl MeshClient {
         holders: &[u64],
         dest: &Path,
         traffic: pb::TrafficClass,
-    ) -> std::io::Result<u64> {
+    ) -> std::io::Result<Arrival> {
         let mut candidates: Vec<u64> = holders.iter().copied().filter(|n| *n != self.me.node_id).collect();
         if candidates.is_empty() {
             candidates = self.live_others().iter().map(|p| p.member.node_id).collect();
@@ -1191,7 +1236,7 @@ impl MeshClient {
         candidates.sort_by(|a, b| self.bandwidth(*b).unwrap_or(0.0).total_cmp(&self.bandwidth(*a).unwrap_or(0.0)));
         for &node in &candidates {
             match self.fetch(node, run, object, size, dest, traffic).await {
-                Ok(_) => return Ok(node),
+                Ok(got) => return Ok(got),
                 Err(e) => last = e,
             }
         }
@@ -1211,8 +1256,8 @@ impl MeshClient {
                 break;
             }
             tried.push(node);
-            if self.fetch(node, run, object, size, dest, traffic).await.is_ok() {
-                return Ok(node);
+            if let Ok(got) = self.fetch(node, run, object, size, dest, traffic).await {
+                return Ok(got);
             }
         }
         Err(last)
@@ -1761,6 +1806,17 @@ impl pb::mesh_server::Mesh for MeshService {
         Ok(Response::new(pb::ActorWaitReply { reason }))
     }
 
+    async fn attempts(&self, req: Request<pb::AttemptsRequest>) -> Result<Response<pb::AttemptsReply>, Status> {
+        let r = req.into_inner();
+        self.0.check(&r.cluster)?;
+        let task = r.task.ok_or_else(|| Status::invalid_argument("attempts names a task"))?;
+        let req = pb::ExplainRequest { run: task.run.clone(), task: Some(task), ..Default::default() };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.0.core.send(CoreMsg::Explain { req, reply }).await.map_err(|_| Status::unavailable("peer is stopping"))?;
+        let attempts = rx.await.map_err(|_| Status::unavailable("peer is stopping"))?.attempts;
+        Ok(Response::new(pb::AttemptsReply { attempts }))
+    }
+
     async fn inventory(&self, req: Request<pb::InventoryRequest>) -> Result<Response<pb::InventoryReply>, Status> {
         let req = req.into_inner();
         self.0.check(&req.cluster)?;
@@ -1860,6 +1916,14 @@ fn ring_after(me: u64, mut ids: Vec<u64>, n: usize) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use tonic::service::Interceptor;
+
+    #[test]
+    fn the_largest_chunk_fits_in_the_staging_budget_many_times_over() {
+        // A chunk asks for its pieces at once: one larger than the budget
+        // would wait for ever.
+        let pieces = super::FETCH_CHUNK.div_ceil(super::STAGE_PIECE);
+        assert!(pieces * 16 <= super::STAGED_PIECES, "{pieces} pieces per chunk");
+    }
 
     #[test]
     fn successors_go_round_the_ring_after_this_peer() {

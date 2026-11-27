@@ -34,6 +34,8 @@ mod actor_limits;
 mod actor_state;
 mod demand;
 mod holds;
+mod inputs;
+mod recovery;
 mod shortlist;
 
 type Kind = pb::error_record::Kind;
@@ -83,6 +85,12 @@ const GOSSIP_MAX: usize = 64;
 const LOCALITY_MIN_BYTES: u64 = 1 << 20;
 /// Assumed transfer rate from a peer not yet measured (bytes/s).
 const DEFAULT_BANDWIDTH: f64 = 200e6;
+/// What a call whose duration was never measured is taken to last, when
+/// placing it weighs moving its inputs: short. A burst of new readers of a
+/// large input then stays near it (as once their time is learned), rather
+/// than every peer pulling it at once; if they are long, the ones still
+/// queued move (spillback, after SPILL_AFTER) once calls have been measured.
+const UNMEASURED_CALL_S: f64 = 0.01;
 const FLUSH_AT: usize = 256;
 const ATTEMPT_LOG_CAP: usize = 200_000;
 /// Tasks (threads) a new executor takes beyond its granted threads: the
@@ -113,9 +121,6 @@ const RUN_FETCH_EVERY: Duration = Duration::from_secs(1);
 const ACTOR_BATCH: usize = 64;
 /// Inputs of one call fetched from other peers at once.
 const INPUT_FETCHES: usize = 16;
-/// Times one attempt's lost inputs are rebuilt (each rebuild may itself
-/// rebuild its own lost inputs) before the attempt fails.
-const MAX_REBUILDS: u32 = 3;
 /// Publish proposals this peer keeps in flight per vshard. Results finishing
 /// meanwhile wait and go in the next one, so under load each commit carries
 /// many results instead of one or two (a lone result still goes at once).
@@ -299,9 +304,7 @@ pub enum CoreMsg {
     Rebuild {
         consumer: Box<Work>,
         producer: Tk,
-        attempt: u32,
-        spec: Box<pb::TaskSpec>,
-        deps: Vec<pb::Outcome>,
+        plan: Box<Plan>,
     },
     /// This peer stopped serving `group` (no longer a member): what it
     /// watched there is watched on the group's members instead.
@@ -313,9 +316,7 @@ pub enum CoreMsg {
     /// value is in this peer's store, else why not).
     RebuildRead {
         producer: Tk,
-        attempt: u32,
-        spec: Box<pb::TaskSpec>,
-        deps: Vec<pb::Outcome>,
+        plan: Box<Plan>,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Where a handle's order stands, for an actor host that had not seen it
@@ -449,8 +450,15 @@ pub struct Work {
     read_bytes: u64,
     /// Spillback was refused for this attempt: it runs here.
     stays: bool,
-    /// Lost inputs rebuilt for this attempt so far (see `MAX_REBUILDS`).
+    /// Lost inputs made again for this attempt so far, and how many levels
+    /// of calls run again it is above the reader it remakes a value for (0:
+    /// an ordinary attempt). See core/recovery.rs.
     rebuilds: u32,
+    depth: u32,
+    /// A call run again to remake a lost value: the value it published.
+    expect: Option<pb::ObjectRef>,
+    /// How its stored inputs reached this peer (core/inputs.rs).
+    inputs: Vec<pb::InputRead>,
     /// When it reached this peer (unix ns), read once like every other
     /// stamp: rebuilding it from `ready_at` mixes the monotonic clock with
     /// the wall clock, and the two drift apart by microseconds.
@@ -469,13 +477,24 @@ async fn rebuild_plan(
     mesh: &crate::mesh::MeshClient,
     w: &Work,
     object: &[u8],
-) -> Result<(Tk, u32, pb::TaskSpec, Vec<pb::Outcome>), String> {
+) -> Result<(Tk, Plan), String> {
     let Some(key) = w.spec.deps.iter().zip(&w.deps).find(|(_, o)| made(o, object)).map(|(k, _)| k) else {
         return Err("it is a value the program stored (ch.put, or an argument), not one a call returned".into());
     };
     let producer = Tk::parse(key).ok_or("malformed task key")?;
-    let (attempt, spec, deps) = producer_plan(router, mesh, producer, object).await?;
-    Ok((producer, attempt, spec, deps))
+    Ok((producer, producer_plan(router, mesh, producer, object).await?))
+}
+
+/// How to make a lost value again by running the call that returned it.
+pub struct Plan {
+    /// The attempt that made it: the same attempt writes the same object ids.
+    attempt: u32,
+    spec: pb::TaskSpec,
+    /// Its own inputs' outcomes.
+    deps: Vec<pb::Outcome>,
+    /// The value it published, which running it again must make again
+    /// (core/recovery.rs: divergence).
+    made: pb::ObjectRef,
 }
 
 /// Why the call `spec` describes may not run again to remake a value it
@@ -497,15 +516,13 @@ fn replay_refusal(spec: &pb::TaskSpec) -> Option<&'static str> {
 }
 
 /// How to make `object` again by running `producer`, the call that returned
-/// it: the attempt that made it (the same attempt writes the same object id),
-/// its spec and its own inputs' outcomes. The error says why the call cannot
-/// run again (see `replay_refusal`).
+/// it. The error says why the call cannot run again (see `replay_refusal`).
 pub(crate) async fn producer_plan(
     router: &Router,
     mesh: &crate::mesh::MeshClient,
     producer: Tk,
     object: &[u8],
-) -> Result<(u32, pb::TaskSpec, Vec<pb::Outcome>), String> {
+) -> Result<Plan, String> {
     let record = task_record(router, mesh, producer).await?.ok_or("its call's record is gone (its run ended)")?;
     let spec = record.spec.ok_or("its call's record holds no spec")?;
     if let Some(why) = replay_refusal(&spec) {
@@ -514,16 +531,20 @@ pub(crate) async fn producer_plan(
     let Some(outcome) = record.outcome.filter(|o| made(o, object)) else {
         return Err("its call's recorded outcome is another value".into());
     };
-    if matches!(&outcome.value, Some(pb::outcome::Value::Ok(o)) if o.durability() == pb::Durability::Ephemeral) {
+    let Some(pb::outcome::Value::Ok(made)) = outcome.value else {
+        return Err("its call's recorded outcome is an error, not a value".into());
+    };
+    if made.durability() == pb::Durability::Ephemeral {
         return Err("it was stored with durability='ephemeral', which is lost with its peer, never made again".into());
     }
-    let mut deps = Vec::with_capacity(spec.deps.len());
-    for d in &spec.deps {
-        let dep = Tk::parse(d).ok_or("malformed task key")?;
-        let rec = task_record(router, mesh, dep).await?.ok_or("an input of its call has no record")?;
-        deps.push(rec.outcome.ok_or("an input of its call has no outcome")?);
+    let tks = spec.deps.iter().map(|d| Tk::parse(d).ok_or("malformed task key")).collect::<Result<Vec<_>, _>>()?;
+    let mut deps = Vec::with_capacity(tks.len());
+    for rec in task_records(router, mesh, &tks).await? {
+        deps.push(
+            rec.ok_or("an input of its call has no record")?.outcome.ok_or("an input of its call has no outcome")?,
+        );
     }
-    Ok((outcome.attempt, spec, deps))
+    Ok(Plan { attempt: outcome.attempt, spec, deps, made })
 }
 
 /// How far back `handle_floor` walks a handle's calls before assuming the
@@ -590,6 +611,35 @@ async fn task_record(
     Ok(reply.tasks.into_iter().next().filter(|r| r.spec.is_some()))
 }
 
+/// The records of `tks`, as task_record reads one: from this peer's
+/// replicas, else one read per group that hosts the rest (a gather's inputs
+/// are many records, mostly in few groups), in order.
+async fn task_records(
+    router: &Router,
+    mesh: &crate::mesh::MeshClient,
+    tks: &[Tk],
+) -> Result<Vec<Option<pb::TaskRecord>>, String> {
+    let mut out: Vec<Option<Option<pb::TaskRecord>>> =
+        tks.iter().map(|&tk| router.read(tk.v(), |kv| read::task(kv, tk))).collect();
+    let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, got) in out.iter().enumerate() {
+        if got.is_none() {
+            groups.entry(router.group_of(tks[i].v())).or_default().push(i);
+        }
+    }
+    let reads = groups.into_iter().map(|(group, at)| async move {
+        let req = pb::ReadRequest { tasks: at.iter().map(|&i| tks[i].pb()).collect(), ..Default::default() };
+        let reply = mesh.read_group(group, req).await.map_err(|e| format!("reading its inputs' records: {e}"))?;
+        Ok::<_, String>((at, reply.tasks))
+    });
+    for (at, records) in futures_util::future::try_join_all(reads).await? {
+        for (i, rec) in at.into_iter().zip(records) {
+            out[i] = Some(Some(rec).filter(|r| r.spec.is_some()));
+        }
+    }
+    Ok(out.into_iter().map(Option::flatten).collect())
+}
+
 /// Whether the shard took a give-back (spillback) of an unstarted attempt, so
 /// this peer must not run it. Existing: the task already has its outcome.
 /// Anything else (refused, fenced, unknown, or no answer) leaves it here.
@@ -629,6 +679,9 @@ impl Work {
             read_bytes: 0,
             stays: false,
             rebuilds: 0,
+            depth: 0,
+            expect: None,
+            inputs: Vec::new(),
             ready_ns: now_ns(),
             queued_ns: 0,
         }
@@ -726,25 +779,49 @@ impl Work {
 /// its object is.
 /// Fetch a call's inputs into the store, INPUT_FETCHES at once: a call reading
 /// many small values (a shuffle's gather reads one per scatter) would otherwise
-/// pay one round trip per input, one after another. On failure, the first input
-/// that could not be fetched, and why.
-async fn fetch_inputs(
+/// pay one round trip per input, one after another. How each came (explain);
+/// on failure, the first input that could not be fetched, and why.
+pub(crate) async fn fetch_inputs(
     mesh: &Arc<MeshClient>,
     store: &ObjectStore,
     objs: Vec<pb::ObjectRef>,
-) -> Result<(), (Vec<u8>, String)> {
+) -> Result<Vec<pb::InputRead>, (Vec<u8>, String)> {
     use futures_util::StreamExt;
     let fetches = objs.into_iter().map(|obj| async move {
         let holders = mesh.holders(&obj);
+        let started = Instant::now();
         mesh.localize(store, &obj.run, &obj.object_id, obj.size, &holders, pb::TrafficClass::TrafficForeground)
             .await
+            .map(|got| inputs::arrived(mesh, &obj, got, started.elapsed()))
             .map_err(|e| (obj.object_id.clone(), format!("cannot fetch input object {}: {e}", hex(&obj.object_id))))
     });
     let mut fetches = futures_util::stream::iter(fetches).buffer_unordered(INPUT_FETCHES);
+    let mut reads = Vec::new();
     while let Some(r) = fetches.next().await {
-        r?;
+        reads.push(r?);
     }
-    Ok(())
+    Ok(reads)
+}
+
+/// The stored files of `producer`'s result that a reader of `object` needs,
+/// at the sizes and holders its record names: the result's file and every
+/// buffer its frame links when `object` is that file, else the one buffer.
+/// None when the record is not at hand or names another value.
+pub(crate) async fn stored_files(
+    router: &Router,
+    mesh: &crate::mesh::MeshClient,
+    producer: Tk,
+    object: &[u8],
+) -> Option<Vec<pb::ObjectRef>> {
+    let outcome = task_record(router, mesh, producer).await.ok()??.outcome?;
+    let Some(pb::outcome::Value::Ok(obj)) = outcome.value else { return None };
+    let stored = |o: &pb::ObjectRef| o.inline_data.is_empty() && !o.run.is_empty();
+    let all = with_blobs(&obj);
+    if obj.object_id == object {
+        Some(all.into_iter().filter(stored).collect())
+    } else {
+        all.into_iter().find(|b| b.object_id == object && stored(b)).map(|b| vec![b])
+    }
 }
 
 fn with_blobs(obj: &pb::ObjectRef) -> Vec<pb::ObjectRef> {
@@ -1080,6 +1157,10 @@ pub struct Core {
     rebuilding: HashMap<Tk, Vec<Work>>,
     /// Programs waiting for a call to be run again (`RebuildRead`), by call.
     rebuild_readers: HashMap<Tk, Vec<oneshot::Sender<Result<(), String>>>>,
+    /// Calls run again per run on this peer (core/recovery.rs).
+    rebuild_budget: recovery::Budget,
+    /// Peers large inputs are on their way to (core/shortlist.rs).
+    fanout: shortlist::Fanout,
     /// Tasks watched through another peer's replica.
     remote_watched: HashSet<Tk>,
     /// Hosts of actors whose records live in groups not hosted here.
@@ -1240,6 +1321,8 @@ impl Core {
             localizing: HashSet::new(),
             rebuilding: HashMap::new(),
             rebuild_readers: HashMap::new(),
+            rebuild_budget: recovery::Budget::default(),
+            fanout: shortlist::Fanout::default(),
             remote_watched: HashSet::new(),
             actor_hosts: HashMap::new(),
             waiting_actor: HashMap::new(),
@@ -1484,32 +1567,47 @@ impl Core {
                 self.rebuilt(&work, outcome.as_ref());
                 self.dispatch();
             }
-            CoreMsg::Rebuild { consumer, producer, attempt, spec, deps } => {
+            CoreMsg::Rebuild { consumer, producer, plan } => {
                 self.localizing.remove(&(consumer.tk, consumer.attempt));
                 let mut consumer = *consumer;
                 consumer.rebuilds += 1;
-                let depth = consumer.rebuilds;
-                let running = self.rebuild_readers.contains_key(&producer);
-                let waiting = self.rebuilding.entry(producer).or_default();
-                waiting.push(consumer);
-                if waiting.len() == 1 && !running {
-                    tracing::info!(
-                        task = %producer.task.hex(),
-                        "an input was lost with every peer that held it: running the call that made it again"
-                    );
-                    self.start_rebuild(producer, attempt, *spec, deps, depth);
+                let depth = consumer.depth + 1;
+                let running = self.rebuilding.contains_key(&producer) || self.rebuild_readers.contains_key(&producer);
+                match (!running).then(|| self.rebuild_budget.spend(producer.run)).flatten() {
+                    Some(spent) => {
+                        let why = format!("an input was lost with every peer that held it, and {spent}");
+                        self.give_up(&consumer, &why);
+                    }
+                    None => {
+                        self.rebuilding.entry(producer).or_default().push(consumer);
+                        if !running {
+                            tracing::info!(
+                                task = %producer.task.hex(),
+                                depth,
+                                "an input was lost with every peer that held it: running the call that made it again"
+                            );
+                            self.start_rebuild(producer, *plan, depth);
+                        }
+                    }
                 }
                 self.dispatch();
             }
-            CoreMsg::RebuildRead { producer, attempt, spec, deps, reply } => {
+            CoreMsg::RebuildRead { producer, plan, reply } => {
                 let running = self.rebuilding.contains_key(&producer) || self.rebuild_readers.contains_key(&producer);
-                self.rebuild_readers.entry(producer).or_default().push(reply);
-                if !running {
-                    tracing::info!(
-                        task = %producer.task.hex(),
-                        "a result a program reads was lost with every peer that held it: running its call again"
-                    );
-                    self.start_rebuild(producer, attempt, *spec, deps, 1);
+                match (!running).then(|| self.rebuild_budget.spend(producer.run)).flatten() {
+                    Some(spent) => {
+                        let _ = reply.send(Err(spent));
+                    }
+                    None => {
+                        self.rebuild_readers.entry(producer).or_default().push(reply);
+                        if !running {
+                            tracing::info!(
+                                task = %producer.task.hex(),
+                                "a result a program reads was lost with every peer that held it: running its call again"
+                            );
+                            self.start_rebuild(producer, *plan, 1);
+                        }
+                    }
                 }
                 self.dispatch();
             }
@@ -1634,6 +1732,7 @@ impl Core {
             CoreMsg::StreamCredit { task, up_to } => self.on_stream_credit(task, up_to),
             CoreMsg::EndRun { run, cancel } => {
                 self.direct.end_run(run);
+                self.rebuild_budget.end_run(run);
                 let body = if cancel {
                     pb::shard_cmd::Body::CancelRun(pb::CancelRun {
                         run: run.to_vec(),
@@ -2069,6 +2168,13 @@ impl Core {
         let cpus = if policy.cpus > 0.0 { policy.cpus } else { 1.0 };
         let mesh = self.router.mesh.clone()?;
         let cost = self.place_cost(tk, &spec, &policy, rec.memory_hint, &mesh);
+        // Peers a large input was on its way to that hold it now leave room
+        // for others to fetch it.
+        let mut fanout = std::mem::take(&mut self.fanout);
+        for (o, h) in cost.inputs.iter().zip(&cost.held).filter(|(o, _)| o.size >= shortlist::FANOUT_MIN_BYTES) {
+            fanout.arrived(&o.object_id, |n| self.holds(&mesh, n, o, h));
+        }
+        self.fanout = fanout;
         let here = self.cpu_used + self.queue.len() as f64;
         let mine = self.pressure(self.router.node_id(), here, None, self.capacity)
             + self.extra_cost(&mesh, &cost, mesh.me.node_id, self.memory_used(), self.budget.pool);
@@ -2112,6 +2218,17 @@ impl Core {
             chosen = ?best.as_ref().map(|(s, p)| (*s, hex(&p.peer[12..]))),
             "placement"
         );
+        if let Some((_, p)) = &best {
+            // The large inputs it lacks are on their way there now.
+            let (node, now) = (crate::stores::node_id_of(&p.peer), Instant::now());
+            let sent: Vec<Vec<u8>> = (cost.inputs.iter().zip(&cost.held))
+                .filter(|(o, h)| o.size >= shortlist::FANOUT_MIN_BYTES && !self.holds(&mesh, node, o, h))
+                .map(|(o, _)| o.object_id.clone())
+                .collect();
+            for object in sent {
+                self.fanout.sent(&object, node, now);
+            }
+        }
         best.map(|(_, p)| Some(p))
     }
 
@@ -2135,7 +2252,7 @@ impl Core {
         let inputs = shortlist::distinct(inputs);
         let total = inputs.iter().map(|o| o.size).sum();
         let key = profile_key(spec, policy);
-        let est_s = self.profiles.summary(&key).map(|s| s.wall_p50_s).filter(|s| *s > 0.0).unwrap_or(1.0);
+        let est_s = self.profiles.summary(&key).map(|s| s.wall_p50_s).filter(|s| *s > 0.0).unwrap_or(UNMEASURED_CALL_S);
         let need = self.profiles.memory_estimate(&key, total).map_or(0, |m| m.bytes).max(hint);
         let held: Vec<Vec<u64>> =
             if total >= LOCALITY_MIN_BYTES { inputs.iter().map(|o| mesh.holders(o)).collect() } else { Vec::new() };
@@ -2147,22 +2264,27 @@ impl Core {
         PlaceCost { inputs, held, total, est_s, need, holders }
     }
 
-    /// Cost beyond load of running the call on `node`: inputs it lacks (only
-    /// when over 30% of them would move, so locality is a preference, never a
-    /// pin) and a pool it would overflow.
+    /// Cost beyond load of running the call on `node`: inputs it lacks (see
+    /// shortlist::moving) and a pool it would overflow.
     fn extra_cost(&self, mesh: &MeshClient, c: &PlaceCost, node: u64, mem_used: u64, mem_pool: u64) -> f64 {
         let mut extra = 0.0;
         if c.total >= LOCALITY_MIN_BYTES {
-            let missing: u64 =
-                c.inputs.iter().zip(&c.held).filter(|(o, h)| !self.holds(mesh, node, o, h)).map(|(o, _)| o.size).sum();
-            if missing as f64 > 0.3 * c.total as f64 {
-                // A peer holding the input wins unless it is saturated (the
-                // missing share costs up to one full core's queue), plus the
-                // time to move the bytes, in units of the call's duration.
-                let bw = c.holders.iter().filter_map(|h| mesh.bandwidth(*h)).fold(0.0, f64::max);
-                let bw = if bw > 0.0 { bw } else { DEFAULT_BANDWIDTH };
-                extra += missing as f64 / c.total as f64 + missing as f64 / bw / c.est_s;
+            // An input on its way to `node` (a call reading it was placed
+            // there) costs nothing more to move.
+            let now = Instant::now();
+            let lacks = |o: &pb::ObjectRef, h: &Vec<u64>| {
+                !self.holds(mesh, node, o, h) && !self.fanout.going(&o.object_id, node, now)
+            };
+            let missing: u64 = c.inputs.iter().zip(&c.held).filter(|(o, h)| lacks(o, h)).map(|(o, _)| o.size).sum();
+            let wait = c.inputs.iter().zip(&c.held).any(|(o, h)| {
+                o.size >= shortlist::FANOUT_MIN_BYTES && lacks(o, h) && self.fanout.full(&o.object_id, now)
+            });
+            if wait {
+                extra += shortlist::FANOUT_WAIT; // it may go to no more peers at once
             }
+            let bw = c.holders.iter().filter_map(|h| mesh.bandwidth(*h)).fold(0.0, f64::max);
+            let bw = if bw > 0.0 { bw } else { DEFAULT_BANDWIDTH };
+            extra += shortlist::moving(missing, c.total, bw, c.est_s);
         }
         if c.need > 0 && mem_pool > 0 && mem_used + c.need > mem_pool {
             extra += 1.0 + (mem_used + c.need - mem_pool) as f64 / mem_pool as f64;
@@ -2330,8 +2452,20 @@ impl Core {
 
     /// Queue an attempt once its code and every object it reads are in the
     /// local stores (a cluster peer fetches what it is missing).
-    fn admit(&mut self, w: Work) {
+    fn admit(&mut self, mut w: Work) {
+        // Inputs it reads again after a rebuild are counted again; the
+        // rebuild itself stays noted.
+        w.inputs.retain(|r| r.how == "rebuilt");
         let Some(mesh) = self.router.mesh.clone() else {
+            // Alone: every stored input is here.
+            let deps = w.deps.iter().filter_map(|o| match &o.value {
+                Some(pb::outcome::Value::Ok(obj)) => Some(with_blobs(obj)),
+                _ => None,
+            });
+            let all: Vec<pb::ObjectRef> =
+                w.spec.args.iter().chain(w.spec.blobs.iter()).cloned().chain(deps.flatten()).collect();
+            let stored = all.iter().filter(|o| o.inline_data.is_empty() && !o.run.is_empty());
+            w.inputs.extend(stored.map(inputs::here));
             self.enqueue(w);
             return;
         };
@@ -2348,7 +2482,13 @@ impl Core {
             let mut all = with_blobs(obj);
             let head = all.remove(0);
             if head.inline_data.is_empty() && !head.run.is_empty() {
-                all.retain(|b| !self.objects.path(&b.run, &b.object_id).exists());
+                all.retain(|b| {
+                    let present = self.objects.path(&b.run, &b.object_id).exists();
+                    if present {
+                        w.inputs.push(inputs::here(b));
+                    }
+                    !present
+                });
                 if !all.is_empty() {
                     later.push((head.clone(), std::mem::take(&mut all)));
                 }
@@ -2357,11 +2497,12 @@ impl Core {
             deps.extend(all);
         }
         for obj in args.chain(deps.iter()) {
-            if obj.inline_data.is_empty()
-                && !obj.run.is_empty()
-                && !self.objects.path(&obj.run, &obj.object_id).exists()
-            {
-                missing.push(obj.clone());
+            if obj.inline_data.is_empty() && !obj.run.is_empty() {
+                if self.objects.path(&obj.run, &obj.object_id).exists() {
+                    w.inputs.push(inputs::here(obj));
+                } else {
+                    missing.push(obj.clone());
+                }
             }
         }
         let digest = w.spec.fn_digest.clone();
@@ -2380,7 +2521,7 @@ impl Core {
                 error = Some(format!("cannot fetch the function's code {}: {e}", hex(&digest)));
             }
             if error.is_none() {
-                let mut fetched = fetch_inputs(&mesh, &store, missing).await;
+                let mut fetched = fetch_inputs(&mesh, &store, missing).await.map(|reads| w.inputs.extend(reads));
                 if fetched.is_ok() && !later.is_empty() {
                     let s = store.clone();
                     // Off the async workers: reads each file's header.
@@ -2393,24 +2534,27 @@ impl Core {
                     })
                     .await
                     .unwrap_or_default();
-                    fetched = fetch_inputs(&mesh, &store, blobs).await;
+                    fetched = fetch_inputs(&mesh, &store, blobs).await.map(|reads| w.inputs.extend(reads));
                 }
                 if let Err((object, e)) = fetched {
                     error = Some(e);
                     lost = Some(object);
                 }
             }
-            if let (Some(object), Some(why)) = (lost, error.as_mut())
-                && w.rebuilds < MAX_REBUILDS
-            {
-                match rebuild_plan(&router, &mesh, &w, &object).await {
-                    Ok((producer, attempt, spec, deps)) => {
-                        let consumer = Box::new(w);
-                        let msg = CoreMsg::Rebuild { consumer, producer, attempt, spec: Box::new(spec), deps };
-                        let _ = tx.send(msg).await;
-                        return;
+            if let (Some(object), Some(why)) = (lost, error.as_mut()) {
+                if let Some(bound) = recovery::refusal(w.depth, w.rebuilds, w.deps.len()) {
+                    why.push_str(&format!("; it is not made again: {bound}"));
+                } else {
+                    match rebuild_plan(&router, &mesh, &w, &object).await {
+                        Ok((producer, plan)) => {
+                            w.inputs.push(inputs::rebuilt(&object, producer));
+                            let consumer = Box::new(w);
+                            let msg = CoreMsg::Rebuild { consumer, producer, plan: Box::new(plan) };
+                            let _ = tx.send(msg).await;
+                            return;
+                        }
+                        Err(cannot) => why.push_str(&format!("; it cannot be made again: {cannot}")),
                     }
-                    Err(cannot) => why.push_str(&format!("; it cannot be made again: {cannot}")),
                 }
             }
             let _ = tx.send(CoreMsg::Localized { work: Box::new(w), error }).await;
@@ -2551,12 +2695,13 @@ impl Core {
     /// Run `producer` again here to remake a lost value: its outcome is
     /// committed, so this run only rewrites the value under the same id (the
     /// same attempt) and has nothing to start or publish.
-    fn start_rebuild(&mut self, producer: Tk, attempt: u32, spec: pb::TaskSpec, deps: Vec<pb::Outcome>, depth: u32) {
-        let policy = pb::Policy::decode(spec.policy.as_slice()).unwrap_or_default();
-        let mut work = Work::new(producer, attempt, spec, policy, deps);
+    fn start_rebuild(&mut self, producer: Tk, plan: Plan, depth: u32) {
+        let policy = pb::Policy::decode(plan.spec.policy.as_slice()).unwrap_or_default();
+        let mut work = Work::new(producer, plan.attempt, plan.spec, policy, plan.deps);
         work.publish = false;
         work.start_consumed = true;
-        work.rebuilds = depth;
+        work.depth = depth;
+        work.expect = Some(plan.made);
         self.reserve(&mut work, 0, 0.0, 0);
         self.admit(work);
     }
@@ -2565,7 +2710,16 @@ impl Core {
     /// for that value go on (it is in this peer's store now), or fail with it.
     fn rebuilt(&mut self, w: &Work, outcome: Option<&pb::Outcome>) {
         match outcome.and_then(|o| o.value.as_ref()) {
-            Some(pb::outcome::Value::Ok(_)) => {
+            Some(pb::outcome::Value::Ok(remade)) => {
+                if let Some(why) = recovery::divergence(w.expect.as_ref(), remade) {
+                    // Other bytes under the old ids: never read as the value.
+                    for o in with_blobs(remade) {
+                        let _ = std::fs::remove_file(self.objects.path(&o.run, &o.object_id));
+                    }
+                    tracing::warn!(task = %w.tk.task.hex(), "{why}");
+                    self.give_up(w, &why);
+                    return;
+                }
                 for reader in self.rebuild_readers.remove(&w.tk).unwrap_or_default() {
                     let _ = reader.send(Ok(()));
                 }
@@ -4723,6 +4877,7 @@ impl Core {
             None if done.forward_to.is_some() => "forwarded",
             None => "unknown",
         };
+        let inputs = inputs::summarize(&w.inputs, &mut measures);
         let rec = pb::AttemptRecord {
             task: Some(w.tk.pb()),
             attempt: w.attempt,
@@ -4740,9 +4895,10 @@ impl Core {
             measures,
             end_reason: end_reason.into(),
             detail: String::new(),
-            placement_reason: "local peer had a warm executor and free CPU".into(),
+            placement_reason: inputs::placement(&w.inputs),
             reservation: w.reservation(),
             settings: w.settings(self.capacity),
+            inputs,
         };
         self.push_attempt(w.tk, rec);
         cpu_measured

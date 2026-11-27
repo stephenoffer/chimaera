@@ -1,6 +1,7 @@
 //! The Chimaera peer agent.
 
 pub mod accounting;
+pub mod attempts;
 pub mod auth;
 pub mod budget;
 pub mod budgets;

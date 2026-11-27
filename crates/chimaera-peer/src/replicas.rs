@@ -108,27 +108,58 @@ fn retain_turns() -> &'static tokio::sync::Semaphore {
     TURNS.get_or_init(|| tokio::sync::Semaphore::new(crate::objplane::REPLICAS_AT_ONCE))
 }
 
+/// Why `retain` made no copies: none could survive losing this peer
+/// (Infeasible: no other peer, or none on another machine), or a copy failed.
+#[derive(Debug)]
+pub enum NotRetained {
+    Infeasible(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for NotRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotRetained::Infeasible(why) | NotRetained::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+/// Why copies made on `nodes` would be lost with this machine, or None: one
+/// of them is on another machine (or this peer does not know its machine).
+pub fn same_machine(mesh: &MeshClient, nodes: &[u64]) -> Option<String> {
+    let host = &mesh.me.host;
+    if host.is_empty() || nodes.iter().any(|&n| mesh.member(n).is_some_and(|p| p.member.host != *host)) {
+        return None;
+    }
+    Some("every live peer that could hold a copy is on this machine, and a copy there is lost with it".into())
+}
+
 /// Copy the objects `ids` of `run`, stored here, to `copies` peers each (see
-/// `targets`; fewer when fewer are live) and wait for every copy. Returns
-/// the peers holding the copies; an error says why there are none.
+/// `targets`; fewer when fewer are live), one of them at least on another
+/// machine, and wait for every copy. Returns the peers holding the copies.
 pub async fn retain(
     mesh: &MeshClient,
     objects: &ObjectStore,
     run: &[u8],
     ids: &[Vec<u8>],
     copies: usize,
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<u64>, NotRetained> {
     let mut sized = Vec::with_capacity(ids.len());
     for id in ids {
         let size = tokio::fs::metadata(objects.path(run, id))
             .await
-            .map_err(|e| format!("object {} is not stored on this peer: {e}", crate::stores::hex(id)))?
+            .map_err(|e| {
+                NotRetained::Failed(format!("object {} is not stored on this peer: {e}", crate::stores::hex(id)))
+            })?
             .len();
         sized.push((id.clone(), size));
     }
     let nodes = targets(mesh, mesh.me.node_id, copies.max(1));
     if nodes.is_empty() {
-        return Err("there is no other live peer to hold a copy".into());
+        return Err(NotRetained::Infeasible("there is no other live peer to hold a copy".into()));
+    }
+    if let Some(why) = same_machine(mesh, &nodes) {
+        return Err(NotRetained::Infeasible(why));
     }
     let copied = futures_util::future::join_all(
         nodes.iter().flat_map(|&node| sized.iter().map(move |(id, size)| (node, id, *size))).map(
@@ -142,7 +173,7 @@ pub async fn retain(
         ),
     )
     .await;
-    copied.into_iter().collect::<Result<Vec<()>, String>>()?;
+    copied.into_iter().collect::<Result<Vec<()>, String>>().map_err(NotRetained::Failed)?;
     Ok(nodes)
 }
 

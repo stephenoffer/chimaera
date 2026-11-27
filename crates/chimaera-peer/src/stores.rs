@@ -150,7 +150,23 @@ pub struct ObjectStore {
     /// pack): the pack is deleted when its last one is freed (after a
     /// restart, with its run).
     packs: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), usize>>>,
+    /// Objects in memory, oldest written first, for spill_oldest.
+    candidates: std::sync::Arc<std::sync::Mutex<Candidates>>,
 }
+
+/// A listing of the objects in memory, oldest written first (mtime, bytes,
+/// path): spill_oldest takes from its front, so a round costs about the
+/// objects it moves rather than a stat of every object stored. It is made
+/// again when used up or older than CANDIDATES_FOR. An object written since
+/// is newer than every listed one, so oldest-first holds.
+#[derive(Default)]
+struct Candidates {
+    listed: Option<std::time::Instant>,
+    oldest: std::collections::VecDeque<(std::time::SystemTime, u64, PathBuf)>,
+    listings: u64,
+}
+
+const CANDIDATES_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl ObjectStore {
     pub fn open(dir: PathBuf) -> io::Result<ObjectStore> {
@@ -162,6 +178,7 @@ impl ObjectStore {
             spill_failed: Default::default(),
             remote: None,
             packs: Default::default(),
+            candidates: Default::default(),
         })
     }
 
@@ -238,30 +255,9 @@ impl ObjectStore {
             return Ok(0);
         }
         let started = std::time::Instant::now();
-        let mut files = Vec::new();
-        for run in std::fs::read_dir(&self.dir)?.flatten().filter(|e| !is_plane_dir(e)) {
-            let Ok(entries) = std::fs::read_dir(run.path()) else { continue };
-            for e in entries.flatten() {
-                let Ok(m) = e.metadata() else { continue }; // does not follow symlinks
-                let name = e.file_name();
-                if m.is_file() && !name.to_string_lossy().contains(".tmp") && !name.to_string_lossy().contains(".part")
-                {
-                    files.push((m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), m.len(), e.path()));
-                }
-            }
-        }
-        files.sort();
         // The oldest files that cover `want`, moved spill_threads() at a time
         // (one copy stream is well below what the disk takes).
-        let mut picked = Vec::new();
-        let mut planned = 0;
-        for (_, len, path) in files {
-            if planned >= want {
-                break;
-            }
-            planned += len;
-            picked.push((len, path));
-        }
+        let picked = self.oldest(want)?;
         let moved = std::sync::atomic::AtomicU64::new(0);
         let failed: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
         // To object storage, small objects go several to one upload (Ray's
@@ -314,6 +310,53 @@ impl ObjectStore {
             Some(e) if moved.load(std::sync::atomic::Ordering::Relaxed) == 0 => Err(e),
             _ => Ok(moved.into_inner()),
         }
+    }
+
+    /// The oldest objects still in memory that cover `want` bytes, from the
+    /// listing (Candidates), listed again once when it is used up or stale.
+    fn oldest(&self, want: u64) -> io::Result<Vec<(u64, PathBuf)>> {
+        let mut c = self.candidates.lock().expect("lock");
+        let (mut picked, mut planned, mut fresh) = (Vec::new(), 0, false);
+        let mut taken = std::collections::HashSet::new();
+        while planned < want {
+            if c.oldest.is_empty() || c.listed.is_none_or(|t| t.elapsed() > CANDIDATES_FOR) {
+                if fresh {
+                    break; // listed this round already: nothing more to move
+                }
+                c.oldest = self.in_memory()?.into();
+                c.listed = Some(std::time::Instant::now());
+                c.listings += 1;
+                fresh = true;
+                continue;
+            }
+            let (_, len, path) = c.oldest.pop_front().expect("not empty");
+            // Freed, or moved to disk (a link now), since it was listed; or
+            // picked already this round (listed again before it moved).
+            let here = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == len);
+            if here && taken.insert(path.clone()) {
+                planned += len;
+                picked.push((len, path));
+            }
+        }
+        Ok(picked)
+    }
+
+    /// Every object file in memory, oldest written first.
+    fn in_memory(&self) -> io::Result<Vec<(std::time::SystemTime, u64, PathBuf)>> {
+        let mut files = Vec::new();
+        for run in std::fs::read_dir(&self.dir)?.flatten().filter(|e| !is_plane_dir(e)) {
+            let Ok(entries) = std::fs::read_dir(run.path()) else { continue };
+            for e in entries.flatten() {
+                let Ok(m) = e.metadata() else { continue }; // does not follow symlinks
+                let name = e.file_name();
+                if m.is_file() && !name.to_string_lossy().contains(".tmp") && !name.to_string_lossy().contains(".part")
+                {
+                    files.push((m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), m.len(), e.path()));
+                }
+            }
+        }
+        files.sort();
+        Ok(files)
     }
 
     /// Upload small in-memory objects of one run as one object storage object
@@ -570,18 +613,51 @@ impl ObjectStore {
         walk(&self.dir)
     }
 
-    /// Store a blob uploaded by a client, checking its size and content
-    /// digest (blake3, first 16 bytes) before it becomes visible.
-    pub fn put_blob(&self, run: &[u8], blob_id: &[u8], data: &[u8]) -> io::Result<()> {
-        if blake3::hash(data).as_bytes()[..16] != *blob_id {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "blob content does not match its id"));
-        }
+    /// Store a blob a client uploads, `size` bytes in `chunks`, as they come:
+    /// written to a file beside its path and hashed on the way, it appears
+    /// under its id only once its bytes match it (blake3, first 16 bytes).
+    pub fn put_blob_from(
+        &self,
+        run: &[u8],
+        blob_id: &[u8],
+        size: u64,
+        mut chunks: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = self.path(run, blob_id);
         if path.exists() {
+            while chunks.blocking_recv().is_some() {} // stored already: the upload ends as it would
             return Ok(());
         }
         std::fs::create_dir_all(path.parent().expect("object paths have a run directory"))?;
-        write_atomic(&path, data)
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp{}-{n}", std::process::id()));
+        let written = (|| -> io::Result<blake3::Hash> {
+            let (mut f, mut hash, mut got) = (std::fs::File::create(&tmp)?, blake3::Hasher::new(), 0u64);
+            while let Some(chunk) = chunks.blocking_recv() {
+                hash.update(&chunk);
+                f.write_all(&chunk)?;
+                got += chunk.len() as u64;
+            }
+            if got != size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("upload ended at {got} of {size} bytes"),
+                ));
+            }
+            f.sync_all()?;
+            Ok(hash.finalize())
+        })();
+        let done = match written {
+            Ok(hash) if hash.as_bytes()[..16] == *blob_id => std::fs::rename(&tmp, &path),
+            Ok(_) => Err(io::Error::new(io::ErrorKind::InvalidData, "blob content does not match its id")),
+            Err(e) => Err(e),
+        };
+        if done.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        done
     }
 }
 
@@ -806,6 +882,69 @@ mod tests {
             assert_eq!(std::fs::read(store.path(&run.0, &[i])).unwrap(), vec![i; 1000]);
         }
         assert_eq!(store.spill_down_to(u64::MAX, 0, |_| panic!("nothing past the line")).unwrap(), 0);
+    }
+
+    /// `data` as a client's upload of blob `id` (put_blob_from) in 1 MiB
+    /// chunks; `size` is what the upload declares.
+    fn upload_sized(store: &ObjectStore, run: &[u8], id: &[u8], data: &[u8], size: u64) -> io::Result<()> {
+        let pieces: Vec<Vec<u8>> = data.chunks(1 << 20).map(<[u8]>::to_vec).collect();
+        let (tx, rx) = tokio::sync::mpsc::channel(pieces.len().max(1));
+        for p in pieces {
+            tx.try_send(p).unwrap();
+        }
+        drop(tx);
+        store.put_blob_from(run, id, size, rx)
+    }
+
+    fn upload(store: &ObjectStore, run: &[u8], id: &[u8], data: &[u8]) -> io::Result<()> {
+        upload_sized(store, run, id, data, data.len() as u64)
+    }
+
+    #[test]
+    fn an_upload_is_stored_as_it_comes_and_only_when_its_bytes_match_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::open(dir.path().to_path_buf()).unwrap();
+        let data: Vec<u8> = (0..(3 << 20) + 5).map(|i| (i % 251) as u8).collect();
+        let id = blake3::hash(&data).as_bytes()[..16].to_vec();
+        let leftovers = || std::fs::read_dir(dir.path().join(hex(b"run"))).map_or(0, |d| d.count());
+        assert!(upload_sized(&store, b"run", &id, &data[..1 << 20], data.len() as u64).is_err(), "cut short");
+        assert_eq!(leftovers(), 0, "nothing left behind by a failed upload");
+        let mut other = data.clone();
+        other[7] ^= 1;
+        let e = upload(&store, b"run", &id, &other).unwrap_err();
+        assert!(e.to_string().contains("does not match"), "{e}");
+        assert!(!store.path(b"run", &id).exists());
+        upload(&store, b"run", &id, &data).unwrap();
+        assert_eq!(std::fs::read(store.path(b"run", &id)).unwrap(), data);
+        assert_eq!(leftovers(), 1, "the blob alone");
+        upload(&store, b"run", &id, &data).unwrap(); // stored already
+    }
+
+    #[test]
+    fn a_spill_round_takes_the_next_oldest_without_listing_the_store_again() {
+        let (mem, disk) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let store = ObjectStore::open(mem.path().to_path_buf()).unwrap().with_spill(vec![disk.path().to_path_buf()]);
+        let run = Id::derive(0, 0, &[b"run"]);
+        let write = |i: u8| {
+            let path = store.path(&run.0, &[i]);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![i; 1000]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20)); // distinct mtimes
+        };
+        (1..=6).for_each(write);
+        let spilled = |i: u8| std::fs::symlink_metadata(store.path(&run.0, &[i])).unwrap().is_symlink();
+        let listings = || store.candidates.lock().unwrap().listings;
+        assert_eq!(store.spill_oldest(1000).unwrap(), 1000);
+        assert_eq!(store.spill_oldest(1000).unwrap(), 1000);
+        std::fs::remove_file(store.path(&run.0, &[3])).unwrap(); // freed after it was listed
+        assert_eq!(store.spill_oldest(1000).unwrap(), 1000);
+        assert!(spilled(1) && spilled(2) && spilled(4), "oldest first, the freed one skipped");
+        assert_eq!(listings(), 1, "three rounds, one listing");
+        write(7); // newer than every listed one
+        assert_eq!(store.spill_oldest(3000).unwrap(), 3000, "5 and 6 from the listing, then 7 from a new one");
+        assert!(spilled(5) && spilled(6) && spilled(7));
+        assert_eq!(listings(), 2);
+        assert_eq!(store.spill_oldest(1000).unwrap(), 0, "nothing left in memory");
     }
 
     #[test]
@@ -1036,7 +1175,7 @@ mod tests {
             std::fs::create_dir_all(mem.path().join(d)).unwrap();
             std::fs::write(mem.path().join(d).join("21-0"), vec![0u8; 3000]).unwrap();
         }
-        store.put_blob(b"run", &blake3::hash(b"x").as_bytes()[..16], b"x").unwrap();
+        upload(&store, b"run", &blake3::hash(b"x").as_bytes()[..16], b"x").unwrap();
         assert_eq!(store.bytes_used(), 1, "only the object counts");
         store.spill_oldest(1 << 20).unwrap();
         assert!(mem.path().join(".reserve/21-0").symlink_metadata().unwrap().is_file(), "reserve files stay in memory");
@@ -1049,8 +1188,8 @@ mod tests {
         let store = ObjectStore::open(d.path().to_path_buf()).unwrap();
         let data = b"some large value".repeat(100);
         let id = blake3::hash(&data).as_bytes()[..16].to_vec();
-        assert!(store.put_blob(b"run", &id, b"something else").is_err());
-        store.put_blob(b"run", &id, &data).unwrap();
+        assert!(upload(&store, b"run", &id, b"something else").is_err());
+        upload(&store, b"run", &id, &data).unwrap();
         assert_eq!(std::fs::read(store.path(b"run", &id)).unwrap(), data);
     }
 

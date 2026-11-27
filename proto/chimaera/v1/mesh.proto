@@ -48,6 +48,8 @@ service Mesh {
   // Why an actor placed on this peer has not started ("" if it is not
   // waiting): explain() on another peer asks the actor's host.
   rpc ActorWait(ActorWaitRequest) returns (ActorWaitReply);
+  // The attempts of a call this peer ran, as it recorded them (explain).
+  rpc Attempts(AttemptsRequest) returns (AttemptsReply);
 }
 
 message ActorWaitRequest {
@@ -57,6 +59,15 @@ message ActorWaitRequest {
 
 message ActorWaitReply {
   string reason = 1;
+}
+
+message AttemptsRequest {
+  string cluster = 1;
+  TaskKey task = 2;
+}
+
+message AttemptsReply {
+  repeated AttemptRecord attempts = 1;
 }
 
 message InventoryRequest {

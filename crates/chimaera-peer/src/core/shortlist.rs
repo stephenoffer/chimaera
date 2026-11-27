@@ -6,7 +6,8 @@
 //! that holds several medium inputs (more bytes in all) in the running.
 
 use chimaera_core::pb;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// Holders weighed besides the two random choices, most input bytes first.
 const HOLDER_PICKS: usize = 4;
@@ -42,6 +43,71 @@ pub(super) fn by_bytes(inputs: &[pb::ObjectRef], held: &[Vec<u64>], seed: u64) -
 /// clock is no seed alone: on macOS it moves in whole microseconds.
 pub(super) fn seed(task: &[u8; 16], now_ns: u64) -> usize {
     (u64::from_le_bytes(task[8..16].try_into().expect("8 bytes")) ^ now_ns) as usize
+}
+
+/// What moving `missing` of a call's `total` input bytes to a peer costs, in
+/// the units of load (a core's queue): the missing share, up to one full
+/// core's queue (a peer holding the input wins unless it is saturated), plus
+/// the time to move the bytes at `bw` (bytes per second), in units of the
+/// call's duration `est_s`. It grows with every byte that moves, so a fifth
+/// of a large input on a slow link counts for what it costs; locality stays a
+/// preference, never a pin, since load can always outweigh it.
+pub(super) fn moving(missing: u64, total: u64, bw: f64, est_s: f64) -> f64 {
+    if missing == 0 || total == 0 {
+        return 0.0;
+    }
+    missing as f64 / total as f64 + missing as f64 / bw / est_s
+}
+
+/// Inputs at least this large are fetched by at most FANOUT_MAX peers at once.
+pub(super) const FANOUT_MIN_BYTES: u64 = 64 << 20;
+/// Peers placement may send calls to that lack one large input, before they
+/// hold it: a burst of readers then pulls it from its holder a few peers at a
+/// time, not with every peer at once (64 peers pulling 512 MiB through one
+/// NIC took minutes and made the holder miss its liveness probes).
+pub(super) const FANOUT_MAX: usize = 4;
+/// How long a peer chosen for a call reading an input it lacks counts as
+/// having it on the way (its fetch is done well before, unless it failed).
+const FANOUT_FOR: Duration = Duration::from_secs(30);
+/// What a call costs on a peer the input could not go to yet: it goes there
+/// only if no peer where the input is, or is going, can run it.
+pub(super) const FANOUT_WAIT: f64 = 1e3;
+
+/// The peers large inputs are on their way to: chosen for calls reading
+/// them, and not yet holding them.
+#[derive(Default)]
+pub(super) struct Fanout(HashMap<Vec<u8>, Vec<(u64, Instant)>>);
+
+impl Fanout {
+    /// Whether `object` is on its way to `node`.
+    pub(super) fn going(&self, object: &[u8], node: u64, now: Instant) -> bool {
+        self.0.get(object).is_some_and(|to| to.iter().any(|&(n, at)| n == node && now - at < FANOUT_FOR))
+    }
+
+    /// Whether `object` is on its way to as many peers as may fetch it at once.
+    pub(super) fn full(&self, object: &[u8], now: Instant) -> bool {
+        self.0.get(object).is_some_and(|to| to.iter().filter(|&&(_, at)| now - at < FANOUT_FOR).count() >= FANOUT_MAX)
+    }
+
+    /// A call reading `object` was placed on `node`, which lacks it.
+    pub(super) fn sent(&mut self, object: &[u8], node: u64, now: Instant) {
+        let to = self.0.entry(object.to_vec()).or_default();
+        to.retain(|&(n, at)| n != node && now - at < FANOUT_FOR);
+        to.push((node, now));
+        if self.0.len() > 4096 {
+            self.0.retain(|_, to| to.iter().any(|&(_, at)| now - at < FANOUT_FOR));
+        }
+    }
+
+    /// The peers among those `object` is going to that hold it now.
+    pub(super) fn arrived(&mut self, object: &[u8], holds: impl Fn(u64) -> bool) {
+        if let Some(to) = self.0.get_mut(object) {
+            to.retain(|&(n, _)| !holds(n));
+            if to.is_empty() {
+                self.0.remove(object);
+            }
+        }
+    }
 }
 
 /// Indexes into `others` to weigh: two random choices from `seed`, then up to
@@ -103,6 +169,38 @@ mod tests {
             let picks = shortlist(&others, seed, &ranked);
             assert!(picks.iter().any(|&i| others[i] == b), "seed {seed}: {picks:?}");
         }
+    }
+
+    #[test]
+    fn moving_a_fifth_of_a_large_input_counts_and_nothing_jumps_at_a_threshold() {
+        let (total, slow) = (100 * GIB, 125e6); // 1 Gbit/s
+        let fifth = moving(total / 5, total, slow, 60.0);
+        assert!(fifth > 2.0, "20 GiB over a 1 Gbit/s link is minutes, against a 60 s call: {fifth}");
+        assert_eq!(moving(0, total, slow, 60.0), 0.0);
+        // No step where a threshold was: 29% and 31% cost about the same.
+        let (below, above) = (moving(29 * GIB, total, slow, 60.0), moving(31 * GIB, total, slow, 60.0));
+        assert!(above > below && above - below < 0.1 * above, "{below} {above}");
+        // A small input on a fast link costs little more than its share.
+        let small = moving(2 << 20, 4 << 20, 1e9, 1.0);
+        assert!((0.5..0.51).contains(&small), "{small}");
+    }
+
+    #[test]
+    fn a_large_input_goes_to_a_few_peers_at_once_and_to_more_as_they_get_it() {
+        let (mut f, t0) = (Fanout::default(), Instant::now());
+        let big = [9u8; 16];
+        for node in 1..=FANOUT_MAX as u64 {
+            assert!(!f.full(&big, t0));
+            f.sent(&big, node, t0);
+        }
+        assert!(f.full(&big, t0), "{FANOUT_MAX} peers are fetching it");
+        assert!(f.going(&big, 2, t0) && !f.going(&big, 99, t0));
+        f.sent(&big, 2, t0); // another call there: still one fetch
+        assert!(f.full(&big, t0));
+        f.arrived(&big, |n| n == 1); // peer 1 holds it now: room for another
+        assert!(!f.full(&big, t0) && !f.going(&big, 1, t0));
+        assert!(!f.full(&big, t0 + FANOUT_FOR), "a fetch that never finished stops counting");
+        assert!(!f.full(&[1u8; 16], t0), "each input apart");
     }
 
     #[test]

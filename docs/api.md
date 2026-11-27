@@ -162,7 +162,7 @@ assert list(double.map([1, 2, 3])) == [2, 4, 6]
 | `gpus`, `device` | Accelerators (P5 assigns and isolates them; see Tier 3). |
 | `effects` | `"none"` (default), `"idempotent"` or `"external"`. External calls start at most once. |
 | `deterministic` | `True` (default): the function returns the same value for the same inputs, so a result lost with every copy of it is made again by running its call. `False`: such a result is `DataLost`, saying why, and the call is never speculated or cached. |
-| `durability` | What the result survives if its peer is lost: by default a background copy on another peer, and the call runs again; `"ephemeral"` (no copy, lost with its peer), `"replayable"` (no copy, the call runs again) or `"retained"` (the call succeeds only once copies on other peers, other racks first, exist). See [objects](objects.md#fault-tolerance). |
+| `durability` | What the result survives if its peer is lost: by default a background copy on another peer, and the call runs again; `"ephemeral"` (no copy, lost with its peer), `"replayable"` (no copy, the call runs again) or `"retained"` (the call succeeds only once copies on other peers, other racks first, exist, one at least on another machine). See [objects](objects.md#fault-tolerance). |
 | `max_attempts`, `retry_exceptions` | Infrastructure failures are retried. Of your exceptions, a dropped connection or a timeout (`ConnectionError`, `TimeoutError`, and requests', aiohttp's and urllib3's equivalents) is retried in calls that may run again (`effects="none"` or `"idempotent"`, not actor calls or streams); others only when listed, and `retry_exceptions=()` turns the default off. A retry waits 0.1 s, doubling to at most 2 s. |
 | `deadline` | Relative (`"30s"`) or a `datetime`; children inherit the earliest one. |
 | `concurrency` | Calls an actor may run at once (default 1). |
@@ -371,7 +371,17 @@ f = word_count.remote("explain me")
 f.result()
 info = f.explain()
 assert info["state"] == "Done" and info["attempts"]
+assert info["attempts"][-1]["inputs"] == []      # its argument travelled inside the call
 ```
+
+Each attempt comes from the peer that ran it, wherever the call ran: its stage
+times, its measures, and `inputs`, how each stored input reached that peer.
+An input is `here` (in that peer's store already), `linked` (from the store of
+a peer on the same machine; no bytes cross the network), `fetched` (over the
+network, with its `source` peer and `seconds`) or `rebuilt` (every copy was
+lost and its call ran again). The 16 largest are listed; `input_bytes_here`,
+`input_bytes_linked` and `input_bytes_fetched` in `measures` count them all,
+and `placement` says the same in words.
 
 What a run's calls print is kept on the peer that ran them, after the driver
 has gone: `run.logs()` yields it line by line (`<call> <stream>| text`),
