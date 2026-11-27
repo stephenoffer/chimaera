@@ -126,7 +126,7 @@ for 512 MiB, against 2 ms read-only), so large reads on a laptop are slower
 than on Linux.
 
 Three kinds of value are read rather than mapped:
-- a small object file, read whole: up to 1 MiB on Linux and 16 MiB on macOS,
+- a small object file, read whole: up to 256 KiB on Linux and 16 MiB on macOS,
   where a first mapping costs about 2.5 ms;
 - a large `bytes` value, read with one `pread` from its file or linked blob
   into the new `bytes` object (it must be copied anyway, and copying out of a

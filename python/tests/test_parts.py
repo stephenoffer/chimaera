@@ -7,7 +7,10 @@ from __future__ import annotations
 import glob
 import json
 import os
+import sys
 import time
+
+import pytest
 
 from test_cluster import Cluster
 
@@ -150,6 +153,19 @@ def test_a_consumer_at_scale_fetches_only_its_value_and_parts_go_with_their_resu
         if drv.poll() is None:
             drv.kill()
         c.close()
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS reads files up to 16 MiB whole: a first map costs ~2.5 ms")
+def test_an_object_file_from_256_kib_is_mapped_on_linux_not_copied(tmp_path):
+    # An array of 1 MiB or more is written in place by the arena and linked as
+    # a file of exactly its size; reading that file whole copied it again,
+    # which made its get 4x slower than mapping it.
+    import mmap
+
+    for n in (512 << 10, 1 << 20):
+        path = tmp_path / f"blob{n}"
+        path.write_bytes(bytes(n))
+        assert isinstance(_serde._map(str(path)), mmap.mmap), n
 
 
 def test_a_small_object_file_is_read_and_a_large_one_mapped_both_private(tmp_path):

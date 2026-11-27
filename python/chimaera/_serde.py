@@ -69,9 +69,12 @@ _NO_BLOB = bytes(16)
 # Object files up to this size are read, not mapped. On macOS the first map of
 # a file costs about 2.5 ms however small it is (8 ms at 16 MB; reading 400 KB
 # takes 0.07 ms, measured on an M3 Pro), and every input a peer fetched is a
-# first map: a gather of 64 fetched inputs spent 180 ms mapping them. Larger
-# values stay mapped: no copy, paged in as they are touched.
-_READ_MAX = (16 << 20) if sys.platform == "darwin" else (1 << 20)
+# first map: a gather of 64 fetched inputs spent 180 ms mapping them. On Linux
+# a map costs microseconds, and from 256 KiB a mapped value is read faster than
+# a copy: a 512 KiB array's get and first touch took 0.10 ms against 0.15, and
+# at 1 MiB, the arena's size, 0.09 against 0.18. Larger values stay mapped: no
+# copy, paged in as they are touched.
+_READ_MAX = (16 << 20) if sys.platform == "darwin" else (256 << 10)
 
 # Fetches a blob another peer holds into this peer's store: (run, blob_id).
 # Set by the runtime; None means a missing blob is an error.

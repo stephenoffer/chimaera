@@ -87,18 +87,33 @@ objects; there Chimaera's base call is 1.9 ms against Ray's 0.37 ms.
 
 ## What Chimaera is not faster for, and why
 
-Re-measured on 2026-11-24 at e012f2b on the same workspace, both runtimes
-the same day (Ray 2.59 as Anyscale runs it), two runs each: `/dev/shm` with
-4 KiB pages, medians. Every case where Chimaera is slower than Ray, or
-barely faster:
+Re-measured on 2026-11-25 at 6f881ea on the same workspace (32 vCPUs,
+kernel 6.8), two runs each: `/dev/shm` with 4 KiB pages and shared-memory
+huge pages off, medians. Ray 2.59 ran as a local cluster of its own from
+the same virtualenv (the workspace cluster's workers have no torch), with
+a 33 GB store. Of the 308 rows both runtimes reported (scenario, type, size,
+operation), Chimaera was at least 1.1x faster in both runs in 252. The
+rest, apart from rows of a few microseconds:
 
 | data, pattern | vs Ray | why | what helps |
 |---|---:|---|---|
-| writing 3x the memory limit (spill), 16 MB objects on `/dev/shm` | 0.82–0.89x (5.5–5.8 s against 4.8–4.9 s) | Each new array is allocated in shared memory, on pages the kernel allocates and zeroes, while Ray reuses its heap's pages for each new array and copies it into its store on several threads: making and filling each 16 MB array took 2.8 ms against Ray's 1.2 ms. Measured on 2026-11-24 (4 GiB of 64 MiB objects into `/dev/shm`, two runs): fresh tmpfs pages 2.6 s (1.7 GB/s), a heap array copied into warm shared memory as Ray does 1.5 s (2.9 GB/s), and pages already in a tmpfs file, mapped with `MAP_POPULATE`, 0.95 s (4.5 GB/s). Those faults cost the most on `/dev/shm`, with shared-memory huge pages off (`shmem_enabled=never`, the usual default): on a huge-page tmpfs the same writes are 1.4x faster than Ray's, and 256 MB objects are faster on `/dev/shm` too. 8 or 16 spill threads did no better than 4. | A huge-page tmpfs (`mount -t tmpfs -o huge=within_size`; the peer uses one it finds, and nodes Chimaera provisions mount one), a larger memory limit, or reusing arrays. Handing a spilled object's pages to the next array would not help: a 16 MiB array on pages that already exist cost 2.95 ms to map and fill, against 3.08 ms from the pre-zeroed reserve, because the cost is mapping the block and writing pages that are cold in the cache (the same mapping again costs 0.9 ms), and a stored array's block is remapped copy-on-write, so its mapping cannot be kept. Storing a copy instead (`CHIMAERA_ARENA=0`: arrays on the heap) took the 16 MB writes to 5.0–5.1 s, but the 256 MB ones to 11.3–11.6 s. |
-| first touch of a value's pages just after `get`, on `/dev/shm` | pandas 16 MiB 0.4x (747–751 µs against 291–313), Arrow 1 MiB 0.5x (84–87 µs against 46) | A value read in place is a mapping of its file, whose pages fault in when first touched. Ray's touch is cheap in this test because it puts and frees one value over and over: its store hands out the same pages again, which the reader has mapped already. Mapping the pages at `get` instead (`MADV_POPULATE_READ`) only moves the cost (16 MiB: 513 µs faulting them in as they are read, 566 µs populating, then reading). `get` and the touch together are faster than Ray's: pandas 16 MiB 37.2–37.6 ms against 42.2–43.3, Arrow 1 MiB 186–195 µs against 201–206. Measured again on 2026-11-24, two runs. | A huge-page tmpfs: pandas 16 MiB 0.9x (345 µs against 301–304), Arrow 16 MiB 2.4x faster (277–282 µs against 674); objects under 2 MiB still use 4 KiB pages there (Arrow 1 MiB 0.6x). |
-| Arrow tables, `return` and `pipeline` of 1 MiB | 0.9–1.4x | Arrow buffers are copied once into shared memory: the zero-copy allocator covers NumPy. From 16 MiB 1.2–2.1x; put and get are 1.2–1.9x. | - |
-| 1 MiB `str` | 0.9–1.7x over four runs (put 425–541 µs against 486–749) | Encoding to and decoding from UTF-8 is most of the time in both, and Ray's own time varies most. From 16 MiB, put, return and pipeline are 1.9–2.4x. | - |
-| `str` get of 16 MiB; many 1 MB values read in one call | 1.1x (2.85–2.91 ms against 3.02–3.09; 475–482 µs against 503–514 each) | Decoding the UTF-8 into a new `str`, and one copy per value, are the cost in both. | Batch small values into one array. |
+| NumPy arrays, Arrow tables and dicts of arrays of 16 MB to 1 GB, read in another process: `get`, then a read of every page | NumPy 16 MiB 0.26x (0.58–0.61 ms against 0.15–0.16), 256 MiB 0.10x (9.2 ms against 0.93–0.96), 1 GiB 0.68–0.73x; dicts of arrays 16 MiB 0.31–0.34x, 256 MiB 0.12x, 1 GiB 0.10x; Arrow 16 MiB 0.43–0.50x, 256 MiB 0.14x, 1 GiB 0.11x | Each value is a file of its own, which its reader maps; its 4 KiB pages fault in when first touched, about 0.15 µs a page (9.7 ms for 256 MiB). A Ray worker maps its whole store once, and the allocator hands the next object the pages the last one had, which the reader has touched already. Populating the mapping when it is made costs the same (256 MiB: 10.1 ms), and populating with 4, 8 or 16 threads no less (10.5–11.3 ms): this kernel does that work one page at a time. The `get` alone is faster than Ray's (NumPy 256 MiB 0.053 ms against 0.13). Torch tensors are 5–30x faster in the same rows, because Ray's tensor path copies. | A huge-page tmpfs: 512 times fewer faults; on one, NumPy pipelines of 256 MiB and 1 GiB are 6.7–7.0x faster than Ray's (tables below). Reading only the pages needed. |
+| the same values through a producer → consumer pipeline that reads every byte | NumPy 256 MiB 0.56–0.59x (13.9–14.1 ms against 7.9–8.2), 1 GiB 0.45–1.77x (Ray's own time ranged 25–96 ms); dicts of arrays 256 MiB 0.65–0.67x, 1 GiB 0.43–0.51x; Arrow 16–256 MiB 0.91–0.99x | The consumer's page faults, as above, on top of reading the bytes, which costs the same in both. The same rows were slower on 2026-11-21 too; the list on 2026-11-24 left them out. | As above. |
+| writing 3x the memory limit (spill), 16 MB objects | 0.82–0.91x (5.86–5.90 s against 4.81–5.31 s) | Each new array is allocated in shared memory, on pages the kernel allocates and zeroes, while Ray reuses its heap's pages for each new array and copies it into its store on several threads. Handing a spilled object's pages to the next array does not help (2026-11-24: 2.95 ms to map and fill 16 MiB on existing pages, 3.08 from the pre-zeroed reserve), and storing a copy instead (`CHIMAERA_ARENA=0`) took the 16 MB writes to 5.0–5.1 s but the 256 MB ones to 11.3–11.6 s. Reading them back is 4.8–5.7x faster than Ray (1.48–1.51 s against 7.17–8.44), and 256 MB writes are 1.16–1.34x faster. | A huge-page tmpfs (1.4x faster than Ray there), or a larger memory limit. |
+| Arrow tables of 1 MiB: `put`, `put` then `get`, `return` | 0.74–0.76x (0.86–0.88 ms against 0.64–0.67), 0.78x, 0.93–0.94x | Its buffers are copied once into shared memory (the zero-copy allocator covers NumPy). A `put` on its own in a process took 0.55–0.56 ms, faster than Ray's 0.63–0.81 ms; after 16 MiB torch puts in the same process it took 0.84–0.92 ms, for a reason not found. | - |
+| a dict of 262,000 floats, 16 MB: `put` | 0.87–0.93x (11.9–12.6 ms against 11.0) | Pickling the dict is most of the time in both. | - |
+| `get` of dicts, lists and `str` of 1–256 MB; reading every page of `bytes` of 256 MB–1 GB; Arrow `get`, `return` and `pipeline` of 1 MiB–1 GiB | 0.95–1.10x | Decoding the value into Python objects, or the one copy `bytes` needs, is the time in both. | - |
+
+Fixed with this re-measurement: a 1 MiB NumPy array's `get` in another
+process took 0.154–0.157 ms against Ray's 0.087–0.095 (0.6x), because Linux
+read object files up to 1 MiB whole and so copied an array the arena had
+written in place. Linux now maps files from 256 KiB: that `get` takes
+0.041 ms, and with its first touch 0.09 ms against 0.18 read whole and
+Ray's 0.11. From 256 to 512 KiB, `get` and first touch were as fast or faster
+mapped, up to 3.8x (NumPy 512 KiB 0.10 ms against 0.15, `bytes` 0.11
+against 0.42; dicts of arrays at 256 KiB 0.15 ms both ways), and calls
+returning or passing such values were unchanged (one build, two runs of
+each threshold).
 
 Fixed on 2026-11-24 (in e012f2b): small results through `return` and
 `pipeline`, and 1 MiB `str`.
