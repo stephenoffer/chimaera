@@ -6,6 +6,7 @@ import functools
 import inspect
 import os
 import sys
+import weakref
 import types
 from collections.abc import Callable, Generator, Mapping
 from typing import Any
@@ -118,21 +119,39 @@ class ObjectRefGenerator:
 
 
 _PACKAGE = os.path.dirname(os.path.abspath(ch.__file__)) + os.sep
+# ObjectRef.call_site() of the calls made while RAY_record_ref_creation_sites was set.
+_creation_sites: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
 
 
-def stamped(f: Any) -> Any:
-    """`f` (a call's or a put's future) marked with the line that called into
-    the shim, the first frame outside this package, as Chimaera's own API marks
-    its calls: its warnings name that line, and an error nothing reads is
-    reported (Ray's "Unhandled error"), which a call made from inside the
-    package is not. ObjectRef.call_site() gives it too."""
+def stamped(f: Any, kind: str = "task call") -> Any:
+    """`f` (a call's future) marked with the line that called into the shim,
+    the first frame outside this package, as Chimaera's own API marks its
+    calls: its warnings name that line, and an error nothing reads is reported
+    (Ray's "Unhandled error"), which a call made from inside the package is
+    not. With RAY_record_ref_creation_sites set, it also records the call
+    site in Ray's form for ObjectRef.call_site(): "(task call)  | " and up to
+    three frames as file:function:line, the innermost first."""
     if isinstance(f, ch.Future):
         frame = sys._getframe(1)
         while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE):
             frame = frame.f_back
         if frame is not None:
             f._site = f"{frame.f_code.co_filename}:{frame.f_lineno}"
+            if os.environ.get("RAY_record_ref_creation_sites", "").lower() in ("1", "true"):
+                frames = [f"({kind}) "]
+                while frame is not None and len(frames) < 4:
+                    frames.append(f"{frame.f_code.co_filename}:{frame.f_code.co_name}:{frame.f_lineno}")
+                    frame = frame.f_back
+                _creation_sites[f] = " | ".join(frames)
     return f
+
+
+def creation_site(ref: Any) -> str:
+    """The call site stamped() recorded for `ref` or the call it is a value of, or ""."""
+    try:
+        return _creation_sites.get(getattr(ref, "_parent", ref), "")
+    except TypeError:  # not weakly referable: made by no call here
+        return ""
 
 
 def _streamed(f: Any) -> Any:
@@ -345,7 +364,7 @@ class ActorMethod:
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
         args, kwargs = _as_ray(args, kwargs)
-        f = stamped(self._method.remote(*args, **kwargs))
+        f = stamped(self._method.remote(*args, **kwargs), "actor call")
         if self._streams:
             return ObjectRefGenerator(_Items(f))  # type: ignore[arg-type]
         if isinstance(f, ch.Results):

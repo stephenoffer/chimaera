@@ -149,14 +149,12 @@ def from_random() -> Any:
 
 
 def call_site(ref: Any) -> str:
-    """Where the ref was made (Ray's ``ObjectRef.call_site()``): the file and
-    line of the call or ``put``, when RAY_record_ref_creation_sites is set, as
-    Ray records it only then; "" otherwise, and for a generator item."""
-    from ._remote import PutRef
+    """Where the ref was made (Ray's ``ObjectRef.call_site()``), in Ray's form,
+    for a call made while RAY_record_ref_creation_sites was set; "" otherwise,
+    and for a ``put`` and a generator item, as Ray gives."""
+    from ._remote import creation_site
 
-    if os.environ.get("RAY_record_ref_creation_sites", "").lower() not in ("1", "true"):
-        return ""
-    return getattr(ref._ref if isinstance(ref, PutRef) else ref, "_site", None) or ""
+    return creation_site(ref)
 
 
 def attach(types: tuple[type, ...]) -> None:

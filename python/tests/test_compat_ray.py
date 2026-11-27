@@ -809,12 +809,29 @@ def test_a_ref_names_the_line_that_made_it_when_ray_records_sites(monkeypatch):
     def one():
         return 1
 
-    assert one.remote().call_site() == "" and ray.put(1).call_site() == "", "Ray records none by default"
+    @ray.remote(num_returns=2)
+    def two():
+        return 1, 2
+
+    @ray.remote
+    class A:
+        def m(self):
+            return 1
+
+    def make():
+        return one.remote(), two.remote(), A.remote().m.remote(), ray.put(1)
+
+    assert all(r.call_site() == "" for r in (one.remote(), ray.put(1))), "Ray records none by default"
     monkeypatch.setenv("RAY_record_ref_creation_sites", "1")
-    call, put = one.remote(), ray.put(1)
-    line = sys._getframe().f_lineno - 1
-    site = call.call_site()
-    assert site == put.call_site() and site.endswith(f"{os.path.basename(__file__)}:{line}"), site
+    call, (a, b), method, put = make()
+    here = sys._getframe().f_lineno - 1
+    name = os.path.basename(__file__)
+    frames = call.call_site().split(" | ")
+    assert frames[0] == "(task call) " and 3 <= len(frames) <= 4, frames  # Ray's form: up to 4 entries
+    assert frames[1].endswith(f"{name}:make:{make.__code__.co_firstlineno + 1}"), frames
+    assert frames[2].endswith(f"{name}:test_a_ref_names_the_line_that_made_it_when_ray_records_sites:{here}"), frames
+    assert a.call_site() == b.call_site() == call.call_site(), "each value of a call made on the same line"
+    assert method.call_site().startswith("(actor call)  | ") and put.call_site() == "", "a put has none, as in Ray"
 
 
 def test_a_failed_call_nothing_read_is_reported_at_the_callers_line_as_ray_does():

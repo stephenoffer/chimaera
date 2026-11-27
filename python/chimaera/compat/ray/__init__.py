@@ -25,7 +25,6 @@ from . import _ids, _state
 from ._nodes import available_resources, cluster_resources, nodes
 from ._ids import JobID, TaskID
 from ._remote import ActorClass, ActorHandle, ItemRef, ObjectRefGenerator, PutRef, RemoteFunction, get_actor, make
-from ._remote import stamped as _stamped
 from ._unsupported import ChimaeraCompatWarning, Unsupported, UnsupportedAttribute, unsupported, warn_once
 from .exceptions import GetTimeoutError, reraise
 from .runtime_context import get_runtime_context
@@ -197,7 +196,7 @@ def get(object_refs: Any, *, timeout: float | None = None) -> Any:
 def put(value: Any, *, _owner: Any = None) -> PutRef:
     if _owner is not None:
         warn_once("CHR001", "put(_owner=...)", "ignored: objects belong to the run, not to an actor")
-    return PutRef(_stamped(ch.put(value)), _ids.this_task())
+    return PutRef(ch.put(value), _ids.this_task())
 
 
 def wait(

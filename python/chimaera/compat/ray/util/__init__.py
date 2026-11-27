@@ -56,6 +56,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "ActorPool",
     "collective",
+    "deregister_serializer",
     "get_current_placement_group",
     "get_placement_group",
     "list_named_actors",
@@ -63,6 +64,7 @@ __all__ = [
     "placement_group",
     "placement_group_table",
     "queue",
+    "register_serializer",
     "remove_placement_group",
     "scheduling_strategies",
 ]
