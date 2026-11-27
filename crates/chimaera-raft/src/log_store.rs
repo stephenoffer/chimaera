@@ -16,8 +16,19 @@
 //! end of the commit it queued behind, whose completions bring the next
 //! operations. So no operation waits for company longer than the maximum.
 //! One slow commit on a fast disk (another process's burst of writes) holds
-//! nothing back. Every commit still syncs: holding changes how many
-//! operations share an fsync, never whether they get one.
+//! nothing back. Holding changes how many operations share an fsync, never
+//! whether they get one.
+//!
+//! A `durable` writer (`DiskDurability::Durable`) syncs a batch only when one
+//! of its operations needs it (`Op::optional`). A batch of sync-optional
+//! operations alone is written to the wal without a sync, is not held for
+//! company (it has no fsync to share), completes at once, and is left out of
+//! the timings that set the pace. The next synced batch or checkpoint makes it
+//! durable: a sync covers everything written to the wal before it, so what a
+//! crash keeps is always a prefix of what was written. Under `none`
+//! (`DiskDurability::Process`) the database never syncs, except that a batch
+//! with a vote syncs its file before the vote is acknowledged, so a voter
+//! whose machine restarts cannot vote twice in a term.
 //!
 //! openraft requires appended entries to be readable as soon as `append`
 //! returns, before they are flushed, so each group keeps its unflushed tail in
@@ -26,9 +37,9 @@
 //! followed by a new append at the same index is never clobbered.
 
 use crate::TypeConfig;
-use openraft::OptionalSend;
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 use openraft::type_config::alias::{EntryOf, LogIdOf, VoteOf};
+use openraft::{EntryPayload, OptionalSend};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -70,8 +81,10 @@ pub(crate) fn dec<T: serde::de::DeserializeOwned>(b: &[u8]) -> io::Result<T> {
 
 type Done = tokio::sync::oneshot::Sender<io::Result<()>>;
 
+/// `Append::optional`: the append has entries, and every one is a command that
+/// allows being acknowledged unsynced (`crate::sync_optional`).
 enum Op {
-    Append { group: u32, seq: u64, entries: Vec<(u64, Vec<u8>)>, cb: IOFlushed<TypeConfig> },
+    Append { group: u32, seq: u64, entries: Vec<(u64, Vec<u8>)>, optional: bool, cb: IOFlushed<TypeConfig> },
     Meta { group: u32, key: &'static str, value: Option<Vec<u8>>, done: Done },
     Truncate { group: u32, from: u64, done: Done },
     Purge { group: u32, upto: u64, record: Vec<u8>, done: Done },
@@ -99,6 +112,32 @@ impl Op {
             _ => 16,
         }
     }
+
+    /// Whether a `durable` writer may complete it before it is synced: an
+    /// optional append, or a commit point (a voter that loses one learns it
+    /// again from the leader). Votes, truncations and purges never.
+    fn optional(&self) -> bool {
+        match self {
+            Op::Append { optional, .. } => *optional,
+            Op::Meta { key, .. } => *key == "committed",
+            Op::Truncate { .. } | Op::Purge { .. } => false,
+        }
+    }
+
+    fn is_vote(&self) -> bool {
+        matches!(self, Op::Meta { key: "vote", .. })
+    }
+}
+
+/// Which batches the writer makes durable before completing them.
+pub(crate) enum Syncing {
+    /// Every batch: synced in the wal, or by redb's own commit.
+    All,
+    /// Every batch but one of sync-optional operations only (`DiskDurability::Durable`).
+    Selective,
+    /// A batch with a vote, by syncing this file, the database's, after its
+    /// commit; the database never syncs (`DiskDurability::Process`).
+    Votes(std::fs::File),
 }
 
 /// Unflushed tail of one group: index -> (append seq, encoded entry).
@@ -109,17 +148,26 @@ type Tail = Arc<Mutex<BTreeMap<u64, (u64, Vec<u8>)>>>;
 pub struct DiskStats {
     commits: AtomicU64,
     operations: AtomicU64,
-    /// The last `RECENT` commits: how long each took, how long its oldest
-    /// operation waited from queueing to being on disk, and how long the
-    /// writer meant to hold it open (µs; the scheduler may wake it later).
+    unsynced: AtomicU64,
+    /// The last `RECENT` synced commits: how long each took, how long its
+    /// oldest operation waited from queueing to being on disk, and how long
+    /// the writer meant to hold it open (µs; the scheduler may wake it later).
     recent: Mutex<std::collections::VecDeque<[u32; 3]>>,
+    /// Syncs of the database's file after a batch with a vote (`Syncing::Votes`).
+    #[cfg(test)]
+    pub(crate) vote_syncs: AtomicU64,
 }
 
 /// A summary of [`DiskStats`] over the recent commits.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DiskReport {
+    /// Batches committed with the sync the peer's durability asks for, and
+    /// their operations; the timings below cover these alone.
     pub commits: u64,
     pub operations: u64,
+    /// Batches a `durable` writer wrote without a sync (sync-optional
+    /// operations only), which the next synced batch makes durable.
+    pub unsynced_commits: u64,
     pub commit_p50_us: u32,
     pub commit_p99_us: u32,
     pub wait_p99_us: u32,
@@ -127,7 +175,11 @@ pub struct DiskReport {
 }
 
 impl DiskStats {
-    fn record(&self, ops: usize, took: Duration, waited: Duration, held: Duration) {
+    fn record(&self, ops: usize, synced: bool, took: Duration, waited: Duration, held: Duration) {
+        if !synced {
+            self.unsynced.fetch_add(1, Ordering::Relaxed);
+            return; // its time says nothing about the disk's syncs
+        }
         self.commits.fetch_add(1, Ordering::Relaxed);
         self.operations.fetch_add(ops as u64, Ordering::Relaxed);
         let us = |d: Duration| d.as_micros().min(u128::from(u32::MAX)) as u32;
@@ -150,6 +202,7 @@ impl DiskStats {
         DiskReport {
             commits: self.commits.load(Ordering::Relaxed),
             operations: self.operations.load(Ordering::Relaxed),
+            unsynced_commits: self.unsynced.load(Ordering::Relaxed),
             commit_p50_us: at(&took, 0.5),
             commit_p99_us: at(&took, 0.99),
             wait_p99_us: at(&waited, 0.99),
@@ -174,21 +227,38 @@ pub struct DiskWriter {
     /// each other's entries.
     seq: Arc<std::sync::atomic::AtomicU64>,
     stats: Arc<DiskStats>,
+    #[cfg(test)]
+    pub(crate) wal_synced: Option<Arc<crate::wal::Synced>>,
 }
 
 impl DiskWriter {
     /// Start the writer; a batch is held open at most `max_hold` for company.
-    /// With a `wal`, each batch is synced there and committed to redb unsynced
-    /// (see `crate::wal`); without, each commit syncs redb (or nothing does).
-    pub(crate) fn start(db: Arc<Database>, max_hold: Duration, wal: Option<Wal>) -> io::Result<DiskWriter> {
+    /// With a `wal`, each batch is written there (and synced, as `syncing`
+    /// says) and committed to redb unsynced (see `crate::wal`); without, each
+    /// commit syncs redb (or nothing does).
+    pub(crate) fn start(
+        db: Arc<Database>,
+        max_hold: Duration,
+        wal: Option<Wal>,
+        syncing: Syncing,
+    ) -> io::Result<DiskWriter> {
         let (tx, rx) = mpsc::channel::<(Instant, Op)>();
         let tails: Arc<Mutex<BTreeMap<u32, Tail>>> = Arc::default();
         let stats: Arc<DiskStats> = Arc::default();
         let (t2, s2) = (tails.clone(), stats.clone());
+        #[cfg(test)]
+        let wal_synced = wal.as_ref().map(|w| w.synced.clone());
         std::thread::Builder::new()
             .name("chimaera-raft-disk".into())
-            .spawn(move || run_writer(&db, &rx, &t2, &s2, max_hold, wal))?;
-        Ok(DiskWriter { tx, tails, seq: Arc::default(), stats })
+            .spawn(move || run_writer(&db, &rx, &t2, &s2, max_hold, wal, &syncing))?;
+        Ok(DiskWriter {
+            tx,
+            tails,
+            seq: Arc::default(),
+            stats,
+            #[cfg(test)]
+            wal_synced,
+        })
     }
 
     pub fn stats(&self) -> Arc<DiskStats> {
@@ -213,8 +283,10 @@ fn run_writer(
     stats: &DiskStats,
     max_hold: Duration,
     mut wal: Option<Wal>,
+    syncing: &Syncing,
 ) {
-    let mut recent = [Duration::ZERO; PACE]; // the last commits' durations
+    let selective = matches!(syncing, Syncing::Selective);
+    let mut recent = [Duration::ZERO; PACE]; // the last synced commits' durations
     let (mut last_end, mut last_len, mut commits) = (Instant::now(), 0, 0);
     loop {
         // Idle with batches only in the wal: checkpoint once it is due.
@@ -233,41 +305,43 @@ fn run_writer(
         // queued while the last commit ran (the disk set the pace).
         let company = last_len > 1 || queued < last_end;
         let until = queued.max(last_end) + hold(&recent, company, max_hold);
-        let mut bytes = first.bytes();
-        let mut batch = vec![first];
-        while batch.len() < MAX_BATCH_OPS && bytes < MAX_BATCH_BYTES {
-            let next = match rx.try_recv() {
-                Ok((_, op)) => Some(op),
-                Err(mpsc::TryRecvError::Empty) => match until.checked_duration_since(Instant::now()) {
-                    Some(left) if !left.is_zero() => rx.recv_timeout(left).ok().map(|(_, op)| op),
-                    _ => None,
-                },
-                Err(mpsc::TryRecvError::Disconnected) => None,
-            };
-            let Some(op) = next else { break };
-            bytes += op.bytes();
-            batch.push(op);
-        }
+        let (batch, sync) = gather(rx, first, until, selective);
         let start = Instant::now();
         let ops: Vec<WalOp> = batch.iter().map(Op::wal).collect();
         let result = match wal.as_mut() {
-            // Synced in the wal first: once that returns, the batch is safe;
-            // redb's copy reaches the disk at the next checkpoint.
-            Some(w) => w
-                .append(&ops)
-                .map_err(|e| e.to_string())
-                .and_then(|()| crate::wal::apply(db, &ops, redb::Durability::None).map_err(|e| e.to_string())),
-            None => crate::wal::apply(db, &ops, redb::Durability::Immediate).map_err(|e| e.to_string()),
+            // In the wal first, synced unless nothing in the batch needs it:
+            // once that returns, the batch is safe (or will be with the next
+            // sync); redb's copy reaches the disk at the next checkpoint.
+            Some(w) => {
+                let written = if sync { w.append(&ops) } else { w.write(&ops) };
+                written
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| crate::wal::apply(db, &ops, redb::Durability::None).map_err(|e| e.to_string()))
+            }
+            None => {
+                let durability = if sync { redb::Durability::Immediate } else { redb::Durability::None };
+                let applied = crate::wal::apply(db, &ops, durability).map_err(|e| e.to_string());
+                match syncing {
+                    Syncing::Votes(file) if applied.is_ok() && batch.iter().any(Op::is_vote) => {
+                        #[cfg(test)]
+                        stats.vote_syncs.fetch_add(1, Ordering::Relaxed);
+                        crate::backend::fsync(file).map_err(|e| e.to_string())
+                    }
+                    _ => applied,
+                }
+            }
         };
         let end = Instant::now();
-        recent[commits % PACE] = end - start;
-        commits += 1;
-        stats.record(batch.len(), end - start, end - queued, until.saturating_duration_since(got));
+        if sync {
+            recent[commits % PACE] = end - start;
+            commits += 1;
+        }
+        stats.record(batch.len(), sync, end - start, end - queued, until.saturating_duration_since(got));
         last_len = batch.len();
         for op in batch {
             let r = result.clone().map_err(io_err);
             match op {
-                Op::Append { group, seq, entries, cb } => {
+                Op::Append { group, seq, entries, cb, .. } => {
                     if r.is_ok()
                         && let Some(tail) = tails.lock().expect("tail lock").get(&group).cloned()
                     {
@@ -290,6 +364,33 @@ fn run_writer(
             checkpoint(db, wal.as_mut());
         }
     }
+}
+
+/// The batch `first` begins: what is queued now and, if the batch is to be
+/// synced, what arrives before `until`, so more operations share its sync.
+/// For a `selective` writer a batch of sync-optional operations alone has no
+/// sync to share and goes at once; one that takes an operation needing a sync
+/// waits like any other. Returns the batch and whether to sync it.
+fn gather(rx: &mpsc::Receiver<(Instant, Op)>, first: Op, until: Instant, selective: bool) -> (Vec<Op>, bool) {
+    let needs_sync = |op: &Op| !selective || !op.optional();
+    let mut sync = needs_sync(&first);
+    let mut bytes = first.bytes();
+    let mut batch = vec![first];
+    while batch.len() < MAX_BATCH_OPS && bytes < MAX_BATCH_BYTES {
+        let next = match rx.try_recv() {
+            Ok((_, op)) => Some(op),
+            Err(mpsc::TryRecvError::Empty) if sync => match until.checked_duration_since(Instant::now()) {
+                Some(left) if !left.is_zero() => rx.recv_timeout(left).ok().map(|(_, op)| op),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        let Some(op) = next else { break };
+        sync |= needs_sync(&op);
+        bytes += op.bytes();
+        batch.push(op);
+    }
+    (batch, sync)
 }
 
 /// Persist redb and empty the wal; on failure the wal keeps its records
@@ -321,9 +422,41 @@ impl LogStore {
         let tail = writer.tail(group);
         let store = LogStore { group, db, writer, tail, due: Arc::default(), committed: Arc::default() };
         // A store that cannot read it fails openraft's own read at start.
-        let saved = store.read_meta("committed").ok().flatten().and_then(|b| dec(&b).ok());
+        let saved = store.saved_committed().ok().flatten();
         *store.committed.lock().expect("committed lock") = saved;
         store
+    }
+
+    /// The commit point on disk, but never past the log's last entry. A
+    /// machine's crash can keep the point and lose entries it covers that
+    /// were written before it, neither synced (under `none`); openraft would
+    /// then replay entries it cannot read, and the group would not start.
+    fn saved_committed(&self) -> io::Result<Option<LogIdOf<TypeConfig>>> {
+        let saved: Option<LogIdOf<TypeConfig>> = self.read_meta("committed")?.map(|b| dec(&b)).transpose()?;
+        let Some(committed) = saved else { return Ok(None) };
+        let last = self.log_state()?.last_log_id;
+        if last.is_some_and(|l| l.index >= committed.index) {
+            return Ok(Some(committed));
+        }
+        tracing::warn!(
+            group = self.group,
+            "the saved commit point {committed} is past the log's last entry ({}); the log lost entries it \
+             covered, and the group starts from that entry",
+            last.map_or_else(|| "none".to_string(), |l| l.to_string())
+        );
+        Ok(last)
+    }
+
+    /// The purge point, and the last entry in memory or on disk (or the
+    /// purge point, for a log purged to its end).
+    fn log_state(&self) -> io::Result<LogState<TypeConfig>> {
+        let last_purged: Option<LogIdOf<TypeConfig>> = self.read_meta("purged")?.map(|b| dec(&b)).transpose()?;
+        let tail_last = {
+            let t = self.tail.lock().expect("tail lock");
+            t.values().next_back().map(|(_, e)| dec::<EntryOf<TypeConfig>>(e).map(|e| e.log_id)).transpose()?
+        };
+        let last = tail_last.or(self.last_on_disk()?).or(last_purged);
+        Ok(LogState { last_purged_log_id: last_purged, last_log_id: last })
     }
 
     fn read_meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -425,13 +558,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     type LogReader = LogStore;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, io::Error> {
-        let last_purged: Option<LogIdOf<TypeConfig>> = self.read_meta("purged")?.map(|b| dec(&b)).transpose()?;
-        let tail_last = {
-            let t = self.tail.lock().expect("tail lock");
-            t.values().next_back().map(|(_, e)| dec::<EntryOf<TypeConfig>>(e).map(|e| e.log_id)).transpose()?
-        };
-        let last = tail_last.or(self.last_on_disk()?).or(last_purged);
-        Ok(LogState { last_purged_log_id: last_purged, last_log_id: last })
+        self.log_state()
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -457,7 +584,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogIdOf<TypeConfig>>, io::Error> {
-        self.read_meta("committed")?.map(|b| dec(&b)).transpose()
+        self.saved_committed()
     }
 
     async fn append<I>(&mut self, entries: I, callback: IOFlushed<TypeConfig>) -> Result<(), io::Error>
@@ -466,8 +593,16 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I::IntoIter: OptionalSend,
     {
         let seq = self.writer.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let encoded: Vec<(u64, Vec<u8>)> =
-            entries.into_iter().map(|e| Ok((e.log_id.index, enc(&e)?))).collect::<io::Result<_>>()?;
+        // Blank and membership entries, and commands not marked, need a sync.
+        let mut optional = true;
+        let encoded: Vec<(u64, Vec<u8>)> = entries
+            .into_iter()
+            .map(|e| {
+                optional &= matches!(&e.payload, EntryPayload::Normal(d) if crate::sync_optional(&d.0));
+                Ok((e.log_id.index, enc(&e)?))
+            })
+            .collect::<io::Result<_>>()?;
+        let optional = optional && !encoded.is_empty();
         let bytes: usize = encoded.iter().map(|(_, e)| e.len()).sum();
         self.due.log_bytes.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
         {
@@ -478,7 +613,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         }
         self.writer
             .tx
-            .send((Instant::now(), Op::Append { group: self.group, seq, entries: encoded, cb: callback }))
+            .send((Instant::now(), Op::Append { group: self.group, seq, entries: encoded, optional, cb: callback }))
             .map_err(|_| io_err("raft disk writer stopped"))
     }
 
@@ -530,5 +665,42 @@ mod tests {
         assert_eq!(hold(&volume, true, Duration::ZERO), Duration::ZERO);
         // An operation with no company is never held.
         assert_eq!(hold(&volume, false, max), Duration::ZERO);
+    }
+
+    /// A batch waits for company only when it will be synced: one of
+    /// sync-optional operations alone goes at once, with whatever is queued;
+    /// a vote's waits until `until`, as does one that began optional and took
+    /// a vote from the queue. A writer that syncs every batch waits as before.
+    #[test]
+    fn only_a_batch_that_will_be_synced_waits_for_company() {
+        let optional =
+            || Op::Append { group: 1, seq: 0, entries: vec![(1, vec![])], optional: true, cb: IOFlushed::noop() };
+        let vote = || Op::Meta { group: 1, key: "vote", value: Some(vec![]), done: tokio::sync::oneshot::channel().0 };
+        let (tx, rx) = mpsc::channel();
+        let queue = |op| tx.send((Instant::now(), op)).unwrap();
+        let (never, wait) = (Duration::from_secs(20), Duration::from_millis(200));
+        let gathered = |first, wait: Duration, selective| {
+            let t = Instant::now();
+            let (batch, sync) = gather(&rx, first, t + wait, selective);
+            (batch.len(), sync, t.elapsed())
+        };
+
+        queue(optional());
+        let (len, sync, took) = gathered(optional(), never, true);
+        assert_eq!((len, sync), (2, false));
+        assert!(took < never, "an unsynced batch waited {took:?} for company");
+
+        let (len, sync, took) = gathered(vote(), wait, true);
+        assert_eq!((len, sync), (1, true));
+        assert!(took >= wait, "a vote's batch went after {took:?}, before its hold ended");
+
+        queue(vote());
+        let (len, sync, took) = gathered(optional(), wait, true);
+        assert_eq!((len, sync), (2, true));
+        assert!(took >= wait, "a batch that took a vote went after {took:?}, before its hold ended");
+
+        let (len, sync, took) = gathered(optional(), wait, false);
+        assert_eq!((len, sync), (1, true));
+        assert!(took >= wait, "a writer that syncs everything stopped holding batches ({took:?})");
     }
 }

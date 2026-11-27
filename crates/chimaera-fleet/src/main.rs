@@ -144,7 +144,8 @@ impl Ledger {
 
     fn apply(&mut self, v: u16, body: pb::shard_cmd::Body) -> pb::ShardReply {
         self.hlc += 1;
-        let cmd = pb::ShardCmd { vshard: v as u32, vshard_epoch: 1, issuer: None, hlc: self.hlc, body: Some(body) };
+        let cmd =
+            pb::ShardCmd { vshard: v as u32, vshard_epoch: 1, hlc: self.hlc, body: Some(body), ..Default::default() };
         let t = Instant::now();
         let out = self.sm.apply(&mut self.kv, &cmd);
         self.cpu_s += t.elapsed().as_secs_f64();

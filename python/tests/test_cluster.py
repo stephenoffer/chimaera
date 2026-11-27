@@ -567,10 +567,12 @@ print("SUM", sum(ch.get((add.remote(i, i) for i in range(50)), timeout=60)))
 
 
 @pytest.mark.slow
-def test_an_unsynced_peer_whose_machine_rebooted_rejoins_as_a_new_member(monkeypatch):
-    # Without fsync a voter's log lives in the page cache: after a reboot it
-    # may have forgotten its vote, so it must not vote again under its old id.
-    monkeypatch.setenv("CHIMAERA_RAFT_SYNC", "none")
+@pytest.mark.parametrize("sync", ["none", "durable"])
+def test_an_unsynced_peer_whose_machine_rebooted_rejoins_as_a_new_member(monkeypatch, sync):
+    # Without fsync a voter's log lives in the page cache (with `durable`, an
+    # attached run's calls do): after a reboot it may have forgotten them, so
+    # it must not vote again under its old id.
+    monkeypatch.setenv("CHIMAERA_RAFT_SYNC", sync)
     c = Cluster(3, spares=1)
     add = """
 import chimaera as ch
@@ -666,13 +668,47 @@ def status(c: Cluster, i: int) -> dict:
     return json.loads(out.stdout)
 
 
+def settled(c: Cluster, i: int, timeout: float = 30) -> dict:
+    """Peer i's status once it knows every group's voters: until then it
+    reports a group as `process` ("no voters known"), whatever they give."""
+    deadline = time.monotonic() + timeout
+    while True:
+        s = status(c, i)
+        unknown = any(d.endswith("no voters known") for d in s["durability"]["degraded"])
+        if not unknown or time.monotonic() > deadline:
+            return s
+        time.sleep(0.2)
+
+
 def test_synced_peers_on_separate_machines_give_machine_durability(three):
-    s = status(three, 1)
+    # The default, fsync, syncs every commit, an attached run's calls included.
+    s = settled(three, 1)
+    assert any(a.startswith("raft sync fsync (the default)") for a in s["automatic"]), s["automatic"]
     assert s["durability"]["requested"] == "machine", s["durability"]
     assert s["durability"]["effective"] == "machine", s["durability"]
+    assert s["durability"]["calls"] == "machine", s["durability"]
     assert s["groups"] and all(g["durability"] == "machine" for g in s["groups"]), s["groups"]
+    assert all(g["calls_durability"] == "machine" for g in s["groups"]), s["groups"]
     # A slow disk may degrade service here; no group falls short of what was asked.
     assert not [d for d in s["durability"]["degraded"] if d.startswith("group")], s["durability"]
+
+
+def test_a_peer_that_syncs_every_commit_says_a_durable_voter_gives_attached_calls_less():
+    # Peers 0 and 1 sync every commit; peer 2, durable, votes in every group
+    # and acknowledges an attached run's calls before syncing them.
+    c = Cluster(3, env={2: {"CHIMAERA_RAFT_SYNC": "durable"}})
+    try:
+        synced, durable = settled(c, 0), settled(c, 2)
+        for s in (synced, durable):
+            assert s["durability"]["requested"] == "machine", s["durability"]
+            assert s["durability"]["effective"] == "machine", s["durability"]
+            assert s["durability"]["calls"] == "replicated-memory", s["durability"]
+        why = [d for d in synced["durability"]["degraded"] if d.startswith("group")]
+        assert len(why) == len(synced["groups"]), synced["durability"]
+        assert all(f"{c.addrs[2]} acknowledges an attached run's calls before syncing them" in d for d in why), why
+        assert not [d for d in durable["durability"]["degraded"] if d.startswith("group")], "it asked no more"
+    finally:
+        c.close()
 
 
 def test_a_group_with_a_voter_that_does_not_sync_reports_process_durability_only():
@@ -682,12 +718,14 @@ def test_a_group_with_a_voter_that_does_not_sync_reports_process_durability_only
     # restarts. No group may claim to survive a machine's loss.
     c = Cluster(3, env={2: {"CHIMAERA_RAFT_SYNC": "none"}})
     try:
-        synced, unsynced = status(c, 0), status(c, 2)
+        synced, unsynced = settled(c, 0), settled(c, 2)
         assert synced["durability"]["requested"] == "machine", synced["durability"]
         assert unsynced["durability"]["requested"] == "process", unsynced["durability"]
         for s in (synced, unsynced):
             assert s["durability"]["effective"] == "process", s["durability"]
+            assert s["durability"]["calls"] == "process", s["durability"]
             assert s["groups"] and all(g["durability"] == "process" for g in s["groups"]), s["groups"]
+            assert all(g["calls_durability"] == "process" for g in s["groups"]), s["groups"]
         why = [d for d in synced["durability"]["degraded"] if d.startswith("group")]
         assert len(why) == len(synced["groups"]), synced["durability"]
         assert all(f"{c.addrs[2]} keeps its raft log in the page cache" in d for d in why), why

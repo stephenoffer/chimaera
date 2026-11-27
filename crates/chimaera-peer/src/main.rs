@@ -836,12 +836,14 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
                     "applied": g.applied,
                     "max_lag": g.leading.then_some(g.max_lag),
                     "durability": g.durability,
+                    "calls_durability": g.calls_durability,
                 })).collect::<Vec<_>>(),
                 "leaderless_groups": leaderless(&s),
                 "durability": {
                     "requested": s.durability_requested,
                     "effective": s.durability_effective,
                     "degraded": s.durability_degraded,
+                    "calls": s.durability_calls,
                 },
             })
         );
@@ -869,6 +871,18 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
             "  durability: commits survive a {} loss (asked for: {})",
             s.durability_effective, s.durability_requested
         );
+        let calls = match s.durability_calls.as_str() {
+            "" => None,
+            "replicated-memory" => Some(
+                "replicated-memory: in memory on a majority of each group's voters, so they survive the \
+                 restart or loss of machines holding fewer than half of them, not a majority restarting together"
+                    .to_string(),
+            ),
+            c => Some(format!("survive a {c} loss")),
+        };
+        if let Some(calls) = calls {
+            println!("    an attached run's calls: {calls}");
+        }
         for d in &s.durability_degraded {
             println!("    degraded: {d}");
         }
@@ -929,8 +943,13 @@ async fn status(mut c: Client, json: bool) -> Result<u8, String> {
                     (false, addr) => format!("leader {addr}"),
                 };
                 let name = if g.group == 0 { "0 (directory)".to_string() } else { g.group.to_string() };
+                let calls = match g.calls_durability.as_str() {
+                    "" => String::new(),
+                    c if c == g.durability => String::new(),
+                    c => format!(", an attached run's calls: {c}"),
+                };
                 println!(
-                    "    {name} · {leader} · {} voters · log {}, applied {} · survives a {} loss",
+                    "    {name} · {leader} · {} voters · log {}, applied {} · survives a {} loss{calls}",
                     g.voters, g.last_log, g.applied, g.durability
                 );
             }

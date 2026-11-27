@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The groups the divergence hook has been called with, in this process.
-fn divergences() -> &'static Mutex<Vec<u32>> {
+pub(super) fn divergences() -> &'static Mutex<Vec<u32>> {
     static SEEN: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
     SEEN.get_or_init(|| {
         set_divergence_hook(|g| divergences().lock().unwrap().push(g));
@@ -22,7 +22,7 @@ fn divergences() -> &'static Mutex<Vec<u32>> {
     })
 }
 
-fn diverged(group: u32) -> usize {
+pub(super) fn diverged(group: u32) -> usize {
     divergences().lock().unwrap().iter().filter(|g| **g == group).count()
 }
 
@@ -79,11 +79,11 @@ impl Transport for Partition {
     }
 }
 
-fn node(net: &LocalNet, id: NodeId) -> Group {
+pub(super) fn node(net: &LocalNet, id: NodeId) -> Group {
     net.nodes.lock().unwrap().get(&id).cloned().unwrap()
 }
 
-async fn wait_applied(net: &LocalNet, ids: &[NodeId], index: u64) {
+pub(super) async fn wait_applied(net: &LocalNet, ids: &[NodeId], index: u64) {
     for _ in 0..800 {
         if ids.iter().all(|id| node(net, *id).stats().applied >= index) {
             return;
@@ -93,7 +93,7 @@ async fn wait_applied(net: &LocalNet, ids: &[NodeId], index: u64) {
     panic!("not every one of {ids:?} applied index {index}");
 }
 
-async fn leader_among(net: &LocalNet, ids: &[NodeId]) -> Group {
+pub(super) async fn leader_among(net: &LocalNet, ids: &[NodeId]) -> Group {
     for _ in 0..800 {
         for id in ids {
             let g = node(net, *id);
@@ -106,7 +106,7 @@ async fn leader_among(net: &LocalNet, ids: &[NodeId]) -> Group {
     panic!("none of {ids:?} became the leader");
 }
 
-async fn propose_among(net: &LocalNet, ids: &[NodeId], c: &pb::ShardCmd) {
+pub(super) async fn propose_among(net: &LocalNet, ids: &[NodeId], c: &pb::ShardCmd) {
     for _ in 0..100 {
         if leader_among(net, ids).await.propose(c).await.is_ok() {
             return;
@@ -116,7 +116,12 @@ async fn propose_among(net: &LocalNet, ids: &[NodeId], c: &pb::ShardCmd) {
     panic!("{ids:?} could not commit");
 }
 
-async fn reopen(dir: &Path, id: NodeId, transport: Arc<dyn Transport>, durability: DiskDurability) -> RaftHost {
+pub(super) async fn reopen(
+    dir: &Path,
+    id: NodeId,
+    transport: Arc<dyn Transport>,
+    durability: DiskDurability,
+) -> RaftHost {
     for _ in 0..200 {
         if let Ok((host, rx)) = RaftHost::open(dir, id, transport.clone(), durability) {
             std::mem::forget(rx);
@@ -127,7 +132,7 @@ async fn reopen(dir: &Path, id: NodeId, transport: Arc<dyn Transport>, durabilit
     panic!("{} stayed locked", dir.display());
 }
 
-fn copy_dir(from: &Path, to: &Path) {
+pub(super) fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for e in std::fs::read_dir(from).unwrap().flatten() {
         let (src, dst) = (e.path(), to.join(e.file_name()));

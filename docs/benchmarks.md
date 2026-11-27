@@ -188,7 +188,9 @@ three peers with Raft. At commit 933f9a2, a peer whose disk took a
 millisecond or more per fsync (these EBS volumes took about 3.5 ms) kept
 each call's record in memory on those three machines instead of syncing it;
 Ray's control plane does not fsync either. Later commits sync every record
-by default: set `CHIMAERA_RAFT_SYNC=none` to measure them the same way. The
+by default. `CHIMAERA_RAFT_SYNC=durable` keeps an attached run's per-call
+records in memory on those three machines, as at 933f9a2, and syncs
+everything else; `CHIMAERA_RAFT_SYNC=none` keeps every record in memory. The
 one-machine runs use the default of their commit.
 
 **Raw data.** Every result named on this page is in

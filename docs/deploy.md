@@ -45,25 +45,41 @@ when the match is unique; IP addresses only match exactly.
 Ports: 7700, or `CHIMAERA_PORT`. Under Slurm the default is
 `7700 + SLURM_JOB_ID % 1000`, so two jobs sharing a node don't collide.
 
-Raft durability: every cluster peer syncs each Raft commit to its disk, so a
-call is acknowledged once a majority of its group's voters have it on disk.
-`CHIMAERA_RAFT_SYNC=none` keeps commits in the page cache only, and only when
-set: a commit then survives the peers' processes dying, not a majority of
-their machines restarting together. It buys throughput on slow volumes (on 4
-cloud machines with EBS, about 3.5 ms per fsync: 2,681 no-op calls/s synced,
-17,547/s with `none`, measured before commits were batched as below). A slow
-disk never lowers the setting. While its commits keep taking a millisecond or
-more, a peer holds each one open for a quarter of a recent commit (at most
-`CHIMAERA_RAFT_MAX_COMMIT_DELAY_US`, 2 ms) so more entries share its fsync,
-and `chimaera status` lists the slow disk as degraded service. `full` also
-flushes the drive cache (very slow on macOS).
+Raft durability: by default (`CHIMAERA_RAFT_SYNC=fsync`) a cluster peer
+syncs each Raft commit to its disk before acknowledging it. With
+`CHIMAERA_RAFT_SYNC=durable` it does so for every commit except an attached
+run's per-call commits: its calls' submissions, grants and results. Those are
+acknowledged once a majority of the group's voters hold them in memory. They
+survive the peers' processes dying and the restart or loss of machines holding
+fewer than half of a group's voters; the last of them are lost if machines
+holding a majority of a group's voters lose power together. The calls of an
+attached run that must survive anyway are synced: those with
+`effects="external"`, a durable actor's calls, durable workflows and their
+steps, gang ranks and reservation hosts, and calls that return a `retained`
+value. So is everything else: detached runs, the store, leases, quotas and
+membership. A driver older than the release that added `durable` does not
+mark its durable workflow's root call, so under `durable` that one commit (not
+its steps) is acknowledged from memory. `CHIMAERA_RAFT_SYNC=none` keeps every
+commit in the page cache only, and only when set: a commit then survives the
+peers' processes dying, not a majority of their machines restarting together.
+It buys throughput on slow volumes (on 4 cloud machines with EBS, about 3.5 ms
+per fsync: 2,681 no-op calls/s synced, 17,547/s with `none`, measured before
+commits were batched as below). A slow disk never lowers the setting. While
+its commits keep taking a millisecond or more, a peer holds each one open for
+a quarter of a recent commit (at most `CHIMAERA_RAFT_MAX_COMMIT_DELAY_US`,
+2 ms) so more entries share its fsync, and `chimaera status` lists the slow disk
+as degraded service. `full` also flushes the drive cache (very slow on macOS).
 
 What is synced, and how often:
 - **The log.** A syncing peer appends each batch of Raft operations to a
   write-ahead file (`raft/raft-log.wal`) and syncs that: one sequential write.
   Its database takes the batch unsynced and is synced by a checkpoint every
   second, after which the file starts over; at start, what the file holds is
-  applied again.
+  applied again. Under `durable`, a batch made only of attached runs'
+  per-call commands is written there without a sync, and the next synced
+  batch or checkpoint makes it durable; every other batch is synced before
+  it is acknowledged. Under `none` the log's database is never synced, except
+  after a vote, so a restarted voter cannot vote twice in one term.
 - **The state.** The state machine's database (`raft/raft-sm.redb`) is not
   synced as the peer runs: it is the log applied, and the log and snapshot
   files are synced. After the machine restarts without a clean stop, the peer
@@ -82,22 +98,27 @@ give: `machine` (every voter syncs and no machine holds a majority of a
 group's voters, so a commit survives the loss of any one machine and every
 machine restarting at once), `reboot` (every voter syncs, but one machine
 holds a majority: restarts are survived, that machine's loss is not) or
-`process` (some voter does not sync). A group is only as strong as its
-weakest voter, since a majority that includes it can acknowledge a commit,
-and status names the voter that holds a group back. Dead voters are
-replaced, and seats moved, only with peers that sync as the leader asks.
+`process` (some voter does not sync). Next to it, `calls` is what an attached
+run's per-call commits survive: the same where every voter syncs every commit,
+`replicated-memory` where a `durable` voter acknowledges them from memory
+(fewer than half of a group's voters restarting or lost is survived, a
+majority restarting together is not), and `process` where in addition one
+machine holds a majority of a group's voters. A group is only as strong as its
+weakest voter, since a majority that includes it can acknowledge a commit, and
+status names the voter that holds a group back. Dead voters are replaced, and
+seats moved, only with peers that sync as the leader asks.
 
-A peer whose logs were not synced and whose machine rebooted without a clean
-shutdown first asks the other voters of its groups whether they still lead
-them (for up to 10 seconds). If they do, it discards its raft identity and
-joins as a new member, so it can never vote with a log it may have lost. If
-some group has no leader (most of its machines went down together), it keeps
-its state instead, so the group comes back when enough of its voters return,
-possibly without its last moments of commits. A peer whose groups have no
-majority yet still starts and serves the groups that do; the others are
-retried in the background. Local peers never sync, except that the record of
-an `effects="external"` call starting is synced before the call runs, so a
-power loss cannot make it run twice.
+A peer whose logs were not all synced (`durable` or `none`) and whose machine
+rebooted without a clean shutdown first asks the other voters of its groups
+whether they still lead them (for up to 10 seconds). If they do, it discards
+its raft identity and joins as a new member, so it can never vote with a log
+it may have lost. If some group has no leader (most of its machines went down
+together), it keeps its state instead, so the group comes back when enough of
+its voters return, possibly without its last moments of commits. A peer whose
+groups have no majority yet still starts and serves the groups that do; the
+others are retried in the background. Local peers never sync, except that the
+record of an `effects="external"` call starting is synced before the call
+runs, so a power loss cannot make it run twice.
 
 Recovering a group whose other voters are gone for good (their disks lost):
 stop the surviving peer, then run
@@ -110,25 +131,28 @@ and on the surviving replica that holds the most of the group's log.
 Upgrading: `chimaera --version` prints the release and its peer level, for
 example `chimaera 0.1.0 (peer level 1, wire 1, build dev-487df68cf4ccb0f2)`.
 Every replica of a group must apply its log with the same code, so peers at
-different levels refuse each other's calls (the refused peer logs "every
-peer of a cluster must run the same release"). A release that keeps the
-level can replace peers one at a time: restart a peer, wait for
-`chimaera status` to list it, then the next. A peer still on a release that
-does not say whether it syncs its raft log counts as not syncing, so until
-the last one is replaced, upgraded peers that sync give it no voter seat and
-may move its seats to each other, and each group it votes in reports `process`
-durability with a degraded line. Likewise, while a peer on a release too old
-to say which stored layouts it reads is live, shuffles store their buckets in
-the layout every release reads, so any peer can run any gather. Under Kubernetes,
-`kubectl apply` the new image, then `kubectl delete pod NAME-N`
-one pod at a time, since the StatefulSet only replaces pods you delete. A
-release that raises the level needs every peer stopped before any starts
-again on the new release (`kubectl scale --replicas=0`, then back). Raft
-state and peer identities stay on disk across a clean stop, so detached runs
-and named actors' records survive; calls running at the stop are interrupted
-as in any whole-cluster restart. Drivers are checked separately: a peer
-refuses a driver whose wire version is newer than its own, so upgrade peers
-before drivers.
+different levels refuse each other's calls (the refused peer logs "every peer
+of a cluster must run the same release"). A release that keeps the level can
+replace peers one at a time: restart a peer, wait for `chimaera status` to
+list it, then the next. A peer still on a release that does not say whether it
+syncs its raft log counts as not syncing, so until the last one is replaced,
+upgraded peers that sync give it no voter seat and may move its seats to each
+other, and each group it votes in reports `process` durability with a degraded
+line. A `durable` peer tells the others it syncs, which holds for every commit
+that must survive, plus that it acknowledges an attached run's calls from
+memory, which an older peer does not read: an older leader seats it as a
+voter, and an older peer's status shows no `calls` class. Likewise, while a
+peer on a release too old to say which stored layouts it reads is live,
+shuffles store their buckets in the layout every release reads, so any peer
+can run any gather. Under Kubernetes, `kubectl apply` the new image, then
+`kubectl delete pod NAME-N` one pod at a time, since the StatefulSet only
+replaces pods you delete. A release that raises the level needs every peer
+stopped before any starts again on the new release
+(`kubectl scale --replicas=0`, then back). Raft state and peer identities stay on disk across
+a clean stop, so detached runs and named actors' records survive; calls
+running at the stop are interrupted as in any whole-cluster restart. Drivers
+are checked separately: a peer refuses a driver whose wire version is newer
+than its own, so upgrade peers before drivers.
 
 Under `auto`, two flags keep the meaning they had before providers existed:
 `--listen` means a hand-configured (`static`) peer, and `--idle-timeout`

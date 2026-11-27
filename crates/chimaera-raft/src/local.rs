@@ -474,7 +474,7 @@ mod tests {
     use std::time::Duration;
 
     fn cmd(body: pb::shard_cmd::Body) -> pb::ShardCmd {
-        pb::ShardCmd { vshard: 3, vshard_epoch: 1, issuer: None, hlc: 1, body: Some(body) }
+        pb::ShardCmd { vshard: 3, vshard_epoch: 1, issuer: None, hlc: 1, body: Some(body), sync_optional: false }
     }
 
     fn submit(i: u64) -> pb::ShardCmd {

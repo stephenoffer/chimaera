@@ -11,6 +11,7 @@ use std::time::Duration;
 
 mod diverge;
 mod restore;
+mod selective;
 
 struct Builder;
 
@@ -21,7 +22,7 @@ impl openraft::testing::log::StoreBuilder<TypeConfig, LogStore, StateMachine, te
         let sm_db = Arc::new(Database::create(dir.path().join("sm.redb")).unwrap());
         create_tables(&log_db, &sm_db).unwrap();
         std::fs::create_dir_all(dir.path().join("snap")).unwrap();
-        let writer = DiskWriter::start(log_db.clone(), MAX_COMMIT_DELAY, None).unwrap();
+        let writer = DiskWriter::start(log_db.clone(), MAX_COMMIT_DELAY, None, log_store::Syncing::All).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1 << 16);
         std::mem::forget(rx); // the suite never reads events; keep sends from failing
         let log = LogStore::new(7, log_db, writer);
@@ -40,7 +41,7 @@ fn members(ids: &[NodeId]) -> BTreeMap<NodeId, BasicNode> {
 }
 
 fn cmd(v: u16, body: pb::shard_cmd::Body) -> pb::ShardCmd {
-    pb::ShardCmd { vshard: v as u32, vshard_epoch: 1, issuer: None, hlc: 1, body: Some(body) }
+    pb::ShardCmd { vshard: v as u32, vshard_epoch: 1, issuer: None, hlc: 1, body: Some(body), sync_optional: false }
 }
 
 fn run_id(v: u16) -> Id {
@@ -296,7 +297,7 @@ async fn reads_racing_flushes_never_see_a_gap() {
     let log_db = Arc::new(open_db(&dir.path().join("log.redb"), DiskDurability::Process, DEFAULT_CACHE_BYTES).unwrap());
     let sm_db = Arc::new(open_db(&dir.path().join("sm.redb"), DiskDurability::Process, DEFAULT_CACHE_BYTES).unwrap());
     create_tables(&log_db, &sm_db).unwrap();
-    let writer = DiskWriter::start(log_db.clone(), MAX_COMMIT_DELAY, None).unwrap();
+    let writer = DiskWriter::start(log_db.clone(), MAX_COMMIT_DELAY, None, log_store::Syncing::All).unwrap();
     let mut log = LogStore::new(3, log_db, writer);
     let last = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -857,7 +858,7 @@ async fn closed_loop(clients: u32, sync: Duration, max_hold: Duration, run: Dura
     txn.open_table(log_store::LOG_META).unwrap();
     txn.commit().unwrap();
     let wal = with_wal.then(|| wal::Wal::recover(&db, &dir.path().join("log.wal"), false).unwrap().0);
-    let writer = DiskWriter::start(db.clone(), max_hold, wal).unwrap();
+    let writer = DiskWriter::start(db.clone(), max_hold, wal, log_store::Syncing::All).unwrap();
     let stats = writer.stats();
     let before = syncs.load(std::sync::atomic::Ordering::Relaxed);
     let t0 = std::time::Instant::now();

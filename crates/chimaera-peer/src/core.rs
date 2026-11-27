@@ -1425,7 +1425,9 @@ impl Core {
         let keys: Vec<(Option<Tk>, u32)> =
             entries.iter().map(|e| (e.task.as_ref().and_then(Tk::parse), e.attempt)).collect();
         tokio::spawn(async move {
-            let reply = router.propose(v, pb::shard_cmd::Body::Publish(pb::PublishResults { entries })).await;
+            let unsynced = crate::sync_class::publish(&router, v, &entries);
+            let body = pb::shard_cmd::Body::Publish(pb::PublishResults { entries });
+            let reply = router.propose_opt(v, body, unsynced).await;
             let at = now_ns();
             let published = match reply {
                 Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(t)) }) => keys
@@ -1455,8 +1457,9 @@ impl Core {
         in_flight.fetch_add(1, Relaxed);
         tokio::spawn(async move {
             let tasks: Vec<Tk> = grants.iter().filter_map(|g| g.task.as_ref().and_then(Tk::parse)).collect();
-            let again: Vec<Tk> = match router.propose(v, pb::shard_cmd::Body::Grant(pb::GrantAttempts { grants })).await
-            {
+            let unsynced = crate::sync_class::grants(&router, v, &grants);
+            let body = pb::shard_cmd::Body::Grant(pb::GrantAttempts { grants });
+            let again: Vec<Tk> = match router.propose_opt(v, body, unsynced).await {
                 Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(t)) }) => t
                     .acks
                     .iter()
@@ -2428,6 +2431,7 @@ impl Core {
     fn accept_remote(&mut self, rw: pb::RemoteWork) {
         let Some(tk) = rw.task.as_ref().and_then(Tk::parse) else { return };
         let attempt = rw.attempt;
+        self.router.known.note_remote(&rw);
         let known = self.localizing.contains(&(tk, attempt))
             || self.queue.any_for(&tk, |w| w.tk == tk && w.attempt == attempt)
             || (self.batched.contains_key(&tk)
@@ -6833,6 +6837,7 @@ impl Core {
             .iter()
             .map(|g| {
                 let s = g.stats();
+                let (must, calls) = crate::durability::group(&self.router, &s.voters);
                 pb::GroupStatus {
                     group: g.id,
                     leader: s.leader.map(addr).unwrap_or_default(),
@@ -6841,7 +6846,8 @@ impl Core {
                     applied: s.applied,
                     leading: s.leader == Some(self.router.node_id()),
                     max_lag: s.max_lag.unwrap_or(0),
-                    durability: crate::durability::group(&self.router, &s.voters).0.name().into(),
+                    durability: must.name().into(),
+                    calls_durability: calls.name().into(),
                 }
             })
             .collect()
@@ -6940,9 +6946,10 @@ impl Core {
             nodes: self.nodes(),
             groups: self.group_status(),
             data_groups: if self.router.is_cluster() { self.router.data_groups().count() as u32 } else { 0 },
-            durability_requested: durability.0.name().into(),
-            durability_effective: durability.1.name().into(),
-            durability_degraded: durability.2,
+            durability_requested: durability.requested.name().into(),
+            durability_effective: durability.effective.name().into(),
+            durability_calls: durability.calls.name().into(),
+            durability_degraded: durability.degraded,
             objects: Vec::new(), // filled by the ingress when asked (StatusRequest.objects)
             automatic: vec![
                 self.budget.describe(),

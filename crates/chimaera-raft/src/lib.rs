@@ -15,6 +15,7 @@ mod restore;
 mod settle;
 mod snapshot_file;
 mod state_machine;
+mod sync_class;
 mod wal;
 
 pub use log_store::{DiskReport, DiskStats, DiskWriter, LogStore, MAX_COMMIT_DELAY, SLOW_COMMIT};
@@ -24,6 +25,7 @@ pub use recover::force_single_voter;
 pub use restore::{Backed, Restored, backup, restore};
 pub use settle::settle_files;
 pub use state_machine::{GroupEvents, GroupRead, StateMachine, mark_state_machine_clean};
+pub use sync_class::sync_optional;
 
 use chimaera_core::kv::KvRead;
 use chimaera_core::pb;
@@ -113,6 +115,12 @@ pub enum DiskDurability {
     Os,
     /// No sync: survives the peer process dying, not the machine. Local peers.
     Process,
+    /// Plain `fsync` for every batch except one made only of entries whose
+    /// command allows it ([`sync_optional`]: an attached run's per-call
+    /// commands), which is written without a sync and becomes durable with the
+    /// next synced batch. Votes, membership changes, truncations, purges and
+    /// every other command are synced before they are acknowledged.
+    Durable,
 }
 
 /// redb's own page cache size, for a database with no tighter budget.
@@ -123,7 +131,9 @@ fn open_db(path: &Path, durability: DiskDurability, cache_bytes: usize) -> io::R
     builder.set_cache_size(cache_bytes);
     let db = match durability {
         DiskDurability::Full => builder.create(path),
-        DiskDurability::Os => builder.create_with_backend(backend::OsSyncBackend::open(path, true)?),
+        DiskDurability::Os | DiskDurability::Durable => {
+            builder.create_with_backend(backend::OsSyncBackend::open(path, true)?)
+        }
         DiskDurability::Process => builder.create_with_backend(backend::OsSyncBackend::open(path, false)?),
     };
     db.map_err(log_store::io_err)
@@ -202,7 +212,15 @@ impl RaftHost {
             .ok()
             .and_then(|v| v.parse().ok())
             .map_or(MAX_COMMIT_DELAY, std::time::Duration::from_micros);
-        let writer = DiskWriter::start(log_db.clone(), max_hold, wal)?;
+        let syncing = match durability {
+            DiskDurability::Full | DiskDurability::Os => log_store::Syncing::All,
+            DiskDurability::Durable => log_store::Syncing::Selective,
+            // The database never syncs; a vote syncs its file.
+            DiskDurability::Process => {
+                log_store::Syncing::Votes(std::fs::File::options().read(true).write(true).open(&log_path)?)
+            }
+        };
+        let writer = DiskWriter::start(log_db.clone(), max_hold, wal, syncing)?;
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
         let host = RaftHost {
             node_id,

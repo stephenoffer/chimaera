@@ -480,6 +480,9 @@ struct CallSpec {
     /// A durable workflow's call, described (JSON) for a replay that diverges.
     #[pyo3(item, default)]
     workflow_step: String,
+    /// The root call of a durable workflow (TaskSpec.durable_workflow).
+    #[pyo3(item, default)]
+    durable_workflow: bool,
 }
 
 impl CallSpec {
@@ -537,6 +540,7 @@ impl CallSpec {
                 .transpose()?,
             direct: self.direct,
             workflow_step: self.workflow_step,
+            durable_workflow: self.durable_workflow,
         })
     }
 }

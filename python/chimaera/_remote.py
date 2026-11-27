@@ -260,6 +260,8 @@ def build_call(
     }
     if stream:
         spec["stream"] = True
+    if getattr(target, "__chimaera_workflow__", False):
+        spec["durable_workflow"] = True  # must survive, like its steps, even in an attached run
     if ctx is not None and ctx.workflow and not durable:
         # What this step asks for, and how to show it: a replay asking for
         # something else diverged (`shown`: the call a ch.durable helper makes).

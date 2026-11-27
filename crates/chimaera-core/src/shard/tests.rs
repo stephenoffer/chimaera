@@ -66,7 +66,14 @@ impl Harness {
     /// trip. Returns replica A's result.
     fn raw(&mut self, body: Body, v: u16) -> Applied {
         self.hlc += 1;
-        let cmd = pb::ShardCmd { vshard: v as u32, vshard_epoch: EPOCH, issuer: None, hlc: self.hlc, body: Some(body) };
+        let cmd = pb::ShardCmd {
+            vshard: v as u32,
+            vshard_epoch: EPOCH,
+            issuer: None,
+            hlc: self.hlc,
+            body: Some(body),
+            ..Default::default()
+        };
         let a = self.sm.apply(&mut self.a, &cmd);
         let wire = pb::ShardCmd::decode(cmd.encode_to_vec().as_slice()).unwrap();
         let b = self.sm.apply(&mut self.b, &wire);
@@ -931,6 +938,7 @@ fn envelope_rejects_unowned_stale_and_retired() {
         issuer: issuer.map(peer_pb),
         hlc: 100,
         body: Some(Body::Release(pb::Release { tasks: vec![] })),
+        ..Default::default()
     };
     let rej = |a: Applied| matches!(a.reply.body, Some(pb::shard_reply::Body::Rejected(_)));
     assert!(rej(h.sm.apply(&mut h.a, &cmd(9, EPOCH, None))));

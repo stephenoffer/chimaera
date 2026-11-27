@@ -17,8 +17,8 @@ compute_config:
 working_dir: .
 excludes: [".git", "target", ".venv", ".venv-bench", "__pycache__", "*.pyc", "*.so", "results", "dist"]
 entrypoint: bash deploy/anyscale/run_eval_multi.sh
-# Peers choose raft sync from their disk's measured fsync latency (the
-# forced-fsync comparison is in docs/qualification.md).
+# Peers use the default raft sync, fsync: every commit is synced before it
+# is acknowledged (docs/configuration.md, CHIMAERA_RAFT_SYNC).
 env_vars:
   # Timed repetitions per workload after a warm-up (the job's hour bounds it).
   EVAL_MIN_SECONDS: "60"

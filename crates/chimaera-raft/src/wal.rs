@@ -103,6 +103,18 @@ pub(crate) struct Wal {
     at: u64,
     written: u64,
     since: Instant,
+    #[cfg(test)]
+    pub(crate) synced: std::sync::Arc<Synced>,
+}
+
+/// How far the file is synced, for tests that stand in for a machine losing
+/// its power: the records before `to` survive it, the ones up to `end` may not.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct Synced {
+    pub(crate) to: std::sync::atomic::AtomicU64,
+    pub(crate) end: std::sync::atomic::AtomicU64,
+    pub(crate) checkpoints: std::sync::atomic::AtomicU64,
 }
 
 impl Wal {
@@ -115,7 +127,16 @@ impl Wal {
             apply(db, &ops, Durability::Immediate).map_err(io_err)?;
         }
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
-        let mut wal = Wal { file, full, epoch, at: FILE_HEADER, written: 0, since: Instant::now() };
+        let mut wal = Wal {
+            file,
+            full,
+            epoch,
+            at: FILE_HEADER,
+            written: 0,
+            since: Instant::now(),
+            #[cfg(test)]
+            synced: std::sync::Arc::default(),
+        };
         wal.zero_fill(path)?;
         // Only after redb holds them durably may the records go.
         wal.reset()?;
@@ -159,6 +180,8 @@ impl Wal {
         self.file.write_all_at(&rec, self.at)?;
         self.at += rec.len() as u64;
         self.written += rec.len() as u64;
+        #[cfg(test)]
+        self.synced.end.store(self.at, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -178,6 +201,8 @@ impl Wal {
         let mut txn = db.begin_write().map_err(io_err)?;
         txn.set_durability(Durability::Immediate).map_err(io_err)?;
         txn.commit().map_err(io_err)?;
+        #[cfg(test)]
+        self.synced.checkpoints.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.reset()
     }
 
@@ -194,24 +219,31 @@ impl Wal {
         self.at = FILE_HEADER;
         self.written = 0;
         self.since = Instant::now();
+        #[cfg(test)]
+        for at in [&self.synced.to, &self.synced.end] {
+            at.store(FILE_HEADER, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
     /// Make every batch written so far durable.
     pub(crate) fn sync(&self) -> io::Result<()> {
         if self.full {
-            return self.file.sync_data(); // F_FULLFSYNC on macOS
+            self.file.sync_data()?; // F_FULLFSYNC on macOS
+        } else {
+            use std::os::fd::AsRawFd;
+            #[cfg(target_os = "linux")]
+            // SAFETY: the descriptor is owned by `self.file` and open for the call.
+            let r = unsafe { libc::fdatasync(self.file.as_raw_fd()) };
+            #[cfg(not(target_os = "linux"))]
+            // SAFETY: as above.
+            let r = unsafe { libc::fsync(self.file.as_raw_fd()) };
+            if r != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
-        use std::os::fd::AsRawFd;
-        #[cfg(target_os = "linux")]
-        // SAFETY: the descriptor is owned by `self.file` and open for the call.
-        let r = unsafe { libc::fdatasync(self.file.as_raw_fd()) };
-        #[cfg(not(target_os = "linux"))]
-        // SAFETY: as above.
-        let r = unsafe { libc::fsync(self.file.as_raw_fd()) };
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        #[cfg(test)]
+        self.synced.to.store(self.at, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

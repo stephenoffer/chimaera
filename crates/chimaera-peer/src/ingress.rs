@@ -205,13 +205,15 @@ impl Ingress {
         &self,
         v: u16,
         body: pb::shard_cmd::Body,
+        sync_optional: bool,
     ) -> Result<pb::ShardReply, chimaera_raft::ProposeError> {
         let started = std::time::Instant::now();
         loop {
             // One attempt may itself wait (connects to a dead leader, retries
             // inside the router): bound it by what is left of the patience.
             let left = SUBMIT_PATIENCE.saturating_sub(started.elapsed()).max(std::time::Duration::from_secs(1));
-            let attempt = match tokio::time::timeout(left, self.router.propose(v, body.clone())).await {
+            let proposal = self.router.propose_opt(v, body.clone(), sync_optional);
+            let attempt = match tokio::time::timeout(left, proposal).await {
                 Ok(r) => r,
                 Err(_) => Err(chimaera_raft::ProposeError::Unavailable {
                     group: self.router.group_of(v),
@@ -321,13 +323,14 @@ impl Ingress {
         } else {
             split = by_vshard;
         }
-        for ((v, here), tasks) in split {
+        // Calls that must be synced and those that may go unsynced go in separate commands.
+        for ((v, here), tasks, unsynced) in crate::sync_class::submits(&self.router, split) {
             // A local peer grants to itself in the same commit; in a cluster
             // the group's leader places the rest.
             let grant_to = (!self.router.is_cluster() || here).then(|| self.router.identity.pb());
             let batch: Vec<Tk> = tasks.iter().filter_map(|t| t.key.as_ref().and_then(Tk::parse)).collect();
             let body = pb::shard_cmd::Body::SubmitTasks(pb::SubmitTasks { tasks, grant_to });
-            match self.propose_patiently(v, body).await {
+            match self.propose_patiently(v, body, unsynced).await {
                 Ok(pb::ShardReply { body: Some(pb::shard_reply::Body::Tasks(t)) }) => {
                     for a in t.acks {
                         if let Some(tk) = a.task.as_ref().and_then(Tk::parse) {
@@ -488,7 +491,7 @@ impl pb::peer_server::Peer for Service {
         // Patient like a submission: a leader election is not a lost majority.
         let reply = self
             .0
-            .propose_patiently(vshard, pb::shard_cmd::Body::RunCreate(pb::RunCreate { run: Some(record) }))
+            .propose_patiently(vshard, pb::shard_cmd::Body::RunCreate(pb::RunCreate { run: Some(record) }), false)
             .await
             .map_err(|e| match e {
                 // The client raises ch.QuorumLost on this prefix.
@@ -505,6 +508,7 @@ impl pb::peer_server::Peer for Service {
         let env = ExecEnv { python: r.python, cwd: r.cwd, sys_path: r.sys_path, env: r.env.into_iter().collect() };
         let run_id = Id::from_slice(&rec.run).map_err(|e| Status::internal(e.to_string()))?;
         self.0.owners.lock().expect("lock").insert((run_id, false), rec.tenant.clone());
+        self.0.router.known.note_run(&rec);
         let _ = self.0.core.send(CoreMsg::RegisterRun { run: run_id, env, detached: rec.detached }).await;
         Ok(Response::new(rec))
     }

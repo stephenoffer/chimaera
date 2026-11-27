@@ -44,6 +44,7 @@ pub mod settings;
 pub mod sharing;
 pub mod start_failures;
 pub mod stores;
+pub mod sync_class;
 pub mod target;
 pub mod tls;
 pub mod topology;

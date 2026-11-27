@@ -113,6 +113,15 @@ def test_every_workload_states_its_unit():
     assert multi_node.CHIMAERA_ONLY <= set(multi_node.CONTROL_ENV)
 
 
+def test_the_calls_class_is_the_weakest_any_peer_reports():
+    durable = {"durability": {**DURABLE, "calls": "replicated-memory"}}
+    synced = {"durability": {**DURABLE, "calls": "machine"}}
+    d = manifest.durability([synced, durable])
+    assert (d["effective"], d["calls"]) == ("machine", "replicated-memory")
+    # A peer too old to report the class leaves it unknown, never assumed.
+    assert manifest.durability([synced, {"durability": DURABLE}])["calls"] == ""
+
+
 def test_the_manifest_names_the_running_peer_its_build_and_durability_class():
     out = run_script("import chimaera as ch\nprint(ch.get([ch.remote(lambda: 1).remote()]))")
     assert out.returncode == 0, out.stderr[-2000:]
@@ -143,7 +152,9 @@ def test_paired_rounds_report_units_digests_intervals_and_commits(tmp_path):
     assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
     doc = json.load(open(glob.glob(str(tmp_path / "*.json"))[0]))
     m = doc["manifest"]
+    # The default, fsync: every commit is synced, an attached run's calls included.
     assert m["durability"]["effective"] == "machine" and m["durability"]["raft_sync"] == ["fsync"], m["durability"]
+    assert m["durability"]["calls"] == "machine", m["durability"]
     assert m["order"]["seed"] == 7 and m["order"]["scale"] == 0.01 and m["topology"]["nodes"] == 3
 
     # The seeded order: each round's workloads in a fresh random order.
@@ -179,4 +190,4 @@ def test_paired_rounds_report_units_digests_intervals_and_commits(tmp_path):
         assert unit == multi_node.UNITS[workload], ln
         assert re.match(r"[\d,.]+ \[[\d,.]+, [\d,.]+\], \d+ samples in 2 runs", chimaera), ln
         assert re.search(r"raft entries per (unit|run)", commits), ln
-    assert "Durability: requested machine, effective machine, raft_sync fsync." in report
+    assert "Durability: requested machine, effective machine, calls machine, raft_sync fsync." in report

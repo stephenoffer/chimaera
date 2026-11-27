@@ -445,9 +445,10 @@ message StatusReply {
   repeated GroupStatus groups = 22;
   // How many data groups the cluster has (0 on a local peer).
   uint32 data_groups = 23;
-  // What an acknowledged commit survives ("process", "reboot", "machine"):
-  // asked for by this peer's CHIMAERA_RAFT_SYNC, and given by the weakest of
-  // the cluster's groups as their voters' syncing and machines allow.
+  // What an acknowledged commit that must survive survives ("process",
+  // "reboot", "machine"): asked for by this peer's CHIMAERA_RAFT_SYNC, and
+  // given by the weakest of the cluster's groups as their voters' syncing and
+  // machines allow.
   string durability_requested = 24;
   string durability_effective = 25;
   // Why service is below what was asked: groups whose voters give less, a slow disk.
@@ -475,6 +476,13 @@ message StatusReply {
   // How long the longest-waiting call queued here has waited for a slot, in
   // seconds (0 when none waits): the backlog's age, a scaling signal.
   double queue_oldest_seconds = 36;
+  // What an attached run's per-call commits (ShardCmd.sync_optional) survive,
+  // in the weakest group: durability_effective where every voter syncs every
+  // entry, else no more than "replicated-memory" (the processes dying, and
+  // the restart or loss of machines holding fewer than half of a group's
+  // voters, not a majority restarting together), since a durable voter
+  // acknowledges them from its page cache. Empty from an older peer.
+  string durability_calls = 37;
 }
 
 // One cell's free capacity of one resource class, as the fleet hears of it.
@@ -525,6 +533,7 @@ message GroupStatus {
   bool leading = 6;       // this peer leads it
   uint64 max_lag = 7;     // when leading: entries the furthest-behind voter lacks
   string durability = 8;  // what its acknowledged commits survive (see StatusReply.durability_effective)
+  string calls_durability = 9;  // what an attached run's per-call commits survive (StatusReply.durability_calls)
 }
 
 message ClusterNode {

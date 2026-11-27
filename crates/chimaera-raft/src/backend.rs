@@ -29,6 +29,15 @@ impl OsSyncBackend {
     }
 }
 
+/// A plain `fsync` of `file` (not `F_FULLFSYNC` on macOS).
+pub(crate) fn fsync(file: &File) -> std::io::Result<()> {
+    // SAFETY: the descriptor is owned by `file` and open for the call.
+    if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl StorageBackend for OsSyncBackend {
     fn len(&self) -> Result<u64, BackendError> {
         Ok(self.file.metadata()?.len())
@@ -48,11 +57,7 @@ impl StorageBackend for OsSyncBackend {
         if !self.fsync {
             return Ok(());
         }
-        // SAFETY: the descriptor is owned by `self.file` and open for the call.
-        if unsafe { libc::fsync(self.file.as_raw_fd()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
+        Ok(fsync(&self.file)?)
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {

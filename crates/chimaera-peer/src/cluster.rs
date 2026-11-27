@@ -331,6 +331,7 @@ pub async fn run_cluster(cfg: ClusterConfig) -> io::Result<()> {
             .unwrap_or_default(),
         object_dir: node.objects.dir().to_string_lossy().into_owned(),
         raft_sync: crate::durability::advertised(durability) as i32,
+        raft_sync_selective: durability == chimaera_raft::DiskDurability::Durable,
         object_layout: crate::parts::OBJECT_LAYOUT,
     };
     let mesh = Arc::new(MeshClient::new(

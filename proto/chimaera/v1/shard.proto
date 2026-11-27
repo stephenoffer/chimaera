@@ -62,6 +62,10 @@ message TaskSpec {
   // shard: a replay that makes another call at this step is rejected with
   // the recorded description and its own.
   string workflow_step = 26;
+  // The root call of a `workflow="durable"` function: kept like its steps,
+  // synced before it is acknowledged even in an attached run
+  // (CHIMAERA_RAFT_SYNC=durable).
+  bool durable_workflow = 27;
 }
 
 // What the direct path reports for a call it ran (TaskSpec.ran).
@@ -237,6 +241,11 @@ message ShardCmd {
   uint64 vshard_epoch = 2;
   PeerInc issuer = 3;
   uint64 hlc = 4;
+  // The proposer allows this command to be acknowledged from the voters'
+  // page cache (CHIMAERA_RAFT_SYNC=durable): an attached run's per-call
+  // command with ordinary effects and no retained output. Everything else
+  // is synced before it is acknowledged. Unset (the default) means synced.
+  bool sync_optional = 5;
   oneof body {
     RunCreate run_create = 10;
     SubmitTasks submit_tasks = 11;

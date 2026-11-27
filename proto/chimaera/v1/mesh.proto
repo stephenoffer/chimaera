@@ -117,6 +117,11 @@ message Member {
   string host = 9;        // the machine (its boot id, or CHIMAERA_MACHINE_ID): peers with the same one share it
   string object_dir = 10; // this peer's object store, which a peer on the same machine may read directly
   RaftSync raft_sync = 11; // how it writes its raft log: what a commit it acknowledges survives
+  // With raft_sync FSYNC: the peer syncs every entry but attached runs'
+  // per-call ones (ShardCmd.sync_optional), which it acknowledges from its
+  // page cache (CHIMAERA_RAFT_SYNC=durable). An older peer ignores this and
+  // reads FSYNC, which holds for every entry that must survive.
+  bool raft_sync_selective = 13;
   // The newest layout of stored results it (and its executors) read: 1, a
   // shuffle scatter's sparse buckets. 0: a peer too old to say, which reads
   // only the older layouts, so no peer writes the newer while it is live.

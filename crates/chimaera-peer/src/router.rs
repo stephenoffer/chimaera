@@ -44,6 +44,8 @@ pub struct Router {
     /// Local-first grants handed out whose work has not reached the queue
     /// yet: they count against the room the core publishes.
     local_pending: std::sync::atomic::AtomicI64,
+    /// What this peer was told about runs and calls, for `sync_class`.
+    pub known: crate::sync_class::Known,
 }
 
 impl Router {
@@ -70,6 +72,7 @@ impl Router {
             local_room: std::sync::atomic::AtomicI64::new(0),
             local_pending: std::sync::atomic::AtomicI64::new(0),
             mesh,
+            known: Default::default(),
         }
     }
 
@@ -245,11 +248,23 @@ impl Router {
             issuer: Some(self.identity.pb()),
             hlc: self.hlc(),
             body: Some(body),
+            sync_optional: false,
         }
     }
 
     pub async fn propose(&self, vshard: u16, body: pb::shard_cmd::Body) -> Result<pb::ShardReply, ProposeError> {
         self.propose_cmd(self.cmd(vshard, body)).await
+    }
+
+    /// As `propose`; with `sync_optional`, the voters may acknowledge the
+    /// command before syncing it (only what `sync_class` allows).
+    pub async fn propose_opt(
+        &self,
+        vshard: u16,
+        body: pb::shard_cmd::Body,
+        sync_optional: bool,
+    ) -> Result<pb::ShardReply, ProposeError> {
+        self.propose_cmd(pb::ShardCmd { sync_optional, ..self.cmd(vshard, body) }).await
     }
 
     /// Deliver `cmd` to its group's leader, following leader hints and

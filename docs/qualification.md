@@ -519,7 +519,7 @@ also caught a starting peer being declared dead while its core was not yet
 answering pings, and a dead identity kept alive by a new one answering at its
 address).
 
-Since 2026-11-23 cluster peers sync every commit unless `CHIMAERA_RAFT_SYNC=none` is set, slow volumes included (commits are held open up to 2 ms to batch them), so throughput numbers measured after that change are not comparable with earlier ones, including the hosting and nested-tree numbers in `docs/ray-gotchas.md` and `bench/evals/nested_tree.py`.
+Since 2026-11-23 cluster peers sync every commit unless `CHIMAERA_RAFT_SYNC=none` is set, slow volumes included (commits are held open up to 2 ms to batch them), so throughput numbers measured after that change are not comparable with earlier ones, including the hosting and nested-tree numbers in `docs/ray-gotchas.md` and `bench/evals/nested_tree.py`. With `CHIMAERA_RAFT_SYNC=durable` an attached run's per-call commits are acknowledged from memory on a majority of each group's voters and everything else is synced, so cluster numbers measured with it are not comparable with fully synced ones either. Each result's manifest records both classes (`effective` and `calls`).
 
 Holding commits open on a slow disk (laptop; the ignored test
 `measure_group_commit_hold_on_a_slow_disk` in `chimaera-raft`: 16 writers in a

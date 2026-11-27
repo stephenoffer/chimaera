@@ -38,7 +38,7 @@ SOURCE = (
 SKIP_DIRS = {"__pycache__", "target", "results"}
 SKIP_SUFFIXES = (".pyc", ".so")
 # Guarantee names, weakest first (chimaera_core::durability::Guarantee).
-GUARANTEES = ("process", "reboot", "machine")
+GUARANTEES = ("process", "replicated-memory", "reboot", "machine")
 SYNC = re.compile(r"raft sync (\S+) \(")
 
 
@@ -146,8 +146,10 @@ def status(binary: str | None, home: str) -> dict[str, Any]:
 def durability(statuses: list[dict[str, Any]]) -> dict[str, Any]:
     """The durability class the peers report: the guarantee asked for, the
     weakest any of them sees a group give (what an acknowledged commit
-    survives), how they write their raft logs (a local peer keeps none) and
-    why service is below what was asked. {} when no peer answered."""
+    survives), the weakest an attached run's per-call commits get (`calls`;
+    empty from a peer too old to say), how they write their raft logs (a
+    local peer keeps none) and why service is below what was asked. {} when
+    no peer answered."""
     seen = [s["durability"] for s in statuses if s.get("durability")]
     if not seen:
         return {}
@@ -158,6 +160,7 @@ def durability(statuses: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "requested": min((d["requested"] for d in seen), key=rank),
         "effective": min((d["effective"] for d in seen), key=rank),
+        "calls": min((d.get("calls", "") for d in seen), key=rank),
         "raft_sync": sorted({m[1] for s in statuses for line in s.get("automatic", []) if (m := SYNC.match(line))}),
         "degraded": sorted({x for d in seen for x in d.get("degraded", [])}),
     }
