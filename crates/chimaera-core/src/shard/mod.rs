@@ -18,6 +18,7 @@ mod actors;
 pub mod chunks;
 pub mod keys;
 pub mod leases;
+mod released;
 pub mod store;
 #[cfg(test)]
 mod tests;
@@ -260,10 +261,11 @@ fn cancelled_kind(o: &pb::Outcome) -> Option<Kind> {
 
 /// A finished call nothing holds any more: emit its result object for the
 /// peer to free, and shrink its record to a tombstone. The spec (with inline
-/// arguments), attempts and failure history go; the outcome stays, unchanged:
-/// a small result lives inline in it, and a durable workflow's replay or an
-/// attach still reads it (a large result's file is freed, as before). Without
-/// this a long-lived run (a service's driver) keeps every record until it ends.
+/// arguments), attempts and failure history go; the outcome stays, unless it
+/// is a plain call's success ([`released::kept_outcome`]): a durable
+/// workflow's replay or an attach still reads it (a large result's file is
+/// freed, as before). Without this a long-lived run (a service's driver)
+/// keeps every record until it ends.
 fn tombstone(cx: &mut Cx, tk: Tk, rec: &pb::TaskRecord) -> pb::TaskRecord {
     let object = match rec.outcome.as_ref().and_then(|o| o.value.as_ref()) {
         Some(pb::outcome::Value::Ok(obj)) => Some(obj.clone()),
@@ -274,7 +276,7 @@ fn tombstone(cx: &mut Cx, tk: Tk, rec: &pb::TaskRecord) -> pb::TaskRecord {
         state: TState::Done as i32,
         submitted_hlc: rec.submitted_hlc,
         done_hlc: rec.done_hlc,
-        outcome: rec.outcome.clone(),
+        outcome: released::kept_outcome(cx.kv, tk, rec),
         ..Default::default()
     }
 }
@@ -1326,12 +1328,16 @@ impl ShardState {
     /// there was a pin to drop.
     fn unpin(&self, cx: &mut Cx, producer: Tk) -> bool {
         let Some(n) = pin_count(cx.kv, producer).filter(|n| *n > 0) else { return false };
-        cx.kv.put(pins_key(producer), (n - 1).to_be_bytes().to_vec());
-        if n == 1
-            && let Some(p) = load::<pb::TaskRecord>(cx.kv, &producer.key())
-            && p.state() == TState::Done
-            && p.spec.is_some()
-        {
+        let done = (n == 1)
+            .then(|| load::<pb::TaskRecord>(cx.kv, &producer.key()))
+            .flatten()
+            .filter(|p| p.state() == TState::Done);
+        if done.is_some() {
+            cx.kv.delete(&pins_key(producer)); // a finished call's count of 0 is read from its record
+        } else {
+            cx.kv.put(pins_key(producer), (n - 1).to_be_bytes().to_vec());
+        }
+        if let Some(p) = done.filter(|p| p.spec.is_some()) {
             let tomb = tombstone(cx, producer, &p);
             store(cx.kv, producer.key(), &tomb);
         }
@@ -1353,6 +1359,7 @@ impl ShardState {
         let dead = dead_letter(&rec, &outcome, cx.now);
         cx.events.push(Event::Done { task: tk, outcome });
         if pin_count(cx.kv, tk).unwrap_or(rec.pins) == 0 {
+            cx.kv.delete(&pins_key(tk)); // as in unpin
             let tomb = tombstone(cx, tk, &rec);
             store(cx.kv, tk.key(), &tomb);
         } else {

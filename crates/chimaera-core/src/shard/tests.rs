@@ -1042,6 +1042,7 @@ fn run_case(defs: &[TaskDef], ops: &[Op], sm: ShardState) -> Result<(), TestCase
     let mut inc = [1u64; N_PEERS];
     let mut retired: BTreeSet<PeerInc> = BTreeSet::new();
     let mut first_outcome: BTreeMap<Tk, Vec<u8>> = BTreeMap::new();
+    let mut slimmed: BTreeSet<Tk> = BTreeSet::new();
     let mut deps_satisfied: BTreeMap<Tk, u32> = BTreeMap::new();
     let mut done_events: BTreeMap<Tk, u32> = BTreeMap::new();
     let mut ext_started: BTreeMap<Tk, u32> = BTreeMap::new();
@@ -1320,7 +1321,17 @@ fn run_case(defs: &[TaskDef], ops: &[Op], sm: ShardState) -> Result<(), TestCase
             if let Some(o) = &rec.outcome {
                 let bytes = o.encode_to_vec();
                 let first = first_outcome.entry(*tk).or_insert_with(|| bytes.clone());
-                prop_assert_eq!(&*first, &bytes, "outcome of task {} changed", i);
+                // Only a release changes an outcome: a success then keeps only
+                // that it succeeded (shard::released), and stays so.
+                let was = pb::Outcome::decode(first.as_slice()).expect("an outcome");
+                if *first != bytes || slimmed.contains(tk) {
+                    prop_assert!(
+                        is_ok(&was) && *o == crate::shard::released::succeeded_only(&was),
+                        "outcome of task {} changed",
+                        i
+                    );
+                    slimmed.insert(*tk);
+                }
                 if is_ok(o) {
                     for &d in &defs[i].deps {
                         if let Some(drec) = h.task(tks[d]) {
@@ -1602,6 +1613,8 @@ mod actor_state;
 mod workflow;
 
 mod leases;
+
+mod released;
 
 #[test]
 fn store_versions_make_compare_and_set() {
