@@ -69,7 +69,8 @@ Chimaera API work on them too.
 | `ref.hex()`, `ref.binary()`, `ref.future()`, `ref.as_future()`, `await ref` | The same, for every kind of ref. An id is 36 bytes (`ObjectRef.size()`): the run, the call or `put`, and which of a call's `num_returns` values; a generator item's middle is random |
 | `ref.task_id()`, `ref.job_id()`, `ray.TaskID`, `ray.JobID` | The call that made the value and its run, the ids `get_runtime_context()` gives inside that call. A driver's `put` and a generator item have the nil `TaskID` |
 | `ray.ObjectRef(id)`, `ObjectRef.from_binary`, `from_hex`, `nil()`, `from_random()`, `ref.is_nil()` | The ref with that id while it is alive in this process and its id was read here, as Ray finds an id through its owner. Any other id, `nil()` and `from_random()` make a ref whose `ray.get` raises `ObjectLostError` (Ray's `from_hex` raises `NotImplementedError`) |
-| `ref.call_site()` | `""`, Ray's answer unless `RAY_record_ref_creation_sites` is set |
+| `ref.call_site()` | With `RAY_record_ref_creation_sites` set, the file and line of the call or `put` (Ray gives a stack); `""` otherwise, as in Ray |
+| a failed task's ref dropped unread ("Unhandled error") | Reported on stderr with the error and the line of the call, as for Chimaera's own calls |
 | `ref.owner_address()` | Missing: a value has no owner process; it belongs to its run, and its copies are on other peers |
 | `f.bind()`, `ray.dag` | `Unsupported` until `ch.graph` (P5) |
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import sys
 import types
 from collections.abc import Callable, Generator, Mapping
@@ -114,6 +115,24 @@ class ObjectRefGenerator:
         for _ in self:
             pass
         return ItemRef(None)
+
+
+_PACKAGE = os.path.dirname(os.path.abspath(ch.__file__)) + os.sep
+
+
+def stamped(f: Any) -> Any:
+    """`f` (a call's or a put's future) marked with the line that called into
+    the shim, the first frame outside this package, as Chimaera's own API marks
+    its calls: its warnings name that line, and an error nothing reads is
+    reported (Ray's "Unhandled error"), which a call made from inside the
+    package is not. ObjectRef.call_site() gives it too."""
+    if isinstance(f, ch.Future):
+        frame = sys._getframe(1)
+        while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE):
+            frame = frame.f_back
+        if frame is not None:
+            f._site = f"{frame.f_code.co_filename}:{frame.f_lineno}"
+    return f
 
 
 def _streamed(f: Any) -> Any:
@@ -240,7 +259,7 @@ class RemoteFunction:
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
         args, kwargs = _as_ray(args, kwargs)
-        f = self._view.remote(*args, **kwargs)
+        f = stamped(self._view.remote(*args, **kwargs))  # before split: the parts take its line
         return list(f.split(self._returns)) if self._returns > 1 else _streamed(f)
 
     def options(self, **options: Any) -> RemoteFunction:
@@ -326,7 +345,7 @@ class ActorMethod:
 
     def remote(self, *args: Any, **kwargs: Any) -> Any:
         args, kwargs = _as_ray(args, kwargs)
-        f = self._method.remote(*args, **kwargs)
+        f = stamped(self._method.remote(*args, **kwargs))
         if self._streams:
             return ObjectRefGenerator(_Items(f))  # type: ignore[arg-type]
         if isinstance(f, ch.Results):

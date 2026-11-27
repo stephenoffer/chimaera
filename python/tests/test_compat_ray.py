@@ -24,7 +24,7 @@ import chimaera.compat.ray as ray
 from chimaera.compat.ray import _options
 from chimaera.compat.ray.exceptions import translate
 
-from conftest import BIN, HOME, REPO
+from conftest import BIN, HOME, REPO, run_script
 
 SHIM = pathlib.Path(REPO, "python", "chimaera", "compat", "ray")
 CORPUS = pathlib.Path(__file__).parent / "compat_corpus"
@@ -802,6 +802,46 @@ def test_a_ref_id_finds_its_ref_and_names_its_task_and_run_as_in_ray():
     with pytest.raises(ValueError, match="36 bytes"):
         ray.ObjectRef(b"short")
     assert call.call_site() == ""  # as in Ray unless RAY_record_ref_creation_sites is set
+
+
+def test_a_ref_names_the_line_that_made_it_when_ray_records_sites(monkeypatch):
+    @ray.remote
+    def one():
+        return 1
+
+    assert one.remote().call_site() == "" and ray.put(1).call_site() == "", "Ray records none by default"
+    monkeypatch.setenv("RAY_record_ref_creation_sites", "1")
+    call, put = one.remote(), ray.put(1)
+    line = sys._getframe().f_lineno - 1
+    site = call.call_site()
+    assert site == put.call_site() and site.endswith(f"{os.path.basename(__file__)}:{line}"), site
+
+
+def test_a_failed_call_nothing_read_is_reported_at_the_callers_line_as_ray_does():
+    # Ray prints "Unhandled error" for a failed task whose ref is dropped
+    # unread; the shim's calls are reported as Chimaera's own are, at the
+    # caller's line, not the shim's.
+    r = run_script(
+        """
+        import gc
+        import chimaera.compat.ray as ray
+
+        @ray.remote
+        def dropped():
+            raise ValueError("first failure")
+
+        f = dropped.remote()
+        ray.wait([f], timeout=60)
+        del f
+        gc.collect()
+        print("end")
+        """,
+        timeout=180,
+    )
+    assert r.returncode == 0, r.stderr
+    lines = [line for line in r.stderr.splitlines() if "nothing read its error" in line]
+    assert len(lines) == 1, r.stderr
+    assert "script.py:" in lines[0] and "ValueError: first failure" in lines[0], lines
 
 
 def test_a_ref_gives_a_concurrent_future_of_its_value_as_in_ray():

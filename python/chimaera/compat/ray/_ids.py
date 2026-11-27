@@ -148,6 +148,17 @@ def from_random() -> Any:
     return ItemRef(error=ObjectLostError("an ObjectRef from from_random names no object"), id=os.urandom(SIZE))
 
 
+def call_site(ref: Any) -> str:
+    """Where the ref was made (Ray's ``ObjectRef.call_site()``): the file and
+    line of the call or ``put``, when RAY_record_ref_creation_sites is set, as
+    Ray records it only then; "" otherwise, and for a generator item."""
+    from ._remote import PutRef
+
+    if os.environ.get("RAY_record_ref_creation_sites", "").lower() not in ("1", "true"):
+        return ""
+    return getattr(ref._ref if isinstance(ref, PutRef) else ref, "_site", None) or ""
+
+
 def attach(types: tuple[type, ...]) -> None:
     """Give each of `types` Ray's ObjectRef id methods."""
     methods = {
@@ -156,8 +167,7 @@ def attach(types: tuple[type, ...]) -> None:
         "task_id": task_id,
         "job_id": lambda self: JobID(binary(self)[:16]),
         "is_nil": lambda self: binary(self) == _NIL,
-        # Ray records a ref's call site only with RAY_record_ref_creation_sites set; Chimaera never does.
-        "call_site": lambda self: "",
+        "call_site": call_site,
     }
     for t in types:
         for name, fn in methods.items():

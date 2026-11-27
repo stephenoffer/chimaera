@@ -382,7 +382,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | task results up to 100 KiB returned to the caller inline (`max_direct_call_object_size`); a `ray.put` value always in the store | a result up to 64 KiB and a `put` value up to 4 KiB travel in the handle |
 | Ray Direct Transport: GPU tensors between actors over NCCL or NIXL | a `put` CUDA tensor: on one machine over CUDA IPC, across machines GPU to GPU with `CHIMAERA_CUDA_NET` (NCCL over EFA measured; NIXL did not complete there, bench/objects/RESULTS.md); `durability="ephemeral"` keeps no host copy |
 
-Not matched yet: `ObjectRef.call_site()` with `RAY_record_ref_creation_sites` set (it is always empty). `ObjectRef.owner_address()` has no counterpart: no process owns a value.
+Not matched yet: nothing in Ray's object store API. `ObjectRef.owner_address()` has no counterpart: no process owns a value, and `call_site()` gives a file and line where Ray gives a stack.
 `ray.experimental.get_object_locations` is `ch.runs.object_locations`: the
 peer each value is stored at, with its size. Copies made in the background
 are not listed, as no peer keeps a record of where every copy is, and Ray
