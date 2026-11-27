@@ -1,6 +1,8 @@
-"""The direct actor path (docs/architecture.md, D2): on a local peer, an
-eligible call to a one-at-a-time actor goes from the driver straight to the
-actor's executor over a Unix socket, and its outcome comes straight back.
+"""The direct actor path (docs/architecture.md, D2): an eligible call from a
+process on the actor's own machine, a driver or a call running there, goes
+straight to the actor's executor over a Unix socket, and its outcome comes
+straight back. The actor may run one call at a time or several at once: the
+executor runs direct calls as it runs the peer's.
 
 The peer still records every call. Once the outcome is in, the driver submits
 the call with ``ran`` set: the shard stores it as done (nothing runs again),
