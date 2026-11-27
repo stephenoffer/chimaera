@@ -21,6 +21,9 @@ use std::path::Path;
 /// `dir` (the peer must be stopped). Returns the log index the group resumes
 /// from.
 pub fn force_single_voter(dir: &Path, group: u32, me: NodeId) -> io::Result<u64> {
+    // What the peer's next start would read: the write-ahead log replayed,
+    // and a state machine its unclean stop may have left behind rebuilt.
+    crate::settle::settle_files(dir)?;
     let log_db = open_db(&dir.join("raft-log.redb"), DiskDurability::Os, DEFAULT_CACHE_BYTES)?;
     let sm_db = open_db(&dir.join("raft-sm.redb"), DiskDurability::Os, DEFAULT_CACHE_BYTES)?;
 
