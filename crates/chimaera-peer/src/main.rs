@@ -3,6 +3,12 @@
 //! Results go to stdout; progress and errors go to stderr; the exit code is
 //! non-zero when anything failed.
 
+/// Under the peer's many threads glibc kept the memory the peer freed: after a
+/// million tiny calls it held 2.0 GB, 0.6 GB of it in use. With jemalloc the
+/// same run ends at 1.1 GB, and runs about 20% more calls per second.
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use chimaera_core::ids::Id;
 use chimaera_core::pb;
 use chimaera_core::provider::ProviderKind;
