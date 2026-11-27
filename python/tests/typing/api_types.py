@@ -192,3 +192,14 @@ class Renderer:
 ch.Mailbox(max_calls=8, on_full="wait", max_wait="2s")
 ch.Mailbox(max_calls=8, on_full="drop")  # type: ignore[arg-type]
 ch.durable.State(version=2, migrate=lambda state, version: state)
+
+
+# Training: checkpoints a restarted gang resumes from, and a rank's share of the input.
+ckpts = ch.dist.Checkpoints("bert-7", "/shared/ckpt", keep=3)
+assert_type(ckpts.latest(), ch.dist.Checkpoint | None)
+assert_type(ckpts.save(10, cursor={"epoch": 1}, meta={"loss": 0.5}).checkpoint, ch.dist.Checkpoint | None)
+ch.dist.Checkpoints("bert-7", ch.ext.S3Store("bucket"))
+feed = ch.data.loader("data/*.parquet", batch_size=32, columns=["x", "y"], num_workers=2)
+assert_type(feed, ch.data.Loader)
+assert_type(feed.state(), dict[str, Any])
+ch.data.loader("data/*.parquet")  # type: ignore[call-arg]

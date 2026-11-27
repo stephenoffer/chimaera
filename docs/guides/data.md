@@ -430,6 +430,69 @@ assert bump.remote(Tally(41)).result() == 42
 
 </details>
 
+## Feed a training loop
+
+`ch.data.loader(source, batch_size=)` gives a training loop its rank's
+batches. Each epoch shuffles the partitions by `seed` and epoch. Inside a
+gang, rank r of W reads every W-th partition, so ranks read disjoint input;
+outside one, the process reads them all. `state()` says where the loop
+stands, as JSON for a checkpoint's cursor, and `load_state()` resumes there:
+after a restart, the loop takes exactly the batches it took after that save.
+
+```python run
+import json
+import tempfile
+
+shards = tempfile.mkdtemp()
+for i in range(4):
+    with open(f"{shards}/part-{i}.jsonl", "w") as f:
+        f.writelines(json.dumps({"id": i * 10 + j}) + "\n" for j in range(6))
+
+def ids(batches) -> list:
+    return [[row["id"] for row in batch] for batch in batches]
+
+epoch = ids(ch.data.loader(f"{shards}/*.jsonl", batch_size=4, seed=0))
+assert sorted(i for batch in epoch for i in batch) == [i * 10 + j for i in range(4) for j in range(6)]
+
+loader = ch.data.loader(f"{shards}/*.jsonl", batch_size=4, seed=0)
+batches = iter(loader)
+first = [next(batches), next(batches)]
+cursor = loader.state()                     # what ckpts.save(step, cursor=...) keeps
+resumed = ch.data.loader(f"{shards}/*.jsonl", batch_size=4, seed=0)
+resumed.load_state(cursor)
+assert ids(first) + ids(resumed) == epoch
+```
+
+<details>
+<summary>Workers, collation and uneven ranks</summary>
+
+`collate=` turns a batch's rows into what the loop takes, such as
+`torch.utils.data.default_collate` for tensors. Without it, a batch is a
+list of rows. `columns=` and `filter=` work as they do for
+`ch.data.partitions`, and you can pass a list of partitions instead of a path.
+
+`num_workers=K` reads through a torch `DataLoader` with K processes. Each
+reads every K-th of the rank's partitions, and their batches come out in
+turn. A rank's rows don't depend on K, but its cursor does, so resume with
+the same K. The cursor counts only batches the loop took, not ones a worker
+read ahead.
+
+Iterating a loader runs the current epoch and moves on to the next one.
+`set_epoch(e)` jumps to epoch `e`; the epoch a restore left halfway stays
+where it stands.
+
+With several ranks, `even=True` (the default) stops every rank as soon as
+one runs out, so DDP never waits on a rank with no batch. It needs
+`g.torch()` first. `stopped_early` counts the epochs this rank cut short.
+Pass `even=False` to handle uneven input yourself.
+
+Every rank must list the same partitions in the same order, which a
+`FileSource` on a shared filesystem does. A cursor taken with other input,
+or with another rank count, worker count, seed or batch size, raises
+`ValueError`.
+
+</details>
+
 ## Stream items from a generator
 
 Call a generator function with `.remote()`, and you get its items as it yields them:

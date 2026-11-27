@@ -976,6 +976,22 @@ def row_sum() -> int:
 assert row_sum.options(ranks=4).gang().result() == [1, 1, 5, 5]
 ```
 
+**Checkpoints and loaders for training.** `ch.dist.Checkpoints(name, root,
+keep=2)` keeps a job's checkpoints in a shared directory or an
+`ext.ObjectStore`. `latest(claim=None)` returns the last committed
+`Checkpoint` (`step`, `meta`, `world`, `cursor`, `path(name, rank=None)`);
+inside a gang, or with `claim=True`, it first claims them for this
+generation. `with
+ckpts.save(step, cursor=, meta=) as d:` commits the files each rank writes
+into `d`. Both are collectives inside a gang. A commit is fenced by
+generation, so a rank of a replaced generation gets `ch.errors.LeaseLost`.
+Missing or changed files raise `ch.dist.CheckpointError`.
+`ch.data.loader(source, batch_size=, columns=, filter=, num_workers=0,
+seed=0, shuffle=True, collate=None, even=None)` gives a rank its share of
+each epoch; its `state()` is the cursor a checkpoint keeps, and
+`load_state()` resumes from it. See [gangs.md](guides/gangs.md#resume-from-a-checkpoint)
+and [data.md](guides/data.md#feed-a-training-loop).
+
 ### Reservations
 
 `ch.dist.reserve(bundles, strategy=)` holds resources on peers before anything

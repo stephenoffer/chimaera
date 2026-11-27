@@ -140,16 +140,14 @@ collectives, they wait for each other instead of mixing data, and
 
 `g.torch()` sets up the default `torch.distributed` process group for this
 gang and hands back the module. Here's DDP with checkpoints; it needs torch,
-eight GPUs (on any number of peers) and a checkpoint path every peer can
-read:
+eight GPUs (on any number of peers) and a checkpoint directory every peer can
+read and write:
 
 ```python
-import os
-
 import chimaera as ch
 
 @ch.remote(gpus=1, cpus=4)
-def train(epochs: int, ckpt: str) -> float:
+def train(epochs: int, root: str) -> float:
     import torch
     from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.utils.data import DataLoader, TensorDataset
@@ -165,12 +163,13 @@ def train(epochs: int, ckpt: str) -> float:
 
     model = torch.nn.Sequential(torch.nn.Linear(512, 256), torch.nn.ReLU(), torch.nn.Linear(256, 1)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ckpts = ch.dist.Checkpoints("ddp-demo", root)
     start = 0
-    if os.path.exists(ckpt):                          # a later generation resumes here
-        state = torch.load(ckpt, map_location=device)
+    if ckpt := ckpts.latest():                        # a later generation resumes here
+        state = torch.load(ckpt.path("state.pt", rank=0), map_location=device)
         model.load_state_dict(state["model"])
         opt.load_state_dict(state["opt"])
-        start = state["epoch"] + 1
+        start = ckpt.step + 1
     ddp = DDP(model, device_ids=[device.index])
 
     loss = torch.zeros(())
@@ -181,13 +180,12 @@ def train(epochs: int, ckpt: str) -> float:
             opt.zero_grad()
             loss.backward()
             opt.step()
-        if g.rank == 0:
-            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "epoch": epoch}, ckpt + ".tmp")
-            os.replace(ckpt + ".tmp", ckpt)           # never leave a half-written checkpoint
-        dist.barrier()
+        with ckpts.save(epoch) as d:                  # every rank: it commits once all have left the block
+            if g.rank == 0:
+                torch.save({"model": model.state_dict(), "opt": opt.state_dict()}, d / "state.pt")
     return loss.item()
 
-losses = train.options(ranks=8, max_attempts=5).gang(20, "/mnt/shared/ckpt.pt").result()
+losses = train.options(ranks=8, max_attempts=5).gang(20, "/mnt/shared/ckpt").result()
 ```
 
 <details>
@@ -310,7 +308,7 @@ assert retried.generation == 2
 <details>
 <summary>Why the restart takes 15 s</summary>
 
-Resume from your own checkpoint; `g.generation` tells you which try this is.
+Resume from a checkpoint (see the next section); `g.generation` tells you which try this is.
 After `max_attempts` generations have each lost a rank, the gang fails with
 `ch.errors.GangFailed`.
 
@@ -408,6 +406,82 @@ store on another port, and the other ranks connect to that one.
 </details>
 
 [failures.md](failures.md) covers retries and errors for ordinary calls.
+
+## Resume from a checkpoint
+
+`ch.dist.Checkpoints(name, root)` keeps a training job's checkpoints under
+`root/<name>/`, on a filesystem every rank can reach. `latest()` returns the
+last committed one, or `None`. `with ckpts.save(step) as d:` gives each rank
+a directory `d` to write into, and the checkpoint commits once every rank
+has left the block. Both are collectives, so call them on every rank:
+
+```python run
+import json
+import tempfile
+
+@ch.remote(cpus=0.5)
+def count(root: str) -> tuple:
+    g = ch.context().gang
+    ckpts = ch.dist.Checkpoints("count", root)
+    ckpt = ckpts.latest()                         # the same answer on every rank
+    step = resumed_at = ckpt.step if ckpt else 0
+    total = json.loads(ckpt.path("total.json").read_text()) if ckpt else 0
+    while step < 4:
+        step += 1
+        total += step
+        with ckpts.save(step) as d:               # this rank's own directory
+            (d / "total.json").write_text(json.dumps(total))
+        if g.generation == 1 and g.rank == 1 and step == 2:
+            os._exit(1)                           # lost once step 2 has committed
+    return g.generation, resumed_at, total
+
+assert count.options(ranks=2).gang(tempfile.mkdtemp()).result() == [(2, 2, 10), (2, 2, 10)]
+```
+
+Generation 2 picked up at step 2, the last commit, and still added up to
+1 + 2 + 3 + 4. Step 3 never committed, because rank 1 never finished it.
+
+<details>
+<summary>What a save guarantees</summary>
+
+When the block ends, each rank syncs its files to disk and records their
+sizes and SHA-256 hashes. Rank 0 checks that it can see every rank's files,
+writes the checkpoint's manifest, and only then moves the committed pointer
+to it. A save that a dying rank left half done never commits: `latest()`
+skips it, and a later save deletes it. `keep=2` (the default) keeps the last
+two committed checkpoints.
+
+The pointer lives in the cluster's replicated store, and it's fenced by
+generation. Once a restarted generation has called `latest()` (or its first
+`save()`), no rank of the generation it replaced can commit: its save raises
+`ch.errors.LeaseLost`. A new run under the same name takes the checkpoints
+over for good. Outside a gang, `latest()` only reads, so the driver or an
+evaluation call can look without taking them from a running job;
+`latest(claim=True)` claims, and a plain call that trains claims them at its
+first save. If the store loses the pointer, on a new cluster for example,
+`latest()` reads the last commit from `LATEST.json` beside the checkpoints.
+
+`ckpt.path(name, rank=None)` is the file this rank wrote, or the one `rank`
+wrote, checked against its size and hash. A missing or changed file raises
+`ch.dist.CheckpointError`. So does a save that one rank broke: the rank that
+raised keeps its own exception, and the others raise `CheckpointError` at
+once, without waiting out `collective_timeout`. It's not an infrastructure
+failure, so the gang doesn't restart over it.
+
+`save(step, cursor=..., meta=...)` stores JSON with the files: `meta` once
+for the checkpoint (`ckpt.meta`), and `cursor` for each rank (`ckpt.cursor`).
+A `ch.data.loader`'s `state()` is such a cursor, and `load_state()` takes it
+back; see [data.md](data.md#feed-a-training-loop). A cursor saved by a
+different number of ranks raises `ValueError`.
+
+`root` can also be an object store, such as `chimaera.ext.S3Store(bucket)`.
+Ranks write into a local directory, the files upload when the block ends,
+and `path()` downloads into a local cache. An object store keeps every
+checkpoint. Outside a gang, in a plain call or the driver, `latest()` and
+`save()` act alone, and a retried call's attempt stands in for the
+generation.
+
+</details>
 
 ## Group actors you already have
 

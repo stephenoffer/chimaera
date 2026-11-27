@@ -36,3 +36,8 @@ __all__ = [
     "OutOfDisk", "OutOfMemory", "OutcomeUnknown", "Overloaded", "PreflightError", "QuorumLost", "RemoteError", "SerializationError",
     "StreamInterrupted", "VersionConflict", "WorkerCrashed", "WorkflowDivergence",
 ]
+
+# An error of ch.dist's checkpoints, listed here with the others.
+from ._checkpoint import CheckpointError  # noqa: E402
+
+__all__ += ["CheckpointError"]
