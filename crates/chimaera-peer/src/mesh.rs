@@ -206,6 +206,8 @@ pub struct MeshClient {
     pub traffic: crate::traffic::Shaper,
     /// Round trips of the Raft heartbeats this peer sent lately.
     pub heartbeats: crate::traffic::Rtts,
+    /// When object bytes last arrived from each peer (see heard).
+    pub heard: crate::heard::Heard,
 }
 
 /// SWIM incarnation of a member: process incarnation high, refutations low.
@@ -358,6 +360,7 @@ impl MeshClient {
             epoch: Instant::now(),
             traffic: crate::traffic::Shaper::from_env(),
             heartbeats: Default::default(),
+            heard: Default::default(),
         })
     }
 
@@ -1032,6 +1035,7 @@ impl MeshClient {
         loop {
             match stream.message().await {
                 Ok(Some(chunk)) => {
+                    self.heard.note(node);
                     total.get_or_insert(chunk.total);
                     let pieces = chunk.data.len().div_ceil(STAGE_PIECE).clamp(1, STAGED_PIECES) as u32;
                     let Ok(staged) = STAGED.acquire_many(pieces).await else { break };
@@ -1741,12 +1745,15 @@ impl pb::mesh_server::Mesh for MeshService {
             Err(_) => pb::PingReply { draining: true, ..Default::default() },
         };
         if r.relay_to != 0 {
-            p.relay_ok = self.0.mesh.ping(r.relay_to, RELAY_TIMEOUT).await.is_ok();
+            let asked = Instant::now();
+            p.relay_ok =
+                self.0.mesh.ping(r.relay_to, RELAY_TIMEOUT).await.is_ok() || self.0.mesh.heard.since(r.relay_to, asked);
         }
         p.node_id = self.0.mesh.me.node_id;
         p.incarnation = self.0.mesh.me.incarnation;
         p.leading = self.0.router.get().map(|r| r.leading()).unwrap_or_default();
         p.updates = self.0.mesh.swim_out();
+        crate::heard::slow_ping(&self.0.mesh.traffic).await;
         Ok(Response::new(p))
     }
 

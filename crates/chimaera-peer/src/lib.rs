@@ -15,6 +15,7 @@ pub mod durability;
 pub mod executor;
 pub mod fleet;
 pub mod gc;
+pub mod heard;
 pub mod ingress;
 pub mod keyed_queue;
 pub mod labels;

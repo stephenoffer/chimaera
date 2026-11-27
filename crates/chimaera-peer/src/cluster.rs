@@ -569,6 +569,7 @@ async fn liveness(
         let probes = targets.into_iter().map(|target| {
             let mesh = mesh.clone();
             async move {
+                let asked = Instant::now();
                 // Only the target itself counts: a new identity answering at
                 // a dead one's address must not keep the dead one alive.
                 let refused = match mesh.ping(target, PING_TIMEOUT).await {
@@ -579,6 +580,11 @@ async fn liveness(
                     Ok(_) => true, // another process holds the address now
                     Err(e) => e.kind() == std::io::ErrorKind::ConnectionRefused,
                 };
+                // Not refused, and its object bytes arrived while the probe
+                // waited: it is alive, its link full (see heard).
+                if !refused && mesh.heard.since(target, asked) {
+                    return (target, true, false);
+                }
                 let relays = mesh.swim.lock().expect("lock").relays(target);
                 let tries = relays.into_iter().map(|r| {
                     let mesh = mesh.clone();
