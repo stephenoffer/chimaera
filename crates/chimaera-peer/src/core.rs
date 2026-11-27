@@ -4162,14 +4162,17 @@ impl Core {
         let k = if first.batchable() && first.policy.adaptive() == pb::policy::Adaptive::On {
             let profile =
                 (self.profiles.batch(&first.key()) / first.policy.items.max(1) as usize).clamp(1, profiles::MAX_BATCH);
-            // Never more than an even share of the queue for each free slot:
-            // a batch runs its calls one after another, so while CPUs sit
-            // idle a deep batch only delays the calls at its back. Sixteen
-            // 5 ms calls on a 16-CPU peer went to one executor as a 200 ms
-            // batch and took 80 ms instead of 5. A long queue (a large map)
-            // still gets the profile's batches.
-            let free = ((self.capacity - self.cpu_used) / first.cpus.max(0.01)).floor().max(1.0) as usize;
-            profile.min((self.queue.len() + 1).div_ceil(free))
+            // Never more than an even share of the queue for each of the
+            // peer's slots: a batch runs its calls one after another, so a
+            // deep batch only delays the calls at its back while other CPUs
+            // idle or free up. Sixteen 5 ms calls on a 16-CPU peer went to one
+            // executor as a 200 ms batch and took 80 ms instead of 5. Shared
+            // only among the slots free at that moment, the first executor to
+            // free up in a burst took the whole queue while the rest freed up
+            // just after: 534 of 768 readers of one value on one of 12. A long
+            // queue (a large map) still gets the profile's batches.
+            let slots = (self.capacity / first.cpus.max(0.01)).floor().max(1.0) as usize;
+            profile.min((self.queue.len() + 1).div_ceil(slots))
         } else {
             1
         };
