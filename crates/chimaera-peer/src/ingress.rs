@@ -1084,29 +1084,39 @@ impl pb::peer_server::Peer for Service {
         if size > self.0.info.memory_bytes.max(1 << 30) {
             return Err(Status::resource_exhausted(format!("value of {size} bytes is larger than this peer's memory")));
         }
-        let mut data = first.data;
-        data.reserve(size.saturating_sub(data.len() as u64) as usize);
-        while let Some(c) = chunks.next().await {
-            data.extend_from_slice(&c?.data);
-            if data.len() as u64 > size {
-                return Err(Status::invalid_argument(format!("upload is longer than the declared {size} bytes")));
+        // Stored as it comes (uploads.rs), like a blob: a few chunks at a time
+        // in memory here, however large the value.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let objects = self.0.objects.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            crate::uploads::put_object_from(&objects, &run, &id, size, &checksum, rx)
+        });
+        let (mut got, mut failed) = (first.data.len() as u64, None);
+        let mut open = tx.send(first.data).await.is_ok();
+        while open && let Some(c) = chunks.next().await {
+            match c {
+                Ok(c) if got + c.data.len() as u64 > size => {
+                    failed = Some(Status::invalid_argument(format!("upload is longer than the declared {size} bytes")));
+                    break;
+                }
+                Ok(c) => {
+                    got += c.data.len() as u64;
+                    open = tx.send(c.data).await.is_ok();
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
             }
         }
-        if data.len() as u64 != size {
-            return Err(Status::invalid_argument(format!("upload ended at {} of {size} bytes", data.len())));
+        // A broken or over-long upload stops here: the writer keeps the value
+        // only if all its declared bytes came and match their checksum.
+        drop(tx);
+        let stored = writer.await.map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(e) = failed {
+            return Err(e);
         }
-        let path = self.0.objects.path(&run, &id);
-        tokio::task::spawn_blocking(move || {
-            let existing = std::fs::read(&path).ok();
-            if object_upload(&data, &checksum, existing.as_deref())? {
-                std::fs::create_dir_all(path.parent().expect("object paths have a run directory"))
-                    .and_then(|()| crate::stores::write_atomic(&path, &data))
-                    .map_err(|e| Status::internal(e.to_string()))?;
-            }
-            Ok::<_, Status>(())
-        })
-        .await
-        .map_err(|e| Status::internal(e.to_string()))??;
+        stored.map_err(crate::uploads::refused)?;
         Ok(Response::new(pb::PutObjectReply {}))
     }
 
@@ -1661,24 +1671,9 @@ fn keyed_actor_id(tenant: &str, key: &str) -> Id {
     Id::derive(0, vshard, &[b"actor", tenant.as_bytes(), key.as_bytes()])
 }
 
-/// Whether an uploaded value (PutObject) should be written: it must match its
-/// checksum; an id that already holds the same bytes is a no-op (false), and one
-/// that holds different bytes is refused.
-fn object_upload(data: &[u8], checksum: &[u8], existing: Option<&[u8]>) -> Result<bool, Status> {
-    let digest = |b: &[u8]| blake3::hash(b).as_bytes()[..16].to_vec();
-    if digest(data) != checksum {
-        return Err(Status::invalid_argument("value does not match its checksum"));
-    }
-    match existing {
-        Some(old) if digest(old) == checksum => Ok(false),
-        Some(_) => Err(Status::already_exists("that id already holds a different value")),
-        None => Ok(true),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{keyed_actor_id, local_first_candidate, object_upload, runs_anywhere};
+    use super::{keyed_actor_id, local_first_candidate, runs_anywhere};
     use chimaera_core::pb;
     use prost::Message;
 
@@ -1713,17 +1708,5 @@ mod tests {
         // python -c "from chimaera._remote import _keyed_actor_id; print(_keyed_actor_id('alice','counter').hex())"
         assert_eq!(keyed_actor_id("alice", "counter").hex(), "000000ed8f8e6f7dfdd825d528086d96");
         assert_ne!(keyed_actor_id("bob", "counter"), keyed_actor_id("alice", "counter"));
-    }
-
-    #[test]
-    fn an_uploaded_value_must_match_its_checksum_and_never_replaces_another() {
-        let sum = |b: &[u8]| blake3::hash(b).as_bytes()[..16].to_vec();
-        let (v, w) = (b"value".as_slice(), b"other".as_slice());
-        assert!(object_upload(v, &sum(v), None).unwrap(), "new: written");
-        assert!(!object_upload(v, &sum(v), Some(v)).unwrap(), "the same bytes again: nothing to do");
-        let e = object_upload(v, &sum(w), None).unwrap_err();
-        assert_eq!(e.code(), tonic::Code::InvalidArgument, "bytes that do not match the checksum");
-        let e = object_upload(v, &sum(v), Some(w)).unwrap_err();
-        assert_eq!(e.code(), tonic::Code::AlreadyExists, "an id never changes value");
     }
 }
