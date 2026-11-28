@@ -154,6 +154,9 @@ class Future(Generic[T]):
             while True:
                 with rt.cond:
                     while not self.done():
+                        lost = getattr(rt, "lost", None)
+                        if lost is not None:
+                            raise InfrastructureFailure(lost)
                         now = time.monotonic()
                         if deadline is not None and now >= deadline:
                             return False

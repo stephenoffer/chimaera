@@ -28,7 +28,7 @@ import weakref
 from typing import Any, Callable
 
 from . import _cluster, _context, _objects, _project, _serde, _values
-from ._errors import ChimaeraError, DataLost, Infeasible, QuorumLost, SerializationError, divergence
+from ._errors import ChimaeraError, DataLost, Infeasible, InfrastructureFailure, QuorumLost, SerializationError, divergence
 # VERSION: the release, as the extension module and its peer binary report it.
 from ._native import VERSION, Client, blake3_digest, child_id, derive_id, socket_path, vshard_of
 
@@ -439,6 +439,9 @@ class Runtime:
         self._reads: dict[bytes, list[Any]] = {}
         self._streams: weakref.WeakValueDictionary[bytes, Any] = weakref.WeakValueDictionary()
         self.cond = threading.Condition()
+        # Why this program's connection to its peer ended for good (the
+        # session could not be resumed): every wait raises it from then on.
+        self.lost: str | None = None
         # id(callable) -> (callable, digest), newest last; bounded, since a
         # program wrapping a fresh lambda per call would keep every one.
         self._code: collections.OrderedDict[int, tuple[Any, bytes]] = collections.OrderedDict()
@@ -765,6 +768,17 @@ class Runtime:
                 self.client.release(batch)
             events = self.client.next_events(0.5, 4096)
             if events is None:
+                self.lost = (
+                    "the connection to this program's peer ended and could not be resumed (the peer stopped or "
+                    "restarted): calls already submitted may still finish on the cluster, but this program cannot "
+                    "receive their results"
+                )
+                # Nothing more can arrive: every call still awaited fails now,
+                # so waits, maps, as_completed and the exit wait end.
+                with self.cond:
+                    pending = list(self._unfinished.values())
+                for f in pending:
+                    f._set_exception(InfrastructureFailure(self.lost))
                 break
             if not events:
                 continue
