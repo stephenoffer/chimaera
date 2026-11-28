@@ -83,6 +83,7 @@ object store these tune.
 
 | Variable | Read by | Default | What it does |
 |---|---|---|---|
+| `CHIMAERA_HUGE_PAGES` | peer | unset | `mount`: with no huge-page tmpfs mounted, the peer mounts one at `/mnt/chimaera-objects` with `sudo -n` (at most half the RAM, as `/dev/shm`; pages are taken as objects are written) and keeps its objects there. Where sudo needs a password, or the mount fails, it stays on `/dev/shm` and its log says why. Large values read in other processes fault in 512 times fewer pages there (docs/objects.md) |
 | `CHIMAERA_OBJECT_DIR` | peer | unset | Directory under which the peer keeps its object store. Otherwise: a huge-page tmpfs if one is mounted, else `/dev/shm` when it has room (Linux), else `objects/` in the data directory |
 | `CHIMAERA_SPILL_DIR` | peer | `spill/` in the data directory | Where objects in memory move under pressure: directories separated by `:`, used in turn (local disks or a network mount). Used only when the store is in memory and the directory is on another filesystem |
 | `CHIMAERA_SPILL_URL` | peer | unset | Object storage for spilled objects: `s3://bucket/prefix`, `gs://...`, `az://...` or `file:///path`. Needs a peer built with the `object-store-spill` feature. Without it, or if the store can't be opened, the peer logs an error and spills to local disk. Used only when the store is in memory |

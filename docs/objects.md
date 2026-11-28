@@ -70,7 +70,13 @@ sudo mkdir -p /mnt/chimaera-shm
 sudo mount -t tmpfs -o huge=within_size,size=50%,mode=1777 tmpfs /mnt/chimaera-shm
 ```
 
-Nodes Chimaera launches itself (the SkyPilot spares of
+Or set `CHIMAERA_HUGE_PAGES=mount` where peers start: a peer that finds
+no huge-page tmpfs mounts one at `/mnt/chimaera-objects` itself, with
+`sudo -n`, so only where sudo needs no password (as on Anyscale's images
+and most cloud images). Otherwise it stays on `/dev/shm`, and its log says
+why. On the benchmark workspace it took 16 MB spill writes from 0.82–0.91x
+Ray's speed to 1.17–1.25x, and NumPy pipelines of 256 MiB and 1 GiB from
+0.45–0.59x to 4.7x or more (bench/objects/RESULTS.md). Nodes Chimaera launches itself (the SkyPilot spares of
 `chimaera.provisioner`) mount one at `/mnt/chimaera-objects` before their
 peer starts, wherever `sudo` needs no password. Writing three times the
 memory limit in 16 MB objects then took 3.2–3.3 s, against 5.5–5.8 s on

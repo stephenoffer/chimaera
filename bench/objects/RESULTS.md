@@ -104,6 +104,24 @@ rest, apart from rows of a few microseconds:
 | a dict of 262,000 floats, 16 MB: `put` | 0.87–0.93x (11.9–12.6 ms against 11.0) | Pickling the dict is most of the time in both. | - |
 | `get` of dicts, lists and `str` of 1–256 MB; reading every page of `bytes` of 256 MB–1 GB; Arrow `get`, `return` and `pipeline` of 1 MiB–1 GiB | 0.95–1.10x | Decoding the value into Python objects, or the one copy `bytes` needs, is the time in both. | - |
 
+With `CHIMAERA_HUGE_PAGES=mount` (2026-11-27, 63cb739 with that setting
+added, the same workspace, two runs), the peer mounted a huge-page tmpfs
+itself, and against Ray on `/dev/shm` those rows became:
+
+| data, pattern | vs Ray |
+|---|---:|
+| writing 3x the memory limit (spill), 16 MB / 256 MB objects | **1.17–1.25x** (4.47–4.50 s against 5.26–5.61) / **1.48–2.14x**; reading them back **5.5–6.1x** |
+| NumPy pipeline, 256 MiB / 1 GiB | **4.7–5.2x** (1.57–1.69 ms against 7.9–8.2) / **5.5x** and more (4.4–4.5 ms; Ray's own time ranged 25–96 ms) |
+| dicts of arrays, pipeline, 256 MiB / 1 GiB | **4.6–5.1x** (1.84–1.97 ms against 9.1–9.5) / **5.5–5.7x** (4.75–4.79 ms against 26.5–27.3) |
+| NumPy `get` and a read of every page, 16 MiB / 256 MiB / 1 GiB | **1.7–1.9x** (0.088–0.090 ms against 0.15–0.16) / **1.1x** (0.84–0.85 against 0.93–0.96) / **7.4–8.3x** (3.2–3.4 against 25–26) |
+| dicts of arrays, the same | 0.93–1.09x |
+| Arrow tables, the same, 16 MiB / 256 MiB / 1 GiB | 0.77–0.92x (0.41–0.44 ms against 0.34–0.38) / 0.87–0.91x / 0.95–1.02x |
+
+Ray's figures for the `get` and pipeline rows are from the full run above,
+where the rows before them had touched its store's pages. Run alone, with
+its store cold, Ray took 4 to 11 times longer for NumPy (256 MiB `get` and
+read: 8.2–10.4 ms).
+
 Fixed with this re-measurement: a 1 MiB NumPy array's `get` in another
 process took 0.154–0.157 ms against Ray's 0.087–0.095 (0.6x), because Linux
 read object files up to 1 MiB whole and so copied an array the arena had

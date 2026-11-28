@@ -16,6 +16,7 @@ pub mod executor;
 pub mod fleet;
 pub mod gc;
 pub mod heard;
+pub mod hugemount;
 pub mod ingress;
 pub mod keyed_queue;
 pub mod labels;

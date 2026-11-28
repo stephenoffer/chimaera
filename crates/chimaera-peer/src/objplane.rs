@@ -52,17 +52,19 @@ pub fn huge_tmpfs_mounts(table: &str) -> Vec<PathBuf> {
 }
 
 /// This peer's object directory: under `CHIMAERA_OBJECT_DIR` when set; else a
-/// huge-page tmpfs if one is mounted; else /dev/shm when it has room (Linux);
-/// else `<dir>/objects` on disk.
+/// huge-page tmpfs if one is mounted (or, with `CHIMAERA_HUGE_PAGES=mount`,
+/// one it mounts); else /dev/shm when it has room (Linux); else
+/// `<dir>/objects` on disk.
 pub fn object_dir(dir: &Path, peer_hex: &str) -> PathBuf {
     let name = format!("chimaera-{}", &peer_hex[..16]);
     if let Some(base) = std::env::var_os("CHIMAERA_OBJECT_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(base).join(name);
     }
     if cfg!(target_os = "linux") {
-        if let Some(m) =
-            std::fs::read_to_string("/proc/self/mounts").ok().and_then(|t| huge_tmpfs_mounts(&t).into_iter().next())
-        {
+        let huge =
+            || std::fs::read_to_string("/proc/self/mounts").ok().and_then(|t| huge_tmpfs_mounts(&t).into_iter().next());
+        // None mounted and CHIMAERA_HUGE_PAGES=mount: mount one (hugemount).
+        if let Some(m) = huge().or_else(|| crate::hugemount::mount_if_asked().then(huge).flatten()) {
             return m.join(name);
         }
         let shm = Path::new("/dev/shm");
