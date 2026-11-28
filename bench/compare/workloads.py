@@ -250,10 +250,10 @@ class Dask:
         return fut.result(timeout=timeout)
 
     def put(self, v):
-        return self.client.scatter(v)
+        return self.client.scatter(v, hash=False)  # a key per put: repeated runs never share one
 
     def put_many(self, vs):
-        return self.client.scatter(list(vs))  # Dask's way: one scatter of the list
+        return self.client.scatter(list(vs), hash=False)  # Dask's way: one scatter of the list
 
     def map(self, f, items):
         return self.client.gather(self.client.map(f, items, pure=False))

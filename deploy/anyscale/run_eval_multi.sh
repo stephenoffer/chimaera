@@ -2,7 +2,8 @@
 # Entry point of the multi-node Anyscale eval jobs. Builds Chimaera once on the
 # head node, then bench/evals/multi_node.py ships the binary and wheel to every
 # node (through Ray), starts one peer per node, and runs each workload against
-# Chimaera and against the node's Ray cluster.
+# Chimaera and against the node's Ray cluster (and Dask, with
+# EVAL_RUNTIMES=ray,chimaera,dask).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
@@ -30,6 +31,9 @@ cargo --version
 time cargo build -q --release -p chimaera-peer
 PY=${RAY_PYTHON:-python3}
 "$PY" -m pip install -q maturin numpy
+# Dask only when EVAL_RUNTIMES asks for it (default "ray,chimaera"): multi_node.py
+# installs this version on every other node before it starts the workers there.
+case ",${EVAL_RUNTIMES:-}," in *,dask,*) "$PY" -m pip install -q "dask[distributed]" ;; esac
 "$PY" -m maturin build -q --release -o /tmp/chimaera-wheels
 "$PY" -m pip install -q --force-reinstall /tmp/chimaera-wheels/chimaera-*.whl
 DIST=/tmp/chimaera-dist

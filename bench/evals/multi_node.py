@@ -1,13 +1,16 @@
-"""Multi-node head-to-head on an Anyscale (Ray) cluster: Ray vs Chimaera on
-the same machines, one after the other.
+"""Multi-node head-to-head on an Anyscale (Ray) cluster: Ray vs Chimaera, and
+Dask when asked, on the same machines, one after the other.
 
 Ray is the launcher here too: one task pinned to each node installs the
 Chimaera wheel and starts a peer, all peers founding one cluster. The driver
 then runs each workload against Chimaera (through the head node's peer) and
 against Ray (through the node's Ray cluster), each in a fresh process.
+EVAL_RUNTIMES picks the runtimes (default "ray,chimaera"); with "dask" in it,
+Ray also starts a Dask scheduler on the head node and a Dask worker on every
+node (launch_dask), and the workloads reach it through DASK_SCHEDULER.
 
-Runs are paired: both runtimes stay up, and each trial runs every workload
-once per runtime, the workloads and which runtime goes first in a seeded
+Runs are paired: every runtime stays up, and each trial runs every workload
+once per runtime, the workloads and the runtimes' order in a seeded
 random order (EVAL_SEED, else a random seed; the manifest records it).
 EVAL_TRIALS repeats the trial (the promotion gate asks for 7, with a smaller
 EVAL_MIN_SECONDS to fit the job). node_loss runs last, once per runtime.
@@ -25,6 +28,7 @@ import hashlib
 import json
 import os
 import random
+import signal
 import subprocess
 import sys
 import time
@@ -34,6 +38,7 @@ import manifest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 7100
+DASK_PORT = 8786
 PEER_DIR = "/tmp/chimaera-multi"
 # EVAL_SCALE < 1 shrinks every workload, for a smoke run on a small machine.
 SCALE = float(os.environ.get("EVAL_SCALE", "1"))
@@ -42,7 +47,7 @@ SCALE = float(os.environ.get("EVAL_SCALE", "1"))
 def n(x: int) -> int:
     return max(1, int(x * SCALE))
 
-# Each workload is run by `multi_node.py --workload NAME --runtime ray|chimaera`.
+# Each workload is run by `multi_node.py --workload NAME --runtime ray|chimaera|dask`.
 WORKLOADS = [
     "tasks", "tasks_serial", "cpu_scaling", "map_small", "broadcast", "naive_big_arg", "follow_input", "actors",
     "actors_peer", "nested", "shuffle", "shuffle_unfused", "node_loss",
@@ -55,7 +60,7 @@ UNITS = {
     "before the next call",
     "cpu_scaling": "busy CPU-seconds / (CPUs x wall seconds) for 4 x CPUs calls of 0.5 s of CPU",
     "map_small": "items/s: one int doubled (Chimaera: a 4M-item map; Ray naive: 200k items, one task each; "
-    "Ray hand_batched: 4M items, 1,000 per task)",
+    "Ray hand_batched: 4M items, 1,000 per task; Dask: client.map over 200k items, one task each)",
     "broadcast": "seconds: 2 x CPUs calls each reading one 512 MiB put value",
     "naive_big_arg": "seconds: 2 x CPUs calls each passed the same 32 MiB array",
     "follow_input": "seconds: 10 calls on a 256 MiB value just made",
@@ -63,7 +68,8 @@ UNITS = {
     "actors_peer": "calls/s: as actors, with direct actor calls off (CHIMAERA_DIRECT=0)",
     "nested": "seconds: 4 x CPUs calls each making and reading 8 child calls",
     "shuffle": "seconds: 3.2M (key, 1) pairs summed into 64 partitions, all in the driver; "
-    "the map runs inside the split (Ray: by hand, Chimaera: Results.reduce_by_key)",
+    "the map runs inside the split (Ray: by hand, Dask: by hand with dask.delayed(nout=64), "
+    "Chimaera: Results.reduce_by_key)",
     "shuffle_unfused": "seconds: as shuffle, with the map's outputs stored first and read by separate split calls",
     "node_loss": "seconds: 4 x CPUs one-second calls all returned while one worker node's runtime is SIGKILLed",
 }
@@ -288,6 +294,90 @@ def stop_peers(wipe: bool = False) -> None:
     ray.shutdown()
 
 
+# ---- launching a Dask cluster on every node (runs under Ray) ---------------------
+
+
+def launch_dask() -> tuple[str, int]:
+    """Start (or restart) a Dask scheduler on the head node and one `dask
+    worker` per alive Ray node, with one single-threaded worker process per
+    CPU: Ray and Chimaera also run one worker process per CPU, and the
+    workloads' Python holds the GIL. Return the scheduler's address and the
+    worker count, once every worker has joined.
+
+    As with the peers, each node's processes run under a detached actor,
+    which first installs the driver's Dask version on its node."""
+    import distributed
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
+    nodes = [n for n in ray.nodes() if n["Alive"]]
+    head_ip = ray.util.get_node_ip_address()
+    address = f"tcp://{head_ip}:{DASK_PORT}"
+
+    @ray.remote(num_cpus=0)
+    class DaskHost:
+        def __init__(self, address: str, version: str, scheduler: bool) -> None:
+            spec = f"dask[distributed]=={version}"
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", spec], check=True)
+            ip = ray.util.get_node_ip_address()
+            self.cpus = os.cpu_count() or 1
+            dask = [sys.executable, "-m", "dask"]
+            self.cmds = []
+            if scheduler:
+                self.cmds.append(dask + ["scheduler", "--host", ip, "--port", str(DASK_PORT), "--no-dashboard"])
+            self.cmds.append(dask + ["worker", address, "--host", ip, "--nworkers", str(self.cpus), "--nthreads", "1",
+                                     "--no-dashboard"])
+            self.procs: list[subprocess.Popen] = []
+
+        def start(self) -> int:
+            log = open("/tmp/dask.log", "ab")
+            self.procs = [subprocess.Popen(c, stdout=log, stderr=log, start_new_session=True) for c in self.cmds]
+            return self.cpus
+
+        def stop(self) -> None:
+            # Each command leads its own process group: the CLI and the worker processes it spawned.
+            for p in self.procs:
+                for sig, wait in ((signal.SIGTERM, 60), (signal.SIGKILL, 10)):
+                    p.poll()  # reap a CLI already killed (node_loss): macOS refuses to signal a zombie's group
+                    try:
+                        os.killpg(p.pid, sig)
+                        p.wait(timeout=wait)
+                    except (ProcessLookupError, subprocess.TimeoutExpired):
+                        pass
+            self.procs = []
+
+    hosts = [
+        DaskHost.options(
+            name=f"dask-host-{n['NodeID']}", lifetime="detached", get_if_exists=True,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(n["NodeID"], soft=False),
+        ).remote(address, distributed.__version__, n["NodeManagerAddress"] == head_ip)
+        for n in nodes
+    ]
+    ray.get([h.stop.remote() for h in hosts])  # a restart: no new worker joins the old scheduler
+    workers = sum(ray.get([h.start.remote() for h in hosts]))
+    ray.shutdown()
+    with distributed.Client(address, timeout=120) as c:
+        c.wait_for_workers(workers, timeout=600)
+    print("dask:", address, workers, "workers", flush=True)
+    return address, workers
+
+
+def stop_dask() -> None:
+    import ray
+
+    ray.init(address="auto", namespace="chimaera-eval", log_to_driver=False)
+    hosts = [ray.get_actor(f"dask-host-{n['NodeID']}") for n in ray.nodes() if n["Alive"]]
+    stops = [h.stop.remote() for h in hosts]  # all nodes at once
+    for h, ref in zip(hosts, stops):
+        try:
+            ray.get(ref, timeout=90)
+            ray.kill(h)
+        except Exception as e:  # noqa: BLE001
+            print("stop dask:", e)
+    ray.shutdown()
+
+
 # ---- workloads -----------------------------------------------------------------
 
 
@@ -296,6 +386,10 @@ def total_cpus(rt: str) -> int:
         import ray
 
         return int(ray.cluster_resources().get("CPU", 1))
+    if rt == "dask":  # one thread per worker process
+        from distributed import default_client
+
+        return sum(default_client().nthreads().values())
     import chimaera as ch
 
     return int(sum(n.cpus for n in ch.runs.cluster().nodes()))
@@ -365,6 +459,18 @@ def run_workload(rt: str, name: str) -> dict:
             ray.init(address="auto", log_to_driver=False)
         remote = ray.remote
         get = ray.get
+    elif rt == "dask":
+        import types
+
+        from distributed import Client, default_client
+
+        client = default_client() if _INIT else Client(os.environ["DASK_SCHEDULER"])
+
+        def remote(f):  # f.remote(*args) is one client.submit; pure=False, so equal calls each run
+            return types.SimpleNamespace(remote=lambda *a: client.submit(f, *a, pure=False))
+
+        def get(x):
+            return client.gather(x) if isinstance(x, list) else x.result()
     else:
         import chimaera as ch
 
@@ -416,6 +522,13 @@ def run_workload(rt: str, name: str) -> dict:
             hand = n2 / (time.perf_counter() - t0)
             assert sum(len(p) for p in parts) == n2
             return {"naive_items_per_s": round(naive), "hand_batched_items_per_s": round(hand)}
+        if rt == "dask":  # Dask's map makes one task per item, as Ray's naive program does
+            k = n(200_000)
+            t0 = time.perf_counter()
+            s = sum(client.gather(client.map(lambda x: 2 * x, range(k), pure=False)))
+            dt = time.perf_counter() - t0
+            assert s == k * (k - 1)
+            return {"naive_items_per_s": round(k / dt), "ops": k}
         k = n(4_000_000)
         t0 = time.perf_counter()
         s = sum(double.map(range(k)))
@@ -431,6 +544,13 @@ def run_workload(rt: str, name: str) -> dict:
             import ray
 
             ref = ray.put(np.ones(size // 8))
+        elif rt == "dask":
+            # One stored copy, as the put: the calls fetch it where they run. Not
+            # broadcast=True: it copies to every worker before the clock starts,
+            # and fights the Active Memory Manager's default ReduceReplicas policy.
+            # hash=False: a new key, as a put is a new object (the content's key
+            # would race the release of the previous run's).
+            ref = client.scatter(np.ones(size // 8), hash=False)
         else:
             import chimaera as ch
 
@@ -466,6 +586,10 @@ def run_workload(rt: str, name: str) -> dict:
             import ray
 
             ray.wait([big], fetch_local=False)
+        elif rt == "dask":
+            import distributed
+
+            distributed.wait([big])  # done, not fetched
         else:
             import chimaera as ch
 
@@ -488,18 +612,26 @@ def run_workload(rt: str, name: str) -> dict:
             def host(self):
                 return where()
 
-        A = remote(Counter)
         k = max(8, cpus // 2)
-        actors = [A.remote() for _ in range(k)]
-        hosts = get([a.host.remote() for a in actors])
+        if rt == "dask":  # an actor is a submit's result; a method call returns an ActorFuture
+            actors = [client.submit(Counter, actor=True).result() for _ in range(k)]
+            hosts = [a.host().result() for a in actors]
+        else:
+            A = remote(Counter)
+            actors = [A.remote() for _ in range(k)]
+            hosts = get([a.host.remote() for a in actors])
         calls = n(2000)
         if rt == "chimaera":
             from chimaera import _direct  # counts the calls this process sent straight to an actor
 
             direct = _direct._counter["direct"]
         t0 = time.perf_counter()
-        futs = [a.inc.remote(1) for a in actors for _ in range(calls)]
-        out = get(futs)
+        if rt == "dask":
+            futs = [a.inc(1) for a in actors for _ in range(calls)]
+            out = [f.result() for f in futs]
+        else:
+            futs = [a.inc.remote(1) for a in actors for _ in range(calls)]
+            out = get(futs)
         dt = time.perf_counter() - t0
         assert max(out) == calls
         res = {"calls_per_s": round(k * calls / dt), "actors": k, "hosts": len(set(hosts)), "ops": k * calls}
@@ -521,7 +653,14 @@ def run_workload(rt: str, name: str) -> dict:
 
             return sum(ch.get([child.remote(i) for i in range(n)]))
 
-        parent = remote(parent_fn)
+        def dask_parent(n):
+            from distributed import worker_client
+
+            # The parent secedes from its worker's one thread while its children run.
+            with worker_client() as c:
+                return sum(c.gather(c.map(lambda x: x, range(n), pure=False)))
+
+        parent = remote(dask_parent if rt == "dask" else parent_fn)
         t0 = time.perf_counter()
         out = get([parent.remote(8) for _ in range(4 * cpus)], timeout=600) if rt == "chimaera" else get([parent.remote(8) for _ in range(4 * cpus)])
         dt = time.perf_counter() - t0
@@ -539,7 +678,7 @@ def run_workload(rt: str, name: str) -> dict:
         def produce(i):
             return [((i * 7919 + j) % 100_003, 1) for j in range(per)]
 
-        if rt == "ray":
+        if rt in ("ray", "dask"):
 
             def split(src):
                 out = [dict() for _ in range(parts)]
@@ -555,12 +694,21 @@ def run_workload(rt: str, name: str) -> dict:
                         acc[k] = acc.get(k, 0) + v
                 return acc
 
-            split_r = remote(num_returns=parts)(split)
-            merge_r = remote(merge)
-            gen_r = remote(produce)
-            t0 = time.perf_counter()
-            mapped = [split_r.remote(i if fused else gen_r.remote(i)) for i in range(maps)]
-            reduced = get([merge_r.remote(*[m[p] for m in mapped]) for p in range(parts)])
+            if rt == "ray":
+                split_r = remote(num_returns=parts)(split)
+                merge_r = remote(merge)
+                gen_r = remote(produce)
+                t0 = time.perf_counter()
+                mapped = [split_r.remote(i if fused else gen_r.remote(i)) for i in range(maps)]
+                reduced = get([merge_r.remote(*[m[p] for m in mapped]) for p in range(parts)])
+            else:  # Dask's num_returns: a delayed call with nout outputs, each a getitem task beside it
+                from dask import delayed
+
+                t0 = time.perf_counter()
+                mapped = [delayed(split, nout=parts, pure=False)(i if fused else delayed(produce, pure=False)(i))
+                          for i in range(maps)]
+                merged = [delayed(merge, pure=False)(*[m[p] for m in mapped]) for p in range(parts)]
+                reduced = client.gather(client.compute(merged))
             dt = time.perf_counter() - t0
         else:
             import operator
@@ -619,7 +767,8 @@ def run_workload(rt: str, name: str) -> dict:
 
 
 def kill_one_worker_node(rt: str) -> str:
-    """SIGKILL the runtime's agent on one non-head node (Ray: its raylet)."""
+    """SIGKILL the runtime's agent on one non-head node (Ray: its raylet; Dask:
+    its `dask worker`, whose worker processes exit when it does)."""
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -630,7 +779,7 @@ def kill_one_worker_node(rt: str) -> str:
     if not victims:
         return "none (single node)"
     node = victims[0]
-    pattern = "raylet" if rt == "ray" else f"chimaera --dir {PEER_DIR} peer start"
+    pattern = {"ray": "raylet", "dask": "dask worker tcp://"}.get(rt, f"chimaera --dir {PEER_DIR} peer start")
 
     @ray.remote(num_cpus=0, max_retries=0)
     def kill(p: str) -> None:
@@ -671,6 +820,9 @@ def main() -> None:
     # "," between variables), each running EVAL_VARIANT_WORKLOADS.
     variants = [dict(kv.split("=", 1) for kv in v.split(",")) for v in os.environ.get("EVAL_CHIMAERA_VARIANTS", "").split(";") if v]
     subset = [w for w in os.environ.get("EVAL_VARIANT_WORKLOADS", "tasks,actors").split(",") if w in names]
+    # The runtimes measured, in the paired trials and in node_loss.
+    runtimes = os.environ.get("EVAL_RUNTIMES", "ray,chimaera").split(",")
+    assert set(runtimes) <= {"ray", "chimaera", "dask"}, runtimes
     results = []
     cluster: dict = {}
 
@@ -721,6 +873,14 @@ def main() -> None:
             rec["result"]["raft_entries"] = manifest.raft_entries(peer_status()) - entries0
         if "error" in rec and rt == "chimaera":
             rec["peer_logs"] = peer_logs()[-4000:]
+        if "error" in rec and rt == "dask" and w != "node_loss":
+            # A failed run can leave Dask's cluster broken (its scheduler out of
+            # memory, say): the next run gets a fresh one, as bench/compare does.
+            try:
+                launch_dask()
+                rec["dask_restarted"] = True
+            except Exception as e:  # noqa: BLE001
+                print("restarting dask:", e, flush=True)
         print(json.dumps(rec), flush=True)
         results.append(rec)
 
@@ -730,30 +890,42 @@ def main() -> None:
             child("chimaera", w, durability, variant=v)
         stop()
     durability = launch({})
+    if "dask" in runtimes:
+        os.environ["DASK_SCHEDULER"], cluster["dask_workers"] = launch_dask()
     paired = [w for w in names if w != "node_loss"]
     for trial in range(trials):
         for w in rng.sample(paired, len(paired)):
-            for rt in rng.sample(["ray", "chimaera"], 2):
+            for rt in rng.sample(runtimes, len(runtimes)):
                 if rt == "chimaera" or w not in CHIMAERA_ONLY:
                     child(rt, w, durability, trial=trial)
-    # node_loss last: it takes a node's runtime down. Chimaera's first: Ray,
-    # its launcher, stops the peers afterwards.
-    if "node_loss" in names:
+    # node_loss last: it takes a node's runtime down. Chimaera's first, then
+    # Dask's: Ray, their launcher, stops each afterwards, and goes last.
+    if "node_loss" in names and "chimaera" in runtimes:
         child("chimaera", "node_loss", durability)
     stop()
-    if "node_loss" in names:
+    if "dask" in runtimes:
+        if "node_loss" in names:
+            child("dask", "node_loss", durability)
+        stop_dask()
+    if "node_loss" in names and "ray" in runtimes:
         child("ray", "node_loss", durability)
-    order = {"seed": seed, "trials": trials, "min_seconds": MIN_SECONDS, "scale": SCALE, "variants": variants}
-    meta = manifest.collect(os.path.join(a.dist, "chimaera"), {"ray": sys.executable, "chimaera": sys.executable},
+    order = {"seed": seed, "trials": trials, "min_seconds": MIN_SECONDS, "scale": SCALE, "variants": variants,
+             "runtimes": runtimes}
+    meta = manifest.collect(os.path.join(a.dist, "chimaera"), dict.fromkeys(runtimes, sys.executable),
                             topology=cluster, durability=durability, order=order)
     doc = {"manifest": meta, "results": results}
     with open(os.path.join(a.out, "multi_results.json"), "w") as f:
         json.dump(doc, f, indent=2)
-    report = manifest.report(doc, WORKLOADS, f"Ray vs Chimaera, {cluster['nodes']} nodes", [
+    notes = [
         f"Machines: {'; '.join(cluster['machines'])}. {cluster['data_groups']} data groups.",
         f"{trials} paired trial(s) in a random order (seed {seed}), each run timed for at least {MIN_SECONDS:.0f} s "
         f"after a warm-up; node_loss once per runtime, last. EVAL_SCALE {SCALE}.",
-    ])
+    ]
+    if "dask" in runtimes:
+        notes.append(f"Dask: a scheduler on the head node and {cluster['dask_workers']} worker processes of one "
+                     "thread each, one per CPU.")
+    title = " vs ".join(rt.capitalize() for rt in runtimes) + f", {cluster['nodes']} nodes"
+    report = manifest.report(doc, WORKLOADS, title, notes)
     try:  # what each workload cost, from the machines' instance types (bench/evals/cost.py)
         with open(os.path.join(HERE, "prices.json")) as f:
             spend = cost.costs(doc, json.load(f))

@@ -125,6 +125,8 @@ def collect(binary: str | None, pythons: dict[str, str], **extra: Any) -> dict[s
         versions["chimaera"] = _out([binary, "--version"])
     if "ray" in pythons:
         versions["ray"] = _out([pythons["ray"], "-c", "import ray; print(ray.__version__)"])
+    if "dask" in pythons:
+        versions["dask"] = _out([pythons["dask"], "-c", "import distributed; print(distributed.__version__)"])
     return {"source": source(), "build": build(binary), "versions": versions, "host": host(), **extra}
 
 
@@ -282,7 +284,7 @@ def table(doc: dict[str, Any], workloads: list[str]) -> list[dict[str, Any]]:
         row = rows.setdefault((r["workload"], variant), {"workload": r["workload"], "variant": variant})
         row.setdefault(r["runtime"], []).append(r)
     for row in rows.values():
-        for rt in ("ray", "chimaera"):
+        for rt in ("ray", "dask", "chimaera"):
             runs = row.pop(rt, [])
             ok = [r["result"] for r in runs if "result" in r]
             if ok:
@@ -328,6 +330,7 @@ def report(doc: dict[str, Any], workloads: list[str], title: str, notes: list[st
     with its unit, each runtime's median [95% interval], and how Chimaera
     committed the work. Raises ManifestError for an incomplete manifest."""
     rows = table(doc, workloads)
+    dask = any("dask" in row for row in rows)  # a Dask column only when Dask ran
     m = doc["manifest"]
     src, b, v, d = m["source"], m["build"], m["versions"], m.get("durability", {})
     durable = ", ".join(f"{k} {' / '.join(x) if isinstance(x, list) else x}" for k, x in d.items() if x)
@@ -341,21 +344,23 @@ def report(doc: dict[str, Any], workloads: list[str], title: str, notes: list[st
         + (f", RUSTFLAGS {b['rustflags']}" if b["rustflags"] else "")
         + ")"
         + (f", Ray {v['ray']}" if v.get("ray") else "")
+        + (f", Dask {v['dask']}" if v.get("dask") else "")
         + ", Python "
         + ", ".join(f"{rt} {x}" for rt, x in v.get("python", {}).items())
         + ".",
         f"Durability: {durable or 'per row in the JSON'}.",
         "Cells: median [bootstrap 95% interval of the median], over every timed sample of every run.",
         "",
-        "| Workload | Unit | Ray | Chimaera | Chimaera commits |",
-        "|---|---|---|---|---|",
+        "| Workload | Unit | Ray | " + ("Dask | " if dask else "") + "Chimaera | Chimaera commits |",
+        "|---|---|---|" + ("---|" if dask else "") + "---|---|",
     ]
     for row in rows:
         name = row["workload"] + (f" ({row['variant']})" if row["variant"] else "")
-        s = row.get("chimaera") or row.get("ray") or {}
+        s = row.get("chimaera") or row.get("ray") or row.get("dask") or {}
         lines.append(
-            f"| {name} | {s.get('unit', '')} | {_cell(row.get('ray'))} | {_cell(row.get('chimaera'))} "
-            f"| {_path(row.get('chimaera'))} |"
+            f"| {name} | {s.get('unit', '')} | {_cell(row.get('ray'))} | "
+            + (f"{_cell(row.get('dask'))} | " if dask else "")
+            + f"{_cell(row.get('chimaera'))} | {_path(row.get('chimaera'))} |"
         )
     return "\n".join(lines) + "\n"
 
