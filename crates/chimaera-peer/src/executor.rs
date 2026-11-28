@@ -239,6 +239,7 @@ impl Supervisor {
         }
         no_core_dumps(&mut cmd);
         lower_priority(&mut cmd);
+        kill_first_on_oom(&mut cmd);
         if let Some(group) = cgroup {
             join_cgroup_before_exec(&mut cmd, group)?;
         }
@@ -389,6 +390,30 @@ fn no_core_dumps(cmd: &mut tokio::process::Command) {
         });
     }
 }
+
+/// When the kernel runs out of memory it kills an executor, not its peer: an
+/// executor's call is retried, while losing the peer loses every call, actor
+/// and replica on the machine. The kernel otherwise picks by size, and a peer
+/// can outgrow its executors. Linux only; raising its own score needs no
+/// privilege, and a failure leaves the default.
+#[cfg(target_os = "linux")]
+fn kill_first_on_oom(cmd: &mut tokio::process::Command) {
+    // SAFETY: runs in the forked child before exec and only calls open, write
+    // and close, which are async-signal-safe, on a constant path.
+    unsafe {
+        cmd.pre_exec(|| {
+            let fd = libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY);
+            if fd >= 0 {
+                libc::write(fd, b"1000".as_ptr().cast(), 4);
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_first_on_oom(_cmd: &mut tokio::process::Command) {}
 
 /// How much lower an executor's CPU priority is than its peer's.
 const EXECUTOR_NICE: libc::c_int = 5;

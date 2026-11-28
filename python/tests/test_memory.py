@@ -166,6 +166,20 @@ def test_fast_calls_that_keep_memory_are_not_batched_past_the_leak_watch(home):
     assert max(over) < 128, f"MiB past the limit before each replacement: {over}"
 
 
+def test_the_kernel_kills_a_worker_before_its_peer_when_memory_runs_out():
+    import chimaera as ch
+
+    if sys.platform != "linux":
+        pytest.skip("oom_score_adj is Linux's")
+
+    @ch.remote
+    def oom_score_adj() -> str:
+        with open("/proc/self/oom_score_adj") as f:
+            return f.read().strip()
+
+    assert oom_score_adj.remote().result(timeout=60) == "1000"
+
+
 def test_executors_cap_thread_pools_and_write_no_core_dumps():
     import chimaera as ch
 
