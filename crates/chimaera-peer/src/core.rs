@@ -4824,6 +4824,8 @@ impl Core {
             }
             Commit::Raised => (Some(reply), true),
             Commit::Answered(a) if a.status() == A::Duplicate => {
+                // Its first attempt's commit landed: carry on from that state.
+                self.adopt_committed(actor, a.record.as_ref());
                 let stored = a.reply.clone().unwrap_or_default();
                 (Some(pb::Outcome { value: Some(pb::outcome::Value::Ok(stored)), ..Default::default() }), true)
             }
@@ -4838,8 +4840,10 @@ impl Core {
                 (Some(err(Kind::User, format!("durable state refused: {}", a.reason))), true)
             }
             Commit::Answered(a) => {
-                // Stale generation or version: another instance moved on. Run
-                // the call again there; this instance restarts from the record.
+                // Stale generation or version: another instance moved on, or
+                // this one missed a commit of its own. Run the call again; a
+                // version this instance missed is taken from the record first.
+                self.adopt_committed(actor, a.record.as_ref());
                 let why = format!("commit refused: {:?} {}", a.status(), a.reason);
                 self.fail_attempt(&w, pb::record_failure::Kind::Infra, &why);
                 (None, true)
@@ -5781,7 +5785,10 @@ impl Core {
         // carries none of the state they hold, and starts no instance: the
         // leader's copy, which has them, does.
         let whole = rec.state_chunks.is_empty() || !rec.durable_state.is_empty();
-        if rec.state_version >= host.state_version && whole {
+        if rec.state_version >= host.state_version
+            && whole
+            && !(host.state_version > 0 && actor_state::no_record_push())
+        {
             host.state_version = rec.state_version;
             host.durable_state = rec.durable_state.clone();
             host.state_chunks = rec.state_chunks.clone();

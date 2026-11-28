@@ -15,7 +15,54 @@ fn chunk_delay() -> Option<Duration> {
     })
 }
 
+/// Tests (debug builds only), together what a leader dying between a commit
+/// and its answer leaves the actor's host with: `CHIMAERA_TEST_LOSE_COMMIT_REPLY=n`
+/// drops the answer to this peer's n-th durable commit after it landed, and
+/// `CHIMAERA_TEST_NO_RECORD_PUSH=1` keeps an instance that holds a committed
+/// state from taking a newer one from the records its leader pushes.
+fn test_setting(name: &str) -> u64 {
+    if cfg!(debug_assertions) { std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 }
+}
+
+/// Whether this commit's answer is to be dropped (see `test_setting`).
+fn lose_this_reply() -> bool {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = *N.get_or_init(|| test_setting("CHIMAERA_TEST_LOSE_COMMIT_REPLY"));
+    n > 0 && SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == n
+}
+
+/// Whether pushed records may not move a started instance's state (see `test_setting`).
+pub(super) fn no_record_push() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| test_setting("CHIMAERA_TEST_NO_RECORD_PUSH") == 1)
+}
+
 impl Core {
+    /// A commit's answer carries the actor's record as committed. When this
+    /// instance's state is older (its last commit landed, but the answer was
+    /// lost, and so was the record its leader would have pushed after it, as
+    /// when that leader died), take the record's state: the restore that
+    /// follows puts back what was committed, and the next commit starts from
+    /// its version. A record of another generation (another instance took
+    /// over) is left alone. A state kept in chunks is not in the answer; this
+    /// peer's replica of the actor's group may hold it whole.
+    pub(super) fn adopt_committed(&mut self, actor: Id, answered: Option<&pb::ActorRecord>) {
+        let Some(answered) = answered else { return };
+        let whole = |r: &pb::ActorRecord| r.state_chunks.is_empty() || !r.durable_state.is_empty();
+        let rec = if whole(answered) {
+            Some(answered.clone())
+        } else {
+            self.router.read(actor.vshard(), |kv| whole_record(kv, actor)).flatten().filter(|r| whole(r))
+        };
+        let (Some(rec), Some(h)) = (rec, self.actors.get_mut(&actor)) else { return };
+        if rec.generation == h.generation && rec.state_version > h.state_version {
+            h.state_version = rec.state_version;
+            h.durable_state = rec.durable_state;
+            h.state_chunks = rec.state_chunks;
+        }
+    }
+
     /// A durable call whose commit did not go through is retried under its
     /// own sequence number: its handle's order waits for it again, as when
     /// its worker dies while it runs. (Nothing after it started: the commit
@@ -99,7 +146,11 @@ pub(super) async fn commit(
     };
     if state.len() <= MAX_INLINE_STATE {
         commit.new_state = state.to_vec();
-        return answered(router.propose(actor.vshard(), pb::shard_cmd::Body::ActorCommit(commit)).await);
+        let ack = answered(router.propose(actor.vshard(), pb::shard_cmd::Body::ActorCommit(commit)).await);
+        if lose_this_reply() {
+            return Commit::Unknown("test: the commit's answer was dropped".into());
+        }
+        return ack;
     }
     if state.len() > MAX_CHUNKED_STATE {
         return Commit::Answered(Box::new(pb::ActorAck {
