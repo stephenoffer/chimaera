@@ -58,7 +58,7 @@ def test_every_claim_of_the_readme_and_the_record_is_listed_with_what_backs_it(t
     status = readme.split("\n## Status\n", 1)[1].split("\n## ", 1)[0]
     rows = [ln for ln in status.splitlines() if ln.startswith("| ") and not ln.startswith("| Area |")]
     assert len(rows) >= 10 and set(rows) <= quoted
-    assert "No CPU or memory requests to guess. 2.5x Ray's task throughput on 64 machines." in quoted
+    assert "No head node to babysit." in quoted  # the header is read
     assert "| A machine killed under one-second tasks | 18.5 s | 9.6 s |" in by_id["machine-loss-64-nodes"]["quotes"]
     # What you get: retries, at most once and OOM kills avoided are fault-tolerance claims too.
     assert "A crashed worker's calls get retried; your own exceptions don't, unless you list them." in quoted

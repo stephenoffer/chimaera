@@ -20,7 +20,7 @@ Each guide is about one job, with examples you can paste and run.
 | [Run on a cluster](guides/clusters.md) | go from a laptop to many machines, securely |
 | [Observability](guides/observability.md) | find out what your program is doing and why something waits |
 | [Integrations](guides/integrations.md) | use Chimaera from `concurrent.futures`, joblib or asyncio |
-| [Coming from Ray](guides/from-ray.md) | move a Ray program over, or run it unchanged |
+| [Migrating](guides/from-ray.md) | move an existing program over, or run it unchanged |
 
 ## Reference
 
@@ -28,7 +28,6 @@ Each guide is about one job, with examples you can paste and run.
 - [CLI](cli.md): every `chimaera` command and flag
 - [Configuration](configuration.md): every `CHIMAERA_` environment variable
 - [Deploying](deploy.md): Kubernetes, Slurm, SSH, clouds and accelerators
-- [Ray compatibility](compat-ray.md): how each Ray Core API maps
 
 ## How it works
 
@@ -36,7 +35,14 @@ Each guide is about one job, with examples you can paste and run.
 - [Architecture](architecture.md): how Chimaera grows to many machines, and why
 - [Objects](objects.md): how values move, spill and survive a lost machine
 - [Federation](federation.md): cells that lend each other capacity
-- [Benchmarks](benchmarks.md): Chimaera against Ray on clusters of up to 64 machines, and on Ray's own tests
-- [Qualification](qualification.md): the measurements, how they compare with Ray, and what isn't tested yet
-- [Parity](parity.md) and [the other runtimes](landscape.md): Ray Core and the rest, item by item
-- [Lessons from Ray](ray-lessons.md), [Ray gotchas](ray-gotchas.md) and [requirements](requirements.md): what Chimaera does about the problems Ray users hit
+- [Benchmarks](benchmarks.md): measured results on one machine and on clusters of up to 64 machines, and how to rerun them
+- [Qualification](qualification.md): the measurement behind each claim, and what isn't tested yet
+- [Requirements](requirements.md): where the automatic behavior comes from, and which test proves it
+- [The landscape](landscape.md): every runtime that distributes Python work, what each does well, and what Chimaera takes from it
+
+## Coming from Ray
+
+- [Port your program](guides/from-ray.md): the name mapping, the differences that change behavior, and running it unchanged
+- [Ray compatibility](compat-ray.md): how each Ray Core API and option maps
+- [Parity](parity.md): every Ray Core feature, item by item, and how Chimaera provides it
+- [Lessons](ray-lessons.md) and [gotchas](ray-gotchas.md): the problems Ray users hit, and what Chimaera does about each

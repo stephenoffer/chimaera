@@ -67,7 +67,7 @@ assert zeros[0] == 0.0                         # and so is your array
 <details>
 <summary>Why arrays here are writable</summary>
 
-A stored value's file is mapped copy-on-write (small files are read instead). Ray hands you read-only arrays. Here, `a[0] = value` works.
+A stored value's file is mapped copy-on-write (small files are read instead), so the array arrives writable: `a[0] = value` works.
 
 </details>
 

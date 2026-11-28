@@ -5,7 +5,7 @@
 This is how Chimaera stores the values that calls pass and return, and that
 `ch.put` stores. It covers moving them between processes on one host and
 across hosts, spilling them to disk, and keeping them when a peer dies.
-Measurements against Ray are in [bench/objects/RESULTS.md](../bench/objects/RESULTS.md).
+Measurements are in [bench/objects/RESULTS.md](../bench/objects/RESULTS.md).
 
 A call's result, from the executor that made it to a reader on another peer.
 Only the handle goes through Raft (with the value inside it when small); the
@@ -158,8 +158,7 @@ never stored under the id.
 > *Zero-copy is not a trick. It is a refusal to do pointless work.*
 
 Reading maps the object's file copy-on-write. Arrays come back **writable**,
-and a write stays private to the reader. Ray returns read-only arrays, so
-`arr[0] = 1` raises there. A read costs about the same at 1 KB and at 1 GB
+and a write stays private to the reader, so `arr[0] = 1` just works. A read costs about the same at 1 KB and at 1 GB
 (roughly 80 µs for a 1 GiB array), because pages fault in as they are
 touched. On macOS a copy-on-write mapping costs more to set up (20 to 30 ms
 for 512 MiB, against 2 ms read-only), so large reads on a laptop are slower
@@ -443,7 +442,7 @@ A variable set to an empty value (`CHIMAERA_MEMORY_POOL=` in a compose file or p
 | `ObjectStoreFullError` after the fallback allocator fills | no store-full error: memory, then disk; a full disk is an `OSError` naming it |
 | `ray memory`, `ray.util.state.list_objects` (up to 10,000), `ray summary objects` | `ch.runs.objects(largest=N)`, and `chimaera objects --cluster --largest N` from the CLI: every live peer's store, with what is in memory and on disk, per run, and its N largest objects (up to 10,000), each with its size and where it is. Ray's rows also give each object's reference type, call site and process |
 | store metrics in the dashboard | Prometheus `object_bytes`, `memory_used_bytes`, `replication_failures_total` |
-| chunked pull between nodes | parallel ranges over four connections, every chunk checked with blake3 (Ray checks nothing) |
+| chunked pull between nodes | parallel ranges over four connections, every chunk checked with blake3 |
 | lineage reconstruction of task outputs | both: replicas on another peer (another failure domain first), for task outputs *and* `put` values, with a durability class per value (above). When every copy of a call's result is lost, the call runs again, once in the cell: the first peer whose readers find it lost takes a lease on the call in the cell's store and runs it under the same attempt, so it writes the same object and blob ids; readers on other peers wait and fetch the value from there. The peer records where it made the value under the lease's fencing token, so one whose lease lapsed (stalled, or cut off while another took over) cannot announce its copy. A lease not renewed for 10 s passes to the next peer that asks; a peer that cannot reach the store runs the call itself. That covers a call reading it as an input, and a program reading it, local or remote. Only functions and map items without external effects run again, and not one declared `deterministic=False`, which could return other bytes under the old id; the chain is rebuilt depth first, up to 64 levels of calls (a 40-stage chain recovers from its first surviving value), each call remaking every input it lost, and a run has at most 10,000 calls run again on one peer before the next lost value fails, naming it. A lost `put` value, argument or actor result fails with `DataLost`, which says why it cannot be remade |
 | `OwnerDiedError` when a `put`'s owner dies | the value is read from its replica |
 | ref counting, `free` | a `put` handle dropped without escaping is freed at once; a released value is deleted on every peer that fetched it; the rest go when their run ends, except values another run's handle holds, which go when the last such handle does |

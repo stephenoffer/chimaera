@@ -502,8 +502,7 @@ with Model.options(replicas=3).pool("v1") as pool:
 
 `Class.options(replicas=n).pool(...)` creates one, and its methods look
 like an actor's. Each call goes to whichever replica has the fewest calls in
-flight when you make it. There's no order across replicas. Ray's `ActorPool`
-maps here ([from-ray.md](from-ray.md)).
+flight when you make it. There's no order across replicas.
 
 - Without `replicas=`, you get one replica per core, at most 8.
 - `pool.method.map(items)` streams results in input order (`ordered=False` for

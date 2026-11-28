@@ -30,7 +30,6 @@ id = "ray-cluster-2026-11-24"
 kind = "speed"
 tier = "cluster"
 quotes = [
-  "No CPU or memory requests to guess. 2.5x Ray's task throughput on 64 machines.",
   "Chimaera against Ray on 1, 4, 16 and 64 machines: faster at every size on a map over tiny items (96x to 228x), a 32 MiB array passed to every call (3.9x to 5.2x), independent tasks (1.8x to 2.5x), recovery from a machine killed mid-run (1.9x to 2.1x) and calls on a value just made (1.1x to 1.6x).",
   "On 64 machines, Chimaera finishes 2.5x as many tasks a second as Ray: 11,235 against 4,502.",
   "Kill one of those machines two seconds into 4,096 one-second calls, and all of them are done in 9.6 s.",
@@ -138,7 +137,7 @@ replay = ".venv/bin/python -m pytest python/tests/test_api.py python/tests/test_
 id = "ray-compat"
 kind = "function"
 tier = "local"
-quotes = ["Most Ray Core programs port line by line, and a compatibility shim runs them unchanged (from-ray.md)."]
+quotes = []  # the README no longer names the compatibility shim; docs/guides/from-ray.md covers it
 lanes = ["quick"]
 replay = ".venv/bin/python -m pytest python/tests/test_compat_ray.py -q"
 

@@ -658,8 +658,7 @@ assert where["peers"] and where["size"] >= 1 << 20
 ```
 
 `ch.runs.objects(largest=10)` is what every live peer's object store holds,
-as `chimaera objects --cluster` prints it (Ray's `ray memory` and
-`list_objects`): one dict per peer, the connected peer's first, with the
+as `chimaera objects --cluster` prints it: one dict per peer, the connected peer's first, with the
 objects and bytes in memory and on disk, the same per run, and its `largest`
 largest objects (up to 10,000), each with its run and object id, size, and
 whether it is in memory or on disk. It lists every tenant's runs, so a driver

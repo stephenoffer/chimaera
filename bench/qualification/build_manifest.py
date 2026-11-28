@@ -50,7 +50,7 @@ TIERS = {"local", "linux", "launchers", "cluster", "gpu", "emulation"}
 # Where the README claims speed, scale and fault tolerance: its header (no
 # heading), the comparison with Ray, How it works, What you get and the status table.
 README_SECTIONS = {
-    "", "Faster than Ray on five workloads, at every size we measured", "How it works: no head node, by design",
+    "", "Benchmarks", "How it works: no head node, by design",
     "What you get", "Calls sized for you",
     "Failures you can reason about", "A record of everything", "Runs where your machines are", "Status",
 }

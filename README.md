@@ -10,22 +10,16 @@
 <p align="center">
   <strong>Your Python, on every core of every machine, with one decorator.</strong><br>
   No head node to babysit. No CPU or memory requests to guess.<br>
-  2.5x Ray's task throughput on 64 machines.
+  Calls sized, placed and recovered for you.
 </p>
 
 <p align="center">
   <a href="docs/getting-started.md">Get started</a> ·
   <a href="docs/README.md">Guides</a> ·
-  <a href="docs/guides/from-ray.md">Coming from Ray</a> ·
+  <a href="docs/guides/from-ray.md">Migrating</a> ·
   <a href="docs/api.md">API</a> ·
   <a href="docs/benchmarks.md">Benchmarks</a>
 </p>
-
-| **2.5x** | **180x** | **4.7x** | **1.9x** |
-|:---:|:---:|:---:|:---:|
-| Ray's task throughput | Ray's speed mapping over tiny items | Ray's speed passing one 32 MiB array to every call | Ray's speed recovering from a machine killed mid-run |
-
-<p align="center"><sub>On 64 machines against Ray 2.59. Every number, its method and its raw results are in <a href="docs/benchmarks.md">docs/benchmarks.md</a>.</sub></p>
 
 ---
 
@@ -53,7 +47,13 @@ starts a local peer for you. On a cluster, the same file runs unchanged.
 
 > *Your laptop and your cluster run the same file. We regard this as a minimum standard of honesty, not a feature.*
 
-## Faster than Ray on five workloads, at every size we measured
+## Benchmarks
+
+| **2.5x** | **180x** | **4.7x** | **1.9x** |
+|:---:|:---:|:---:|:---:|
+| Ray's task throughput | Ray's speed mapping over tiny items | Ray's speed passing one 32 MiB array to every call | Ray's speed recovering from a machine killed mid-run |
+
+<p align="center"><sub>On 64 machines against Ray 2.59. Every number, its method and its raw results are in <a href="docs/benchmarks.md">docs/benchmarks.md</a>.</sub></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vs-ray-dark.svg">
@@ -94,9 +94,6 @@ machine-loss row is a single run).
 | 10 calls on a 256 MiB value just made | 0.257 s | 0.228 s |
 
 </details>
-
-Coming from Ray? Most Ray Core programs port line by line, and a
-compatibility shim runs them unchanged ([from-ray.md](docs/guides/from-ray.md)).
 
 ## How it works: no head node, by design
 
@@ -198,7 +195,7 @@ Chimaera is early software. This is what works today:
 
 - [Getting started](docs/getting-started.md): install, a first program, a ten-minute tour
 - [Guides](docs/README.md): tasks, actors, failures, resources and GPUs, data, gangs, clusters, observability
-- [Coming from Ray](docs/guides/from-ray.md): the mapping, the differences that bite, and running Ray code as is
+- [Migrating](docs/guides/from-ray.md): moving an existing program over, the differences that bite, and a compatibility shim that runs it as is
 - [API reference](docs/api.md), [CLI](docs/cli.md), [configuration](docs/configuration.md)
 - [Design](docs/design.md) and [architecture](docs/architecture.md), for how it works inside
 
@@ -214,7 +211,7 @@ make linux-pytest     # the Python tests in a Linux container, with cgroup accou
 `crates/` holds the Rust runtime (`chimaera-core` is the replicated state
 machine, `chimaera-raft` runs many Raft groups per peer, `chimaera-peer` is
 the agent and CLI, `chimaera-py` the extension module), `python/chimaera`
-the Python package, and `bench/` the comparisons against Ray.
+the Python package, and `bench/` the benchmarks.
 
 ## License
 
