@@ -111,8 +111,12 @@ def _install() -> None:
     if not ok:
         with _lock:
             _state["installed"] = False
-    elif first:
+        return
+    if first:
         atexit.register(_native.arena_shutdown)
+    from . import _arrow_pool
+
+    _arrow_pool.install_soon()  # Arrow's large buffers in the arena too
 
 
 class _NumpyHook(importlib.abc.MetaPathFinder):

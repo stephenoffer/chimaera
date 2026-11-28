@@ -106,7 +106,15 @@ that is still exact:
   with the file (a `bytes` object's header, which its reference count
   rewrites, shares the first page with its data). pandas numeric columns,
   NumPy-backed torch tensors and nested structures of arrays take this path
-  too. A growing arena block (a `bytearray` being extended) grows its file
+  too, and so do Arrow buffers of 1 MiB or more: Arrow's default memory pool
+  takes those from the arena (`_arrow_pool.py`), so a table read from
+  Parquet, a computed column or a string column is linked as well. A put of
+  a table of computed columns took 0.06–0.07 ms at 16 MiB and at 256 MiB,
+  against 3.0–6.3 ms and 53–56 ms copied (a 4-core Linux container). That
+  pool is a few lines of C++ built against the installed pyarrow the first
+  time a host needs it, with `$CXX` (else `c++`), and cached under
+  `~/.cache/chimaera/arrow-pool`; without a compiler, Arrow buffers are
+  copied. A growing arena block (a `bytearray` being extended) grows its file
   and remaps in place, with no copy, until it is stored. A new block of
   8 MiB or more is populated on several threads as it is handed out, so the
   code that fills it (a `str` encode, a read into a new `bytes`, a NumPy
@@ -469,9 +477,10 @@ fetched in parallel ranges across machines.
 
 - The arena covers NumPy (with pandas numeric columns and torch tensors
   made from NumPy) and Python's raw allocator (large `bytes`, `bytearray`,
-  `str`, lists). Tensors from torch's own allocator, Arrow buffers, and
-  values made before `ch.init` or while `tracemalloc` traces are copied
-  once (in parallel, onto warm pages).
+  `str`, lists), and Arrow's buffers where a C++ compiler built its pool.
+  Tensors from torch's own allocator, Arrow buffers under 1 MiB or with no
+  compiler, and values made before `ch.init` or while `tracemalloc` traces
+  are copied once (in parallel, onto warm pages).
 - Large top-level dicts, lists and tuples of plain data (str, bytes, int to
   64 bits, float, bool, None; no container reachable twice) go through a
   native codec, faster than pickle both ways, and so do object arrays of

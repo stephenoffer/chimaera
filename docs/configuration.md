@@ -90,7 +90,7 @@ object store these tune.
 | `CHIMAERA_SPILL_THRESHOLD` | peer | `0.8` | Share of the memory pool past which objects in memory move to disk. Values outside 0.05 to 1.0 are ignored |
 | `CHIMAERA_SPILL_THREADS` | peer | `4` | Objects copied to disk at once while spilling |
 | `CHIMAERA_OBJECT_REPLICAS` | peer | `1` | Copies of each new object kept on the next peers, so losing one peer loses no data. `0` turns copies off. Linux only |
-| `CHIMAERA_ARENA` | driver, worker | `1` | `0` turns off the shared-memory arena that NumPy arrays and large values are written into. The arena works only on Linux, with the store in memory |
+| `CHIMAERA_ARENA` | driver, worker | `1` | `0` turns off the shared-memory arena that NumPy arrays, Arrow buffers and large values are written into. The arena works only on Linux, with the store in memory |
 | `CHIMAERA_CUDA_IPC` | driver, worker | `1` | `0` stops `ch.put` of a CUDA tensor from sharing it with readers on the same machine through CUDA IPC (Linux only). Readers then use the host copy |
 
 ## Logging and metrics

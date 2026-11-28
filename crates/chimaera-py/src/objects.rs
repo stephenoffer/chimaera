@@ -662,7 +662,7 @@ fn with_heap<T>(f: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(target_os = "linux")]
-pub use arena::{arena_claim, arena_install, arena_shutdown, arena_stats};
+pub use arena::{arena_claim, arena_install, arena_pool_api, arena_shutdown, arena_stats};
 
 #[cfg(not(target_os = "linux"))]
 mod portable {
@@ -688,10 +688,15 @@ mod portable {
 
     #[pyfunction]
     pub fn arena_shutdown() {}
+
+    #[pyfunction]
+    pub fn arena_pool_api() -> usize {
+        0
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-pub use portable::{arena_claim, arena_install, arena_shutdown, arena_stats};
+pub use portable::{arena_claim, arena_install, arena_pool_api, arena_shutdown, arena_stats};
 
 #[cfg(target_os = "linux")]
 mod arena {
@@ -798,6 +803,52 @@ mod arena {
 
     fn arena() -> &'static Arena {
         ARENA.get().expect("arena functions are installed only after the arena")
+    }
+
+    /// The arena as Arrow's memory pool calls it (python/chimaera/_arrow_pool.py,
+    /// whose C++ declares the same struct): allocations of `min` bytes and up
+    /// come from here, so a value of Arrow buffers is stored by linking their
+    /// files, as a NumPy array is.
+    #[repr(C)]
+    pub struct PoolApi {
+        min: usize,
+        /// A page-aligned allocation of `size` bytes, or null (the arena is
+        /// off or memory is full: the caller's other pool serves it).
+        alloc: unsafe extern "C" fn(usize) -> *mut c_void,
+        /// -1: not ours. 0: ours, but it must move (allocate, copy, free).
+        /// 1: resized; the allocation is now at `*out`.
+        resize: unsafe extern "C" fn(*mut c_void, usize, *mut *mut c_void) -> i32,
+        /// Free an allocation of ours and return true; false if not ours.
+        free: unsafe extern "C" fn(*mut c_void) -> bool,
+    }
+
+    unsafe extern "C" fn pool_alloc(size: usize) -> *mut c_void {
+        arena().alloc(size, false)
+    }
+
+    unsafe extern "C" fn pool_resize(ptr: *mut c_void, new: usize, out: *mut *mut c_void) -> i32 {
+        match arena().resize(ptr as usize, new) {
+            None => -1,
+            Some((_, None)) => 0,
+            Some((_, Some(q))) => {
+                // SAFETY: the caller passes a valid out-pointer (the C++ pool's local).
+                unsafe { *out = q as *mut c_void };
+                1
+            }
+        }
+    }
+
+    unsafe extern "C" fn pool_free(ptr: *mut c_void) -> bool {
+        arena().free(ptr as usize)
+    }
+
+    /// The address of the arena's PoolApi, or 0 when no arena is installed.
+    #[pyfunction]
+    pub fn arena_pool_api() -> usize {
+        static API: OnceLock<PoolApi> = OnceLock::new();
+        let Some(ar) = ARENA.get() else { return 0 };
+        let api = API.get_or_init(|| PoolApi { min: ar.min, alloc: pool_alloc, resize: pool_resize, free: pool_free });
+        api as *const PoolApi as usize
     }
 
     fn page_up(n: usize) -> usize {
@@ -1645,6 +1696,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arena_claim, m)?)?;
     m.add_function(wrap_pyfunction!(arena_stats, m)?)?;
     m.add_function(wrap_pyfunction!(arena_shutdown, m)?)?;
+    m.add_function(wrap_pyfunction!(arena_pool_api, m)?)?;
     Ok(())
 }
 
