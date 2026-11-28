@@ -25,6 +25,12 @@ class RemoteError(ChimaeraError):
         self.message = message
         self.remote_traceback = remote_traceback
 
+    def __reduce__(self) -> tuple[object, ...]:
+        # Exception pickles `args` (the joined message), which this __init__
+        # cannot take back: rebuild from the fields, and keep notes and the
+        # rest of the instance's state.
+        return (RemoteError, (self.type_name, self.message, self.remote_traceback), self.__dict__)
+
 
 class NonRetryable(Exception):
     """Raise it, or an exception class that also derives from it, for a failure
