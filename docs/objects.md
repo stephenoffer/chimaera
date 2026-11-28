@@ -243,7 +243,12 @@ aws-ofi-nccl plugin needs: 1 GiB in 0.14–0.15 s against 0.93–0.95 s for
 the host copy, which such a read never fetches (bench/objects/RESULTS.md).
 A read that fails once it
 has begun falls back after a few seconds, with a warning, and that
-process reads the same holder's host copies from then on.
+process reads the same holder's host copies for 30 s, then tries it again
+(twice as long after each failure in a row, up to 10 minutes). A holder
+sends a tensor once the writes its putting stream had queued are done, not
+after its whole GPU is idle, and with NIXL keeps it registered between
+readers; a reader keeps a holder's agent loaded while its metadata is
+unchanged, and reads from different holders run at once.
 
 `ch.wait(fs, fetch_local=True)` also copies each finished value (its file
 and any blobs it names) to this host before returning, as Ray's
