@@ -21,6 +21,12 @@
   <a href="docs/benchmarks.md">Benchmarks</a>
 </p>
 
+| **2.5x** | **180x** | **4.7x** | **1.9x** |
+|:---:|:---:|:---:|:---:|
+| Ray's task throughput | Ray's speed mapping over tiny items | Ray's speed passing one 32 MiB array to every call | Ray's speed recovering from a machine killed mid-run |
+
+<p align="center"><sub>On 64 machines against Ray 2.59. Every number, its method and its raw results are in <a href="docs/benchmarks.md">docs/benchmarks.md</a>.</sub></p>
+
 ---
 
 ```python
@@ -45,7 +51,9 @@ That's the whole program. `add` waits for both counts, and their results go
 worker to worker, never through your script. On a laptop the first call
 starts a local peer for you. On a cluster, the same file runs unchanged.
 
-## How it stacks up against Ray
+> *Your laptop and your cluster run the same file. We regard this as a minimum standard of honesty, not a feature.*
+
+## Faster than Ray on five workloads, at every size we measured
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vs-ray-dark.svg">
@@ -90,7 +98,9 @@ machine-loss row is a single run).
 Coming from Ray? Most Ray Core programs port line by line, and a
 compatibility shim runs them unchanged ([from-ray.md](docs/guides/from-ray.md)).
 
-## How it works
+## How it works: no head node, by design
+
+> *A cluster should be a democracy of machines, not a monarchy with a single heir and no succession plan.*
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.svg">
@@ -103,6 +113,8 @@ peers. Kill a machine mid-run and its calls finish somewhere else.
 
 ## What you get
 
+> *Chimaera has opinions about your cluster so that you need not have them at three in the morning.*
+
 ### Calls sized for you
 
 Stop guessing CPU and memory requests. After three calls the peer knows a
@@ -112,6 +124,8 @@ of getting OOM-killed. `future.explain()` shows what it picked and why. A
 
 ### Failures you can reason about
 
+> *We do not promise you will never see a failure. We promise you will understand the one you see.*
+
 A crashed worker's calls get retried; your own exceptions don't, unless you
 list them. Mark a function that charges a card `effects="external"` and it
 starts at most once: if its worker dies mid-call, you get `ch.OutcomeUnknown`,
@@ -119,6 +133,8 @@ not a second charge. Detached runs outlive your script, and any process
 can pick one back up with `ch.runs.attach(run_id)`.
 
 ### A record of everything
+
+> *We keep the receipts so that you need not keep the grudges.*
 
 <img src="docs/assets/terminal.svg" alt="A terminal session: running a script, then chimaera runs and chimaera explain showing a call's attempts and what it measured." width="820">
 
@@ -158,6 +174,8 @@ this for every OS and CPU.
 
 ## Status
 
+> *Early software should say it is early. We do.*
+
 Chimaera is early software. This is what works today:
 
 | Area | State |
@@ -183,6 +201,8 @@ Chimaera is early software. This is what works today:
 - [Coming from Ray](docs/guides/from-ray.md): the mapping, the differences that bite, and running Ray code as is
 - [API reference](docs/api.md), [CLI](docs/cli.md), [configuration](docs/configuration.md)
 - [Design](docs/design.md) and [architecture](docs/architecture.md), for how it works inside
+
+*If you have read this far, you are either evaluating us or debugging us. Both are welcome.*
 
 ## Development
 

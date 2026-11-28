@@ -1,5 +1,7 @@
 # See what your program is doing
 
+> *The difference between a mystery and a bug is a good log line.*
+
 Wondering what your calls are up to? Every call leaves a record on the peer:
 what it printed, each attempt, what it measured and why it waited. Read it
 from Python or the `chimaera` command, and look up any `CHnnn` warning in
@@ -94,6 +96,20 @@ attempt = info["attempts"][0]
 assert attempt["end_reason"] == "ok"
 assert attempt["placement"]                      # why it ran where it ran
 assert "wall_seconds" in attempt["measures"]
+```
+
+Your script's peer puts the answer together from these places:
+
+```mermaid
+flowchart LR
+    Q["future.explain(),<br/>chimaera explain"] --> I["Your peer's ingress"]
+    I --> C["Its core"]
+    C -->|"state, prerequisites left"| T["Task record, from this peer's<br/>replica of the call's shard group"]
+    C -->|"queue position, and the CPUs<br/>or memory it waits for"| W["This peer's queue"]
+    C -->|"attempts run here"| A["This peer's attempt records"]
+    I -->|"mesh Attempts"| O["Peers that ran<br/>the other attempts"]
+    I -->|"mesh ActorWait"| H["The peer hosting the actor<br/>a call waits for"]
+    I -->|"read from a replica"| R["Run record and counts,<br/>from the groups that hold them"]
 ```
 
 <details>
@@ -277,6 +293,19 @@ peer 0000000024e6 (incarnation 1) · 0.00/12.00 CPU in use · 16 executors (0 bu
   automatic: cpu capacity 12.00
   automatic: no task limit (cgroup pids.max)
   automatic: 23 learned function profile(s), saved in .../profiles.pb
+```
+
+Everything `status` prints comes from the one peer you ask, so the other
+peers' rows are as old as the last ping reply it had from each:
+
+```mermaid
+flowchart LR
+    S["chimaera status"] --> I["The peer's ingress"]
+    I --> C["Its core"]
+    C --> Q["Its queue, executors<br/>and CPUs in use"]
+    C --> B["Its memory pool and<br/>automatic settings"]
+    C --> M["Other peers and their loads,<br/>from their ping replies"]
+    C --> G["Raft groups it hosts:<br/>leader, voters, lag"]
 ```
 
 <details>

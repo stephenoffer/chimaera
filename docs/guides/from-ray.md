@@ -1,5 +1,7 @@
 # Port your Ray program
 
+> *If you know Ray, you know most of Chimaera. What you do not know is mostly what you no longer have to do.*
+
 Bringing Ray code over? Most Ray Core programs port line by line: `@ray.remote`
 becomes `@ch.remote` and `ray.get(ref)` becomes `future.result()`. Not ready to
 port? The [compatibility shim](#run-a-ray-program-unchanged) runs a Ray Core
@@ -50,6 +52,8 @@ program unchanged, with no Ray installed.
 | Ray Data, Train, Tune, Serve, RLlib | Not provided. `ch.data` covers partitioned data ([data.md](data.md)). |
 
 ## Port a program
+
+> *The cost of switching is a weekend. The cost of not switching is every weekend after.*
 
 This Ray program tokenizes documents in parallel and counts words in an actor:
 

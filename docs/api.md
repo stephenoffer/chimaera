@@ -1,5 +1,7 @@
 # The Chimaera API
 
+> *An API should be small enough to remember and large enough to be useful. These are not opposing virtues.*
+
 This is the contract for Chimaera's Python API: what each name does, what it
 promises, and when it is available. A first program needs five things. The
 rest is there when a program grows into a service, a training job or a
@@ -283,6 +285,8 @@ assert count.remote(scratch, "blue").result() == 50_000
 
 ### Errors
 
+> *If an error message requires a search engine, it has failed at its only job.*
+
 Your exception comes back with its own type and the remote traceback attached.
 A request no machine can satisfy fails at once. **Runs today:**
 
@@ -357,6 +361,8 @@ assert whoami.remote().result() and ch.context() is None   # None in the driver
 ```
 
 ### Runs, reattaching, explaining
+
+> *A future that cannot tell you its history is merely a promise with amnesia.*
 
 Every script gets a run. `ch.init()` returns it; a `Run` is its id string, so
 another process can reattach with `ch.runs.attach(run_id)`, even after the local

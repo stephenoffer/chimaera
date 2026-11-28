@@ -1,9 +1,41 @@
 # Objects: how values move, spill and survive
 
+> *The fastest transfer is the one that never happens.*
+
 This is how Chimaera stores the values that calls pass and return, and that
 `ch.put` stores. It covers moving them between processes on one host and
 across hosts, spilling them to disk, and keeping them when a peer dies.
 Measurements against Ray are in [bench/objects/RESULTS.md](../bench/objects/RESULTS.md).
+
+A call's result, from the executor that made it to a reader on another peer.
+Only the handle goes through Raft (with the value inside it when small); the
+bytes go peer to peer.
+
+```mermaid
+flowchart LR
+    subgraph A["Peer A: ran the call"]
+        EA["Executor"]
+        SA["Object store<br/>tmpfs on Linux, else disk"]
+        DA["Spill: disk directories,<br/>or S3, GCS, Azure"]
+    end
+    G["The call's shard group<br/>(Raft)"]
+    subgraph B["Peer B: reads it"]
+        SB["Object store"]
+        RB["Reader: a call's executor,<br/>or a driver"]
+    end
+    subgraph C["Peer C: another failure domain first"]
+        DC["Spill directory on disk"]
+    end
+    O["Other peers placed to<br/>read a large input"]
+    EA -->|"writes the value's file"| SA
+    SA -->|"oldest, past 80% of the pool"| DA
+    A -->|"PublishResults: the handle<br/>(small values inline)"| G
+    G -->|"outcome names A as holder"| B
+    SA -->|"mesh Fetch: parallel ranges, blake3<br/>(same machine: hard link)"| SB
+    SB -->|"mapped copy-on-write"| RB
+    SA -->|"Replicate: C pulls a copy"| DC
+    SA -->|"64 MiB or more: placement lets<br/>at most 4 peers fetch at once"| O
+```
 
 ## The model
 
@@ -117,6 +149,8 @@ never stored under the id.
 
 ## Reading a value
 
+> *Zero-copy is not a trick. It is a refusal to do pointless work.*
+
 Reading maps the object's file copy-on-write. Arrays come back **writable**,
 and a write stays private to the reader. Ray returns read-only arrays, so
 `arr[0] = 1` raises there. A read costs about the same at 1 KB and at 1 GB
@@ -136,6 +170,8 @@ Three kinds of value are read rather than mapped:
   bucket of each scatter's file).
 
 ## Across hosts
+
+> *A large array should be born where it will be read. Copying it there afterwards is an act of bureaucracy.*
 
 A reader on another host fetches the object's file from the peer that holds
 it. Objects of 1 MiB or more come over eight parallel ranges spread across
@@ -333,6 +369,32 @@ and any blobs it names) to this host before returning, as Ray's
   gone loses its whole object directory; one that may restart (its data
   directory is still there) keeps its objects and loses only its pre-zeroed
   reserve.
+
+When every copy of a call's result is lost, one peer of the cell runs the
+call again and the others fetch the value from it (the lineage row of the
+table below has the rules):
+
+```mermaid
+sequenceDiagram
+    participant P1 as Peer 1 (its reader lost an input)
+    participant S as The cell's store (rebuild lease)
+    participant P2 as Peer 2 (its reader lost the same input)
+    P1->>S: record of a remake of (call, attempt)?
+    S-->>P1: none
+    P1->>S: lock the lease, 10 s TTL
+    S-->>P1: granted, with a fencing token
+    P2->>S: record? lock the lease?
+    S-->>P2: no record, and Peer 1 holds the lease
+    Note over P1: runs the call again under the same attempt<br/>(same object and blob ids), renewing the lease
+    loop every 250 ms, doubling to 2 s, while no record
+        P2->>S: read the record, then the lease
+    end
+    P1->>S: put "made at Peer 1", fenced by the token, then unlock
+    P2->>S: read the record
+    S-->>P2: made at Peer 1
+    P2->>P1: mesh Fetch of the value and its blobs
+    Note over P2: a lapsed lease with no record: Peer 2 takes it.<br/>No store to reach, or Peer 1 gone: it runs the call itself.
+```
 
 ## Settings
 

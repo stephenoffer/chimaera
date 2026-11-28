@@ -1,5 +1,7 @@
 # Environment variables
 
+> *The knob you need should exist. The knob you do not need should not have been invented.*
+
 Every `CHIMAERA_*` environment variable the code reads: who reads it, its
 default and what it does. Most programs need none of them. Names and defaults
 come from the code itself, in the Python package (`python/chimaera/`) and the
@@ -59,6 +61,8 @@ or when you pass `--cluster` ([cli.md](cli.md#which-peer-a-command-asks)).
 | `CHIMAERA_NATIVE_SCATTER` | worker | `1` | `0` makes `reduce_by_key`'s scatter calls split pairs with the Python loop instead of the native one, which makes the same buckets. For comparing the two; set it on the peers |
 
 ## Resources and memory
+
+> *A setting you change is respected. A setting you do not change is measured.*
 
 | Variable | Read by | Default | What it does |
 |---|---|---|---|

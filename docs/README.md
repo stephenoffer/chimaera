@@ -1,5 +1,7 @@
 # Chimaera docs
 
+> *Elegance is what remains when everything unjustified has been removed.*
+
 New here? Start with [Getting started](getting-started.md). It takes about ten
 minutes, and every example in it runs on a laptop.
 

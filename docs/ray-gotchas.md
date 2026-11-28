@@ -1,5 +1,7 @@
 # Ray Core gotchas and what Chimaera does about them
 
+> *Every gotcha you learned the hard way on another runtime, we have tried to make impossible here.*
+
 These are problems Ray Core users commonly hit, and what Chimaera does about
 each by default, with no option to set. "Handled" means a test or a measurement
 in [qualification.md](qualification.md) shows it; "partly" says what is missing;

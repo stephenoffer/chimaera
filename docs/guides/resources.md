@@ -1,10 +1,14 @@
 # Resources, GPUs and automatic tuning
 
+> *Every core you paid for, actually used: an old-fashioned idea we refuse to apologise for.*
+
 Not sure how much CPU or memory a call needs? Let the peer measure it, or tell
 Chimaera yourself. Then see what was reserved and why, hold capacity ahead of
 time, and cap what a tree of calls may spend.
 
 ## Ask for CPUs and memory
+
+> *You should not need a spreadsheet and a seance to size a worker.*
 
 ```python run
 import os
@@ -100,6 +104,8 @@ whole bytes.
 
 ## Cap a call's memory
 
+> *A `memory=` you set always wins. We are opinionated, not tyrannical.*
+
 Need a hard ceiling? `memory_limit=` is enforced:
 
 ```python run
@@ -131,6 +137,8 @@ the request is `ch.Infeasible`.
 
 ## Let the peer measure
 
+> *The cluster should learn from your code, not the other way round.*
+
 You usually don't need `cpus=` or `memory=`. The peer measures each function
 and reserves from what it saw:
 
@@ -148,6 +156,32 @@ for _ in range(4):
 reserved = f.explain()["attempts"][-1]["reservation"]
 print(reserved)  # cpus 1 (default); memory 175 MiB (learned: p95 peak 87 MiB over 3 calls of this input size × 2)
 assert "learned" in reserved
+```
+
+Where each of `cpus` and `memory` comes from, how the call is admitted, and
+how its measurement comes back:
+
+```mermaid
+flowchart TD
+    O["Your options: .options(),<br/>the decorator, ch.defaults"] --> Q{"Set as a plain number?"}
+    Q -->|"yes"| U["Your value"]
+    Q -->|"no, or ch.auto(...)"| L{"adaptive='on' and a<br/>learned value?"}
+    L -->|"yes"| LV["Learned: memory from the p95 peak<br/>× a margin, CPUs from the<br/>learned grant or a trial"]
+    L -->|"no"| D["ch.auto's initial value,<br/>else 1 CPU and no memory"]
+    LV --> C["Clipped to ch.auto's<br/>min and max"]
+    D --> C
+    U --> RS["Reservation"]
+    C --> RS
+    H["After a memory kill:<br/>at least 1.5× its peak"] --> RS
+    RS --> AD{"CPUs free, and memory<br/>fits the pool?"}
+    PL["Memory pool: the peer's memory<br/>less the agent's reserve"] -.-> AD
+    AD -->|"no"| W["Waits:<br/>pending_reason says why"]
+    W --> AD
+    AD -->|"yes"| X["A worker runs the call"]
+    X --> M["Measured: CPU time,<br/>private memory peak"]
+    M --> P["The function's profile,<br/>keyed by its code"]
+    P --> L
+    P -.->|"saved every 30 s,<br/>shared with other peers"| P2["Other peers' profiles"]
 ```
 
 <details>

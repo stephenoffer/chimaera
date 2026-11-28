@@ -47,6 +47,26 @@ it raises, every call to that actor raises that error.
 
 </details>
 
+A method call goes through its shard group to the peer that hosts the actor.
+When the caller's own peer hosts the actor, an eligible call can go straight
+to the actor's worker instead, and the peer records it just after
+(`CHIMAERA_DIRECT` in [configuration.md](../configuration.md)).
+
+```mermaid
+flowchart LR
+    C["Caller"] -->|"submit"| P["Caller's peer"]
+    P -->|"SubmitTasks"| G["Shard group<br/>(Raft log)"]
+    G -->|"granted to the host"| H["Actor's host peer"]
+    H -->|"Execute"| W["Actor's worker"]
+    W -->|"result"| H
+    H -->|"PublishResults"| G
+    G -->|"outcome"| P
+    P -->|"outcome"| C
+    C -.->|"direct path"| W
+    W -.->|"result"| C
+    C -.->|"notes it, then records it"| P
+```
+
 ## Calls through one handle run in order
 
 Calls through one handle start one at a time, in the order you made them. So

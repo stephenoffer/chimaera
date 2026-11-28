@@ -42,6 +42,8 @@ upgraded Chimaera? Scripts warn with CH111 until you stop the old one
 
 ## Start a cluster
 
+> *Scaling out should feel like adding chairs, not renegotiating the lease.*
+
 There's no head node. Every machine runs the same `chimaera` binary. Make a
 shared token once, plus TLS certificates unless you trust the network:
 
@@ -87,6 +89,23 @@ Any token must be at least 16 characters. `--insecure` lets peers join with
 no token at all, so use it only on a network you trust.
 
 </details>
+
+Which peers vote in which Raft group, and which group holds a call's vshard.
+Founders and spares alike run calls.
+
+```mermaid
+flowchart TB
+    D["Your script"] -->|"connects to any one peer"| Peers
+    subgraph Peers["Peers: the same agent on every machine, no head"]
+        F["Founders<br/>(addresses in --seeds)"]
+        S["Spares<br/>(hold no group at first)"]
+    end
+    F -->|"first 5 by node id"| G0["Group 0, the directory<br/>up to 5 voters"]
+    F -->|"3 per group, by hash,<br/>distinct zones first"| DG["Data groups 1 to N<br/>(--data-groups, default 8)"]
+    S -.->|"replace lost voters"| G0
+    S -.->|"replace lost voters"| DG
+    V["1,024 vshards"] -->|"vshard v is in<br/>group 1 + (v mod N)"| DG
+```
 
 <details>
 <summary>Four peers on one machine</summary>
@@ -438,6 +457,8 @@ when the provider announces a preemption
 
 ## When a peer dies
 
+> *A cluster with a head node is a cluster with a hostage.*
+
 A group keeps working as long as a majority of its voters is alive. Here
 we drained the spare, then killed a founder with `kill -9`. The two peers
 left kept serving: `app.py` ran again, and `chimaera status` showed both
@@ -470,6 +491,21 @@ incarnation. And if a group's other voters are gone for good,
 ([../deploy.md](../deploy.md#providers)).
 
 </details>
+
+From a missed probe to a replaced voter:
+
+```mermaid
+flowchart TD
+    A["A peer misses a probe"] --> B["Probed again through<br/>other peers"]
+    B -->|"none reach it"| C["Suspect: no new work<br/>is placed there"]
+    C -->|"it refutes"| L["Alive"]
+    C -->|"suspicion timeout"| D["Dead"]
+    D --> E["Each data group's leader retires<br/>its incarnation there"]
+    E --> F["Its calls are retried elsewhere,<br/>within max_attempts"]
+    E --> G["Its actors restart under<br/>their restart policy"]
+    D -->|"it was a voter, dead 10 s"| H["A live peer not voting in<br/>that group takes its seat"]
+    H --> I["Catches up as a learner,<br/>then votes"]
+```
 
 [failures.md](failures.md) covers what a script sees when a call or a
 value is lost.

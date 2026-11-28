@@ -1,5 +1,7 @@
 # Running Ray programs on Chimaera
 
+> *We kept the parts of the API that were right and changed the parts that hurt. This is called learning, not plagiarism.*
+
 `chimaera.compat.ray` runs Ray Core programs on Chimaera. Use it two ways:
 
 ```bash
@@ -26,6 +28,28 @@ The shim covers Ray Core only. Ray Data, Train, Tune, Serve and RLlib are not
 shimmed. It uses only Chimaera's public API, which a test enforces. Futures
 are Chimaera futures, so `await ref`, `ch.as_completed` and the rest of the
 Chimaera API work on them too.
+
+Where a Ray program's calls go:
+
+```mermaid
+flowchart LR
+    M["python -m chimaera.compat.ray app.py"] -->|"installs it as ray"| SH["chimaera.compat.ray"]
+    A["Ray program"] -->|"import ray"| SH
+    subgraph API["Chimaera's public API"]
+        INIT["ch.init, ch.shutdown"]
+        CR["ch.remote(...).options(...)"]
+        PUT["ch.put"]
+        GW["future.result(), ch.wait"]
+        U["ch.dist.reserve, ch.dist.group,<br/>ch.coord.Queue, actors"]
+    end
+    SH -->|"ray.init, ray.shutdown"| INIT
+    SH -->|"@ray.remote: Ray options translated,<br/>CHR001 to CHR003 warnings"| CR
+    SH -->|"ray.put"| PUT
+    SH -->|"ray.get, ray.wait"| GW
+    SH -->|"ray.util"| U
+    GW -->|"errors, translated by the shim"| EX["ray.exceptions"]
+    SH -->|"anything that does not map"| UN["Unsupported, naming<br/>the Chimaera alternative"]
+```
 
 ## How it says no
 

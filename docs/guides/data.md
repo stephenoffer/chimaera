@@ -4,6 +4,8 @@ Got a big NumPy array that a thousand calls all need? Pass it, and it's stored o
 
 ## Pass a large value to many calls
 
+> *Data should move to compute only when compute cannot move to data, and both should know the difference.*
+
 `ch.put(value)` stores a value once and hands you a finished `ch.Future` to pass to as many calls as you like:
 
 ```python run
@@ -273,6 +275,28 @@ A Parquet reader decodes `batch_rows` rows at a time, so it holds one batch and 
 `combine` folds two values for the same key and must be associative (`operator.add`). Leave it out, and each key maps to the list of its values.
 
 Scatter calls split each result into buckets by key, one bucket for each partition its keys go to and none for the rest, so a scatter into a million partitions stores only the few it touches. Its buckets go in one file, and a bucket of 64 KiB or more gets a file of its own when the gathers are spread over peers, so each fetches only its own: a scatter writes at most one file more per 64 KiB it stores, never one per partition. One more call waits for the scatters and lists where each stored its buckets, and one gather call per output partition reads its own bucket of each, one at a time, folding each into the partition before it reads the next. A gather holds its partition and one bucket, however many inputs there are. If a worker dies, only its call runs again.
+
+Three inputs shuffled into two partitions. Dashed lines show who waits for whom, solid ones bytes moving between workers:
+
+```mermaid
+flowchart LR
+    I1["input 1"] --> S1["scatter 1"]
+    I2["input 2"] --> S2["scatter 2"]
+    I3["input 3"] --> S3["scatter 3"]
+    S1 -.-> MF["manifest call: where<br/>each scatter stored its buckets"]
+    S2 -.-> MF
+    S3 -.-> MF
+    MF -.-> G0["gather, partition 0"]
+    MF -.-> G1["gather, partition 1"]
+    S1 -->|"bucket 0"| G0
+    S2 -->|"bucket 0"| G0
+    S3 -->|"bucket 0"| G0
+    S1 -->|"bucket 1"| G1
+    S2 -->|"bucket 1"| G1
+    S3 -->|"bucket 1"| G1
+    G0 -.-> P["ch.data.Partitioned:<br/>one future per partition"]
+    G1 -.-> P
+```
 
 - `partitions` sets the number of output partitions. By default it is one per input, up to the cores of all the live peers, not only your script's. It's more when the inputs are already stored and that many partitions would not fit in memory: a partition can take about 12 times the bytes it was stored in, a gather holds one bucket beside it, and the two are planned to fill half of `memory`, or else of the memory per core of the peer with the least. The other half is for what that estimate leaves out, such as read buffers and a dict's old and new tables while it grows. The count assumes no key repeats, so a `combine` that folds many pairs into each key gets more partitions than it needs, which costs calls, not memory. A map nobody has read stores nothing before the shuffle, so its count goes by cores alone.
 - `memory` (bytes, or a size such as `"2GiB"`) is what each gather may take for its partition. Each gather reserves it, and one whose process's private memory grows by more fails with a `MemoryError` that says to pass more `partitions`. Without it, a gather fails that way only once it has grown past its whole peer's memory.

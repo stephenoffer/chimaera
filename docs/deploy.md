@@ -45,6 +45,8 @@ when the match is unique; IP addresses only match exactly.
 Ports: 7700, or `CHIMAERA_PORT`. Under Slurm the default is
 `7700 + SLURM_JOB_ID % 1000`, so two jobs sharing a node don't collide.
 
+> *Replication is not paranoia when the machines really are out to fail you.*
+
 Raft durability: by default (`CHIMAERA_RAFT_SYNC=fsync`) a cluster peer
 syncs each Raft commit to its disk before acknowledging it. With
 `CHIMAERA_RAFT_SYNC=durable` it does so for every commit except an attached
@@ -92,6 +94,29 @@ synced redb commit rewrote about twenty pages, and the volume's 3,000 IOPS
 then held one c7i.4xlarge peer to about 1,050 no-op calls/s. With the log
 and state written this way the same peer, still syncing every commit, ran
 13,066/s (13,486/s with `none`).
+
+What a cluster voter does with each batch under each `CHIMAERA_RAFT_SYNC`
+setting, up to the reply its proposer waits for:
+
+```mermaid
+flowchart TD
+    B["A voter gets a batch<br/>of Raft operations"] --> S{"CHIMAERA_RAFT_SYNC"}
+    S -->|"fsync (default)"| W["Append to raft/raft-log.wal<br/>and sync it"]
+    S -->|"durable"| Q{"Only an attached run's<br/>per-call commands?"}
+    Q -->|"no"| W
+    Q -->|"yes"| U["Append to raft/raft-log.wal unsynced:<br/>the next synced batch or checkpoint syncs it"]
+    S -->|"full"| F["Append to raft/raft-log.wal, sync it<br/>and flush the drive cache"]
+    S -->|"none"| N["Log database takes it,<br/>page cache only"]
+    W --> L["Log database takes it unsynced"]
+    U --> L
+    F --> L
+    L -.-> CP["Every second a checkpoint syncs it,<br/>and the write-ahead file starts over"]
+    L --> H["This voter holds the batch"]
+    N --> H
+    H --> M["A majority of the group's voters<br/>hold it: committed"]
+    M --> SM["Applied to raft/raft-sm.redb,<br/>not synced while the peer runs"]
+    SM --> A["The proposer gets its reply"]
+```
 
 `chimaera status` shows the guarantee asked for next to the one the groups
 give: `machine` (every voter syncs and no machine holds a majority of a
@@ -171,6 +196,8 @@ for any cluster peer. The discovered pool and labels are logged at start but
 not used for placement yet.
 
 ### Kubernetes
+
+> *Guesswork dressed in YAML is still guesswork.*
 
 A StatefulSet, a headless Service for the peers, a Service for drivers and a
 PodDisruptionBudget, printed by `chimaera k8s render`. There is no operator

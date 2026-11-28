@@ -45,6 +45,8 @@ quotes = [
   "| Map over tiny items, no hand batching | 4,394/s | 789,192/s |",
   "| 32 MiB array passed straight to 2,048 calls | 4.26 s | 0.91 s |",
   "| 10 calls on a 256 MiB value just made | 0.257 s | 0.228 s |",
+  "| Ray's task throughput | Ray's speed mapping over tiny items | Ray's speed passing one 32 MiB array to every call | Ray's speed recovering from a machine killed mid-run |",
+  "On 64 machines against Ray 2.59.",
 ]
 artifacts = [
   { path = "bench/evals/results/ray-cluster-1-2026-11-24.json", sha256 = "e06f637685148fd39e8becad0754f639f9f8ce1f1ccd75d6fcf112ce6e79bddf" },
@@ -106,6 +108,7 @@ quotes = [
   "There's no head node to size, babysit or lose.",
   "Every machine runs the same `chimaera` peer, and the record of every call is replicated with Raft on three peers.",
   "Kill a machine mid-run and its calls finish somewhere else.",
+  "> *A cluster should be a democracy of machines, not a monarchy with a single heir and no succession plan.*",
 ]
 sections = ["M2 Multi-peer (in progress)"]
 lanes = ["quick"]

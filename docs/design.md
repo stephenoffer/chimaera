@@ -2,6 +2,8 @@
 
 ## A Rust runtime for large CPU and AI applications, with one Python decorator
 
+> *The enemy of good infrastructure is not complexity but unexamined complexity.*
+
 **Engineering design proposal · 20 November 2026**  
 **Status** The public API and Rust cluster runtime are proposed. The companion exercises selected API, recovery, accounting, and CPU data-path contracts locally.
 

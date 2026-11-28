@@ -126,6 +126,8 @@ three).
 
 ## Retry what is safe to retry
 
+> *A system that retries everything has confused perseverance with judgement.*
+
 Calls lost with a worker or peer are retried for you. So are a dropped
 connection and a timeout (`ConnectionError`, `TimeoutError`, and requests',
 aiohttp's and urllib3's equivalents) in calls that may run again:
@@ -150,6 +152,28 @@ def fetch(page: int) -> str:
     return f"page {page}"
 
 assert fetch.remote(1).result() == "page 1"
+```
+
+Here's what the call's shard group does with an attempt that ends without a
+value. Actor calls follow their actor's `restart` policy instead.
+
+```mermaid
+flowchart TD
+    K{"An attempt ends<br/>without a value"}
+    K -->|"your code raised"| L{"In retry_exceptions? By default,<br/>a dropped connection or timeout.<br/>Never for external calls"}
+    L -->|"no"| E["Error recorded:<br/>the call raises it"]
+    L -->|"yes"| F{"Failed exactly like<br/>the attempt before?"}
+    F -->|"yes"| E
+    F -->|"no"| M{"Attempts left?"}
+    K -->|"worker died, peer died<br/>(incarnation retired),<br/>or killed for memory"| X{"effects='external'<br/>and already started?"}
+    X -->|"yes"| OU["ch.OutcomeUnknown"]
+    X -->|"no, a memory kill"| O{"Third memory kill?"}
+    X -->|"no, a lost worker or peer"| M
+    O -->|"yes"| OM["ch.OutOfMemory"]
+    O -->|"no: the retry reserves<br/>1.5× the peak"| R
+    M -->|"no"| T["ch.InfrastructureFailure,<br/>or your exception"]
+    M -->|"yes"| R["Ready again: a new attempt<br/>is granted"]
+    K -->|"given back before it started,<br/>to run on another peer"| R
 ```
 
 <details>

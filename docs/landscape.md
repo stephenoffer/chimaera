@@ -198,6 +198,8 @@ core, so the driver is a client and never the cluster.
 
 ## Ten architectural lessons
 
+> *The head node is the appendix of distributed systems: vestigial, occasionally inflamed, and always in the wrong place when it bursts.*
+
 1. **A central Python scheduler caps throughput at a few thousand tasks per second**, and the limit is overhead, not
    policy (Dask, Parsl, RSDS). Chimaera: native agent, simple sampling, batched submission.
 2. **Fan-out must be a tree.** Monarch's multicast trees bootstrap 16,384 processes in under 5 s; Ray's star-shaped

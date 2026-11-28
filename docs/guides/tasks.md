@@ -44,6 +44,36 @@ settings) and create it inside your function. CPUs, memory and GPUs are in
 
 </details>
 
+<details>
+<summary>What happens to a call</summary>
+
+A call that its group's leader places takes three commits in the shard
+group's Raft log: `SubmitTasks`, `GrantAttempts` and `PublishResults`. A local
+peer grants the call in its `SubmitTasks` commit, so there it takes two.
+
+```mermaid
+sequenceDiagram
+    participant S as Your script
+    participant P as Its peer
+    participant G as Shard group (leader)
+    participant R as Peer that runs it
+    participant W as Worker
+    S->>P: submit, batched with other calls
+    P->>G: SubmitTasks
+    G-->>P: committed
+    P-->>S: accepted
+    G->>G: GrantAttempts, to the peer it picked
+    G->>R: dispatch
+    R->>W: Execute
+    W-->>R: result
+    Note over R,W: A result over 64 KiB stays in this<br/>peer's object store, and the outcome says where
+    R->>G: PublishResults
+    G-->>P: outcome
+    P-->>S: outcome, for the Future
+```
+
+</details>
+
 ## Wait for a result
 
 ```python run

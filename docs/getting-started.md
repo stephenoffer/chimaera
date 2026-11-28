@@ -31,6 +31,18 @@ them.
 and `.result(timeout=5)` gives up after five seconds with `TimeoutError` while
 the call keeps running. You can also `await` a future.
 
+Three kinds of process take part: your script, the peer, and the workers the
+peer starts. On a cluster, peers on other machines run calls too.
+
+```mermaid
+flowchart LR
+    S["Your script"] -->|".remote()"| P["Peer on this machine"]
+    P -->|"the result"| S
+    P -->|"runs calls in"| W1["Worker"]
+    P --> W2["Worker"]
+    P -.->|"on a cluster"| Q["Peers on other machines,<br/>each with its workers"]
+```
+
 ## Chain calls without waiting
 
 Pass a future into another call. The second call starts when its inputs are
@@ -206,6 +218,8 @@ or run it unchanged with `chimaera run --cluster lab -- python app.py`.
 [Run on a cluster](guides/clusters.md) walks through it.
 
 ## A few words
+
+> *The best compliment a runtime can receive is to be ignored because it works.*
 
 | Word | Meaning |
 |---|---|

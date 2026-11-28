@@ -55,6 +55,8 @@ Five rules decide every trade-off below:
 
 ## 2. Shape of the system: peers, cells, fleet
 
+> *There is no head node because there was never a good argument for one; there was only habit.*
+
 ```mermaid
 flowchart TB
     subgraph Fleet["Fleet: up to 512+ cells, no global head"]
@@ -100,6 +102,45 @@ nodes, Borg cells average about 10,000 and are "capped by blast radius, not scal
 170,000. With 512 cells at the top of the envelope, the cross-cell tier is where scaling must be proven, which is
 why it carries no per-call traffic and its directory is sharded (§7). [Hydra][hydra] · [Borg][borg] ·
 [Twine][twine] · [Consul scale][consulscale]
+
+**Inside one peer today.** The agent's parts in `crates/chimaera-peer` and what talks to what. Every Raft group a
+peer holds shares one log database (with a write-ahead file when the peer syncs) and one state-machine database.
+
+```mermaid
+flowchart TB
+    Driver["Driver<br/>chimaera._native Client"]
+    subgraph Agent["The chimaera agent"]
+        Ingress["Ingress<br/>client service"]
+        Core["Core<br/>scheduling and dispatch"]
+        Router["Router"]
+        Raft["Raft groups"]
+        Mesh["Mesh<br/>peer-to-peer RPC"]
+        Sup["Executor supervisor"]
+    end
+    Exec["Python executors"]
+    LogDB[("raft-log.redb<br/>raft-log.wal")]
+    SMDB[("raft-sm.redb")]
+    Store[("Object store and<br/>shared-memory arena")]
+    Others["Other peers"]
+    Driver -->|"peer.sock or client port"| Ingress
+    Ingress -->|"session requests"| Core
+    Ingress -->|"SubmitTasks"| Router
+    Core -->|"grants, results"| Router
+    Router -->|"group led here"| Raft
+    Router -->|"led elsewhere"| Mesh
+    Raft --> LogDB
+    Raft --> SMDB
+    Raft -->|"applied events"| Core
+    Core --> Sup
+    Sup <-->|"exec.sock"| Exec
+    Exec -->|"nested calls, peer.sock"| Ingress
+    Core <-->|"work, outcomes"| Mesh
+    Raft <-->|"Raft messages"| Mesh
+    Mesh <--> Others
+    Driver <-->|"value files, same machine"| Store
+    Exec <-->|"value files"| Store
+    Mesh <-->|"object bytes"| Store
+```
 
 ## 3. The hot path: consensus for lifetimes, not for calls
 
