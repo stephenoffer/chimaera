@@ -38,6 +38,7 @@ mod inputs;
 pub mod rebuild_lease;
 mod recovery;
 mod shortlist;
+mod sweep;
 
 type Kind = pb::error_record::Kind;
 
@@ -203,6 +204,8 @@ pub enum CoreMsg {
     Watch {
         session: u64,
         tasks: Vec<Tk>,
+        /// Their submission was acknowledged here: a record of each was committed.
+        accepted: bool,
     },
     /// Calls a driver sent straight to their actors' executors.
     DirectInflight(Vec<(Tk, crate::direct::Call)>),
@@ -257,6 +260,8 @@ pub enum CoreMsg {
         v: u16,
         published: Vec<(Tk, u32)>,
         at: u64,
+        /// Every attempt the proposal carried.
+        sent: Vec<(Tk, u32)>,
     },
     /// Result of giving back an unstarted attempt (spillback). Refused or
     /// unknown: the work runs here after all.
@@ -403,6 +408,13 @@ pub enum CoreMsg {
         req: pb::HoldRequest,
         reply: oneshot::Sender<pb::HoldReply>,
     },
+    /// `Peer.AttemptsHeld`: whether this peer still holds these attempts (core/sweep.rs).
+    AttemptsHeld {
+        keys: Vec<(Option<Tk>, u32)>,
+        reply: oneshot::Sender<Vec<bool>>,
+    },
+    /// What a lost-call sweep read (core/sweep.rs).
+    Swept(Box<sweep::Found>),
     /// Write learned profiles to disk now (clean shutdown).
     Persist {
         reply: oneshot::Sender<()>,
@@ -1176,6 +1188,11 @@ pub struct Core {
     /// Calls being run again here because a value they made was lost, and
     /// the attempts waiting for that value.
     rebuilding: HashMap<Tk, Vec<Work>>,
+    /// Attempts held here outside the queue and the batches: their results
+    /// being published, or the calls run in another cell (core/sweep.rs).
+    away: HashSet<(Tk, u32)>,
+    /// The lost-call sweep (core/sweep.rs).
+    sweep: sweep::Sweep,
     /// Programs waiting for a call to be run again (`RebuildRead`), by call.
     rebuild_readers: HashMap<Tk, Vec<oneshot::Sender<Result<(), String>>>>,
     /// Calls run again per run on this peer (core/recovery.rs).
@@ -1344,6 +1361,8 @@ impl Core {
             pending_dispatch: BTreeMap::new(),
             localizing: HashSet::new(),
             rebuilding: HashMap::new(),
+            away: HashSet::new(),
+            sweep: sweep::Sweep::default(),
             rebuild_readers: HashMap::new(),
             rebuild_budget: recovery::Budget::default(),
             fanout: shortlist::Fanout::default(),
@@ -1424,6 +1443,7 @@ impl Core {
         in_flight.fetch_add(1, Relaxed);
         let keys: Vec<(Option<Tk>, u32)> =
             entries.iter().map(|e| (e.task.as_ref().and_then(Tk::parse), e.attempt)).collect();
+        let sent: Vec<(Tk, u32)> = keys.iter().filter_map(|(tk, a)| Some(((*tk)?, *a))).collect();
         tokio::spawn(async move {
             let unsynced = crate::sync_class::publish(&router, v, &entries);
             let body = pb::shard_cmd::Body::Publish(pb::PublishResults { entries });
@@ -1443,7 +1463,7 @@ impl Core {
                 }
             };
             in_flight.fetch_sub(1, Relaxed);
-            let _ = tx.send(CoreMsg::Published { v, published, at }).await;
+            let _ = tx.send(CoreMsg::Published { v, published, at, sent }).await;
         });
     }
 
@@ -1506,6 +1526,7 @@ impl Core {
         for v in open {
             let entries = self.pending_publish.remove(&v).expect("listed above");
             *self.publishing.entry(v).or_default() += 1;
+            self.away.extend(entries.iter().filter_map(|e| Some((Tk::parse(e.task.as_ref()?)?, e.attempt))));
             self.propose_publish(v, entries);
         }
         let Some(mesh) = self.router.mesh.clone() else { return };
@@ -1662,7 +1683,7 @@ impl Core {
                     .collect();
                 for tk in tasks {
                     for s in self.watchers.remove(&tk).unwrap_or_default() {
-                        self.watch(s, vec![tk]);
+                        self.watch(s, vec![tk], false);
                     }
                 }
             }
@@ -1671,7 +1692,7 @@ impl Core {
                     self.remote_watched.remove(&tk);
                     let sessions = self.watchers.remove(&tk).unwrap_or_default();
                     for s in sessions {
-                        self.watch(s, vec![tk]);
+                        self.watch(s, vec![tk], false);
                     }
                 }
             }
@@ -1700,6 +1721,11 @@ impl Core {
                 self.on_committed(actor, *work, ack, *reply, state);
                 self.dispatch();
             }
+            CoreMsg::AttemptsHeld { keys, reply } => {
+                let held = keys.into_iter().map(|(tk, a)| tk.is_some_and(|tk| self.holds_attempt(tk, a))).collect();
+                let _ = reply.send(held);
+            }
+            CoreMsg::Swept(found) => self.on_swept(*found),
             CoreMsg::Hold { req, reply } => {
                 let _ = reply.send(self.on_hold(req));
             }
@@ -1756,7 +1782,7 @@ impl Core {
                 self.prestart(&env);
                 self.runs.entry(run).or_insert(RunInfo { env, detached, sessions: BTreeSet::new() });
             }
-            CoreMsg::Watch { session, tasks } => self.watch(session, tasks),
+            CoreMsg::Watch { session, tasks, accepted } => self.watch(session, tasks, accepted),
             CoreMsg::DirectInflight(calls) => self.direct.note(calls),
             CoreMsg::RunFetched { run, rec } => self.on_run_fetched(run, rec),
             CoreMsg::DirectAttempts(records) => {
@@ -1806,7 +1832,10 @@ impl Core {
                 // Denied or stale: another attempt owns the start, or the task
                 // finished; its outcome arrives through the shard.
             }
-            CoreMsg::Published { v, published, at } => {
+            CoreMsg::Published { v, published, at, sent } => {
+                for k in &sent {
+                    self.away.remove(k);
+                }
                 for (tk, attempt) in published {
                     let records = self.attempts.get_mut(&tk).into_iter().flatten();
                     if let Some(r) = records.filter(|r| r.attempt == attempt).last() {
@@ -2427,20 +2456,25 @@ impl Core {
         self.admit(work);
     }
 
-    /// An attempt another peer's leader placed here.
-    fn accept_remote(&mut self, rw: pb::RemoteWork) {
-        let Some(tk) = rw.task.as_ref().and_then(Tk::parse) else { return };
-        let attempt = rw.attempt;
-        self.router.known.note_remote(&rw);
-        let known = self.localizing.contains(&(tk, attempt))
+    /// Whether attempt `attempt` of `tk` is queued or running here: fetching
+    /// its inputs, in the queue, in a batch, or at its actor.
+    fn runs_attempt(&self, tk: Tk, attempt: u32) -> bool {
+        self.localizing.contains(&(tk, attempt))
             || self.queue.any_for(&tk, |w| w.tk == tk && w.attempt == attempt)
             || (self.batched.contains_key(&tk)
                 && self.running.iter().any(|r| r.items.iter().any(|w| w.tk == tk && w.attempt == attempt)))
             || self
                 .actors
                 .values()
-                .any(|h| h.mailbox.values().chain(h.ctor.iter()).any(|w| w.tk == tk && w.attempt == attempt));
-        if known {
+                .any(|h| h.mailbox.values().chain(h.ctor.iter()).any(|w| w.tk == tk && w.attempt == attempt))
+    }
+
+    /// An attempt another peer's leader placed here.
+    fn accept_remote(&mut self, rw: pb::RemoteWork) {
+        let Some(tk) = rw.task.as_ref().and_then(Tk::parse) else { return };
+        let attempt = rw.attempt;
+        self.router.known.note_remote(&rw);
+        if self.runs_attempt(tk, attempt) {
             return; // a new leader re-sent it
         }
         if !rw.home.is_empty() {
@@ -3095,9 +3129,12 @@ impl Core {
         }
     }
 
-    fn watch(&mut self, session: u64, tasks: Vec<Tk>) {
+    fn watch(&mut self, session: u64, tasks: Vec<Tk>, accepted: bool) {
         let mut remote: BTreeMap<u32, Vec<Tk>> = BTreeMap::new();
         for tk in tasks {
+            if accepted {
+                self.sweep.accepted(tk);
+            }
             // Watched where the outcome surely arrives: here only if this
             // peer's replica keeps up with the group, else on its members.
             if !self.router.current(tk.v()) {
@@ -3279,7 +3316,7 @@ impl Core {
         let Some(s) = self.sessions.get_mut(&id) else { return };
         let again = s.refill();
         if !again.is_empty() {
-            self.watch(id, again);
+            self.watch(id, again, false);
         }
     }
 
@@ -3349,6 +3386,7 @@ impl Core {
         let Some(link) = fleet.link(&cell) else { return false };
         let w = self.queue.remove(i).expect("index in range");
         let (spec, tx) = (w.spec.clone(), self.me_tx.clone());
+        self.away.insert((w.tk, w.attempt));
         tracing::debug!(task = %w.tk.task.hex(), %cell, "running a call in another cell");
         tokio::spawn(async move {
             let result = link.delegate(run, &env, spec, code, values).await;
@@ -3376,6 +3414,7 @@ impl Core {
     /// was granted here, and running it twice is harmless (`effects="none"`).
     fn on_delegated(&mut self, work: Work, cell: &str, result: crate::fleet::Delegated) {
         let (tk, attempt) = (work.tk, work.attempt);
+        self.away.remove(&(tk, attempt));
         if let Some(f) = self.fleet.as_mut() {
             f.done(cell, work.cpus);
         }
@@ -6400,6 +6439,7 @@ impl Core {
 
     fn housekeeping(&mut self) {
         self.expire_holds();
+        self.sweep_tick();
         self.spill();
         self.charge_budgets();
         // Actors that waited for CPUs: try again (each re-reads its record).
@@ -6639,6 +6679,10 @@ impl Core {
             let rec = self.router.read(tk.v(), |kv| read::task(kv, tk)).flatten();
             reply.attempts = self.attempts.get(&tk).cloned().unwrap_or_default();
             reply.pending_reason = self.pending_reason(tk, rec.as_ref());
+            if let Some(n) = self.sweep.checks.get(&tk) {
+                reply.pending_reason +=
+                    &format!(" (read {n} time(s) through its group's leader to check it was not lost)");
+            }
             reply.task = rec;
             if reply.task.is_none()
                 && let Some(call) = self.direct.get(&tk)

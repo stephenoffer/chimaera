@@ -45,6 +45,10 @@ service Mesh {
   rpc Inventory(InventoryRequest) returns (InventoryReply);
   // Hold resources on the target's ledger (Peer.Hold asked at another peer).
   rpc Hold(HoldRequest) returns (HoldReply);
+  // Whether this peer still holds attempts of calls: queued, running, or with
+  // a result waiting to be published or being published. The lost-call sweep
+  // asks a running attempt's host (crates/chimaera-peer/src/core/sweep.rs).
+  rpc AttemptsHeld(AttemptsHeldRequest) returns (AttemptsHeldReply);
   // Why an actor placed on this peer has not started ("" if it is not
   // waiting): explain() on another peer asks the actor's host.
   rpc ActorWait(ActorWaitRequest) returns (ActorWaitReply);
@@ -364,4 +368,15 @@ message MeshPutCode {
   string cluster = 1;
   bytes digest = 2;
   bytes code = 3;
+}
+
+message AttemptsHeldRequest {
+  string cluster = 1;
+  repeated TaskKey tasks = 2;
+  repeated uint32 attempts = 3;  // one per task
+}
+
+message AttemptsHeldReply {
+  repeated bool held = 1;  // one per task
+  PeerInc peer = 2;        // who answered: an attempt of another incarnation is not its to hold
 }

@@ -589,11 +589,11 @@ impl pb::peer_server::Peer for Service {
                             let _ = this.core.send(CoreMsg::DirectAttempts(ran)).await;
                         }
                         tx.send(ev(seq, pb::session_event::Event::Acks(acks))).await;
-                        let _ = this.core.send(CoreMsg::Watch { session: id, tasks: accepted }).await;
+                        let _ = this.core.send(CoreMsg::Watch { session: id, tasks: accepted, accepted: true }).await;
                     }
                     Some(pb::client_msg::Msg::Watch(w)) => {
                         let tasks = w.tasks.iter().filter_map(Tk::parse).collect();
-                        let _ = this.core.send(CoreMsg::Watch { session: id, tasks }).await;
+                        let _ = this.core.send(CoreMsg::Watch { session: id, tasks, accepted: false }).await;
                     }
                     Some(pb::client_msg::Msg::ReleaseObjects(r)) => {
                         let msg = CoreMsg::ReleaseObjects { session: id, run: r.run, objects: r.object_ids };

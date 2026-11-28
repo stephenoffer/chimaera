@@ -682,6 +682,19 @@ impl MeshClient {
         Ok(r.map_err(status_err)?.into_inner())
     }
 
+    /// Whether `node` still holds each (call, attempt): queued, running or publishing.
+    pub async fn attempts_held(
+        &self,
+        node: u64,
+        tasks: Vec<pb::TaskKey>,
+        attempts: Vec<u32>,
+    ) -> std::io::Result<pb::AttemptsHeldReply> {
+        let req = pb::AttemptsHeldRequest { cluster: self.cluster.clone(), tasks, attempts };
+        let mut c = self.rpc(node)?;
+        let r = tokio::time::timeout(CALL_TIMEOUT, c.attempts_held(req)).await.map_err(std::io::Error::other)?;
+        Ok(r.map_err(status_err)?.into_inner())
+    }
+
     /// What `node`'s object store holds (objplane::inventory, as JSON).
     pub async fn inventory(&self, node: u64, largest: u32) -> std::io::Result<String> {
         let mut c = self.rpc(node)?;
@@ -1705,7 +1718,7 @@ impl pb::mesh_server::Mesh for MeshService {
         core.send(CoreMsg::OpenSession { id: session, mailbox: reader.0.clone(), tenant: None })
             .await
             .map_err(|_| Status::unavailable("stopping"))?;
-        core.send(CoreMsg::Watch { session, tasks: tasks.clone() })
+        core.send(CoreMsg::Watch { session, tasks: tasks.clone(), accepted: false })
             .await
             .map_err(|_| Status::unavailable("stopping"))?;
         let (out_tx, out_rx) = mpsc::channel(256);
@@ -1795,6 +1808,20 @@ impl pb::mesh_server::Mesh for MeshService {
         let gone = || Status::unavailable("peer is stopping");
         self.0.core.send(CoreMsg::Hold { req: r, reply }).await.map_err(|_| gone())?;
         Ok(Response::new(rx.await.map_err(|_| gone())?))
+    }
+
+    async fn attempts_held(
+        &self,
+        req: Request<pb::AttemptsHeldRequest>,
+    ) -> Result<Response<pb::AttemptsHeldReply>, Status> {
+        let r = req.into_inner();
+        self.0.check(&r.cluster)?;
+        let keys = r.tasks.iter().zip(&r.attempts).map(|(k, a)| (Tk::parse(k), *a)).collect();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let gone = || Status::unavailable("peer is stopping");
+        self.0.core.send(CoreMsg::AttemptsHeld { keys, reply }).await.map_err(|_| gone())?;
+        let held = rx.await.map_err(|_| gone())?;
+        Ok(Response::new(pb::AttemptsHeldReply { held, peer: Some(self.0.router()?.identity.pb()) }))
     }
 
     /// Why an actor placed here has not started (explain() on another peer asks).

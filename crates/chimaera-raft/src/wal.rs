@@ -103,8 +103,20 @@ pub(crate) struct Wal {
     at: u64,
     written: u64,
     since: Instant,
+    /// With `CHIMAERA_TEST_LOSE_UNSYNCED=1` in a debug build: the records
+    /// written since the last sync (where they start, and their bytes), kept
+    /// in memory until it. A peer killed then loses them, as a machine that
+    /// loses its power loses what it had not synced (cluster tests). Only a
+    /// full file is checkpointed then: a test's kill takes everything since
+    /// the last synced batch, the most a power loss could.
+    held: Option<std::sync::Mutex<(u64, Vec<u8>)>>,
     #[cfg(test)]
     pub(crate) synced: std::sync::Arc<Synced>,
+}
+
+/// See [`Wal::held`]. A release build never loses a record on purpose.
+fn lose_unsynced() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("CHIMAERA_TEST_LOSE_UNSYNCED").is_some_and(|v| v == "1")
 }
 
 /// How far the file is synced, for tests that stand in for a machine losing
@@ -134,6 +146,7 @@ impl Wal {
             at: FILE_HEADER,
             written: 0,
             since: Instant::now(),
+            held: lose_unsynced().then(Default::default),
             #[cfg(test)]
             synced: std::sync::Arc::default(),
         };
@@ -177,7 +190,16 @@ impl Wal {
         rec.extend_from_slice(&len.to_le_bytes());
         rec.extend_from_slice(&digest(self.epoch, &payload));
         rec.extend_from_slice(&payload);
-        self.file.write_all_at(&rec, self.at)?;
+        match &self.held {
+            Some(held) => {
+                let mut held = held.lock().expect("lock");
+                if held.1.is_empty() {
+                    held.0 = self.at;
+                }
+                held.1.extend_from_slice(&rec);
+            }
+            None => self.file.write_all_at(&rec, self.at)?,
+        }
         self.at += rec.len() as u64;
         self.written += rec.len() as u64;
         #[cfg(test)]
@@ -198,6 +220,9 @@ impl Wal {
     /// Commit redb durably (persisting every commit made since the last
     /// checkpoint), then start the file over.
     pub(crate) fn checkpoint(&mut self, db: &Database) -> io::Result<()> {
+        if self.held.is_some() && self.written < MAX_BYTES {
+            return Ok(()); // see `held`
+        }
         let mut txn = db.begin_write().map_err(io_err)?;
         txn.set_durability(Durability::Immediate).map_err(io_err)?;
         txn.commit().map_err(io_err)?;
@@ -210,6 +235,9 @@ impl Wal {
     /// naming it is synced. Until then a crash replays them, over a redb that
     /// already holds them durably, which changes nothing.
     fn reset(&mut self) -> io::Result<()> {
+        if let Some(held) = &self.held {
+            held.lock().expect("lock").1.clear(); // redb holds them durably now
+        }
         self.epoch += 1;
         let mut header = [0u8; FILE_HEADER as usize];
         header[..8].copy_from_slice(MAGIC);
@@ -228,6 +256,12 @@ impl Wal {
 
     /// Make every batch written so far durable.
     pub(crate) fn sync(&self) -> io::Result<()> {
+        if let Some(held) = &self.held {
+            let (at, bytes) = std::mem::take(&mut *held.lock().expect("lock"));
+            if !bytes.is_empty() {
+                self.file.write_all_at(&bytes, at)?;
+            }
+        }
         if self.full {
             self.file.sync_data()?; // F_FULLFSYNC on macOS
         } else {
@@ -364,6 +398,30 @@ mod tests {
         let meta = txn.open_table(LOG_META).unwrap();
         assert_eq!(meta.get((1, "vote")).unwrap().unwrap().value(), b"v2");
         assert!(read_records(&wal_path).unwrap().0.is_empty(), "replayed records go once redb holds them");
+    }
+
+    #[test]
+    fn a_wal_that_loses_unsynced_records_keeps_them_from_the_file_until_a_sync() {
+        // CHIMAERA_TEST_LOSE_UNSYNCED's stand-in for a power loss: what a
+        // killed peer's file holds is what a machine's disk would have kept.
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("log.wal");
+        let db = open(dir.path());
+        let (mut wal, _) = Wal::recover(&db, &wal_path, false).unwrap();
+        wal.held = Some(Default::default());
+        wal.append(&[batch(1, 1, 2)]).unwrap();
+        wal.write(&[batch(1, 3, 2)]).unwrap();
+        wal.write(&[batch(1, 5, 1)]).unwrap();
+        assert_eq!(read_records(&wal_path).unwrap().0, vec![batch(1, 1, 2)], "unsynced: not in the file");
+        wal.append(&[batch(2, 1, 1)]).unwrap();
+        let synced = vec![batch(1, 1, 2), batch(1, 3, 2), batch(1, 5, 1), batch(2, 1, 1)];
+        assert_eq!(read_records(&wal_path).unwrap().0, synced, "a sync writes what was held, in order");
+        wal.write(&[batch(3, 1, 1)]).unwrap();
+        wal.checkpoint(&db).unwrap();
+        assert_eq!(read_records(&wal_path).unwrap().0, synced, "no checkpoint by time: the kill takes what is held");
+        wal.append(&[batch(4, 1, 1)]).unwrap();
+        let all = [synced, vec![batch(3, 1, 1), batch(4, 1, 1)]].concat();
+        assert_eq!(read_records(&wal_path).unwrap().0, all);
     }
 
     #[test]

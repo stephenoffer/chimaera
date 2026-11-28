@@ -3,8 +3,9 @@
 //!
 //! Only an attached run's per-call commands: a SubmitTasks, GrantAttempts or
 //! PublishResults whose every call belongs to an active, attached run, has
-//! ordinary effects (not `external`), is a function, map item or actor method
-//! (not a constructor), is neither a durable actor's command nor a durable
+//! ordinary effects (not `external`), is a function or map item (not an
+//! actor's call: one whose result was lost is run again, and an actor's
+//! method run twice changes its state twice), is neither a durable actor's command nor a durable
 //! workflow's step or root, holds no launch token (a gang rank, an actor
 //! gang's rank or a reservation's host: the gang's decision record is synced,
 //! so its rank calls must be too) and, for results, keeps no value
@@ -35,16 +36,16 @@ const RUN_FACT_LIFE: Duration = Duration::from_secs(3600);
 const KEPT: usize = 1 << 16;
 
 /// Whether a call's own facts let its commands go unsynced (`with_result`:
-/// its result's publication too): ordinary effects, a function, map item or
-/// actor method, no durable actor command or durable workflow step (both
-/// carry a command fingerprint) or root, no launch token, and no result of
-/// the direct path kept `retained`. A policy or enum value this peer cannot
-/// read counts against.
-fn call(spec: &pb::TaskSpec, with_result: bool) -> bool {
+/// its result's publication too): ordinary effects, a function or map item,
+/// no durable actor command or durable workflow step (both carry a command
+/// fingerprint) or root, no launch token, and no result of the direct path
+/// kept `retained`. A policy or enum value this peer cannot read counts
+/// against. The lost-call sweep runs a call again when its result's
+/// publication was lost, which only these may be.
+pub(crate) fn call(spec: &pb::TaskSpec, with_result: bool) -> bool {
     let Ok(policy) = pb::Policy::decode(spec.policy.as_slice()) else { return false };
     let effects = [pb::Effects::None, pb::Effects::Idempotent].map(|e| e as i32);
-    let kinds =
-        [pb::CallKind::CallFunction, pb::CallKind::CallMapItem, pb::CallKind::CallActorMethod].map(|k| k as i32);
+    let kinds = [pb::CallKind::CallFunction, pb::CallKind::CallMapItem].map(|k| k as i32);
     effects.contains(&spec.effects)
         && kinds.contains(&spec.kind)
         && spec.command_id.is_empty()
@@ -294,7 +295,6 @@ mod tests {
         assert!(call(&plain, false) && call(&plain, true), "a plain function call");
         for (why, s) in [
             ("map item", pb::TaskSpec { kind: pb::CallKind::CallMapItem as i32, ..plain.clone() }),
-            ("actor method", pb::TaskSpec { kind: pb::CallKind::CallActorMethod as i32, ..plain.clone() }),
             ("idempotent", pb::TaskSpec { effects: pb::Effects::Idempotent as i32, ..plain.clone() }),
             ("a replayable result", pb::TaskSpec { policy: policy(pb::Durability::Replayable), ..plain.clone() }),
             (
@@ -311,6 +311,8 @@ mod tests {
             ("external effects", pb::TaskSpec { effects: pb::Effects::External as i32, ..plain.clone() }),
             ("unknown effects", pb::TaskSpec { effects: 9, ..plain.clone() }),
             ("actor constructor", pb::TaskSpec { kind: pb::CallKind::CallActorCtor as i32, ..plain.clone() }),
+            // A lost result is recovered by running the call again: an actor's method would change its state twice.
+            ("actor method", pb::TaskSpec { kind: pb::CallKind::CallActorMethod as i32, ..plain.clone() }),
             ("unknown kind", pb::TaskSpec { kind: 9, ..plain.clone() }),
             ("durable actor command id", pb::TaskSpec { command_id: b"c".to_vec(), ..plain.clone() }),
             ("durable command fingerprint", pb::TaskSpec { command_fingerprint: vec![1; 32], ..plain.clone() }),

@@ -54,9 +54,16 @@ run's per-call commits: its calls' submissions, grants and results. Those are
 acknowledged once a majority of the group's voters hold them in memory. They
 survive the peers' processes dying and the restart or loss of machines holding
 fewer than half of a group's voters; the last of them are lost if machines
-holding a majority of a group's voters lose power together. The calls of an
+holding a majority of a group's voters lose power together. A driver is not
+left waiting on such a call. Its peer reads the calls its sessions wait on
+through each group's leader, soon after a leader changes and every 30 seconds
+regardless. A submitted call with no record left raises `ch.DataLost`; a call
+whose result was lost runs again if it is a function or map item without
+external effects (any other call's result was synced). Either needs two reads
+30 seconds apart, so it happens within about a minute of the group having a
+leader again. The calls of an
 attached run that must survive anyway are synced: those with
-`effects="external"`, a durable actor's calls, durable workflows and their
+`effects="external"`, actors' calls, durable workflows and their
 steps, gang ranks and reservation hosts, and calls that return a `retained`
 value. So is everything else: detached runs, the store, leases, quotas and
 membership. A driver older than the release that added `durable` does not
